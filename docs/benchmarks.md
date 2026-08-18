@@ -196,22 +196,32 @@ regardless of load — 8–28x less here.
 
 | Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC |
 |---|---|---|---|
-| Produce MB/sec | 311 | **490** | 231 |
-| Consume MB/sec | **575** | 377 | 132 |
-| Produce CPU % (avg) | **139** | 148 | 323 |
-| Produce memory MiB (avg) | 1280 | **277** | 356 |
-| Consume CPU % (avg) | 198 | **60** | 152 |
-| Consume memory MiB (avg) | 2235 | **206** | 243 |
-| Disk bytes per 1 MiB record | — | 1 048 625 | 1 048 622 |
+| Produce MB/sec | 184.8 | **433** (2.34x) | 119 |
+| Consume MB/sec | 257.5 | **603** (2.34x) | 101 |
+| Produce CPU % (avg) | 224.2 | **180.8** | 290.7 |
+| Produce memory MiB (avg) | 1292 | 373 | **300** |
+| Consume CPU % (avg) | 206.0 | **155.1** | 254.4 |
+| Consume memory MiB (avg) | 2518 | **862** | 877 |
+| Disk bytes per 1 MiB record | — | 1 048 615 | 1 048 613 |
+| Produce MB/sec per CPU % | 0.8 | **2.4** | 0.4 |
 
-At megabyte records Brahmaputra produces 1.57x Kafka's throughput on
-comparable CPU, and **Kafka consumes faster** — `sendfile` serves reads
-without copying them through userspace, which Brahmaputra does not yet do.
-That is the one place Kafka is clearly ahead, and it is the top item in
-[kafka-parity.md](kafka-parity.md) §8.
+At megabyte records Brahmaputra over TCP is 2.3x Kafka on **both** sides,
+on less CPU and a third of the memory.
 
-Storage overhead is 49 bytes per 1 MiB record (batch header plus record
-framing), about 0.005 %.
+Consume used to be the exception — 377 MB/sec against Kafka's 575 — and
+fixing it is what the read-path work in §4 was for. Kafka still makes
+strictly fewer copies: `sendfile` moves bytes from the page cache to the
+socket without touching userspace at all, where Brahmaputra still makes
+one copy out of the page cache. Removing that last one is the remaining
+item in [kafka-parity.md](kafka-parity.md) §8; the three copies *after* it
+are gone.
+
+QUIC is weak here for the reason set out in §5: at megabyte records it is
+CPU-bound on per-packet crypto and userspace congestion control, and a
+single connection's packet processing does not parallelise.
+
+Storage overhead is 39 bytes per 1 MiB record (batch header plus record
+framing), about 0.004 %.
 
 ## 4. Optimisations these benchmarks drove
 
@@ -272,7 +282,36 @@ batches are written unmodified. Now the header alone is validated and
 `base_offset`/`leader_epoch` are stamped in place; both sit *before*
 `crc32c`, so the checksum stays valid. **68 031 → 90 948 msgs/sec (+34 %).**
 
-**8. A batched fetch held per-partition errors behind the long poll.**
+**8. A batched fetch could build a response larger than the client's frame.**
+Not a performance bug at all — the 1 MiB benchmark was *hanging*. A
+partition's read stops only after the batch that crosses its allowance, so
+every partition overshoots by up to a whole batch; with multi-megabyte
+batches across six partitions those overshoots added up past
+`max_frame_bytes`, the client's length-delimited decoder rejected the
+frame, and the connection died. It surfaced intermittently, as
+"connection closed" or as a stalled consumer, depending on how much data
+happened to be available. The budget is now enforced across the whole
+response and trimmed from the tail, which is safe because a fetch may
+always return less than was asked for — the client simply asks again. The
+first partition keeps at least one batch regardless, or a consumer whose
+batches exceed the budget could never advance. Covered by
+`large_records_across_partitions_stay_inside_the_frame_limit`, which fails
+with `ConnectionClosed` without the fix.
+
+**9. Every fetched byte was copied four times before the kernel saw it.**
+`pread` into a buffer, concatenate the batches into one body, copy that
+body into a frame, then copy the frame into the codec's write buffer.
+Responses are now a chain of `Bytes` written with a single `writev`:
+the frame prefix is built separately and the record batches go to the
+socket as they came off disk. Three of the four copies are gone, and the
+encoders are proven byte-identical to the concatenating ones they
+replaced. **Consume 377 → 603 MB/sec at 1 MiB records.**
+
+**10. Reads made two syscalls and a zero-filled allocation per batch.**
+One `pread` now covers a run of batches and each is handed out as a slice
+of that shared buffer.
+
+**11. A batched fetch held per-partition errors behind the long poll.**
 "No bytes served" was treated the same as "no data yet", so a consumer
 whose committed offset had fallen off the log could burn its entire poll
 deadline waiting instead of being told to reset — and a group resuming

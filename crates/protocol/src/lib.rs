@@ -25,5 +25,6 @@ pub use batch::{
 };
 pub use error::ProtocolError;
 pub use frame::{
-    decode_payload, encode_frame, encode_payload, error_code, ApiKey, FrameHeader, API_VERSION,
+    decode_payload, encode_frame, encode_frame_prefix, encode_payload, error_code, ApiKey,
+    FrameHeader, API_VERSION,
 };

@@ -2,6 +2,7 @@
 //! supervisor (Blueprint 02 §2).
 
 use std::future::Future;
+use std::io::IoSlice;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,16 +14,17 @@ use brahmaputra_metadata::{
     BrokerEpoch, ClusterMetadata, MetadataCache, NodeRole, PartitionMetadata,
 };
 use brahmaputra_metrics::{names, MetricKey, Metrics};
-use brahmaputra_protocol::{decode_payload, encode_payload, FrameHeader};
+use brahmaputra_protocol::{decode_payload, encode_frame_prefix, FrameHeader};
 use brahmaputra_storage::{Log, LogConfig};
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
 use crate::actor::{self, PartitionHandle};
@@ -955,6 +957,45 @@ pub(crate) trait BrokerStream:
 }
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> BrokerStream for T {}
 
+/// Write a response as the buffers it is made of, in one `writev` where the
+/// transport supports it.
+///
+/// A fetch response is a small struct followed by record batches that came
+/// out of the page cache untouched. Concatenating them to satisfy a framing
+/// codec would copy every byte served an extra time, which at megabyte
+/// records is the dominant cost of serving a read. `write_vectored` takes
+/// the pieces as they are; partial writes are resumed from wherever the
+/// kernel stopped.
+async fn write_chunks<W>(writer: &mut W, chunks: &[Bytes]) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut index = 0;
+    let mut consumed = 0;
+    while index < chunks.len() {
+        let slices: Vec<IoSlice<'_>> = std::iter::once(IoSlice::new(&chunks[index][consumed..]))
+            .chain(chunks[index + 1..].iter().map(|chunk| IoSlice::new(chunk)))
+            .collect();
+        let written = writer.write_vectored(&slices).await?;
+        if written == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        let mut remaining = written;
+        while remaining > 0 && index < chunks.len() {
+            let available = chunks[index].len() - consumed;
+            if remaining >= available {
+                remaining -= available;
+                index += 1;
+                consumed = 0;
+            } else {
+                consumed += remaining;
+                remaining = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Serve one client connection.
 ///
 /// Requests are dispatched concurrently rather than one at a time.
@@ -973,16 +1014,19 @@ async fn handle_connection(
         .length_field_length(4)
         .max_frame_length(broker.config.max_frame_bytes)
         .new_codec();
-    let framed = Framed::new(socket, codec);
-    let (mut sink, mut stream) = framed.split();
+    // Requests still come through the framing codec; responses do not, so
+    // that a fetch can be written from its own buffers.
+    let (reader, mut sink) = tokio::io::split(socket);
+    let mut stream = FramedRead::new(reader, codec);
 
     // Responses funnel through one writer task; the channel is bounded so a
     // client that stops reading applies backpressure instead of growing the
     // broker's memory without limit.
-    let (responses_tx, mut responses_rx) = mpsc::channel::<Bytes>(broker.config.channel_capacity);
+    let (responses_tx, mut responses_rx) =
+        mpsc::channel::<Vec<Bytes>>(broker.config.channel_capacity);
     let writer = tokio::spawn(async move {
-        while let Some(payload) = responses_rx.recv().await {
-            if sink.send(payload).await.is_err() {
+        while let Some(chunks) = responses_rx.recv().await {
+            if write_chunks(&mut sink, &chunks).await.is_err() {
                 break;
             }
         }
@@ -1018,9 +1062,10 @@ async fn handle_connection(
                     correlation_id: header.correlation_id,
                     client_id: None,
                 };
-                let _ = responses
-                    .send(encode_payload(&response_header, &body))
-                    .await;
+                let mut chunks = Vec::with_capacity(body.chunks().len() + 1);
+                chunks.push(encode_frame_prefix(&response_header, body.len()));
+                chunks.extend_from_slice(body.chunks());
+                let _ = responses.send(chunks).await;
             }
         });
 

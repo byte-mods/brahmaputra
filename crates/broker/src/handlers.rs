@@ -36,18 +36,53 @@ use brahmaputra_metrics::{names, MetricKey};
 const TIMESTAMP_LATEST: i64 = -1;
 const TIMESTAMP_EARLIEST: i64 = -2;
 
+/// A response as the buffers it will be written from.
+///
+/// Most responses are one small struct and stay a single buffer. A Fetch
+/// response is a small struct followed by record batches that came
+/// straight out of the page cache and that nothing needs to modify —
+/// concatenating those into one buffer, copying that into a frame, and
+/// copying that into a socket buffer copies every byte served three times
+/// before the kernel sees it. Keeping the pieces apart lets one `writev`
+/// take them as they are.
+pub struct ResponseBody {
+    chunks: Vec<Bytes>,
+}
+
+impl ResponseBody {
+    pub fn chunks(&self) -> &[Bytes] {
+        &self.chunks
+    }
+
+    pub fn len(&self) -> usize {
+        self.chunks.iter().map(Bytes::len).sum()
+    }
+}
+
+impl From<Bytes> for ResponseBody {
+    fn from(body: Bytes) -> Self {
+        ResponseBody { chunks: vec![body] }
+    }
+}
+
+impl From<Vec<Bytes>> for ResponseBody {
+    fn from(chunks: Vec<Bytes>) -> Self {
+        ResponseBody { chunks }
+    }
+}
+
 /// Dispatch one decoded frame to its handler. `None` means "no response"
 /// (only `Produce` with `acks=0`).
-pub async fn dispatch(broker: &Broker, header: &FrameHeader, body: Bytes) -> Option<Bytes> {
+pub async fn dispatch(broker: &Broker, header: &FrameHeader, body: Bytes) -> Option<ResponseBody> {
     // ApiVersions answers at any requested version on purpose: it is how a
     // client discovers what this broker speaks, so refusing it for a version
     // mismatch would make version negotiation impossible — the exact
     // situation a rolling upgrade has to survive.
     if header.api_key == ApiKey::ApiVersions {
-        return Some(api_versions(broker, body).await);
+        return Some(api_versions(broker, body).await.into());
     }
     if header.api_version != API_VERSION {
-        return Some(encode_error_for(header.api_key, ec::UNSUPPORTED_VERSION));
+        return Some(encode_error_for(header.api_key, ec::UNSUPPORTED_VERSION).into());
     }
     let client_id = header.client_id.as_deref();
     broker.metrics().increment(
@@ -55,23 +90,33 @@ pub async fn dispatch(broker: &Broker, header: &FrameHeader, body: Bytes) -> Opt
         1,
     );
     match header.api_key {
-        ApiKey::Produce => produce(broker, body, client_id).await,
-        ApiKey::Fetch => Some(fetch(broker, body, client_id).await),
-        ApiKey::ListOffsets => Some(list_offsets(broker, body).await),
-        ApiKey::Metadata => Some(metadata(broker, body)),
-        ApiKey::ReplicaFetch => Some(replica_fetch(broker, body).await),
-        ApiKey::OffsetsForLeaderEpoch => Some(offsets_for_leader_epoch(broker, body).await),
-        ApiKey::InitProducerId => Some(init_producer_id(broker, body)),
-        ApiKey::JoinGroup => Some(join_group(broker, body).await),
-        ApiKey::SyncGroup => Some(sync_group(broker, body).await),
-        ApiKey::Heartbeat => Some(heartbeat(broker, body).await),
-        ApiKey::OffsetCommit => Some(offset_commit(broker, body).await),
-        ApiKey::OffsetFetch => Some(offset_fetch(broker, body).await),
-        ApiKey::ListGroups => Some(list_groups(broker, body).await),
-        ApiKey::DescribeGroup => Some(describe_group(broker, body).await),
-        ApiKey::ApiVersions => Some(api_versions(broker, body).await),
-        ApiKey::ProduceMulti => crate::multi::produce_multi(broker, body, client_id).await,
-        ApiKey::FetchMulti => Some(crate::multi::fetch_multi(broker, body, client_id).await),
+        ApiKey::Produce => produce(broker, body, client_id)
+            .await
+            .map(ResponseBody::from),
+        // The fetch paths return their pieces rather than one buffer, so
+        // the record batches reach the socket without being copied again.
+        ApiKey::Fetch => Some(fetch(broker, body, client_id).await.into()),
+        ApiKey::FetchMulti => Some(
+            crate::multi::fetch_multi(broker, body, client_id)
+                .await
+                .into(),
+        ),
+        ApiKey::ReplicaFetch => Some(replica_fetch(broker, body).await.into()),
+        ApiKey::ListOffsets => Some(list_offsets(broker, body).await.into()),
+        ApiKey::Metadata => Some(metadata(broker, body).into()),
+        ApiKey::OffsetsForLeaderEpoch => Some(offsets_for_leader_epoch(broker, body).await.into()),
+        ApiKey::InitProducerId => Some(init_producer_id(broker, body).into()),
+        ApiKey::JoinGroup => Some(join_group(broker, body).await.into()),
+        ApiKey::SyncGroup => Some(sync_group(broker, body).await.into()),
+        ApiKey::Heartbeat => Some(heartbeat(broker, body).await.into()),
+        ApiKey::OffsetCommit => Some(offset_commit(broker, body).await.into()),
+        ApiKey::OffsetFetch => Some(offset_fetch(broker, body).await.into()),
+        ApiKey::ListGroups => Some(list_groups(broker, body).await.into()),
+        ApiKey::DescribeGroup => Some(describe_group(broker, body).await.into()),
+        ApiKey::ApiVersions => Some(api_versions(broker, body).await.into()),
+        ApiKey::ProduceMulti => crate::multi::produce_multi(broker, body, client_id)
+            .await
+            .map(ResponseBody::from),
     }
 }
 
@@ -858,12 +903,12 @@ pub(crate) async fn wait_for_high_watermark(
 
 // ---------- Fetch (api_key 1) ----------
 
-async fn fetch(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Bytes {
+async fn fetch(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Vec<Bytes> {
     let req = match FetchRequest::decode(&body) {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "undecodable fetch request");
-            return encode_error_for(ApiKey::Fetch, ec::INVALID_REQUEST);
+            return vec![encode_error_for(ApiKey::Fetch, ec::INVALID_REQUEST)];
         }
     };
     let respond = |error_code, hw: i64, batches: &[Bytes]| {
@@ -875,7 +920,7 @@ async fn fetch(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Bytes {
             last_stable_offset: hw, // M1: LSO == HW (no transactions)
             batches_length: 0,      // filled in by encode_fetch_response
         };
-        codec::encode_fetch_response(&resp, batches).unwrap_or_default()
+        codec::encode_fetch_response_chunks(&resp, batches).unwrap_or_default()
     };
 
     let handle = match broker.partition(&req.topic, req.partition) {

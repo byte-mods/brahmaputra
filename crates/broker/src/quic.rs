@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use brahmaputra_protocol::decode_payload;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use quinn::{Endpoint, ServerConfig, TransportConfig};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
@@ -185,20 +185,27 @@ async fn serve_request(
     let Some(response) = handlers::dispatch(&broker, &header, body).await else {
         return Ok(());
     };
-    let payload = brahmaputra_protocol::encode_payload(
+    // Write the prefix and then each of the response's own buffers, rather
+    // than concatenating them first. A fetch response is mostly record
+    // batches straight from the page cache, and joining them into one
+    // buffer would copy every byte served for no reason — QUIC frames the
+    // stream for us either way.
+    let prefix = brahmaputra_protocol::encode_frame_prefix(
         &brahmaputra_protocol::FrameHeader::new(
             header.api_key,
             header.correlation_id,
             header.client_id.clone(),
         ),
-        &response,
+        response.len(),
     );
-    let mut framed = BytesMut::with_capacity(4 + payload.len());
-    framed.put_u32(payload.len() as u32);
-    framed.extend_from_slice(&payload);
-    send.write_all(&framed)
+    send.write_all(&prefix)
         .await
         .map_err(|error| format!("write response: {error}"))?;
+    for chunk in response.chunks() {
+        send.write_all(chunk)
+            .await
+            .map_err(|error| format!("write response: {error}"))?;
+    }
     send.finish().map_err(|error| format!("finish: {error}"))?;
     Ok(())
 }

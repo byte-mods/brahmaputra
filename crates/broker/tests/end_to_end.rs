@@ -294,3 +294,106 @@ async fn produce_consume_restart_durability() {
     .await
     .expect("test timed out");
 }
+
+/// A batched fetch must never build a response larger than the frame the
+/// client will accept.
+///
+/// Each partition's read stops only *after* the batch that crosses its
+/// allowance, so every partition can overshoot by most of a batch. With
+/// megabyte batches across several partitions those overshoots add up, and
+/// the response used to exceed `max_frame_bytes` — at which point the
+/// client's length-delimited decoder rejects the frame and drops the
+/// connection, which surfaced as an intermittent "connection closed" while
+/// consuming large records. The response budget has to be enforced across
+/// the whole response, not only per partition.
+#[tokio::test]
+async fn large_records_across_partitions_stay_inside_the_frame_limit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let running = start_broker(dir.path()).await;
+
+    // Records big enough that a handful of them approach the frame limit.
+    const RECORD_BYTES: usize = 1024 * 1024;
+    // Enough records per partition, packed into one batch, that a single
+    // batch dwarfs the per-partition allowance — which is what makes the
+    // per-partition overshoot add up past the frame limit.
+    const PER_PARTITION: usize = 12;
+
+    let producer = Producer::connect(
+        running.addr,
+        ProducerConfig {
+            acks: 1,
+            batch_size: 24 * 1024 * 1024,
+            linger_ms: 50,
+            compression: Compression::None,
+            ..ProducerConfig::default()
+        },
+    )
+    .await
+    .expect("connect producer");
+
+    // Send concurrently so the producer packs many records into one batch.
+    // That is what makes this test bite: single-record batches never
+    // overshoot enough to matter, while multi-megabyte batches do.
+    let producer = Arc::new(producer);
+    let mut sends = Vec::new();
+    for partition in 0..PARTITIONS {
+        for index in 0..PER_PARTITION {
+            let producer = Arc::clone(&producer);
+            sends.push(tokio::spawn(async move {
+                let mut value = vec![b'x'; RECORD_BYTES];
+                value[0] = index as u8;
+                producer
+                    .send("bigrec", Some(partition), None, Bytes::from(value))
+                    .await
+                    .expect("send large record");
+            }));
+        }
+    }
+    for send in sends {
+        send.await.expect("send task");
+    }
+    producer.flush().await.expect("flush");
+    drop(producer);
+
+    // Read every partition back. The consumer asks for all of them in one
+    // request, which is precisely the shape that used to overflow.
+    let consumer = Consumer::connect(running.addr, "big-reader")
+        .await
+        .expect("connect consumer");
+    // Ask for every partition in one request: that is the shape whose
+    // per-partition overshoots add up, and the single-partition path never
+    // reproduces it.
+    let mut positions: Vec<i64> = vec![0; PARTITIONS as usize];
+    let mut seen = vec![0usize; PARTITIONS as usize];
+    while seen.iter().sum::<usize>() < PARTITIONS as usize * PER_PARTITION {
+        let requests: Vec<(String, i32, i64)> = (0..PARTITIONS)
+            .filter(|partition| seen[*partition as usize] < PER_PARTITION)
+            .map(|partition| {
+                (
+                    "bigrec".to_string(),
+                    partition,
+                    positions[partition as usize],
+                )
+            })
+            .collect();
+        let fetched = consumer
+            .fetch_many_public(&requests, 500)
+            .await
+            .expect("batched fetch must not tear the connection down");
+        let mut progressed = false;
+        for (_, partition, records) in fetched {
+            for (offset, _, value) in records {
+                assert_eq!(value.len(), RECORD_BYTES);
+                positions[partition as usize] = offset + 1;
+                seen[partition as usize] += 1;
+                progressed = true;
+            }
+        }
+        assert!(
+            progressed,
+            "batched fetch stalled at {positions:?} with {seen:?} read"
+        );
+    }
+
+    stop_broker(running).await;
+}

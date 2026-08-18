@@ -13,6 +13,10 @@
 
 use std::time::Duration;
 
+/// Room left for the frame header and the response struct on top of the
+/// record batches, so a full response still fits inside `max_frame_bytes`.
+const FRAME_HEADROOM: usize = 1 << 20;
+
 use brahmaputra_metrics::names;
 use brahmaputra_protocol::codec;
 use brahmaputra_protocol::error_code as ec;
@@ -276,12 +280,16 @@ async fn produce_one_partition(
     }
 }
 
-pub(crate) async fn fetch_multi(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Bytes {
+pub(crate) async fn fetch_multi(
+    broker: &Broker,
+    body: Bytes,
+    client_id: Option<&str>,
+) -> Vec<Bytes> {
     let request = match FetchMultiRequest::decode(&body) {
         Ok(request) => request,
         Err(error) => {
             warn!(%error, "undecodable FetchMulti request");
-            return encode_error_for(ApiKey::FetchMulti, ec::INVALID_REQUEST);
+            return vec![encode_error_for(ApiKey::FetchMulti, ec::INVALID_REQUEST)];
         }
     };
 
@@ -315,7 +323,7 @@ pub(crate) async fn fetch_multi(broker: &Broker, body: Bytes, client_id: Option<
         metrics.count(names::THROTTLE_MS, throttle.as_millis() as u64);
     }
 
-    codec::encode_fetch_multi_response(&results).unwrap_or_default()
+    codec::encode_fetch_multi_response_chunks(&results).unwrap_or_default()
 }
 
 /// Read every requested partition once. Returns the total bytes gathered.
@@ -324,13 +332,14 @@ async fn read_all_partitions(
     request: &FetchMultiRequest,
     results: &mut Vec<(FetchMultiResult, Vec<Bytes>)>,
 ) -> u64 {
-    // A batched fetch must still fit in one frame, so the response is
-    // capped as a whole and the budget is divided up front. Dividing
-    // rather than consuming it sequentially is what lets the partitions be
-    // read concurrently: one round trip that takes as long as the slowest
-    // partition, not as long as all of them.
+    // Divide the budget up front so the partitions can be read
+    // concurrently: one round trip that takes as long as the slowest
+    // partition, not as long as all of them added together.
     let count = request.partitions.len().max(1);
-    let budget = broker.config().max_frame_bytes.saturating_sub(1 << 20);
+    let budget = broker
+        .config()
+        .max_frame_bytes
+        .saturating_sub(FRAME_HEADROOM);
     let per_partition = (budget / count).max(64 * 1024);
 
     let reads = futures::future::join_all(request.partitions.iter().map(|descriptor| async move {
@@ -364,10 +373,34 @@ async fn read_all_partitions(
     }))
     .await;
 
+    // Now enforce the budget across the whole response, which the
+    // per-partition split alone cannot do: a read stops only *after* the
+    // batch that crosses its allowance, so each partition may overshoot by
+    // most of a batch, and with large batches those overshoots add up. Left
+    // unchecked the frame exceeds `max_frame_bytes`, the client's decoder
+    // rejects it, and the connection dies — which is exactly what a
+    // megabyte-record consumer used to hit, intermittently, depending on
+    // how much happened to be available.
+    //
+    // Trimming from the tail is safe because a fetch is allowed to return
+    // less than was asked for; the client simply asks again from where it
+    // got to. The first partition always keeps at least one batch, or a
+    // consumer whose batches are larger than the budget could never make
+    // progress.
     let mut served = 0_u64;
+    let mut remaining = budget;
     for (result, batches) in reads {
-        served += batches.iter().map(|batch| batch.len() as u64).sum::<u64>();
-        results.push((result, batches));
+        let mut kept = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let size = batch.len();
+            if size > remaining && !(served == 0 && kept.is_empty()) {
+                break;
+            }
+            remaining = remaining.saturating_sub(size);
+            served += size as u64;
+            kept.push(batch);
+        }
+        results.push((result, kept));
     }
     served
 }

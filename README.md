@@ -579,10 +579,18 @@ capacity planning:
 | Peak produce msgs/sec | 257 848 | **916 380** (3.6×) | 419 287 (1.6×) |
 | Peak consume msgs/sec | 572 656 | **3 652 968** (6.4×) | 1 230 769 (2.1×) |
 
-At 1 MiB records the picture is different and Kafka's `sendfile` shows:
-Brahmaputra/TCP produces 490 MB/sec to Kafka's 311, and Kafka consumes
-575 MB/sec to Brahmaputra's 377. Details in
-[docs/benchmarks.md](docs/benchmarks.md).
+**1 MiB records**, same run, same limits:
+
+| Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC |
+|---|---|---|---|
+| Produce MB/sec | 184.8 | **433** (2.3×) | 119 |
+| Consume MB/sec | 257.5 | **603** (2.3×) | 101 |
+| Consume CPU % | 206.0 | **155.1** | 254.4 |
+| Consume memory MiB | 2518 | **862** | 877 |
+
+Consume at this size used to be the one place Kafka clearly won
+(377 against 575). Closing it is what the read-path work below was for.
+Details in [docs/benchmarks.md](docs/benchmarks.md).
 
 Memory is the most stable difference and it is structural rather than
 tuning: the JVM holds its heap and copies records through it, while the
@@ -604,6 +612,16 @@ described where it lives in [docs/benchmarks.md](docs/benchmarks.md).
 | Every `send()` that found a full batch queued its own flush behind the partition lock, so raising concurrency *lowered* throughput | Skip the size-triggered flush when one is already running; the running flusher drains the buffer | 5 162 → **61 187** msgs/sec (11.9×) |
 | The broker never set `TCP_NODELAY` on accepted sockets, so responses waited on Nagle plus the peer's delayed ACK | `set_nodelay(true)` on accept | 6 415 → **14 790** msgs/sec |
 | The broker decoded and re-encoded every batch on append | Validate the header only and stamp `base_offset`/`leader_epoch` in place — both sit before the CRC, so it stays valid | +34 % |
+| Every fetched byte was copied **four times** before the kernel saw it: `pread`, concatenate the batches, copy into a frame, copy into the codec's buffer | Write the response as the chain of buffers it already is, with one `writev` | consume **377 → 603 MB/sec** at 1 MiB |
+| A read made two syscalls and a fresh zero-filled allocation per batch | One `pread` covers a run of batches; each is a slice of that shared buffer | fewer syscalls, no per-batch memset |
+
+And one that was not a performance bug at all: a batched fetch could build
+a response **larger than the frame the client accepts**, because each
+partition's read overshoots its allowance by up to a whole batch and
+nothing capped the total. With megabyte batches across six partitions the
+frame was rejected and the connection dropped — an intermittent
+"connection closed" that made the 1 MiB benchmark hang outright. The
+budget is now enforced across the whole response.
 
 ### Benchmark method
 
@@ -777,7 +795,9 @@ Known gaps, ranked, in [docs/kafka-parity.md](docs/kafka-parity.md) §8.
 The ones that matter most:
 
 1. **No data-plane authentication.** TLS encrypts; it does not identify.
-2. **No `sendfile`** — a fetch copies bytes through userspace twice.
+2. **No `sendfile`** — a fetch still makes one copy out of the page cache,
+   where Kafka makes none. The three further copies it used to make are
+   gone.
 3. Topic-level configs other than `min.insync.replicas` are stored but not
    applied.
 4. **No log compaction**, so `__consumer_offsets` grows without bound on a

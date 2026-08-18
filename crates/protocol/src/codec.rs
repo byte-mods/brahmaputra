@@ -473,3 +473,100 @@ mod multi_tests {
         );
     }
 }
+
+/// Encode a Fetch response as the sequence of buffers it will be written
+/// from, instead of one concatenated buffer.
+///
+/// The batches are page-cache bytes that nothing needs to modify, so
+/// concatenating them — and then copying that result into a frame, and that
+/// frame into a socket buffer — copies every byte served three times before
+/// the kernel sees it. Handing the pieces to a vectored write copies them
+/// none of those times.
+pub fn encode_fetch_response_chunks(
+    resp: &FetchResponse,
+    batches: &[Bytes],
+) -> Result<Vec<Bytes>, ProtocolError> {
+    let mut resp = resp.clone();
+    resp.batches_length = batches.iter().map(|batch| batch.len() as i64).sum();
+    let mut chunks = Vec::with_capacity(batches.len() + 1);
+    chunks.push(Bytes::from(resp.encode().map_err(msg_err)?));
+    chunks.extend(batches.iter().cloned());
+    Ok(chunks)
+}
+
+/// The multi-partition form of [`encode_fetch_response_chunks`].
+pub fn encode_fetch_multi_response_chunks(
+    results: &[(FetchMultiResult, Vec<Bytes>)],
+) -> Result<Vec<Bytes>, ProtocolError> {
+    let response = FetchMultiResponse {
+        results: results
+            .iter()
+            .map(|(result, batches)| FetchMultiResult {
+                batches_length: batches.iter().map(|batch| batch.len() as i64).sum(),
+                ..result.clone()
+            })
+            .collect(),
+    };
+    let mut chunks = Vec::with_capacity(results.iter().map(|(_, b)| b.len()).sum::<usize>() + 1);
+    chunks.push(Bytes::from(response.encode().map_err(msg_err)?));
+    for (_, batches) in results {
+        chunks.extend(batches.iter().cloned());
+    }
+    Ok(chunks)
+}
+
+#[cfg(test)]
+mod chunked_tests {
+    use super::*;
+
+    /// The chunked encoders must be byte-identical to the concatenating
+    /// ones — they are the same wire format, only assembled later.
+    #[test]
+    fn chunked_fetch_matches_contiguous() {
+        let response = FetchResponse {
+            topic: "orders".into(),
+            partition: 3,
+            error_code: 0,
+            high_watermark: 42,
+            last_stable_offset: 42,
+            batches_length: 0,
+        };
+        let batches = vec![Bytes::from_static(b"abcdef"), Bytes::from_static(b"gh")];
+        let contiguous = encode_fetch_response(&response, &batches).unwrap();
+        let chunked = encode_fetch_response_chunks(&response, &batches).unwrap();
+        let joined: Vec<u8> = chunked.iter().flat_map(|c| c.to_vec()).collect();
+        assert_eq!(joined, contiguous.to_vec());
+    }
+
+    #[test]
+    fn chunked_fetch_multi_matches_contiguous() {
+        let results = vec![
+            (
+                FetchMultiResult {
+                    topic: "orders".into(),
+                    partition: 0,
+                    error_code: 0,
+                    high_watermark: 7,
+                    last_stable_offset: 7,
+                    batches_length: 0,
+                },
+                vec![Bytes::from_static(b"one"), Bytes::from_static(b"two")],
+            ),
+            (
+                FetchMultiResult {
+                    topic: "orders".into(),
+                    partition: 1,
+                    error_code: 3,
+                    high_watermark: -1,
+                    last_stable_offset: -1,
+                    batches_length: 0,
+                },
+                Vec::new(),
+            ),
+        ];
+        let contiguous = encode_fetch_multi_response(&results).unwrap();
+        let chunked = encode_fetch_multi_response_chunks(&results).unwrap();
+        let joined: Vec<u8> = chunked.iter().flat_map(|c| c.to_vec()).collect();
+        assert_eq!(joined, contiguous.to_vec());
+    }
+}

@@ -16,6 +16,11 @@ use crate::segment::Segment;
 
 const HWM_FILE: &str = "hwm";
 
+/// How much a single read pulls from a segment when the caller's budget
+/// is larger. Big enough to cover many small batches in one syscall,
+/// small enough not to read far past what a fetch will actually use.
+const READ_CHUNK_BYTES: usize = 1024 * 1024;
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -620,38 +625,72 @@ impl Log {
             let relative = offset.saturating_sub(seg.base_offset).max(0) as u32;
             let mut position = seg.index.lookup(relative) as u64;
             while position + BATCH_HEADER_LEN as u64 <= seg.size {
-                let mut hdr = [0u8; BATCH_HEADER_LEN];
-                seg.read_at(position, &mut hdr)?;
-                let base_offset = i64::from_be_bytes(hdr[0..8].try_into().unwrap());
-                let batch_length = i32::from_be_bytes(hdr[8..12].try_into().unwrap());
-                if batch_length < MIN_BATCH_LENGTH as i32 {
-                    break;
-                }
-                let total_len = BATCH_HEADER_LEN + batch_length as usize;
-                if position + total_len as u64 > seg.size {
-                    break;
-                }
-                let mut buf = BytesMut::with_capacity(total_len);
-                buf.extend_from_slice(&hdr);
-                buf.resize(total_len, 0);
-                seg.read_at(
-                    position + BATCH_HEADER_LEN as u64,
-                    &mut buf[BATCH_HEADER_LEN..],
-                )?;
-                let batch = buf.freeze();
-                // Batches on disk were validated on append/recovery; still,
-                // stop at anything that fails CRC now (e.g. bit rot).
-                let header = match brahmaputra_protocol::validate_batch_header(&batch) {
-                    Ok(h) => h,
-                    Err(_) => break,
-                };
-                position += total_len as u64;
-                if base_offset + header.last_offset_delta as i64 >= offset {
-                    total += total_len;
-                    out.push(batch);
-                    if total >= max_bytes {
+                // Read a run of batches at once rather than a header and a
+                // body per batch. Batches are laid out contiguously, so one
+                // `pread` of the remaining budget usually covers several of
+                // them, and slicing the result hands each one out without
+                // copying it again.
+                let want = (seg.size - position) as usize;
+                let budget = max_bytes.saturating_sub(total).max(BATCH_HEADER_LEN);
+                let want = want.min(budget.max(READ_CHUNK_BYTES.min(want)));
+                let mut buf = BytesMut::zeroed(want);
+                seg.read_at(position, &mut buf)?;
+                let mut chunk = buf.freeze();
+
+                let mut advanced = false;
+                while chunk.len() >= BATCH_HEADER_LEN {
+                    let base_offset = i64::from_be_bytes(chunk[0..8].try_into().unwrap());
+                    let batch_length = i32::from_be_bytes(chunk[8..12].try_into().unwrap());
+                    if batch_length < MIN_BATCH_LENGTH as i32 {
                         break 'segments;
                     }
+                    let total_len = BATCH_HEADER_LEN + batch_length as usize;
+                    if position + total_len as u64 > seg.size {
+                        // Truncated on disk, not merely past this chunk.
+                        break 'segments;
+                    }
+                    if total_len > chunk.len() {
+                        // The batch runs past what this chunk covers. A
+                        // fetch must return at least one batch even when it
+                        // exceeds the byte budget, or a consumer whose
+                        // records are larger than its `max_bytes` can never
+                        // advance — so read that one directly and stop.
+                        if out.is_empty() {
+                            let mut single = BytesMut::zeroed(total_len);
+                            seg.read_at(position, &mut single)?;
+                            let batch = single.freeze();
+                            let Ok(header) = brahmaputra_protocol::validate_batch_header(&batch)
+                            else {
+                                break 'segments;
+                            };
+                            position += total_len as u64;
+                            if base_offset + header.last_offset_delta as i64 >= offset {
+                                out.push(batch);
+                                break 'segments;
+                            }
+                            advanced = true;
+                        }
+                        break;
+                    }
+
+                    let batch = chunk.split_to(total_len);
+                    // Batches on disk were validated on append/recovery;
+                    // still, stop at anything that fails CRC now (bit rot).
+                    let Ok(header) = brahmaputra_protocol::validate_batch_header(&batch) else {
+                        break 'segments;
+                    };
+                    position += total_len as u64;
+                    advanced = true;
+                    if base_offset + header.last_offset_delta as i64 >= offset {
+                        total += total_len;
+                        out.push(batch);
+                        if total >= max_bytes {
+                            break 'segments;
+                        }
+                    }
+                }
+                if !advanced {
+                    break;
                 }
             }
         }
@@ -1647,6 +1686,89 @@ mod hwm_checkpoint_cadence_tests {
                 .unwrap()
                 .high_watermark(),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod chunked_read_tests {
+    use super::*;
+    use brahmaputra_protocol::Record;
+
+    fn config() -> LogConfig {
+        LogConfig {
+            segment_bytes: 1024 * 1024,
+            index_interval_bytes: 64,
+            hwm_checkpoint_interval_ms: 0,
+            ..LogConfig::default()
+        }
+    }
+
+    fn batch_of(size: usize, value: u8) -> RecordBatch {
+        RecordBatch::new(0, 0, 1, vec![Record::new(vec![value; size])])
+    }
+
+    /// A fetch whose budget is smaller than a single batch must still
+    /// return that batch, or a consumer whose records are larger than its
+    /// `max_bytes` could never advance past them.
+    #[test]
+    fn a_batch_larger_than_the_budget_is_still_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        log.append(batch_of(8192, 7)).unwrap();
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+
+        let batches = log.read(0, 16).unwrap();
+        assert_eq!(batches.len(), 1, "one oversized batch must still be served");
+        assert!(batches[0].len() > 8192);
+    }
+
+    /// Several batches inside one chunk are handed out as separate slices,
+    /// in order, and the budget still bounds the total.
+    #[test]
+    fn many_batches_come_back_in_order_within_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for value in 0..8u8 {
+            log.append(batch_of(256, value)).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+
+        let all = log.read(0, 1 << 20).unwrap();
+        assert_eq!(all.len(), 8);
+        for (index, batch) in all.iter().enumerate() {
+            let header = brahmaputra_protocol::validate_batch_header(batch).unwrap();
+            assert_eq!(header.base_offset, index as i64);
+        }
+
+        // A budget covering roughly three batches must stop near there,
+        // not return everything and not return nothing.
+        let one = all[0].len();
+        let bounded = log.read(0, one * 3).unwrap();
+        assert!(
+            !bounded.is_empty() && bounded.len() <= 4,
+            "got {}",
+            bounded.len()
+        );
+    }
+
+    /// Reading from a mid-log offset skips earlier batches even though the
+    /// chunk starts at the index entry before them.
+    #[test]
+    fn reading_from_the_middle_skips_earlier_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for value in 0..6u8 {
+            log.append(batch_of(128, value)).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+
+        let batches = log.read(4, 1 << 20).unwrap();
+        assert!(!batches.is_empty());
+        let first = brahmaputra_protocol::validate_batch_header(&batches[0]).unwrap();
+        assert!(
+            first.base_offset + first.last_offset_delta as i64 >= 4,
+            "first batch must cover the requested offset"
         );
     }
 }

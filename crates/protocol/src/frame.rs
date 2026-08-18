@@ -275,3 +275,70 @@ mod tests {
         }
     }
 }
+
+/// Encode the 4-byte length prefix and frame header for a response whose
+/// body is `body_len` bytes spread across buffers the caller will write
+/// separately.
+///
+/// `encode_payload` exists for the case where the body is already one
+/// contiguous buffer. When it is not — a Fetch response is a small struct
+/// followed by untouched record batches — copying it into one just to hand
+/// it to the framing codec is a copy of every byte served, so this returns
+/// the prefix alone and lets a vectored write supply the rest.
+pub fn encode_frame_prefix(header: &FrameHeader, body_len: usize) -> Bytes {
+    let client_len = header.client_id.as_ref().map_or(0, |c| c.len());
+    let header_len = FIXED_HEADER_LEN + 2 + client_len;
+    let mut out = BytesMut::with_capacity(4 + header_len);
+    out.put_u32((header_len + body_len) as u32);
+    out.put_i16(header.api_key as i16);
+    out.put_i16(header.api_version);
+    out.put_i32(header.correlation_id);
+    match &header.client_id {
+        None => out.put_i16(-1),
+        Some(client_id) => {
+            out.put_i16(client_id.len() as i16);
+            out.extend_from_slice(client_id.as_bytes());
+        }
+    }
+    out.freeze()
+}
+
+#[cfg(test)]
+mod frame_prefix_tests {
+    use super::*;
+
+    /// Prefix + body must be exactly what the length-delimited codec would
+    /// have produced: a 4-byte big-endian length followed by the payload.
+    #[test]
+    fn prefix_plus_body_matches_length_delimited_framing() {
+        let header = FrameHeader {
+            api_key: ApiKey::Fetch,
+            api_version: 1,
+            correlation_id: 77,
+            client_id: Some("reader".into()),
+        };
+        let body = b"payload-bytes";
+        let payload = encode_payload(&header, body);
+
+        let prefix = encode_frame_prefix(&header, body.len());
+        let mut framed = prefix.to_vec();
+        framed.extend_from_slice(body);
+
+        let mut expected = (payload.len() as u32).to_be_bytes().to_vec();
+        expected.extend_from_slice(&payload);
+        assert_eq!(framed, expected);
+    }
+
+    #[test]
+    fn prefix_handles_an_absent_client_id() {
+        let header = FrameHeader {
+            api_key: ApiKey::FetchMulti,
+            api_version: 1,
+            correlation_id: -1,
+            client_id: None,
+        };
+        let prefix = encode_frame_prefix(&header, 4);
+        let declared = u32::from_be_bytes(prefix[..4].try_into().unwrap()) as usize;
+        assert_eq!(declared, prefix.len() - 4 + 4);
+    }
+}
