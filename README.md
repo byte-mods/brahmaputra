@@ -23,6 +23,7 @@ open http://localhost:8080                              # dashboard
 - [Transports](#transports)
 - [Producing and consuming](#producing-and-consuming)
 - [Consumer groups](#consumer-groups)
+- [Using the Rust client](#using-the-rust-client)
 - [Dashboard, metrics and access control](#dashboard-metrics-and-access-control)
 - [Durability, retention and quotas](#durability-retention-and-quotas)
 - [What happens when things fail](#what-happens-when-things-fail)
@@ -197,6 +198,53 @@ from the last commit — see
 [verify-failures.sh](scripts/verify-failures.sh), which asserts nothing is
 skipped or duplicated across a mid-stream kill.
 
+## Using the Rust client
+
+The CLI is a thin wrapper over the `brahmaputra-client` crate; anything the
+CLI does is available as a library.
+
+```rust
+use brahmaputra_client::{Consumer, GroupConsumer, Producer, ProducerConfig, EARLIEST};
+use bytes::Bytes;
+use std::time::Duration;
+
+// Produce. `send` returns the record's offset once it is acknowledged.
+let producer = Producer::connect("127.0.0.1:9092".parse()?, ProducerConfig {
+    acks: 1,
+    batch_size: 64 * 1024,
+    linger_ms: 5,
+    ..ProducerConfig::default()
+}).await?;
+let offset = producer
+    .send("orders", None, Some(Bytes::from("user-7")), Bytes::from(r#"{"id":1}"#))
+    .await?;
+producer.flush().await?;
+
+// Read one partition directly, no group. Returns (offset, key, value).
+let consumer = Consumer::connect("127.0.0.1:9092".parse()?, "reader").await?;
+let records = consumer.fetch("orders", 0, EARLIEST, 500).await?;
+
+// Or join a group and let the coordinator assign partitions.
+let mut group =
+    GroupConsumer::connect("127.0.0.1:9092".parse()?, "reader-1", "billing").await?;
+group.subscribe(&["orders"]);
+loop {
+    for record in group.poll(Duration::from_millis(500)).await? {
+        handle(&record.value);
+    }
+    group.commit_sync().await?;   // at-least-once: commit after processing
+}
+```
+
+`Producer` batches internally and is shared across tasks rather than
+created per message. `GroupConsumer` is single-task by design, matching
+Kafka's consumer: use one per thread and give each its own client id.
+
+This snippet is compiled as
+[crates/client/examples/readme_snippet.rs](crates/client/examples/readme_snippet.rs)
+(`cargo check -p brahmaputra-client --example readme_snippet`), so it
+cannot drift out of date with the API.
+
 ## Dashboard, metrics and access control
 
 Every broker serves an operations surface on `--http-port` (default 8080):
@@ -232,6 +280,34 @@ sessions. Bind the HTTP port to a trusted interface.
 Metrics are kept in-process: a ring buffer per series at 5-second
 granularity holding six hours. Memory is bounded by construction, and the
 dashboard charts work with no Prometheus installed.
+
+Exported series, all on `GET /metrics` in Prometheus text format:
+
+| Metric | Kind | What it tells you |
+|---|---|---|
+| `brahmaputra_produce_requests_total` | counter | produce request rate |
+| `brahmaputra_produce_records_total` | counter | records accepted |
+| `brahmaputra_produce_bytes_total` | counter | bytes accepted |
+| `brahmaputra_produce_errors_total` | counter | rejected appends — the first thing to alert on |
+| `brahmaputra_fetch_requests_total` | counter | fetch request rate |
+| `brahmaputra_fetch_bytes_total` | counter | bytes served to consumers |
+| `brahmaputra_requests_total` | counter | all requests, labelled by API |
+| `brahmaputra_throttled_requests_total` | counter | requests a quota delayed |
+| `brahmaputra_throttle_ms_total` | counter | total delay imposed by quotas |
+| `brahmaputra_connections_open` | gauge | live client connections |
+| `brahmaputra_partition_log_end_offset` | gauge | per-partition write position |
+| `brahmaputra_partition_log_start_offset` | gauge | per-partition retention position |
+| `brahmaputra_partition_high_watermark` | gauge | per-partition committed position |
+| `brahmaputra_partition_isr_size` | gauge | in-sync replica count |
+| `brahmaputra_under_replicated_partitions` | gauge | partitions below their replica count — alert on any non-zero |
+| `brahmaputra_leader_partitions` | gauge | partitions this broker leads |
+| `brahmaputra_group_members` | gauge | members per consumer group |
+| `brahmaputra_group_lag` | gauge | committed offset behind log end, per group |
+
+For an operator the three that matter most are
+`brahmaputra_under_replicated_partitions` (durability at risk),
+`brahmaputra_group_lag` (consumers falling behind), and
+`brahmaputra_produce_errors_total` (writes being refused).
 
 ## Durability, retention and quotas
 
@@ -323,30 +399,66 @@ Each row is asserted by a script, not by argument.
 
 ### Producer (`brahmaputra-cli produce`, `ProducerConfig`)
 
-`--acks`, `--batch-size`, `--linger-ms`, `--compression` (`none`/`lz4`),
-`--max-in-flight`, `--in-flight` (records buffered by bulk modes),
-`--timeout-ms`, `--idempotent`.
+| Flag / field | Default | Kafka equivalent | Meaning |
+|---|---|---|---|
+| `--acks` | 1 | `acks` | `0` fire-and-forget, `1` leader append, `all` full ISR |
+| `--batch-size` | 16 KiB | `batch.size` | flush a partition buffer once it holds this many bytes |
+| `--linger-ms` | 5 | `linger.ms` | flush every non-empty buffer at least this often; `0` sends each record immediately |
+| `--compression` | `lz4` | `compression.type` | `none` or `lz4` |
+| `--max-in-flight` | 5 | `max.in.flight.requests.per.connection` | unacknowledged requests per connection; also the flush shard count |
+| `--in-flight` | — | closest to `buffer.memory` | records the bulk modes keep outstanding |
+| `--timeout-ms` | 30000 | `request.timeout.ms` | broker-side wait for `acks` |
+| `--idempotent` | off | `enable.idempotence` | producer id + sequence; safe replay of an ambiguous send |
+| `--key` | — | — | pins the record to `murmur2(key) % partitions`, as Kafka |
+| `--partition` | — | — | explicit partition, bypassing the partitioner |
+| `batch_partitions` | on | — | send all of a broker's partitions in one `ProduceMulti` |
 
-One interaction is worth knowing before tuning: `--in-flight` bounds how
-many records may be outstanding at once, so it must comfortably exceed
-`batch-size ÷ record size` or a batch can never fill and every flush waits
-out `linger-ms` instead. At 256 B records with a 64 KiB batch, an in-flight
-window of 64 caps the producer in the low thousands of messages per second
-no matter how fast the broker is; 4096 lets it batch properly. It is the
-rough analogue of Kafka's `buffer.memory`.
+Two behaviours are worth knowing before tuning.
 
-Partitions that share a broker are sent in one `ProduceMulti` request
-(`batch_partitions`, on by default). They are split into `max-in-flight`
-fixed shards so that a partition still has at most one request outstanding
-— preserving per-partition ordering — while the shards overlap on the wire.
+**`--in-flight` must exceed `batch-size ÷ record size`.** It bounds how many
+records may be outstanding, so if it is smaller than a batch, the buffer
+can never reach `batch-size` and every flush waits out `linger-ms` instead.
+At 256 B records with a 64 KiB batch, a window of 64 pins the producer at
+roughly 4 000 msgs/sec no matter how fast the broker is; 4096 lets it batch
+properly.
 
-### Consumer (`Consumer`, `GroupConsumer`)
+**Ordering under batching.** Partitions that share a broker travel in one
+request, split into `max-in-flight` fixed shards. A partition always lands
+in the same shard, so it still has at most one request outstanding —
+which is what preserves per-key order — while the shards overlap on the
+wire.
 
-`max.poll.records` (500), session and rebalance timeouts, auto-commit
-interval, assignor, fetch `max_bytes` / `min_bytes` / `max_wait_ms`.
+### Consumer (`brahmaputra-cli consume`, `Consumer`, `GroupConsumer`)
 
-A full config-by-config comparison against Kafka, including what is
-missing, is in [docs/kafka-parity.md](docs/kafka-parity.md).
+| Flag / field | Default | Kafka equivalent | Meaning |
+|---|---|---|---|
+| `--from` | `earliest` | `auto.offset.reset` | `earliest` or `latest` start position |
+| `--offset` | — | — | explicit start offset, overriding `--from` |
+| `--partition` | all | — | read one partition instead of every partition |
+| `--max` | — | — | stop after this many records |
+| `--follow` | off | — | keep long-polling for new records |
+| `--group` | — | `group.id` | join a consumer group instead of reading standalone |
+| `--commit-interval-ms` | 5000 | `auto.commit.interval.ms` | `0` disables auto-commit |
+| `--assignor` | `range` | `partition.assignment.strategy` | `range` or `roundrobin` |
+| `max_poll_records` | 500 | `max.poll.records` | records returned per `poll`; the rest stay buffered and uncommitted |
+| `session_timeout_ms` | 10000 | `session.timeout.ms` | coordinator evicts a silent member after this |
+| `rebalance_timeout_ms` | 3000 | `max.poll.interval.ms` | how long the coordinator waits for members to rejoin |
+| `max_bytes` | 8 MiB | `fetch.max.bytes` | response cap, split across the partitions in one request |
+| `min_bytes` | 1 | `fetch.min.bytes` | return early once this many bytes are ready |
+| `max_wait_ms` | 500 | `fetch.max.wait.ms` | long-poll ceiling when caught up |
+
+A full config-by-config comparison against Kafka, including every knob that
+is missing or inert, is in [docs/kafka-parity.md](docs/kafka-parity.md).
+
+### Topic configuration
+
+Set at creation with `brahmaputra-cli topic create --config K=V`, stored in
+the Raft metadata and returned in metadata responses. **Only
+`min.insync.replicas` currently changes broker behaviour**; `retention.ms`,
+`retention.bytes`, `segment.bytes`, `cleanup.policy`, `max.message.bytes`
+and `compression.type` are accepted and stored but not yet applied per
+topic — set them broker-wide with the flags above. There is no
+`AlterConfigs` equivalent, so topic configs are fixed at creation.
 
 ## Verification
 
@@ -539,6 +651,31 @@ confidence intervals.
 - **Leader-epoch truncation** (KIP-101 semantics) makes divergence
   detection exact after a failover, rather than guessing from offsets.
 
+### On disk
+
+```
+data/
+  meta.toml                              node id, cluster id, listeners
+  orders-0/                              one directory per topic-partition
+    00000000000000000000.log             record batches, named by base offset
+    00000000000000000000.index           sparse offset -> file position
+    00000000000000000000.timeindex       sparse timestamp -> offset
+    00000000000000004096.log             the next segment, and so on
+    hwm                                  high-watermark checkpoint
+    leader-epoch-checkpoint              epoch -> first offset, for truncation
+```
+
+Segment names are the base offset zero-padded to 20 digits, so a directory
+listing is in offset order. Both indices are *sparse* — one entry per
+`index.interval.bytes` of log — so a lookup binary-searches the index and
+then scans forward a bounded amount, which is what keeps them small enough
+to stay in the page cache. All of it is the same layout Kafka uses, and the
+`.log` files hold exactly the bytes the producer sent.
+
+Recovery on startup reads the active segment's tail, validating each
+batch's CRC, and truncates at the first incomplete or corrupt record — so a
+`kill -9` costs at most the un-fsynced tail, never the whole segment.
+
 Deeper dives, one per subsystem, are in
 [docs/blueprint/](docs/blueprint/README.md); the design rationale and the
 alternatives considered are in [DESIGN.md](DESIGN.md).
@@ -547,11 +684,14 @@ alternatives considered are in [DESIGN.md](DESIGN.md).
 
 ```
 DESIGN.md                   architecture and design decisions
+LICENSE, NOTICE             Apache 2.0
 docs/blueprint/             per-subsystem internals
 docs/kafka-parity.md        config-by-config audit against Kafka
-docs/benchmarks.md          measured performance and the fixes it drove
+docs/benchmarks.md          method, machine, results, and the fixes they drove
 schemas/protocol.buff       BitPacker wire schemas (data plane)
 scripts/                    live verification and benchmark harnesses
+bench/                      Dockerfile and results for the Kafka comparison
+.github/workflows/ci.yml    tests plus the live suites on every PR
 crates/
   protocol/                 wire types, record batch codec (pure, sync)
   storage/                  segments, indices, retention, recovery
@@ -568,10 +708,18 @@ tools/bit-packer/           vendored schema compiler (Go)
 
 ## Building
 
+Needs a stable Rust toolchain (edition 2024, so 1.85 or newer; CI builds on
+`rust:1-bookworm`). Nothing else — no JVM, no ZooKeeper, no system
+libraries beyond libc.
+
 ```bash
-cargo build --release
-cargo test --workspace
+cargo build --release          # brahmaputra-server and brahmaputra-cli
+cargo test --workspace         # 194 unit and integration tests
 ```
+
+The live verification scripts additionally need `bash`; they run on Git
+Bash on Windows as well as on Unix. The benchmark harnesses need Docker,
+because they run Kafka and Brahmaputra under identical container limits.
 
 Regenerating wire types after editing `schemas/protocol.buff` needs the
 BitPacker generator, built once from the vendored source (requires Go):
@@ -603,4 +751,21 @@ The ones that matter most:
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Copyright 2026 the Brahmaputra authors.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy
+of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations
+under the License.
+
+Full text in [LICENSE](LICENSE); attribution notices in [NOTICE](NOTICE).
+Apache Kafka is a trademark of the Apache Software Foundation; this project
+is not affiliated with or endorsed by the ASF, and references to Kafka
+describe compatibility of model and behaviour only.
