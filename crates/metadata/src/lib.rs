@@ -470,6 +470,61 @@ impl ClusterMetadata {
                     leader_epoch: partition_metadata.leader_epoch,
                 }
             }
+            MetadataCommand::AddPartitions { name, count } => {
+                let live = self.live_broker_ids();
+                if live.is_empty() {
+                    return Err(MetadataError::InvalidReplicationFactor {
+                        requested: 1,
+                        live_brokers: 0,
+                    });
+                }
+                let Some(topic) = self.topics.get_mut(&name) else {
+                    return Err(MetadataError::UnknownTopic(name));
+                };
+                let current = topic.partitions.len() as i32;
+                // Partitions only ever increase. Removing one would strand
+                // the records already written to it, and a keyed producer
+                // would silently start routing its keys elsewhere.
+                if count <= current {
+                    return Err(MetadataError::InvalidPartitionCount(count));
+                }
+                let replication_factor = topic
+                    .partitions
+                    .values()
+                    .next()
+                    .map(|partition| partition.replicas.len())
+                    .unwrap_or(1)
+                    .min(live.len())
+                    .max(1);
+                for partition in current..count {
+                    let start = partition as usize % live.len();
+                    let replicas: Vec<_> = (0..replication_factor)
+                        .map(|index| live[(start + index) % live.len()])
+                        .collect();
+                    topic.partitions.insert(
+                        partition,
+                        PartitionMetadata {
+                            partition,
+                            leader: replicas[0],
+                            isr: replicas.clone(),
+                            replicas,
+                            leader_epoch: 0,
+                        },
+                    );
+                }
+                MetadataEvent::TopicCreated { name }
+            }
+            MetadataCommand::SetTopicConfig { name, configs } => {
+                let Some(topic) = self.topics.get_mut(&name) else {
+                    return Err(MetadataError::UnknownTopic(name));
+                };
+                // Merge rather than replace: an operator changing one key
+                // from a UI should not silently clear the others.
+                for (key, value) in configs {
+                    topic.configs.insert(key, value);
+                }
+                MetadataEvent::TopicCreated { name }
+            }
             MetadataCommand::PutAcl { rule } => {
                 let key = rule.key();
                 self.acls.insert(key.clone(), rule);
@@ -600,6 +655,14 @@ pub enum MetadataCommand {
     },
     PutUser {
         user: UserRecord,
+    },
+    AddPartitions {
+        name: String,
+        count: i32,
+    },
+    SetTopicConfig {
+        name: String,
+        configs: BTreeMap<String, String>,
     },
     PutAcl {
         rule: AclRule,
@@ -1270,5 +1333,123 @@ pub mod password {
         fn a_corrupt_hash_fails_rather_than_panicking() {
             assert!(!verify("anything", "not-a-hash"));
         }
+    }
+}
+
+#[cfg(test)]
+mod partition_and_config_tests {
+    use super::*;
+
+    fn cluster_with_topic(partitions: i32, replication_factor: i32) -> ClusterMetadata {
+        let mut image = ClusterMetadata::new("ui-test");
+        for broker_id in 1..=3 {
+            image
+                .apply(MetadataCommand::RegisterBroker {
+                    broker_id,
+                    host: format!("host-{broker_id}"),
+                    data_port: 9092,
+                    control_port: 19092,
+                    roles: vec![NodeRole::Broker],
+                    rack: None,
+                    now_ms: 1_000,
+                })
+                .expect("register");
+        }
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "orders".into(),
+                partitions,
+                replication_factor,
+                configs: BTreeMap::new(),
+            })
+            .expect("create");
+        image
+    }
+
+    #[test]
+    fn adding_partitions_keeps_the_existing_ones_untouched() {
+        let mut image = cluster_with_topic(3, 2);
+        let before: Vec<_> = image.topics["orders"]
+            .partitions
+            .iter()
+            .map(|(id, meta)| (*id, meta.replicas.clone()))
+            .collect();
+
+        image
+            .apply(MetadataCommand::AddPartitions {
+                name: "orders".into(),
+                count: 6,
+            })
+            .expect("add partitions");
+
+        let topic = &image.topics["orders"];
+        assert_eq!(topic.partitions.len(), 6);
+        // The partitions that already held data must not be reassigned:
+        // moving them would strand records and re-route keys.
+        for (id, replicas) in before {
+            assert_eq!(
+                topic.partitions[&id].replicas, replicas,
+                "partition {id} was reassigned"
+            );
+        }
+        // New ones get the same replication factor as the old.
+        for id in 3..6 {
+            assert_eq!(topic.partitions[&id].replicas.len(), 2);
+        }
+    }
+
+    #[test]
+    fn partitions_cannot_be_reduced_or_left_unchanged() {
+        let mut image = cluster_with_topic(4, 1);
+        for requested in [4, 3, 0] {
+            assert!(
+                image
+                    .apply(MetadataCommand::AddPartitions {
+                        name: "orders".into(),
+                        count: requested,
+                    })
+                    .is_err(),
+                "count {requested} must be refused"
+            );
+        }
+        assert_eq!(image.topics["orders"].partitions.len(), 4);
+    }
+
+    #[test]
+    fn adding_partitions_to_an_unknown_topic_is_an_error() {
+        let mut image = cluster_with_topic(1, 1);
+        assert!(image
+            .apply(MetadataCommand::AddPartitions {
+                name: "nope".into(),
+                count: 2,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn setting_a_config_merges_rather_than_replaces() {
+        let mut image = cluster_with_topic(1, 1);
+        image
+            .apply(MetadataCommand::SetTopicConfig {
+                name: "orders".into(),
+                configs: BTreeMap::from([
+                    ("retention.ms".to_string(), "60000".to_string()),
+                    ("min.insync.replicas".to_string(), "2".to_string()),
+                ]),
+            })
+            .expect("set config");
+        image
+            .apply(MetadataCommand::SetTopicConfig {
+                name: "orders".into(),
+                configs: BTreeMap::from([("retention.ms".to_string(), "120000".to_string())]),
+            })
+            .expect("update one key");
+
+        let configs = &image.topics["orders"].configs;
+        assert_eq!(configs["retention.ms"], "120000", "the changed key updates");
+        assert_eq!(
+            configs["min.insync.replicas"], "2",
+            "an untouched key must survive"
+        );
     }
 }

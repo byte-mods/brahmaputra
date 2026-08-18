@@ -122,6 +122,11 @@ struct Args {
     #[arg(long, env = "BRAHMAPUTRA_ADMIN_PASSWORD")]
     admin_password: Option<String>,
 
+    /// Username for that first admin. Only used on first boot, alongside
+    /// `--admin-password`.
+    #[arg(long, env = "BRAHMAPUTRA_ADMIN_USER", default_value = "admin")]
+    admin_user: String,
+
     /// Stable controller node ID. Supplying this enables combined cluster mode.
     #[arg(long)]
     node_id: Option<NodeId>,
@@ -499,11 +504,13 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
     let admin_epoch = broker_epoch_rx.clone();
     let admin_shutdown = shutdown_rx.clone();
     let admin_password = args.admin_password.clone();
+    let admin_user = args.admin_user.clone();
     components.spawn(async move {
         ensure_admin_user(
             admin_controller,
             admin_cache,
             admin_epoch,
+            admin_user,
             admin_password,
             admin_shutdown,
         )
@@ -1501,6 +1508,7 @@ async fn ensure_admin_user(
     controller: Arc<ControllerNode>,
     metadata_cache: MetadataCache,
     mut broker_epoch: watch::Receiver<u64>,
+    admin_user: String,
     admin_password: Option<String>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -1523,7 +1531,8 @@ async fn ensure_admin_user(
 
     let image = metadata_cache.snapshot();
     if let Err(error) =
-        observability::bootstrap_admin(&controller, &image, admin_password.as_deref()).await
+        observability::bootstrap_admin(&controller, &image, &admin_user, admin_password.as_deref())
+            .await
     {
         // A losing racer sees "already exists"; a real failure is worth
         // surfacing but must not take the node down, since the data plane

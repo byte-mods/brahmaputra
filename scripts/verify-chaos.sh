@@ -274,9 +274,20 @@ for round in $(seq 1 "$ROUNDS"); do
     leader_is_live "$observer"
 
   # Produce through a live replica; a dead one would just fail to connect.
-  writer="$(replica_nodes | while read -r candidate; do
-    node_running "$candidate" && printf '%s\n' "$candidate"
-  done | head -1)"
+  #
+  # Deliberately not `... | head -1`: under `set -o pipefail` head exits as
+  # soon as it has its line, the upstream loop dies of SIGPIPE, and the
+  # assignment fails — so `set -e` aborted the whole run silently, with no
+  # failed assertion and no message. That is what made this suite look like
+  # a broker fault for so long. Reading from a process substitution and
+  # breaking keeps the exit status ours.
+  writer=""
+  while read -r candidate; do
+    if node_running "$candidate"; then
+      writer="$candidate"
+      break
+    fi
+  done < <(replica_nodes)
   [[ -n "$writer" ]] || die "no live replica to produce through"
   acked="$(produce_round "$writer" "$round")"
   TOTAL_ACKED=$((TOTAL_ACKED + acked))

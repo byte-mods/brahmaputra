@@ -1,0 +1,71 @@
+# A three-node Brahmaputra cluster with the operations dashboard.
+#
+#   docker compose -f docker/docker-compose.yml up --build
+#   open http://localhost:8080        (log in with the credentials below)
+#
+# The dashboard is served by every node, so any of the three HTTP ports
+# works; 8080 is mapped for convenience. Node 1 bootstraps the Raft quorum
+# on first start — that flag is harmless afterwards, since a formed quorum
+# ignores it.
+
+services:
+  brahmaputra-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: brahmaputra:latest
+    hostname: brahmaputra-1
+    environment:
+      # --- change these ---
+      BRAHMAPUTRA_ADMIN_USER: admin
+      BRAHMAPUTRA_ADMIN_PASSWORD: change-me-please
+      # --------------------
+      BRAHMAPUTRA_NODE_ID: 1
+      BRAHMAPUTRA_HOST: brahmaputra-1
+      BRAHMAPUTRA_PEERS: "1=brahmaputra-1:19092,2=brahmaputra-2:19092,3=brahmaputra-3:19092"
+      BRAHMAPUTRA_BOOTSTRAP: 1
+      BRAHMAPUTRA_DEFAULT_PARTITIONS: 3
+    ports:
+      - "9092:9092"
+      - "8080:8080"
+    volumes:
+      - data-1:/var/lib/brahmaputra
+
+  brahmaputra-2:
+    image: brahmaputra:latest
+    hostname: brahmaputra-2
+    depends_on: [brahmaputra-1]
+    environment:
+      BRAHMAPUTRA_ADMIN_USER: admin
+      BRAHMAPUTRA_ADMIN_PASSWORD: change-me-please
+      BRAHMAPUTRA_NODE_ID: 2
+      BRAHMAPUTRA_HOST: brahmaputra-2
+      BRAHMAPUTRA_PEERS: "1=brahmaputra-1:19092,2=brahmaputra-2:19092,3=brahmaputra-3:19092"
+      BRAHMAPUTRA_DEFAULT_PARTITIONS: 3
+    ports:
+      - "9093:9092"
+      - "8081:8080"
+    volumes:
+      - data-2:/var/lib/brahmaputra
+
+  brahmaputra-3:
+    image: brahmaputra:latest
+    hostname: brahmaputra-3
+    depends_on: [brahmaputra-1]
+    environment:
+      BRAHMAPUTRA_ADMIN_USER: admin
+      BRAHMAPUTRA_ADMIN_PASSWORD: change-me-please
+      BRAHMAPUTRA_NODE_ID: 3
+      BRAHMAPUTRA_HOST: brahmaputra-3
+      BRAHMAPUTRA_PEERS: "1=brahmaputra-1:19092,2=brahmaputra-2:19092,3=brahmaputra-3:19092"
+      BRAHMAPUTRA_DEFAULT_PARTITIONS: 3
+    ports:
+      - "9094:9092"
+      - "8082:8080"
+    volumes:
+      - data-3:/var/lib/brahmaputra
+
+volumes:
+  data-1:
+  data-2:
+  data-3:

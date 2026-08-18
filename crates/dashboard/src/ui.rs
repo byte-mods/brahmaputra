@@ -52,6 +52,12 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
            border:1px solid var(--line); border-radius:8px; padding:7px 11px; }
   button { cursor:pointer; }
   button.primary { background:var(--accent); border-color:var(--accent); color:#001; font-weight:600; }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px; }
+  .toolbar input { min-width:160px; }
+  .bad { color:var(--bad); }
+  #messages td { vertical-align:top; word-break:break-word; }
+  #messages td:nth-child(5) { max-width:640px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
   #login { max-width:340px; margin:14vh auto; }
   #login .card { display:grid; gap:10px; }
   #err { color:var(--bad); min-height:1.2em; }
@@ -93,6 +99,45 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
     <section><h2>Brokers</h2><table id="brokers"></table></section>
     <section><h2>Topics</h2><table id="topics"></table></section>
     <section><h2>Consumer groups</h2><table id="groups"></table></section>
+    <section>
+      <h2>Messages</h2>
+      <div class="card">
+        <div class="toolbar">
+          <select id="mtopic" onchange="topicChanged()"></select>
+          <select id="mpart"><option value="">all partitions</option></select>
+          <input id="msearch" placeholder="filter key or value" oninput="debouncedMessages()">
+          <select id="morder">
+            <option value="desc">newest first</option>
+            <option value="asc">oldest first</option>
+          </select>
+          <select id="mlimit">
+            <option>50</option><option selected>100</option><option>250</option><option>500</option>
+          </select>
+          <button onclick="loadMessages()">Refresh</button>
+          <button id="livebtn" onclick="toggleLive()">Go live</button>
+          <span class="muted" id="mcount"></span>
+        </div>
+        <table id="messages"></table>
+      </div>
+    </section>
+
+    <section id="adminpanel">
+      <h2>Topic administration</h2>
+      <div class="card">
+        <div class="toolbar">
+          <span class="muted">Partitions</span>
+          <input id="partcount" type="number" min="1" style="width:90px" placeholder="total">
+          <button onclick="addPartitions()">Increase</button>
+          <span class="muted">·</span>
+          <input id="cfgkey" placeholder="config key e.g. retention.ms" style="width:220px">
+          <input id="cfgval" placeholder="value" style="width:140px">
+          <button onclick="setConfig()">Apply</button>
+          <span class="muted">·</span>
+          <button class="danger" onclick="removeTopic()">Delete topic</button>
+        </div>
+        <div id="adminmsg" class="muted"></div>
+      </div>
+    </section>
   </main>
 </div>
 
@@ -168,6 +213,7 @@ async function refresh() {
         <td><span class="pill ${x.alive ? "ok" : "no"}">${x.alive ? "alive" : "down"}</span></td></tr>`).join("");
 
     const t = await api("/api/v1/topics");
+    fillTopicPicker(t.topics || []);
     document.getElementById("topics").innerHTML =
       "<tr><th>Topic</th><th>Partitions</th><th>RF</th><th>Under-replicated</th></tr>" +
       (t.topics.length ? t.topics.map(x => `<tr><td>${x.name}</td><td>${x.partitions}</td>
@@ -226,12 +272,197 @@ async function loadMetricList() {
     .map(m => `<option ${m === preferred ? "selected" : ""}>${m}</option>`).join("");
 }
 
+
+// ----------------------------------------------------------- messages
+
+let liveSource = null;
+let searchTimer = null;
+let knownTopics = [];
+
+function currentTopic() {
+  return document.getElementById("mtopic").value || "";
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+
+/// Long payloads are truncated in the row: an operations page has to stay
+/// readable when someone posts a megabyte of JSON.
+function preview(text, binary) {
+  const limit = 300;
+  const shown = text.length > limit ? text.slice(0, limit) + "…" : text;
+  return escapeHtml(shown) + (binary ? ' <span class="muted">(binary)</span>' : "");
+}
+
+function renderMessages(rows) {
+  const table = document.getElementById("messages");
+  if (!rows.length) {
+    table.innerHTML = "<tr><td class='muted'>no messages</td></tr>";
+    document.getElementById("mcount").textContent = "";
+    return;
+  }
+  table.innerHTML =
+    "<tr><th>partition</th><th>offset</th><th>time</th><th>key</th><th>value</th><th>bytes</th></tr>" +
+    rows.map(m => `<tr>
+      <td>${m.partition}</td>
+      <td>${m.offset}</td>
+      <td class="muted">${m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : ""}</td>
+      <td>${m.key === null ? '<span class="muted">—</span>' : escapeHtml(m.key)}</td>
+      <td>${preview(m.value, m.binary)}</td>
+      <td class="muted">${m.size_bytes}</td>
+    </tr>`).join("");
+  document.getElementById("mcount").textContent = `${rows.length} shown`;
+}
+
+async function loadMessages() {
+  const topic = currentTopic();
+  if (!topic) { renderMessages([]); return; }
+  const params = new URLSearchParams();
+  const partition = document.getElementById("mpart").value;
+  if (partition !== "") params.set("partition", partition);
+  const search = document.getElementById("msearch").value.trim();
+  if (search) params.set("search", search);
+  params.set("order", document.getElementById("morder").value);
+  params.set("limit", document.getElementById("mlimit").value);
+  try {
+    const data = await api(`/api/v1/topics/${encodeURIComponent(topic)}/messages?${params}`);
+    renderMessages(data.messages || []);
+  } catch (error) {
+    renderMessages([]);
+  }
+}
+
+function debouncedMessages() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(loadMessages, 250);
+}
+
+/// Live tail. EventSource cannot send an Authorization header, so the
+/// token rides in the query string — the same session token, on the same
+/// origin, over whatever transport the page was already served on.
+function toggleLive() {
+  const button = document.getElementById("livebtn");
+  if (liveSource) {
+    liveSource.close();
+    liveSource = null;
+    button.textContent = "Go live";
+    return;
+  }
+  const topic = currentTopic();
+  if (!topic) return;
+  const params = new URLSearchParams({ access_token: token });
+  const partition = document.getElementById("mpart").value;
+  if (partition !== "") params.set("partition", partition);
+  liveSource = new EventSource(`/api/v1/topics/${encodeURIComponent(topic)}/stream?${params}`);
+  button.textContent = "Stop";
+  const table = document.getElementById("messages");
+  liveSource.onmessage = event => {
+    const m = JSON.parse(event.data);
+    const search = document.getElementById("msearch").value.trim().toLowerCase();
+    if (search) {
+      const hay = (m.value + " " + (m.key || "")).toLowerCase();
+      if (!hay.includes(search)) return;
+    }
+    if (!table.rows.length || table.rows[0].cells.length !== 6) {
+      table.innerHTML =
+        "<tr><th>partition</th><th>offset</th><th>time</th><th>key</th><th>value</th><th>bytes</th></tr>";
+    }
+    const row = table.insertRow(1);
+    row.innerHTML = `<td>${m.partition}</td><td>${m.offset}</td>
+      <td class="muted">${m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : ""}</td>
+      <td>${m.key === null ? '<span class="muted">—</span>' : escapeHtml(m.key)}</td>
+      <td>${preview(m.value, m.binary)}</td>
+      <td class="muted">${m.size_bytes}</td>`;
+    // Keep the tail bounded or a busy topic grows the DOM without limit.
+    while (table.rows.length > 400) table.deleteRow(table.rows.length - 1);
+  };
+  liveSource.onerror = () => { toggleLive(); };
+}
+
+function topicChanged() {
+  if (liveSource) toggleLive();
+  const topic = knownTopics.find(t => t.name === currentTopic());
+  const select = document.getElementById("mpart");
+  const count = topic ? topic.partitions : 0;
+  select.innerHTML = '<option value="">all partitions</option>' +
+    Array.from({ length: count }, (_, i) => `<option value="${i}">partition ${i}</option>`).join("");
+  loadMessages();
+}
+
+function fillTopicPicker(topics) {
+  knownTopics = topics.map(t => ({
+    name: t.name,
+    partitions: (t.partitions && t.partitions.length) || t.partition_count || 0
+  }));
+  const select = document.getElementById("mtopic");
+  const previous = select.value;
+  select.innerHTML = knownTopics.map(t => `<option>${escapeHtml(t.name)}</option>`).join("");
+  if (previous && knownTopics.some(t => t.name === previous)) select.value = previous;
+  if (!select.dataset.ready) { select.dataset.ready = "1"; topicChanged(); }
+}
+
+// ------------------------------------------------- topic administration
+
+function adminSay(message, bad) {
+  const element = document.getElementById("adminmsg");
+  element.textContent = message;
+  element.className = bad ? "bad" : "muted";
+}
+
+async function addPartitions() {
+  const topic = currentTopic();
+  const count = parseInt(document.getElementById("partcount").value, 10);
+  if (!topic || !count) { adminSay("choose a topic and a partition count", true); return; }
+  try {
+    await api(`/api/v1/topics/${encodeURIComponent(topic)}/partitions`, {
+      method: "POST", body: JSON.stringify({ count })
+    });
+    adminSay(`${topic} now has ${count} partitions`);
+    await refresh();
+  } catch (error) {
+    adminSay(String(error.message || error), true);
+  }
+}
+
+async function setConfig() {
+  const topic = currentTopic();
+  const key = document.getElementById("cfgkey").value.trim();
+  const value = document.getElementById("cfgval").value.trim();
+  if (!topic || !key) { adminSay("choose a topic and a config key", true); return; }
+  try {
+    await api(`/api/v1/topics/${encodeURIComponent(topic)}/config`, {
+      method: "POST", body: JSON.stringify({ configs: { [key]: value } })
+    });
+    adminSay(`${topic}: ${key} = ${value}`);
+    await refresh();
+  } catch (error) {
+    adminSay(String(error.message || error), true);
+  }
+}
+
+async function removeTopic() {
+  const topic = currentTopic();
+  if (!topic) return;
+  if (!confirm(`Delete topic "${topic}" and everything in it?`)) return;
+  try {
+    await api(`/api/v1/topics/${encodeURIComponent(topic)}`, { method: "DELETE" });
+    adminSay(`${topic} deleted`);
+    await refresh();
+  } catch (error) {
+    adminSay(String(error.message || error), true);
+  }
+}
+
 async function start() {
   document.getElementById("login").hidden = true;
   document.getElementById("app").hidden = false;
   document.getElementById("who").textContent = `${user} · ${role}`;
   await loadMetricList();
   await refresh();
+  await loadMessages();
   await drawChart();
   setInterval(refresh, 3000);
   setInterval(drawChart, 5000);

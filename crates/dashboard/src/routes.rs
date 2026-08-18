@@ -16,6 +16,7 @@ use axum::{Json, Router};
 use brahmaputra_broker::Broker;
 use brahmaputra_metadata::{ClusterMetadata, MetadataCache, Role, UserRecord};
 use brahmaputra_metrics::{names, Metrics};
+use brahmaputra_protocol::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -57,6 +58,45 @@ impl DashboardState {
 
     fn metrics(&self) -> &Metrics {
         self.broker.metrics()
+    }
+
+    /// Authorize a request whose token arrives in the query string rather
+    /// than in a header.
+    ///
+    /// `EventSource` cannot set an `Authorization` header, so the live tail
+    /// has no other way to present a session. It is the same token, checked
+    /// the same way, against the same current role — but a token in a query
+    /// string ends up in server logs and browser history, so nothing except
+    /// the stream endpoint uses this.
+    fn authorize_query(
+        &self,
+        headers: &HeaderMap,
+        query_token: Option<&str>,
+        required: Role,
+    ) -> Result<Claims, AuthError> {
+        match self.authorize(headers, required) {
+            Ok(claims) => Ok(claims),
+            Err(header_error) => {
+                let Some(token) = query_token else {
+                    return Err(header_error);
+                };
+                let image = self.image();
+                let secret = image.jwt_secret.as_deref().ok_or(AuthError::NotReady)?;
+                let claims = verify_token(secret, token)?;
+                // Re-read the role from metadata rather than trusting the
+                // token, exactly as the header path does.
+                let current_role = image
+                    .users
+                    .get(&claims.sub)
+                    .map(|user| user.role)
+                    .ok_or(AuthError::TokenInvalid)?;
+                if current_role.permits(required) {
+                    Ok(claims)
+                } else {
+                    Err(AuthError::Forbidden)
+                }
+            }
+        }
     }
 
     /// Authenticate a request and check its role in one step, so no route
@@ -523,6 +563,10 @@ pub fn router(state: DashboardState) -> Router {
             "/api/v1/topics/{name}",
             get(topic_detail).delete(delete_topic),
         )
+        .route("/api/v1/topics/{name}/messages", get(topic_messages))
+        .route("/api/v1/topics/{name}/stream", get(topic_stream))
+        .route("/api/v1/topics/{name}/partitions", post(add_partitions))
+        .route("/api/v1/topics/{name}/config", post(set_topic_config))
         .route("/api/v1/groups", get(groups))
         .route("/api/v1/groups/{group}/lag", get(group_lag))
         .route("/api/v1/metrics/snapshot", get(metrics_snapshot))
@@ -544,4 +588,322 @@ pub async fn serve(
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+// ------------------------------------------------------- message browsing
+
+#[derive(Debug, Deserialize)]
+pub struct MessageQuery {
+    /// Partition to read; omitted means every partition of the topic.
+    partition: Option<i32>,
+    /// Offset to start from. Omitted means the newest window, which is what
+    /// an operator opening a topic almost always wants.
+    from: Option<i64>,
+    #[serde(default = "default_message_limit")]
+    limit: usize,
+    /// Case-insensitive substring match against the key or the value.
+    search: Option<String>,
+    /// Session token for the live tail, which cannot send a header.
+    access_token: Option<String>,
+    /// `desc` (default, newest first) or `asc`.
+    order: Option<String>,
+}
+
+fn default_message_limit() -> usize {
+    100
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BrowsedMessage {
+    partition: i32,
+    offset: i64,
+    timestamp: i64,
+    key: Option<String>,
+    value: String,
+    /// True when the payload was not valid UTF-8 and had to be rendered
+    /// lossily, so the UI can say so rather than quietly showing mojibake.
+    binary: bool,
+    size_bytes: usize,
+}
+
+/// Read a window of messages from one partition.
+///
+/// Reads backwards from the high watermark by default: an operator opening
+/// a busy topic wants the newest records, and scanning a large log from
+/// offset zero to reach them would be slow and pointless.
+async fn read_partition_messages(
+    broker: &Broker,
+    topic: &str,
+    partition: i32,
+    from: Option<i64>,
+    limit: usize,
+) -> Vec<BrowsedMessage> {
+    let Ok(handle) = broker.partition(topic, partition) else {
+        return Vec::new();
+    };
+    let Ok((log_start, _log_end, high_watermark)) = handle.offsets().await else {
+        return Vec::new();
+    };
+    // A rough guess at how far back `limit` records reach. The caller trims
+    // to `limit`, so a generous window is cheaper than being exact.
+    let window = (limit as i64).saturating_mul(4).max(64);
+    let start = match from {
+        Some(offset) => offset.max(log_start),
+        None => high_watermark.saturating_sub(window).max(log_start),
+    };
+    if start >= high_watermark {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let ceiling = limit.saturating_mul(8);
+    let mut offset = start;
+    while offset < high_watermark && out.len() < ceiling {
+        let Ok(outcome) = handle.read(offset, 4 * 1024 * 1024).await else {
+            break;
+        };
+        if outcome.batches.is_empty() {
+            break;
+        }
+        for raw in outcome.batches {
+            let mut bytes = raw;
+            let Ok(batch) = RecordBatch::decode(&mut bytes) else {
+                break;
+            };
+            let base = batch.base_offset;
+            let timestamp = batch.max_timestamp;
+            for (index, record) in batch.records.into_iter().enumerate() {
+                let record_offset = base + index as i64;
+                offset = record_offset + 1;
+                if record_offset < start || record_offset >= high_watermark {
+                    continue;
+                }
+                let size_bytes = record.value.len();
+                let (value, binary) = match std::str::from_utf8(&record.value) {
+                    Ok(text) => (text.to_owned(), false),
+                    Err(_) => (String::from_utf8_lossy(&record.value).into_owned(), true),
+                };
+                out.push(BrowsedMessage {
+                    partition,
+                    offset: record_offset,
+                    timestamp,
+                    key: record
+                        .key
+                        .as_ref()
+                        .map(|key| String::from_utf8_lossy(key).into_owned()),
+                    value,
+                    binary,
+                    size_bytes,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Which partitions of a topic to read, given an optional explicit choice.
+fn topic_partitions(state: &DashboardState, topic: &str, chosen: Option<i32>) -> Vec<i32> {
+    if let Some(partition) = chosen {
+        return vec![partition];
+    }
+    state
+        .metadata
+        .as_ref()
+        .and_then(|cache| {
+            cache
+                .snapshot()
+                .topics
+                .get(topic)
+                .map(|meta| meta.partitions.keys().copied().collect::<Vec<_>>())
+        })
+        .unwrap_or_else(|| (0..state.broker.config().default_partitions).collect())
+}
+
+/// Browse a topic's messages, with optional search and ordering.
+async fn topic_messages(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(topic): Path<String>,
+    Query(query): Query<MessageQuery>,
+) -> Response {
+    if let Err(error) = state.authorize(&headers, Role::Viewer) {
+        return auth_error(error);
+    }
+    let limit = query.limit.clamp(1, 1_000);
+    let mut messages = Vec::new();
+    for partition in topic_partitions(&state, &topic, query.partition) {
+        messages.extend(
+            read_partition_messages(&state.broker, &topic, partition, query.from, limit).await,
+        );
+    }
+
+    if let Some(needle) = query.search.as_ref().filter(|term| !term.is_empty()) {
+        let needle = needle.to_lowercase();
+        messages.retain(|message| {
+            message.value.to_lowercase().contains(&needle)
+                || message
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| key.to_lowercase().contains(&needle))
+        });
+    }
+
+    let ascending = query.order.as_deref() == Some("asc");
+    messages.sort_by(|a, b| {
+        if ascending {
+            (a.offset, a.partition).cmp(&(b.offset, b.partition))
+        } else {
+            (b.offset, b.partition).cmp(&(a.offset, a.partition))
+        }
+    });
+    messages.truncate(limit);
+
+    Json(json!({ "topic": topic, "messages": messages })).into_response()
+}
+
+/// Server-sent events carrying records as they are appended.
+///
+/// A poll loop rather than a hook in the append path: the dashboard is an
+/// observer and must never be able to slow a producer down, so it reads on
+/// its own schedule and falls behind if it has to.
+async fn topic_stream(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(topic): Path<String>,
+    Query(query): Query<MessageQuery>,
+) -> Response {
+    if let Err(error) = state.authorize_query(&headers, query.access_token.as_deref(), Role::Viewer)
+    {
+        return auth_error(error);
+    }
+    let partitions = topic_partitions(&state, &topic, query.partition);
+    let broker = Arc::clone(&state.broker);
+    let stream_topic = topic.clone();
+
+    // Start at the current end, so a tail shows what arrives from now on
+    // rather than replaying history the operator did not ask for.
+    let mut positions: Vec<(i32, i64)> = Vec::new();
+    for partition in &partitions {
+        let position = match broker.partition(&stream_topic, *partition) {
+            Ok(handle) => handle
+                .offsets()
+                .await
+                .map(|(_, _, high_watermark)| high_watermark)
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        positions.push((*partition, position));
+    }
+
+    let events = async_stream::stream! {
+        loop {
+            let mut sent_any = false;
+            for (partition, position) in positions.iter_mut() {
+                let batch =
+                    read_partition_messages(&broker, &stream_topic, *partition, Some(*position), 200)
+                        .await;
+                for message in batch {
+                    if message.offset >= *position {
+                        *position = message.offset + 1;
+                    }
+                    sent_any = true;
+                    let payload = serde_json::to_string(&message).unwrap_or_default();
+                    yield Ok::<_, std::convert::Infallible>(
+                        axum::response::sse::Event::default().data(payload),
+                    );
+                }
+            }
+            if !sent_any {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
+    };
+
+    axum::response::Sse::new(events)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddPartitionsRequest {
+    /// The total the topic should have afterwards, which is how Kafka
+    /// expresses it too: partitions only ever increase.
+    count: i32,
+}
+
+/// Increase a topic's partition count.
+async fn add_partitions(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(topic): Path<String>,
+    Json(request): Json<AddPartitionsRequest>,
+) -> Response {
+    if let Err(error) = state.authorize(&headers, Role::Operator) {
+        return auth_error(error);
+    }
+    let Some(metadata) = state.metadata.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "partitions can only be changed on a cluster" })),
+        )
+            .into_response();
+    };
+    let image = metadata.snapshot();
+    let Some(existing) = image.topics.get(&topic) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown topic" })),
+        )
+            .into_response();
+    };
+    let current = existing.partitions.len() as i32;
+    if request.count <= current {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "partition count can only increase",
+                "current": current,
+            })),
+        )
+            .into_response();
+    }
+    match state
+        .submit(json!({
+            "type": "add_partitions",
+            "name": topic,
+            "count": request.count,
+        }))
+        .await
+    {
+        Ok(()) => Json(json!({ "topic": topic, "partitions": request.count })).into_response(),
+        Err((status, error)) => (status, Json(json!({ "error": error }))).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TopicConfigRequest {
+    configs: std::collections::BTreeMap<String, String>,
+}
+
+/// Change a topic's configuration at runtime.
+async fn set_topic_config(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(topic): Path<String>,
+    Json(request): Json<TopicConfigRequest>,
+) -> Response {
+    if let Err(error) = state.authorize(&headers, Role::Operator) {
+        return auth_error(error);
+    }
+    match state
+        .submit(json!({
+            "type": "set_topic_config",
+            "name": topic,
+            "configs": request.configs,
+        }))
+        .await
+    {
+        Ok(()) => Json(json!({ "topic": topic, "configs": request.configs })).into_response(),
+        Err((status, error)) => (status, Json(json!({ "error": error }))).into_response(),
+    }
 }

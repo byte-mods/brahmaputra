@@ -124,6 +124,7 @@ pub async fn start_dashboard(
 pub async fn bootstrap_admin(
     controller: &brahmaputra_controller::ControllerNode,
     image: &ClusterMetadata,
+    admin_user: &str,
     admin_password: Option<&str>,
 ) -> Result<()> {
     if image.jwt_secret.is_none() {
@@ -151,7 +152,7 @@ pub async fn bootstrap_admin(
     controller
         .write_metadata(MetadataCommand::PutUser {
             user: UserRecord {
-                username: "admin".to_owned(),
+                username: admin_user.to_owned(),
                 password_hash,
                 role: Role::Admin,
                 force_password_change: generated,
