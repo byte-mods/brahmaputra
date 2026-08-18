@@ -21,6 +21,11 @@ const HWM_FILE: &str = "hwm";
 /// small enough not to read far past what a fetch will actually use.
 const READ_CHUNK_BYTES: usize = 1024 * 1024;
 
+/// Bytes of a batch that must be read to learn where it ends and which
+/// offsets it covers: through `last_offset_delta`. Everything after this is
+/// payload a zero-copy fetch never touches.
+const REGION_PROBE_LEN: usize = 27;
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1770,5 +1775,222 @@ mod chunked_read_tests {
             first.base_offset + first.last_offset_delta as i64 >= 4,
             "first batch must cover the requested offset"
         );
+    }
+}
+
+/// A contiguous run of record batches exactly as they sit in a segment file.
+///
+/// This is what lets a plaintext fetch skip userspace altogether: the
+/// broker sends the range straight from the page cache with `sendfile`,
+/// so the bytes are never read into the process at all. Only the batch
+/// *headers* are read to work out where the run ends.
+#[derive(Clone)]
+pub struct LogRegion {
+    pub file: std::sync::Arc<std::fs::File>,
+    pub position: u64,
+    pub len: usize,
+}
+
+impl std::fmt::Debug for LogRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogRegion")
+            .field("position", &self.position)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl Log {
+    /// The same selection [`Log::read`] makes, described as file ranges
+    /// instead of buffers.
+    ///
+    /// Batches that belong to one segment and follow each other are merged
+    /// into a single region, so a fetch of many batches usually becomes one
+    /// `sendfile` call. Adjacent-run merging is what makes this worth doing
+    /// at small record sizes as well as large ones.
+    pub fn read_regions(
+        &self,
+        offset: i64,
+        max_bytes: usize,
+    ) -> Result<Vec<LogRegion>, StorageError> {
+        if offset < self.start_offset {
+            return Err(StorageError::OffsetOutOfRange {
+                offset,
+                start: self.start_offset,
+                end: self.next_offset,
+            });
+        }
+        let mut regions: Vec<LogRegion> = Vec::new();
+        if offset >= self.next_offset || max_bytes == 0 {
+            return Ok(regions);
+        }
+        let high_watermark = self.high_watermark;
+
+        let first = self
+            .segments
+            .partition_point(|segment| segment.base_offset <= offset)
+            .saturating_sub(1);
+
+        let mut total = 0usize;
+        'segments: for segment in &self.segments[first..] {
+            let relative = offset.saturating_sub(segment.base_offset).max(0) as u32;
+            let mut position = segment.index.lookup(relative) as u64;
+            while position + BATCH_HEADER_LEN as u64 <= segment.size {
+                let mut header = [0u8; REGION_PROBE_LEN];
+                if position + REGION_PROBE_LEN as u64 > segment.size {
+                    break 'segments;
+                }
+                segment.read_at(position, &mut header)?;
+                let base_offset = i64::from_be_bytes(header[0..8].try_into().unwrap());
+                let batch_length = i32::from_be_bytes(header[8..12].try_into().unwrap());
+                if batch_length < MIN_BATCH_LENGTH as i32 {
+                    break 'segments;
+                }
+                let total_len = BATCH_HEADER_LEN + batch_length as usize;
+                if position + total_len as u64 > segment.size {
+                    break 'segments;
+                }
+                // Layout (batch.rs): base_offset i64, batch_length i32,
+                // leader_epoch i32, magic u8, crc32c u32, attributes u16,
+                // then last_offset_delta i32 — so visibility and offset
+                // checks need the header, never the payload.
+                let last_offset_delta = i32::from_be_bytes(header[23..27].try_into().unwrap());
+                let last_offset = base_offset + last_offset_delta as i64;
+
+                // Never serve at or beyond the high watermark, matching the
+                // partition actor's rule for buffered reads.
+                if last_offset >= high_watermark {
+                    break 'segments;
+                }
+
+                if last_offset >= offset {
+                    match regions.last_mut() {
+                        Some(last)
+                            if std::sync::Arc::ptr_eq(&last.file, &segment.file())
+                                && last.position + last.len as u64 == position =>
+                        {
+                            last.len += total_len;
+                        }
+                        _ => regions.push(LogRegion {
+                            file: segment.file(),
+                            position,
+                            len: total_len,
+                        }),
+                    }
+                    total += total_len;
+                }
+                position += total_len as u64;
+                if total >= max_bytes {
+                    break 'segments;
+                }
+            }
+        }
+        Ok(regions)
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    use brahmaputra_protocol::Record;
+
+    fn config() -> LogConfig {
+        LogConfig {
+            segment_bytes: 4096,
+            index_interval_bytes: 64,
+            hwm_checkpoint_interval_ms: 0,
+            ..LogConfig::default()
+        }
+    }
+
+    /// The regions must describe exactly the bytes `read` would have
+    /// returned — same selection, same order, same total.
+    #[test]
+    fn regions_describe_the_same_bytes_as_a_buffered_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for value in 0..12u8 {
+            log.append(RecordBatch::new(
+                0,
+                0,
+                1,
+                vec![Record::new(vec![value; 200])],
+            ))
+            .unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+
+        for budget in [64, 1024, 4096, 1 << 20] {
+            let buffered = log.read(0, budget).unwrap();
+            let regions = log.read_regions(0, budget).unwrap();
+            let buffered_total: usize = buffered.iter().map(Bytes::len).sum();
+            let region_total: usize = regions.iter().map(|region| region.len).sum();
+            assert_eq!(
+                buffered_total, region_total,
+                "byte totals must agree at budget {budget}"
+            );
+        }
+    }
+
+    /// Adjacent batches in one segment collapse into a single range, so a
+    /// fetch of many batches is one `sendfile`, not one per batch.
+    #[test]
+    fn adjacent_batches_merge_into_one_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for value in 0..4u8 {
+            log.append(RecordBatch::new(
+                0,
+                0,
+                1,
+                vec![Record::new(vec![value; 64])],
+            ))
+            .unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+
+        let regions = log.read_regions(0, 1 << 20).unwrap();
+        assert_eq!(regions.len(), 1, "one contiguous run: {regions:?}");
+    }
+
+    /// Records at or beyond the high watermark are not visible, exactly as
+    /// for a buffered read.
+    #[test]
+    fn regions_stop_at_the_high_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for value in 0..6u8 {
+            log.append(RecordBatch::new(
+                0,
+                0,
+                1,
+                vec![Record::new(vec![value; 64])],
+            ))
+            .unwrap();
+        }
+        log.set_high_watermark(3).unwrap();
+
+        // `Log::read` hands back everything on disk and the partition actor
+        // applies the watermark; regions skip the actor, so the cutoff has
+        // to be applied here instead. Only the committed prefix is visible.
+        let regions = log.read_regions(0, 1 << 20).unwrap();
+        let visible: usize = regions.iter().map(|region| region.len).sum();
+        let on_disk: usize = log.read(0, 1 << 20).unwrap().iter().map(Bytes::len).sum();
+        assert!(visible > 0, "the committed prefix must still be visible");
+        assert!(
+            visible < on_disk,
+            "records at or beyond the watermark must not be served ({visible} of {on_disk})"
+        );
+
+        // Raising the watermark makes the rest visible, and then the two
+        // agree exactly.
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        let all: usize = log
+            .read_regions(0, 1 << 20)
+            .unwrap()
+            .iter()
+            .map(|region| region.len)
+            .sum();
+        assert_eq!(all, on_disk);
     }
 }

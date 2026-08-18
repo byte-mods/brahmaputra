@@ -196,25 +196,24 @@ regardless of load — 8–28x less here.
 
 | Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC |
 |---|---|---|---|
-| Produce MB/sec | 184.8 | **433** (2.34x) | 119 |
-| Consume MB/sec | 257.5 | **603** (2.34x) | 101 |
-| Produce CPU % (avg) | 224.2 | **180.8** | 290.7 |
-| Produce memory MiB (avg) | 1292 | 373 | **300** |
-| Consume CPU % (avg) | 206.0 | **155.1** | 254.4 |
-| Consume memory MiB (avg) | 2518 | **862** | 877 |
-| Disk bytes per 1 MiB record | — | 1 048 615 | 1 048 613 |
-| Produce MB/sec per CPU % | 0.8 | **2.4** | 0.4 |
+| Produce MB/sec | 170.9 | **418** (2.45x) | 112 |
+| Consume MB/sec | 221.5 | **942** (4.25x) | 106 |
+| Produce CPU % (avg) | 222.5 | **207.0** | 311.0 |
+| Produce memory MiB (avg) | 1446 | 362 | **356** |
+| Consume CPU % (avg) | 149.8 | **116.0** | 270.3 |
+| Consume memory MiB (avg) | 2952 | 1065 | **792** |
+| Disk bytes per 1 MiB record | — | 1 048 614 | 1 048 612 |
+| Produce MB/sec per CPU % | 0.8 | **2.0** | 0.4 |
 
-At megabyte records Brahmaputra over TCP is 2.3x Kafka on **both** sides,
-on less CPU and a third of the memory.
+At megabyte records Brahmaputra over TCP is 2.5x Kafka on produce and
+**4.3x on consume**, on less CPU and a third of the memory.
 
-Consume used to be the exception — 377 MB/sec against Kafka's 575 — and
-fixing it is what the read-path work in §4 was for. Kafka still makes
-strictly fewer copies: `sendfile` moves bytes from the page cache to the
-socket without touching userspace at all, where Brahmaputra still makes
-one copy out of the page cache. Removing that last one is the remaining
-item in [kafka-parity.md](kafka-parity.md) §8; the three copies *after* it
-are gone.
+Consume used to be the exception — 377 MB/sec against Kafka's 575. It took
+two rounds of read-path work (§4) to turn that around: first removing the
+three copies between the page cache and the socket, then removing the copy
+*out of* the page cache with `sendfile`. The CPU figure is the tell —
+consume went from 603 to 942 MB/sec while its CPU **fell** from 155 % to
+116 %, which is what disappears when bytes stop moving through userspace.
 
 QUIC is weak here for the reason set out in §5: at megabyte records it is
 CPU-bound on per-packet crypto and userspace congestion control, and a
@@ -307,11 +306,31 @@ socket as they came off disk. Three of the four copies are gone, and the
 encoders are proven byte-identical to the concatenating ones they
 replaced. **Consume 377 → 603 MB/sec at 1 MiB records.**
 
-**10. Reads made two syscalls and a zero-filled allocation per batch.**
+**10. The last copy: `sendfile`.**
+After §9 the only remaining copy was the one *out of* the page cache, which
+Kafka does not make at all. A fetch on the plaintext path now describes
+its result as file ranges rather than buffers — `Log::read_regions` reads
+27 bytes per batch, through `last_offset_delta`, which is enough to apply
+the offset filter, the high-watermark cutoff and the byte budget without
+touching the payload — and the socket sends those ranges with `sendfile`.
+Adjacent batches in a segment merge into one range, so a multi-batch fetch
+is usually a single call. Segments hold their file behind an `Arc`, so a
+range stays valid even if retention unlinks the segment while a response
+is still being written. **Consume 603 → 942 MB/sec at 1 MiB, with CPU
+falling from 155 % to 116 %** — more bytes on less CPU is what a removed
+copy looks like.
+
+Only plaintext TCP qualifies: TLS and QUIC have to see the bytes to
+encrypt them, and Kafka draws the same line — enabling SSL disables its
+`sendfile` path too. QUIC instead hands its buffers to quinn with
+`write_chunks`, which queues them rather than copying each into the send
+buffer, so every copy QUIC *can* avoid is avoided.
+
+**11. Reads made two syscalls and a zero-filled allocation per batch.**
 One `pread` now covers a run of batches and each is handed out as a slice
 of that shared buffer.
 
-**11. A batched fetch held per-partition errors behind the long poll.**
+**12. A batched fetch held per-partition errors behind the long poll.**
 "No bytes served" was treated the same as "no data yet", so a consumer
 whose committed offset had fallen off the log could burn its entire poll
 deadline waiting instead of being told to reset — and a group resuming

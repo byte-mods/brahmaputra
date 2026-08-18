@@ -47,6 +47,10 @@ const TIMESTAMP_EARLIEST: i64 = -2;
 /// take them as they are.
 pub struct ResponseBody {
     chunks: Vec<Bytes>,
+    /// File ranges written after the chunks, straight from the page cache.
+    /// Only ever set on the plaintext path, where nothing has to look at
+    /// the bytes on the way out.
+    regions: Vec<brahmaputra_storage::LogRegion>,
 }
 
 impl ResponseBody {
@@ -54,20 +58,42 @@ impl ResponseBody {
         &self.chunks
     }
 
+    pub fn regions(&self) -> &[brahmaputra_storage::LogRegion] {
+        &self.regions
+    }
+
+    /// Total body length, which the frame prefix has to declare before any
+    /// of it is written.
     pub fn len(&self) -> usize {
-        self.chunks.iter().map(Bytes::len).sum()
+        self.chunks.iter().map(Bytes::len).sum::<usize>()
+            + self.regions.iter().map(|region| region.len).sum::<usize>()
+    }
+
+    /// A response whose trailing batches are file ranges rather than
+    /// buffers.
+    pub fn with_regions(header: Bytes, regions: Vec<brahmaputra_storage::LogRegion>) -> Self {
+        ResponseBody {
+            chunks: vec![header],
+            regions,
+        }
     }
 }
 
 impl From<Bytes> for ResponseBody {
     fn from(body: Bytes) -> Self {
-        ResponseBody { chunks: vec![body] }
+        ResponseBody {
+            chunks: vec![body],
+            regions: Vec::new(),
+        }
     }
 }
 
 impl From<Vec<Bytes>> for ResponseBody {
     fn from(chunks: Vec<Bytes>) -> Self {
-        ResponseBody { chunks }
+        ResponseBody {
+            chunks,
+            regions: Vec::new(),
+        }
     }
 }
 
@@ -96,11 +122,7 @@ pub async fn dispatch(broker: &Broker, header: &FrameHeader, body: Bytes) -> Opt
         // The fetch paths return their pieces rather than one buffer, so
         // the record batches reach the socket without being copied again.
         ApiKey::Fetch => Some(fetch(broker, body, client_id).await.into()),
-        ApiKey::FetchMulti => Some(
-            crate::multi::fetch_multi(broker, body, client_id)
-                .await
-                .into(),
-        ),
+        ApiKey::FetchMulti => Some(crate::multi::fetch_multi(broker, body, client_id).await),
         ApiKey::ReplicaFetch => Some(replica_fetch(broker, body).await.into()),
         ApiKey::ListOffsets => Some(list_offsets(broker, body).await.into()),
         ApiKey::Metadata => Some(metadata(broker, body).into()),

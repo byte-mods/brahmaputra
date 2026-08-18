@@ -24,4 +24,4 @@ mod segment;
 
 pub use epoch::{LeaderEpochCheckpoint, LeaderEpochEntry};
 pub use error::StorageError;
-pub use log::{Log, LogConfig};
+pub use log::{Log, LogConfig, LogRegion};

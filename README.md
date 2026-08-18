@@ -9,7 +9,7 @@ binary, with no JVM, no ZooKeeper and no heap to tune.
 [![CI](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml/badge.svg)](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-194%20passing-brightgreen.svg)](#verification)
+[![Tests](https://img.shields.io/badge/tests-206%20passing-brightgreen.svg)](#verification)
 [![Throughput](https://img.shields.io/badge/vs%20Kafka-3.0%C3%97%20produce%20%C2%B7%205.7%C3%97%20consume-brightgreen.svg)](#performance)
 [![Transports](https://img.shields.io/badge/transport-TCP%20%C2%B7%20TLS%201.3%20%C2%B7%20QUIC-informational.svg)](#transports)
 
@@ -482,7 +482,7 @@ topic — set them broker-wide with the flags above. There is no
 ## Verification
 
 ```bash
-cargo test --workspace          # 194 unit and integration tests
+cargo test --workspace          # 206 unit and integration tests
 
 bash scripts/verify-m1.sh       # single-node storage and protocol
 bash scripts/verify-m2.ps1      # controller quorum and metadata
@@ -506,7 +506,7 @@ Last full run on the development host:
 
 | Suite | Checks | Result |
 |---|---|---|
-| `cargo test --workspace` | 194 | pass |
+| `cargo test --workspace` | 206 | pass |
 | `verify-m1.sh` — storage, protocol, concurrent producers, SIGKILL recovery | 31 | pass |
 | `verify-m4.sh` — consumer groups across 5 nodes | 30 | pass |
 | `verify-m5.sh` — fsync policies, quotas, version negotiation | 15 | pass |
@@ -583,13 +583,17 @@ capacity planning:
 
 | Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC |
 |---|---|---|---|
-| Produce MB/sec | 184.8 | **433** (2.3×) | 119 |
-| Consume MB/sec | 257.5 | **603** (2.3×) | 101 |
-| Consume CPU % | 206.0 | **155.1** | 254.4 |
-| Consume memory MiB | 2518 | **862** | 877 |
+| Produce MB/sec | 170.9 | **418** (2.5×) | 112 |
+| Consume MB/sec | 221.5 | **942** (4.3×) | 106 |
+| Consume CPU % | 149.8 | **116.0** | 270.3 |
+| Consume memory MiB | 2952 | **1065** | 792 |
 
 Consume at this size used to be the one place Kafka clearly won
-(377 against 575). Closing it is what the read-path work below was for.
+(377 against 575). It took two rounds of read-path work to turn that
+around: removing the three copies between the page cache and the socket,
+then removing the copy *out of* the page cache with `sendfile`. Consume
+went from 603 to 942 MB/sec while its CPU **fell** from 155 % to 116 % —
+more bytes on less CPU is what a removed copy looks like.
 Details in [docs/benchmarks.md](docs/benchmarks.md).
 
 Memory is the most stable difference and it is structural rather than
@@ -613,6 +617,7 @@ described where it lives in [docs/benchmarks.md](docs/benchmarks.md).
 | The broker never set `TCP_NODELAY` on accepted sockets, so responses waited on Nagle plus the peer's delayed ACK | `set_nodelay(true)` on accept | 6 415 → **14 790** msgs/sec |
 | The broker decoded and re-encoded every batch on append | Validate the header only and stamp `base_offset`/`leader_epoch` in place — both sit before the CRC, so it stays valid | +34 % |
 | Every fetched byte was copied **four times** before the kernel saw it: `pread`, concatenate the batches, copy into a frame, copy into the codec's buffer | Write the response as the chain of buffers it already is, with one `writev` | consume **377 → 603 MB/sec** at 1 MiB |
+| The one copy left was out of the page cache itself — the one Kafka never makes | Describe a fetch as file ranges and let `sendfile` move them; only 27 bytes per batch are read, to apply the offset, watermark and budget rules | consume **603 → 942 MB/sec**, CPU **155 % → 116 %** |
 | A read made two syscalls and a fresh zero-filled allocation per batch | One `pread` covers a run of batches; each is a slice of that shared buffer | fewer syscalls, no per-batch memset |
 
 And one that was not a performance bug at all: a batched fetch could build
@@ -766,7 +771,7 @@ libraries beyond libc.
 
 ```bash
 cargo build --release          # brahmaputra-server and brahmaputra-cli
-cargo test --workspace         # 194 unit and integration tests
+cargo test --workspace         # 206 unit and integration tests
 ```
 
 The live verification scripts additionally need `bash`; they run on Git
@@ -795,9 +800,9 @@ Known gaps, ranked, in [docs/kafka-parity.md](docs/kafka-parity.md) §8.
 The ones that matter most:
 
 1. **No data-plane authentication.** TLS encrypts; it does not identify.
-2. **No `sendfile`** — a fetch still makes one copy out of the page cache,
-   where Kafka makes none. The three further copies it used to make are
-   gone.
+2. **`sendfile` is plaintext-TCP only.** TLS and QUIC must read the bytes
+   to encrypt them, so those paths still make one copy out of the page
+   cache. Kafka has the same limitation whenever SSL is enabled.
 3. Topic-level configs other than `min.insync.replicas` are stored but not
    applied.
 4. **No log compaction**, so `__consumer_offsets` grows without bound on a

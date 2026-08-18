@@ -270,6 +270,12 @@ pub enum Cmd {
         max_bytes: usize,
         reply: oneshot::Sender<Result<ReadOutcome, StorageError>>,
     },
+    /// Describe a read as file ranges, for the zero-copy fetch path.
+    ReadRegions {
+        offset: i64,
+        max_bytes: usize,
+        reply: oneshot::Sender<Result<RegionOutcome, StorageError>>,
+    },
     /// Read raw batch bytes through the log end, including data above HWM.
     ReadUncommitted {
         offset: i64,
@@ -319,6 +325,15 @@ pub enum Cmd {
 
 /// Result of a partition read.
 #[derive(Debug)]
+/// The same selection as [`ReadOutcome`], described as file ranges the
+/// broker can hand straight to `sendfile` instead of buffers it has read.
+pub struct RegionOutcome {
+    pub regions: Vec<brahmaputra_storage::LogRegion>,
+    pub high_watermark: i64,
+    pub log_start_offset: i64,
+    pub log_end_offset: i64,
+}
+
 pub struct ReadOutcome {
     /// Raw, unmodified batch bytes, all strictly below the high watermark.
     pub batches: Vec<Bytes>,
@@ -375,6 +390,26 @@ impl PartitionHandle {
             .map_err(|_| ProducerAppendError::Storage(actor_gone()))?;
         rx.await
             .map_err(|_| ProducerAppendError::Storage(actor_gone()))?
+    }
+
+    /// Describe a read as file ranges instead of buffers, so a plaintext
+    /// fetch can send them with `sendfile` and never read the payload into
+    /// the process at all.
+    pub async fn read_regions(
+        &self,
+        offset: i64,
+        max_bytes: usize,
+    ) -> Result<RegionOutcome, StorageError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::ReadRegions {
+                offset,
+                max_bytes,
+                reply,
+            })
+            .await
+            .map_err(|_| actor_gone())?;
+        rx.await.map_err(|_| actor_gone())?
     }
 
     pub async fn read(&self, offset: i64, max_bytes: usize) -> Result<ReadOutcome, StorageError> {
@@ -757,6 +792,22 @@ async fn run(
                     Err(error) => Err(error),
                 };
                 trace!(?result, "idempotent append");
+                let _ = reply.send(result);
+            }
+            Cmd::ReadRegions {
+                offset,
+                max_bytes,
+                reply,
+            } => {
+                let current = log.as_ref().expect("partition log");
+                let result = current
+                    .read_regions(offset, max_bytes)
+                    .map(|regions| RegionOutcome {
+                        regions,
+                        high_watermark: current.high_watermark(),
+                        log_start_offset: current.log_start_offset(),
+                        log_end_offset: current.log_end_offset(),
+                    });
                 let _ = reply.send(result);
             }
             Cmd::Read {

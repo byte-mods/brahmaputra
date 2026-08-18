@@ -28,9 +28,11 @@ use bytes::Bytes;
 use tracing::warn;
 
 use crate::error::BrokerError;
-use crate::handlers::{code_of, encode_error_for, now_ms, wait_for_high_watermark};
+use crate::handlers::{code_of, encode_error_for, now_ms, wait_for_high_watermark, ResponseBody};
 use crate::quota::QuotaKind;
 use crate::server::Broker;
+use brahmaputra_client::Transport;
+use brahmaputra_storage::LogRegion;
 
 pub(crate) async fn produce_multi(
     broker: &Broker,
@@ -280,18 +282,122 @@ async fn produce_one_partition(
     }
 }
 
+/// Whether a fetch can be answered with file ranges rather than buffers.
+///
+/// Only plaintext TCP qualifies: TLS and QUIC have to see the bytes to
+/// encrypt them, so there is nothing to save. Kafka draws the line in the
+/// same place — enabling SSL disables its `sendfile` path too.
+///
+/// The platform is deliberately not part of this test. Where `sendfile`
+/// exists the ranges go straight from the page cache to the socket; where
+/// it does not, the writer reads them just as the old path did. Keeping
+/// the decision platform-independent means the selection logic is the same
+/// code everywhere, and so is exercised by the tests everywhere.
+fn zero_copy_fetch_available(broker: &Broker) -> bool {
+    broker.config().transport == Transport::Tcp
+}
+
+/// Read every requested partition as file ranges instead of buffers.
+///
+/// Returns `None` when nothing was ready or any partition reported an
+/// error, leaving those cases to the buffered path, which already knows
+/// how to long-poll and how to report per-partition failures. The happy
+/// path — which is the one that moves the bytes — never touches them.
+async fn fetch_multi_zero_copy(
+    broker: &Broker,
+    request: &FetchMultiRequest,
+) -> Option<(Bytes, Vec<LogRegion>, u64)> {
+    let count = request.partitions.len().max(1);
+    let budget = broker
+        .config()
+        .max_frame_bytes
+        .saturating_sub(FRAME_HEADROOM);
+    let per_partition = (budget / count).max(64 * 1024);
+
+    let reads = futures::future::join_all(request.partitions.iter().map(|descriptor| async move {
+        let handle = broker
+            .partition(&descriptor.topic, descriptor.partition)
+            .ok()?;
+        let allowance = (descriptor.max_bytes.max(0) as usize).min(per_partition);
+        let outcome = handle
+            .read_regions(descriptor.fetch_offset, allowance)
+            .await
+            .ok()?;
+        Some((descriptor, outcome))
+    }))
+    .await;
+
+    let mut header_inputs: Vec<(FetchMultiResult, usize)> = Vec::with_capacity(reads.len());
+    let mut regions: Vec<LogRegion> = Vec::new();
+    let mut served = 0_u64;
+    let mut remaining = budget;
+    for read in reads {
+        // Any failure at all hands the whole request to the buffered path,
+        // which reports it per partition with the right error code.
+        let (descriptor, outcome) = read?;
+        let mut kept = 0usize;
+        for region in outcome.regions {
+            if region.len > remaining && !(served == 0 && regions.is_empty()) {
+                break;
+            }
+            remaining = remaining.saturating_sub(region.len);
+            served += region.len as u64;
+            kept += region.len;
+            regions.push(region);
+        }
+        header_inputs.push((
+            FetchMultiResult {
+                topic: descriptor.topic.clone(),
+                partition: descriptor.partition,
+                error_code: ec::NONE,
+                high_watermark: outcome.high_watermark,
+                last_stable_offset: outcome.high_watermark,
+                batches_length: 0,
+            },
+            kept,
+        ));
+    }
+    if served == 0 {
+        return None;
+    }
+    let header = codec::encode_fetch_multi_header(&header_inputs).ok()?;
+    Some((header, regions, served))
+}
+
+/// Count a served fetch and apply the client's quota.
+async fn record_fetch(broker: &Broker, client_id: Option<&str>, served: u64) {
+    let metrics = broker.metrics();
+    metrics.count(names::FETCH_REQUESTS, 1);
+    metrics.count(names::FETCH_BYTES, served);
+    let throttle = broker.throttle(client_id, QuotaKind::Fetch, served).await;
+    if !throttle.is_zero() {
+        metrics.count(names::THROTTLED_REQUESTS, 1);
+        metrics.count(names::THROTTLE_MS, throttle.as_millis() as u64);
+    }
+}
+
 pub(crate) async fn fetch_multi(
     broker: &Broker,
     body: Bytes,
     client_id: Option<&str>,
-) -> Vec<Bytes> {
+) -> ResponseBody {
     let request = match FetchMultiRequest::decode(&body) {
         Ok(request) => request,
         Err(error) => {
             warn!(%error, "undecodable FetchMulti request");
-            return vec![encode_error_for(ApiKey::FetchMulti, ec::INVALID_REQUEST)];
+            return encode_error_for(ApiKey::FetchMulti, ec::INVALID_REQUEST).into();
         }
     };
+
+    // The fast path: hand the socket file ranges and let the kernel move
+    // the bytes. Anything unusual — an idle partition, an error — falls
+    // through to the buffered path below, which handles both.
+    if zero_copy_fetch_available(broker) {
+        if let Some((header, regions, served)) = fetch_multi_zero_copy(broker, &request).await {
+            record_fetch(broker, client_id, served).await;
+            return ResponseBody::with_regions(header, regions);
+        }
+    }
 
     let mut results: Vec<(FetchMultiResult, Vec<Bytes>)> =
         Vec::with_capacity(request.partitions.len());
@@ -314,16 +420,11 @@ pub(crate) async fn fetch_multi(
         served = long_poll(broker, &request, &mut results).await;
     }
 
-    let metrics = broker.metrics();
-    metrics.count(names::FETCH_REQUESTS, 1);
-    metrics.count(names::FETCH_BYTES, served);
-    let throttle = broker.throttle(client_id, QuotaKind::Fetch, served).await;
-    if !throttle.is_zero() {
-        metrics.count(names::THROTTLED_REQUESTS, 1);
-        metrics.count(names::THROTTLE_MS, throttle.as_millis() as u64);
-    }
+    record_fetch(broker, client_id, served).await;
 
-    codec::encode_fetch_multi_response_chunks(&results).unwrap_or_default()
+    codec::encode_fetch_multi_response_chunks(&results)
+        .unwrap_or_default()
+        .into()
 }
 
 /// Read every requested partition once. Returns the total bytes gathered.

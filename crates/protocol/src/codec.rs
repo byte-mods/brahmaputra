@@ -570,3 +570,50 @@ mod chunked_tests {
         assert_eq!(joined, contiguous.to_vec());
     }
 }
+
+/// Encode only the struct of a multi-partition Fetch response, taking each
+/// partition's trailing byte count rather than its buffers.
+///
+/// The zero-copy fetch path never has the batches in memory — they go to
+/// the socket straight from the page cache — so it can supply their length
+/// but not their bytes.
+pub fn encode_fetch_multi_header(
+    results: &[(FetchMultiResult, usize)],
+) -> Result<Bytes, ProtocolError> {
+    let response = FetchMultiResponse {
+        results: results
+            .iter()
+            .map(|(result, batches_length)| FetchMultiResult {
+                batches_length: *batches_length as i64,
+                ..result.clone()
+            })
+            .collect(),
+    };
+    Ok(Bytes::from(response.encode().map_err(msg_err)?))
+}
+
+#[cfg(test)]
+mod header_only_tests {
+    use super::*;
+
+    /// The header the zero-copy path emits must be byte-identical to the
+    /// one the buffered path emits for the same response.
+    #[test]
+    fn header_only_matches_the_buffered_encoding() {
+        let result = FetchMultiResult {
+            topic: "orders".into(),
+            partition: 2,
+            error_code: 0,
+            high_watermark: 9,
+            last_stable_offset: 9,
+            batches_length: 0,
+        };
+        let batches = vec![Bytes::from_static(b"aaaa"), Bytes::from_static(b"bb")];
+        let buffered = encode_fetch_multi_response_chunks(&[(result.clone(), batches.clone())])
+            .expect("buffered header");
+        let lengths: usize = batches.iter().map(Bytes::len).sum();
+        let header_only =
+            encode_fetch_multi_header(&[(result, lengths)]).expect("header-only encoding");
+        assert_eq!(buffered[0], header_only);
+    }
+}

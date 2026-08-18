@@ -198,13 +198,25 @@ async fn serve_request(
         ),
         response.len(),
     );
-    send.write_all(&prefix)
-        .await
-        .map_err(|error| format!("write response: {error}"))?;
-    for chunk in response.chunks() {
-        send.write_all(chunk)
+    // `write_chunks` takes the buffers by value and queues them, where
+    // `write_all` would copy each one into quinn's send buffer first. The
+    // record batches are refcounted slices of what was read off disk, so
+    // handing them over as they are removes a copy of every byte served.
+    //
+    // QUIC cannot go further than this: the bytes have to be read into
+    // userspace to be encrypted, so the page-cache copy that plaintext TCP
+    // avoids with `sendfile` is unavoidable here. Kafka has the same
+    // limitation whenever SSL is enabled.
+    let mut pending: Vec<Bytes> = Vec::with_capacity(response.chunks().len() + 1);
+    pending.push(prefix);
+    pending.extend_from_slice(response.chunks());
+    let mut queued = &mut pending[..];
+    while !queued.is_empty() {
+        let written = send
+            .write_chunks(queued)
             .await
             .map_err(|error| format!("write response: {error}"))?;
+        queued = &mut queued[written.chunks..];
     }
     send.finish().map_err(|error| format!("finish: {error}"))?;
     Ok(())

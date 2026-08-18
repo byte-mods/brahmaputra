@@ -15,7 +15,7 @@ use brahmaputra_metadata::{
 };
 use brahmaputra_metrics::{names, MetricKey, Metrics};
 use brahmaputra_protocol::{decode_payload, encode_frame_prefix, FrameHeader};
-use brahmaputra_storage::{Log, LogConfig};
+use brahmaputra_storage::{Log, LogConfig, LogRegion};
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
@@ -829,24 +829,52 @@ impl Broker {
                             // The TLS handshake happens inside the
                             // connection task, so a slow or hostile peer
                             // stalls only itself, never the accept loop.
-                            let stream: Box<dyn BrokerStream> = match tls {
-                                None => Box::new(socket),
-                                Some(acceptor) => match acceptor.accept(socket).await {
-                                    Ok(stream) => Box::new(stream),
-                                    Err(error) => {
-                                        debug!(%peer, %error, "tls handshake failed");
-                                        return;
+                            match tls {
+                                // Plaintext keeps the socket concrete, so a
+                                // fetch can be answered with `sendfile`.
+                                None => {
+                                    let (reader, writer) = socket.into_split();
+                                    tokio::select! {
+                                        biased;
+                                        _ = wait_for_shutdown(&mut connection_shutdown) => {
+                                            debug!(%peer, "connection cancelled for broker shutdown");
+                                        }
+                                        result = handle_connection(
+                                            broker,
+                                            reader,
+                                            ResponseSink::Plain(writer),
+                                            peer,
+                                        ) => {
+                                            if let Err(error) = result {
+                                                debug!(%peer, %error, "connection closed");
+                                            }
+                                        }
                                     }
-                                },
-                            };
-                            tokio::select! {
-                                biased;
-                                _ = wait_for_shutdown(&mut connection_shutdown) => {
-                                    debug!(%peer, "connection cancelled for broker shutdown");
                                 }
-                                result = handle_connection(broker, stream, peer) => {
-                                    if let Err(e) = result {
-                                        debug!(%peer, error = %e, "connection closed");
+                                Some(acceptor) => {
+                                    let stream: Box<dyn BrokerStream> = match acceptor.accept(socket).await {
+                                        Ok(stream) => Box::new(stream),
+                                        Err(error) => {
+                                            debug!(%peer, %error, "tls handshake failed");
+                                            return;
+                                        }
+                                    };
+                                    let (reader, writer) = tokio::io::split(stream);
+                                    tokio::select! {
+                                        biased;
+                                        _ = wait_for_shutdown(&mut connection_shutdown) => {
+                                            debug!(%peer, "connection cancelled for broker shutdown");
+                                        }
+                                        result = handle_connection(
+                                            broker,
+                                            reader,
+                                            ResponseSink::Encrypted(writer),
+                                            peer,
+                                        ) => {
+                                            if let Err(error) = result {
+                                                debug!(%peer, %error, "connection closed");
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -957,15 +985,136 @@ pub(crate) trait BrokerStream:
 }
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> BrokerStream for T {}
 
-/// Write a response as the buffers it is made of, in one `writev` where the
-/// transport supports it.
+/// One response as it will be written: buffers first, then any file ranges.
+struct Response {
+    chunks: Vec<Bytes>,
+    regions: Vec<LogRegion>,
+}
+
+/// The write half of a connection.
 ///
-/// A fetch response is a small struct followed by record batches that came
-/// out of the page cache untouched. Concatenating them to satisfy a framing
-/// codec would copy every byte served an extra time, which at megabyte
-/// records is the dominant cost of serving a read. `write_vectored` takes
-/// the pieces as they are; partial writes are resumed from wherever the
-/// kernel stopped.
+/// This is an enum rather than a trait object because the plaintext case
+/// has to stay concrete: answering a fetch with `sendfile` needs the
+/// socket's file descriptor, and a boxed `AsyncWrite` does not have one.
+/// `OwnedWriteHalf` hands it back through `AsRef<TcpStream>`.
+enum ResponseSink {
+    Plain(tokio::net::tcp::OwnedWriteHalf),
+    Encrypted(tokio::io::WriteHalf<Box<dyn BrokerStream>>),
+}
+
+impl ResponseSink {
+    async fn write(&mut self, response: &Response) -> std::io::Result<()> {
+        match self {
+            ResponseSink::Plain(sink) => {
+                write_chunks(sink, &response.chunks).await?;
+                if response.regions.is_empty() {
+                    return Ok(());
+                }
+                // `sendfile` writes to the socket itself, so anything still
+                // buffered here has to go out first or it would arrive
+                // after the payload it describes.
+                sink.flush().await?;
+                for region in &response.regions {
+                    send_region(sink, region).await?;
+                }
+                Ok(())
+            }
+            ResponseSink::Encrypted(sink) => {
+                write_chunks(sink, &response.chunks).await?;
+                // Regions are only produced for the plaintext path, so this
+                // is unreachable in practice; reading them keeps it correct
+                // rather than relying on that.
+                for region in &response.regions {
+                    send_region_buffered(sink, region).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Send a range of a log segment straight from the page cache to the
+/// socket, so the payload is never read into this process at all.
+///
+/// This is the point of the whole region path: a fetch response is mostly
+/// record batches that nothing needs to look at, and the kernel can move
+/// them without our help. Only plaintext TCP can do this — TLS and QUIC
+/// must see the bytes to encrypt them, which is exactly where Kafka draws
+/// the same line.
+#[cfg(unix)]
+async fn send_region(
+    sink: &tokio::net::tcp::OwnedWriteHalf,
+    region: &LogRegion,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let socket: &tokio::net::TcpStream = sink.as_ref();
+    let mut offset = region.position as libc::off_t;
+    let end = offset + region.len as libc::off_t;
+    while offset < end {
+        socket.writable().await?;
+        let remaining = (end - offset) as usize;
+        let attempt = socket.try_io(tokio::io::Interest::WRITABLE, || {
+            // SAFETY: both descriptors are owned and stay open across the
+            // call — the socket by `sink`, the segment by the `Arc<File>`
+            // the region carries — and the kernel advances `offset` by
+            // whatever it consumed.
+            let sent = unsafe {
+                libc::sendfile(
+                    socket.as_raw_fd(),
+                    region.file.as_raw_fd(),
+                    &mut offset,
+                    remaining,
+                )
+            };
+            if sent < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(sent)
+        });
+        match attempt {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(_) => {}
+            // The socket was not ready after all; wait again rather than
+            // treating it as a failure.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Where `sendfile` does not exist, read the range and write it. Correct
+/// everywhere, just not free.
+#[cfg(not(unix))]
+async fn send_region(
+    sink: &mut tokio::net::tcp::OwnedWriteHalf,
+    region: &LogRegion,
+) -> std::io::Result<()> {
+    send_region_buffered(sink, region).await
+}
+
+async fn send_region_buffered<W>(writer: &mut W, region: &LogRegion) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file: &std::fs::File = &region.file;
+    let mut buffer = vec![0u8; region.len];
+    file.seek(SeekFrom::Start(region.position))?;
+    file.read_exact(&mut buffer)?;
+    writer.write_all(&buffer).await
+}
+
+/// Write a response's buffers, in one `writev` where the transport
+/// supports it.
+///
+/// A fetch response is a small struct followed by record batches.
+/// Concatenating them to satisfy a framing codec would copy every byte
+/// served an extra time, which at megabyte records is the dominant cost of
+/// serving a read. `write_vectored` takes the pieces as they are; partial
+/// writes resume from wherever the kernel stopped.
 async fn write_chunks<W>(writer: &mut W, chunks: &[Bytes]) -> std::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -995,7 +1144,6 @@ where
     }
     Ok(())
 }
-
 /// Serve one client connection.
 ///
 /// Requests are dispatched concurrently rather than one at a time.
@@ -1004,29 +1152,33 @@ where
 /// a partition's appends — it only stops one slow request (a long poll, an
 /// `acks=all` wait) from blocking every other request on the same socket.
 /// The client's in-flight window is meaningless without this.
-async fn handle_connection(
+async fn handle_connection<R>(
     broker: Arc<Broker>,
-    socket: Box<dyn BrokerStream>,
+    reader: R,
+    mut sink: ResponseSink,
     peer: SocketAddr,
-) -> Result<(), BrokerError> {
+) -> Result<(), BrokerError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     let codec = LengthDelimitedCodec::builder()
         .big_endian()
         .length_field_length(4)
         .max_frame_length(broker.config.max_frame_bytes)
         .new_codec();
     // Requests still come through the framing codec; responses do not, so
-    // that a fetch can be written from its own buffers.
-    let (reader, mut sink) = tokio::io::split(socket);
+    // that a fetch can be written from its own buffers — or, on the
+    // plaintext path, straight out of the page cache.
     let mut stream = FramedRead::new(reader, codec);
 
     // Responses funnel through one writer task; the channel is bounded so a
     // client that stops reading applies backpressure instead of growing the
     // broker's memory without limit.
     let (responses_tx, mut responses_rx) =
-        mpsc::channel::<Vec<Bytes>>(broker.config.channel_capacity);
+        mpsc::channel::<Response>(broker.config.channel_capacity);
     let writer = tokio::spawn(async move {
-        while let Some(chunks) = responses_rx.recv().await {
-            if write_chunks(&mut sink, &chunks).await.is_err() {
+        while let Some(response) = responses_rx.recv().await {
+            if sink.write(&response).await.is_err() {
                 break;
             }
         }
@@ -1065,7 +1217,12 @@ async fn handle_connection(
                 let mut chunks = Vec::with_capacity(body.chunks().len() + 1);
                 chunks.push(encode_frame_prefix(&response_header, body.len()));
                 chunks.extend_from_slice(body.chunks());
-                let _ = responses.send(chunks).await;
+                let _ = responses
+                    .send(Response {
+                        chunks,
+                        regions: body.regions().to_vec(),
+                    })
+                    .await;
             }
         });
 

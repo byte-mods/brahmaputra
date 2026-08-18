@@ -3,6 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use brahmaputra_protocol::{validate_batch_header, BATCH_HEADER_LEN, MIN_BATCH_LENGTH};
 
@@ -23,7 +24,7 @@ pub(crate) struct Segment {
     /// Largest batch `max_timestamp` seen; `None` while the segment is empty.
     pub max_timestamp: Option<i64>,
     dir: PathBuf,
-    log_file: File,
+    log_file: Arc<File>,
     pub index: SparseIndex<OffsetEntry>,
     pub timeindex: SparseIndex<TimeEntry>,
     index_interval_bytes: u64,
@@ -58,7 +59,7 @@ impl Segment {
             size,
             max_timestamp: None,
             dir: dir.to_path_buf(),
-            log_file,
+            log_file: Arc::new(log_file),
             index,
             timeindex,
             index_interval_bytes,
@@ -67,7 +68,7 @@ impl Segment {
     }
 
     pub fn read_at(&self, position: u64, buf: &mut [u8]) -> io::Result<()> {
-        let mut file = &self.log_file;
+        let mut file: &File = &self.log_file;
         file.seek(SeekFrom::Start(position))?;
         file.read_exact(buf)
     }
@@ -106,7 +107,7 @@ impl Segment {
             self.bytes_since_index = 0;
         }
         // File is opened in append mode: writes always land at EOF.
-        self.log_file.write_all(bytes)?;
+        (&*self.log_file).write_all(bytes)?;
         self.size += bytes.len() as u64;
         self.bytes_since_index += bytes.len() as u64;
         self.max_timestamp = Some(
@@ -263,5 +264,17 @@ impl Segment {
             }
         }
         Ok(())
+    }
+}
+
+impl Segment {
+    /// A shared handle to this segment's `.log` file.
+    ///
+    /// Cloned into fetch regions so the descriptor stays valid for as long
+    /// as a response is being written, even if retention unlinks the
+    /// segment in the meantime — an unlinked file that is still open keeps
+    /// its data until the last handle closes.
+    pub(crate) fn file(&self) -> Arc<File> {
+        Arc::clone(&self.log_file)
     }
 }

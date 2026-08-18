@@ -274,6 +274,7 @@ dependencies = [
  "crc32c",
  "dashmap",
  "futures",
+ "libc",
  "quinn",
  "rcgen",
  "rustls",
