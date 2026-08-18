@@ -9,9 +9,10 @@ binary, with no JVM, no ZooKeeper and no heap to tune.
 [![CI](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml/badge.svg)](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-206%20passing-brightgreen.svg)](#verification)
+[![Tests](https://img.shields.io/badge/tests-230%20passing-brightgreen.svg)](#verification)
 [![Throughput](https://img.shields.io/badge/vs%20Kafka-3.0%C3%97%20produce%20%C2%B7%205.7%C3%97%20consume-brightgreen.svg)](#performance)
 [![Transports](https://img.shields.io/badge/transport-TCP%20%C2%B7%20TLS%201.3%20%C2%B7%20QUIC-informational.svg)](#transports)
+[![Auth](https://img.shields.io/badge/auth-SASL--style%20%C2%B7%20ACLs-blueviolet.svg)](#authentication-and-access-control)
 
 </div>
 
@@ -29,7 +30,8 @@ open http://localhost:8080                              # dashboard
 | 🔁 **Kafka semantics, not just Kafka shape** | Leader/ISR replication, leader-epoch truncation (KIP-101), high-watermark visibility, `acks=0/1/all`, idempotent producer, consumer groups with generation fencing. |
 | 🔌 **Three transports, one flag** | Plain TCP, TLS 1.3, or QUIC — same wire format, same correctness suite. |
 | 🧪 **Verified by killing things** | Live scripts start real brokers, `kill -9` them mid-write, and audit what survived. Not only unit tests. |
-| 📊 **Operations built in** | Dashboard, Prometheus endpoint, six hours of in-process history, login and RBAC. |
+| 📊 **Operations built in** | Browse and live-tail messages, add partitions, change topic config, consumer lag, Prometheus endpoint, login and RBAC — [in one container](#docker). |
+| 🔐 **Authentication and ACLs** | Principals bound per connection, deny-by-default authorization on topics, groups and the cluster. [Details →](#authentication-and-access-control) |
 
 ---
 
@@ -43,7 +45,9 @@ open http://localhost:8080                              # dashboard
 - [Producing and consuming](#producing-and-consuming)
 - [Consumer groups](#consumer-groups)
 - [Using the Rust client](#using-the-rust-client)
+- [Authentication and access control](#authentication-and-access-control)
 - [Dashboard, metrics and access control](#dashboard-metrics-and-access-control)
+- [Docker](#docker)
 - [Durability, retention and quotas](#durability-retention-and-quotas)
 - [What happens when things fail](#what-happens-when-things-fail)
 - [Configuration reference](#configuration-reference)
@@ -68,6 +72,7 @@ open http://localhost:8080                              # dashboard
 | M5 | Hardening: retention, fsync policies, quotas, TLS, fault injection, benchmarks | ✅ complete |
 | M6 | Metrics API, embedded dashboard, login and RBAC | ✅ complete |
 | M7 | Multi-partition Produce/Fetch, concurrent request handling, benchmark vs Kafka | ✅ complete |
+| M8 | Data-plane authentication and ACLs, log compaction, message explorer, Docker image | ✅ complete |
 
 Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
@@ -162,9 +167,59 @@ long-haul links, and its costs are measured in
 [docs/benchmarks.md §5](docs/benchmarks.md).
 
 TLS uses a self-signed certificate generated at startup. That gives
-confidentiality and integrity, **not** authentication: the data plane has
-no client identity yet, so anyone who can reach the port can read and
-write. Restrict it by network.
+confidentiality and integrity; identity comes from
+[authentication](#authentication-and-access-control), which must be
+enabled separately.
+
+## Authentication and access control
+
+Off by default, matching a Kafka `PLAINTEXT` listener. Production should
+turn it on:
+
+```bash
+brahmaputra-server --require-auth --transport tcp-tls ...
+```
+
+With `--require-auth`, a connection starts anonymous and is refused until
+it authenticates, and an authenticated principal still needs a matching
+ACL. **The default is denial** — enabling authentication cannot silently
+widen access.
+
+```rust
+let connection = Connection::connect_with(Transport::TcpTls, addr, id, 5).await?;
+connection.authenticate(&Credentials {
+    username: "billing".into(),
+    password: "…".into(),
+}).await?;
+```
+
+Credentials are checked against the same argon2 user store the dashboard
+uses, so there is one set of accounts rather than two to keep in sync. A
+password crosses the wire in the clear exactly as SASL/PLAIN does, so the
+broker **refuses to accept one on a plaintext listener** — use `tcp-tls`
+or `quic`.
+
+ACLs are stored in the Raft metadata and evaluated deny-over-allow:
+
+| Field | Values |
+|---|---|
+| `principal` | a username, or `*` |
+| `resource_type` | `topic`, `group`, `cluster` |
+| `resource_name` | an exact name, or `*` |
+| `operation` | `read`, `write`, `describe`, `all` |
+| `permission` | `allow`, `deny` |
+
+An `admin` is exempt, so a bad rule cannot lock a cluster out of its own
+administration. An unknown user fails identically to a wrong password, so
+probing cannot enumerate accounts. The inter-broker replication APIs are
+covered too — they serve raw log bytes above the high watermark, so leaving
+them open would hand out every topic to anyone who can speak the protocol.
+
+Six tests assert the *denial* direction specifically, which is the only
+direction that matters for a security control: anonymous refused, wrong
+password refused, unknown user indistinguishable from a wrong password, an
+authenticated principal still bound by its ACLs, permission scoped to the
+named topic, and a deny rule beating a wildcard allow.
 
 ## Producing and consuming
 
@@ -276,9 +331,14 @@ Every broker serves an operations surface on `--http-port` (default 8080):
 | `GET /api/v1/brokers` | viewer | broker list, liveness, roles |
 | `GET /api/v1/topics`, `/topics/{name}` | viewer | topics, per-partition leader/ISR/offsets |
 | `POST /api/v1/topics`, `DELETE /topics/{name}` | operator | topic administration |
+| `GET /api/v1/topics/{name}/messages` | viewer | browse records, with `search`, `order`, `partition`, `limit` |
+| `GET /api/v1/topics/{name}/stream` | viewer | live tail as server-sent events |
+| `POST /api/v1/topics/{name}/partitions` | operator | increase the partition count |
+| `POST /api/v1/topics/{name}/config` | operator | change topic configuration |
 | `GET /api/v1/groups`, `/groups/{id}/lag` | viewer | consumer groups and lag |
 | `GET /api/v1/metrics/snapshot`, `/timeseries` | viewer | current values, chart history |
 | `GET /api/v1/users`, `POST`, `DELETE` | admin | user administration |
+| ACL rules | admin | via the controller, `put_acl` / `delete_acl` |
 | `GET /metrics` | none | Prometheus text format |
 
 On first boot the cluster creates an `admin` user and a signing secret,
@@ -328,6 +388,70 @@ For an operator the three that matter most are
 `brahmaputra_group_lag` (consumers falling behind), and
 `brahmaputra_produce_errors_total` (writes being refused).
 
+
+### Browsing messages
+
+The dashboard is not only a status page: it reads the log.
+
+- **Browse** any topic's records — partition, offset, timestamp, key, value
+  and size. Reads backwards from the high watermark by default, because an
+  operator opening a busy topic wants the newest records and scanning from
+  offset zero to reach them would be slow and pointless.
+- **Filter** by substring across key and value, and order newest- or
+  oldest-first.
+- **Live tail** over server-sent events, so records appear as they are
+  produced. This is a poll loop rather than a hook in the append path: the
+  dashboard is an observer and must never be able to slow a producer down,
+  so it reads on its own schedule and falls behind if it has to.
+- **Administer** from the same page — increase a topic's partition count,
+  change its configuration, delete it — and watch consumer-group lag.
+
+Partitions only ever increase. Removing one would strand the records
+already written to it and silently re-route a keyed producer, so a request
+to shrink is refused rather than obeyed.
+
+Payloads that are not valid UTF-8 are rendered lossily and *labelled* as
+binary, rather than quietly shown as mojibake.
+
+## Docker
+
+The dashboard is compiled into the broker, so there is no separate UI
+service, no Node build and no CDN at runtime — hosting the UI is just
+running a node with an HTTP port.
+
+```bash
+docker compose -f docker/docker-compose.yml up --build
+open http://localhost:8080
+```
+
+That brings up a three-node cluster with the dashboard on 8080 (and 8081,
+8082 — every node serves it). Credentials come from the image environment,
+so they are set where the container is defined:
+
+```yaml
+environment:
+  BRAHMAPUTRA_ADMIN_USER: admin
+  BRAHMAPUTRA_ADMIN_PASSWORD: change-me-please
+```
+
+A single container works too, and needs no peer list — a node given none
+becomes its own one-member quorum, because the dashboard's users and
+sessions live in controller metadata and a node with no controller has
+nothing to log in against:
+
+```bash
+docker build -f docker/Dockerfile -t brahmaputra .
+docker run -p 8080:8080 -p 9092:9092 \
+  -e BRAHMAPUTRA_ADMIN_PASSWORD='choose-something-long' brahmaputra
+```
+
+Everything the broker takes as a flag is available as an environment
+variable — `BRAHMAPUTRA_DEFAULT_PARTITIONS`, `BRAHMAPUTRA_RETENTION_MS`,
+`BRAHMAPUTRA_SEGMENT_BYTES`, `BRAHMAPUTRA_TRANSPORT`,
+`BRAHMAPUTRA_REQUIRE_AUTH`, and the rest — and anything unset simply omits
+its flag rather than passing an empty value. Extra flags can be appended
+after the image name.
+
 ## Durability, retention and quotas
 
 **Durability** is replication-first, as Kafka's is. `acks=all` plus
@@ -365,6 +489,23 @@ deleted:
 
 A consumer whose committed offset falls off the log restarts at the new
 log start rather than failing.
+
+**Compaction** applies where deleting by age would be wrong. A consumer
+group rewrites the same key — its committed offset — forever, so the
+internal `__consumer_offsets` topic is compacted rather than aged out: only
+the newest record per key is kept. Without it, a cluster committing every
+few seconds fills its disk, and coordinator failover slows without limit
+because it replays every superseded commit.
+
+Offsets are preserved exactly. A surviving record is rewritten as a
+single-record batch at its original offset, so compaction leaves gaps
+rather than renumbering anything, and a previously committed offset still
+means the record it always meant. Only sealed segments below the high
+watermark are eligible — the active segment is still being appended to, and
+uncommitted records are not the broker's to discard — and records with no
+key are never removed, having nothing that could supersede them. In a live
+run the offsets topic plateaus at tens of kilobytes instead of growing with
+the commit count.
 
 **Quotas** bound a noisy client without losing its data:
 
@@ -415,6 +556,8 @@ Each row is asserted by a script, not by argument.
 | `--replica-lag-time-max-ms` | 10000 | ISR eviction threshold |
 | `--offsets-topic-partitions` | 50 | internal offsets topic |
 | `--rack` | — | rack label (recorded, not yet used for placement) |
+| `--require-auth` | off | refuse unauthenticated connections and authorize every request against the ACLs |
+| `--admin-user`, `--admin-password` | `admin` / generated | first admin, created on first boot; also `BRAHMAPUTRA_ADMIN_USER` / `BRAHMAPUTRA_ADMIN_PASSWORD` |
 
 ### Producer (`brahmaputra-cli produce`, `ProducerConfig`)
 
@@ -482,7 +625,7 @@ topic — set them broker-wide with the flags above. There is no
 ## Verification
 
 ```bash
-cargo test --workspace          # 206 unit and integration tests
+cargo test --workspace          # 230 unit and integration tests
 
 bash scripts/verify-m1.sh       # single-node storage and protocol
 bash scripts/verify-m2.ps1      # controller quorum and metadata
@@ -506,7 +649,7 @@ Last full run on the development host:
 
 | Suite | Checks | Result |
 |---|---|---|
-| `cargo test --workspace` | 206 | pass |
+| `cargo test --workspace` | 230 | pass |
 | `verify-m1.sh` — storage, protocol, concurrent producers, SIGKILL recovery | 31 | pass |
 | `verify-m4.sh` — consumer groups across 5 nodes | 30 | pass |
 | `verify-m5.sh` — fsync policies, quotas, version negotiation | 15 | pass |
@@ -515,23 +658,27 @@ Last full run on the development host:
 | `verify-retention.sh` — time and size retention, group resume | 21 | pass |
 | `verify-failures.sh` — producer/broker/consumer kills | 15 | pass |
 | `verify-transport-parity.sh` — tcp vs tcp-tls vs quic | 18 | pass |
-| `verify-chaos.sh` — 5 nodes, random kills under load | — | **flaky, see below** |
+| `verify-chaos.sh` — 5 nodes, random kills under load | 7 | pass |
+| `authentication` tests — anonymous, wrong password, ACL denial | 6 | pass |
 
-**Known issue.** `verify-chaos.sh` — the roughest suite, which kills and
-restarts brokers in a five-node cluster while producing continuously — does
-not complete reliably. Three runs reached rounds 1, 3 and 6 of 6 before
-stopping. In every case the run ended *during* a kill or restart step, and
-no assertion ever failed: every round that executed acknowledged all 150 of
-its records. So this is not a known data-loss bug — it is an unresolved
-early exit, and it is unresolved whether the fault lies in the harness or
-in broker behaviour under repeated restarts. It is listed as unverified
-rather than passing until that is settled.
+`verify-chaos.sh` is the roughest of these: it kills and restarts brokers
+in a five-node cluster while producing continuously with `acks=all`, then
+asserts the only invariant that must hold regardless of the order events
+happened in — every acknowledged record still readable, exactly once, from
+every surviving replica, with the replicas byte-identical.
 
-The narrower failure suites cover the same ground with deterministic
-timing and do pass: `verify-failures.sh` (15/15) includes `kill -9`
-mid-produce with recovery from a partial tail, and `verify-replication.sh`
-(14/14) includes leader failover with no acknowledged record lost and a
-killed broker rejoining the ISR byte-identical.
+It used to exit early on every run, which looked like a broker fault for a
+long time. It was the harness: `writer="$(… | head -1)"` under
+`set -o pipefail` lets `head` exit as soon as it has its line, the upstream
+loop dies of `SIGPIPE`, and `set -e` then aborted the whole run **silently**
+— no failed assertion, no message. It now completes reliably (three
+consecutive runs, 7/7 checks each).
+
+**On load sensitivity.** `verify-m4.sh` failed once at *"controllers did not
+agree on a live Raft leader"* while seven other suites were running on the
+same host, and passes 30/30 in isolation. Its election deadline is already
+120 seconds, so this is recorded as contention on a busy machine rather
+than papered over with a larger timeout. Run the live suites serially.
 
 ## Performance
 
@@ -771,7 +918,7 @@ libraries beyond libc.
 
 ```bash
 cargo build --release          # brahmaputra-server and brahmaputra-cli
-cargo test --workspace         # 206 unit and integration tests
+cargo test --workspace         # 230 unit and integration tests
 ```
 
 The live verification scripts additionally need `bash`; they run on Git
@@ -791,22 +938,34 @@ bash scripts/gen-protocol.sh
 Present: partitioned segmented logs, leader/ISR replication with
 leader-epoch truncation, high-watermark visibility, `acks=0/1/all`,
 idempotent producer, consumer groups with generation fencing, retention,
-quotas, fsync policies, API version negotiation, TLS, metrics and RBAC.
+log compaction, quotas, fsync policies, API version negotiation, TLS,
+data-plane authentication with ACLs, metrics and RBAC.
 
-Deliberately **not** in v1 (DESIGN.md §1): log compaction, transactions and
-exactly-once semantics, multi-datacentre replication, tiered storage.
+Deliberately **not** in v1 (DESIGN.md §1): transactions and exactly-once
+semantics, multi-datacentre replication, tiered storage.
 
 Known gaps, ranked, in [docs/kafka-parity.md](docs/kafka-parity.md) §8.
 The ones that matter most:
 
-1. **No data-plane authentication.** TLS encrypts; it does not identify.
+1. **Topic-level configs other than `min.insync.replicas` are stored but
+   not applied.** The dashboard can set `retention.ms` on a topic and the
+   value is persisted, but the log still follows the broker-wide flag.
 2. **`sendfile` is plaintext-TCP only.** TLS and QUIC must read the bytes
    to encrypt them, so those paths still make one copy out of the page
    cache. Kafka has the same limitation whenever SSL is enabled.
-3. Topic-level configs other than `min.insync.replicas` are stored but not
-   applied.
-4. **No log compaction**, so `__consumer_offsets` grows without bound on a
-   long-lived cluster.
+3. **No Kafka wire-protocol compatibility.** Existing Kafka clients,
+   Connect, Streams and the surrounding ecosystem do not work against it;
+   this speaks its own protocol.
+4. **Not benchmarked at RF=3 with `acks=all`.** Every published throughput
+   number is single-node, RF=1, so the replicated produce path — the one
+   production actually runs — is unmeasured. No soak test either.
+
+On production readiness: with `--require-auth` and TLS this is no longer
+open to anyone who can reach the port, and the offsets topic no longer
+grows without bound. That is a real change in what can responsibly be run.
+It is still young software with no production track record, and the last
+two gaps above are the ones to close before trusting it with data you
+cannot lose.
 
 ## License
 
