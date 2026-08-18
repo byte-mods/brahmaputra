@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use brahmaputra_client::Transport;
-use brahmaputra_metrics::{names, MetricKey, Metrics};
 use brahmaputra_metadata::{
     BrokerEpoch, ClusterMetadata, MetadataCache, NodeRole, PartitionMetadata,
 };
+use brahmaputra_metrics::{names, MetricKey, Metrics};
 use brahmaputra_protocol::{decode_payload, encode_payload, FrameHeader};
 use brahmaputra_storage::{Log, LogConfig};
 use bytes::Bytes;
@@ -32,9 +32,9 @@ use crate::handlers;
 use crate::producer_id::ProducerIdManager;
 use crate::quic::QuicListener;
 use crate::quota::{QuotaConfig, QuotaKind, QuotaManager};
-use tokio_rustls::TlsAcceptor;
 use crate::replication::{ReplicationHealthSnapshot, ReplicationTracker};
 use crate::state::{partition_dir, BrokerState};
+use tokio_rustls::TlsAcceptor;
 
 const TASK_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// Requests one connection may have in flight at once. Generous enough to
@@ -422,7 +422,10 @@ impl Broker {
     /// Per-partition committed offsets for one group, as the dashboard's
     /// lag view needs them. Lag itself is derived against the log end
     /// offsets this broker leads.
-    pub async fn group_lag(self: &Arc<Self>, group_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    pub async fn group_lag(
+        self: &Arc<Self>,
+        group_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let shard = crate::handlers::coordinator_shard_for(self, group_id)
             .await
             .map_err(|error| error.to_string())?;
@@ -466,10 +469,16 @@ impl Broker {
                 continue;
             };
             let partition_label = partition.to_string();
-            let labels = [("topic", topic.as_str()), ("partition", partition_label.as_str())];
+            let labels = [
+                ("topic", topic.as_str()),
+                ("partition", partition_label.as_str()),
+            ];
             metrics.set_gauge(MetricKey::with(names::LOG_START_OFFSET, &labels), start);
             metrics.set_gauge(MetricKey::with(names::LOG_END_OFFSET, &labels), end);
-            metrics.set_gauge(MetricKey::with(names::HIGH_WATERMARK, &labels), high_watermark);
+            metrics.set_gauge(
+                MetricKey::with(names::HIGH_WATERMARK, &labels),
+                high_watermark,
+            );
 
             if let Some(assignment) = image
                 .as_ref()
@@ -509,7 +518,12 @@ impl Broker {
         }
         let delay = self.quotas.throttle_for(client_id, kind, bytes);
         if !delay.is_zero() {
-            debug!(client = client_id.unwrap_or("<anonymous>"), ?delay, ?kind, "throttling client");
+            debug!(
+                client = client_id.unwrap_or("<anonymous>"),
+                ?delay,
+                ?kind,
+                "throttling client"
+            );
             tokio::time::sleep(delay).await;
         }
         delay
@@ -935,7 +949,10 @@ fn log_task_result(joined: Option<Result<(), tokio::task::JoinError>>, kind: &st
 /// handlers, responses framed back. Requests are processed in arrival
 /// order per connection, so responses go out in order too.
 /// A plain or TLS-wrapped client socket; the framing above is identical.
-pub(crate) trait BrokerStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+pub(crate) trait BrokerStream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
+{
+}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> BrokerStream for T {}
 
 /// Serve one client connection.
@@ -1001,7 +1018,9 @@ async fn handle_connection(
                     correlation_id: header.correlation_id,
                     client_id: None,
                 };
-                let _ = responses.send(encode_payload(&response_header, &body)).await;
+                let _ = responses
+                    .send(encode_payload(&response_header, &body))
+                    .await;
             }
         });
 
@@ -1025,7 +1044,6 @@ async fn handle_connection(
     let _ = writer.await;
     Ok(())
 }
-
 
 fn trace_request(header: &FrameHeader, body_len: usize) {
     debug!(

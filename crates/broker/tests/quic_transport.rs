@@ -145,7 +145,10 @@ async fn quic_produce_and_fetch_match_tcp_byte_for_byte() {
         .unwrap();
     let mut total = 0;
     for partition in 0..PARTITIONS {
-        total += consumer.list_offsets(TOPIC, partition, LATEST).await.unwrap();
+        total += consumer
+            .list_offsets(TOPIC, partition, LATEST)
+            .await
+            .unwrap();
     }
     assert_eq!(total, 200, "log end offsets sum to the produced count");
 
@@ -248,13 +251,10 @@ async fn tls_over_tcp_carries_the_same_records_and_encrypts_them() {
     // A plaintext client must not be able to talk to a TLS listener: the
     // handshake bytes are not a valid frame, so the connection fails rather
     // than silently downgrading.
-    let plaintext = tokio::time::timeout(
-        Duration::from_secs(5),
-        async {
-            let consumer = Consumer::connect_with(Transport::Tcp, broker.addr, "plaintext").await?;
-            consumer.list_offsets(TOPIC, 0, EARLIEST).await
-        },
-    )
+    let plaintext = tokio::time::timeout(Duration::from_secs(5), async {
+        let consumer = Consumer::connect_with(Transport::Tcp, broker.addr, "plaintext").await?;
+        consumer.list_offsets(TOPIC, 0, EARLIEST).await
+    })
     .await
     .expect("attempt should not hang");
     assert!(

@@ -465,10 +465,7 @@ impl BrokerRouter {
     pub(crate) async fn group_by_leader(
         &self,
         partitions: &[(String, i32)],
-    ) -> (
-        Vec<(SocketAddr, Vec<(String, i32)>)>,
-        Vec<(String, i32)>,
-    ) {
+    ) -> (Vec<(SocketAddr, Vec<(String, i32)>)>, Vec<(String, i32)>) {
         let mut unknown_topics: HashSet<String> = HashSet::new();
         for (topic, partition) in partitions {
             if self.cached_endpoint(topic, *partition).is_none() {

@@ -496,15 +496,31 @@ async fn run(cli: Cli) -> Result<()> {
                         broker,
                         &topic,
                         group,
-                        commit_interval_ms,
-                        &assignor,
-                        max,
-                        follow,
-                        quiet,
+                        GroupConsumeOptions {
+                            commit_interval_ms,
+                            assignor: &assignor,
+                            max,
+                            follow,
+                            quiet,
+                        },
                     )
                     .await
                 }
-                None => consume(broker, topic, partition, &from, offset, max, follow, quiet).await,
+                None => {
+                    consume(
+                        broker,
+                        topic,
+                        ConsumeOptions {
+                            partition,
+                            from: &from,
+                            offset,
+                            max,
+                            follow,
+                            quiet,
+                        },
+                    )
+                    .await
+                }
             }
         }
         Command::Metadata { topic } => {
@@ -897,9 +913,13 @@ async fn explicit_produce(
         batches_length: 0,
     };
     let body = codec::encode_produce_request(&request, &[batch.encode()])?;
-    let connection =
-        Connection::connect_with(transport(), broker, Some("brahmaputra-cli-explicit".into()), 1)
-            .await?;
+    let connection = Connection::connect_with(
+        transport(),
+        broker,
+        Some("brahmaputra-cli-explicit".into()),
+        1,
+    )
+    .await?;
     let response = connection.request(ApiKey::Produce, &body).await?;
     let response = ProduceResponse::decode(&response)
         .map_err(|error| brahmaputra_protocol::ProtocolError::Message(error.to_string()))?;
@@ -925,16 +945,26 @@ async fn topic_partitions(
     Ok(info.partitions.iter().map(|p| p.partition).collect())
 }
 
-async fn consume(
-    broker: SocketAddr,
-    topic: String,
+/// Where a standalone read starts and when it stops. Bundled because these
+/// travel together everywhere and are meaningless apart.
+struct ConsumeOptions<'a> {
     partition: Option<i32>,
-    from: &str,
+    from: &'a str,
     offset: Option<i64>,
     max: Option<u64>,
     follow: bool,
     quiet: bool,
-) -> Result<()> {
+}
+
+async fn consume(broker: SocketAddr, topic: String, options: ConsumeOptions<'_>) -> Result<()> {
+    let ConsumeOptions {
+        partition,
+        from,
+        offset,
+        max,
+        follow,
+        quiet,
+    } = options;
     let consumer = Consumer::connect_with(transport(), broker, "brahmaputra-cli").await?;
     let started = Instant::now();
     let mut bytes = 0u64;
@@ -1018,7 +1048,6 @@ async fn consume(
     Ok(())
 }
 
-
 /// Throughput summary for `--quiet` runs (benchmark mode).
 fn report_consume_rate(quiet: bool, records: u64, bytes: u64, started: Instant) {
     if !quiet {
@@ -1034,16 +1063,28 @@ fn report_consume_rate(quiet: bool, records: u64, bytes: u64, started: Instant) 
 
 /// Group-coordinated consumption: join `group`, print records in the usual
 /// format, and print the new assignment (one line) whenever it changes.
+/// The group-specific half of the same thing.
+struct GroupConsumeOptions<'a> {
+    commit_interval_ms: u64,
+    assignor: &'a str,
+    max: Option<u64>,
+    follow: bool,
+    quiet: bool,
+}
+
 async fn consume_group(
     broker: SocketAddr,
     topic: &str,
     group: String,
-    commit_interval_ms: u64,
-    assignor: &str,
-    max: Option<u64>,
-    follow: bool,
-    quiet: bool,
+    options: GroupConsumeOptions<'_>,
 ) -> Result<()> {
+    let GroupConsumeOptions {
+        commit_interval_ms,
+        assignor,
+        max,
+        follow,
+        quiet,
+    } = options;
     let topics: Vec<&str> = topic
         .split(',')
         .map(str::trim)
@@ -2061,12 +2102,14 @@ mod tests {
             consume(
                 addr,
                 "follow-fairness".into(),
-                None,
-                "earliest",
-                None,
-                Some(1),
-                true,
-                false,
+                ConsumeOptions {
+                    partition: None,
+                    from: "earliest",
+                    offset: None,
+                    max: Some(1),
+                    follow: true,
+                    quiet: false,
+                },
             ),
         )
         .await

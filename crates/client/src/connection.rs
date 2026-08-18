@@ -28,7 +28,10 @@ type Pending = Arc<Mutex<HashMap<i32, oneshot::Sender<Result<Bytes, ClientError>
 
 /// Either a plain or a TLS-wrapped socket: the framing above them is
 /// identical, so the rest of the connection does not care which it has.
-pub(crate) trait ClientStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+pub(crate) trait ClientStream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
+{
+}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ClientStream for T {}
 
 /// A multiplexed TCP client connection. Cheap to clone.
@@ -72,9 +75,7 @@ impl TcpConnection {
         socket.set_nodelay(true)?;
         let mut config = rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(std::sync::Arc::new(
-                crate::quic::AcceptAnyServerCert,
-            ))
+            .with_custom_certificate_verifier(std::sync::Arc::new(crate::quic::AcceptAnyServerCert))
             .with_no_client_auth();
         config.alpn_protocols = vec![crate::quic::ALPN.to_vec()];
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));

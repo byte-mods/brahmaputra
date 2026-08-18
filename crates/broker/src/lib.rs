@@ -27,10 +27,10 @@ mod state;
 
 pub use actor::{PartitionHandle, ReadOutcome};
 pub use error::BrokerError;
+pub use quota::{QuotaConfig, QuotaKind};
 pub use replication::{
     FetcherState, FollowerFetcherHealth, LeaderFollowerHealth, ReplicaManager,
     ReplicaManagerConfig, ReplicaPartition, ReplicationHealthSnapshot,
 };
-pub use quota::{QuotaConfig, QuotaKind};
 pub use server::{Broker, BrokerConfig};
 pub use state::BrokerState;

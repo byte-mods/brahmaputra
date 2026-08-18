@@ -624,10 +624,7 @@ impl GroupConsumer {
         let records: Vec<ConsumedRecord> = self.buffered.drain(..count).collect();
         let mut positions = self.positions.lock().expect("positions");
         for record in &records {
-            positions.insert(
-                (record.topic.clone(), record.partition),
-                record.offset + 1,
-            );
+            positions.insert((record.topic.clone(), record.partition), record.offset + 1);
         }
         records
     }

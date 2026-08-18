@@ -219,7 +219,10 @@ impl GroupAdmin {
 
         let mut lags = Vec::with_capacity(partitions.len());
         for (topic, partition) in partitions {
-            let log_end_offset = self.consumer.list_offsets(&topic, partition, LATEST).await?;
+            let log_end_offset = self
+                .consumer
+                .list_offsets(&topic, partition, LATEST)
+                .await?;
             let committed_offset = committed.get(&(topic.clone(), partition)).copied();
             lags.push(PartitionLag {
                 lag: committed_offset.map(|offset| (log_end_offset - offset).max(0)),

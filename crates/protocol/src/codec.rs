@@ -210,10 +210,7 @@ pub fn decode_fetch_multi_response(
 /// total length locates the start; from there each partition takes exactly
 /// its declared byte count. Slicing `Bytes` shares the buffer, so this does
 /// not copy record data.
-fn split_trailing_regions(
-    body: &Bytes,
-    lengths: &[i64],
-) -> Result<Vec<Vec<Bytes>>, ProtocolError> {
+fn split_trailing_regions(body: &Bytes, lengths: &[i64]) -> Result<Vec<Vec<Bytes>>, ProtocolError> {
     let total: i64 = lengths.iter().sum();
     if total < 0 || total as usize > body.len() {
         return Err(ProtocolError::Malformed("batches_length out of bounds"));
@@ -222,7 +219,9 @@ fn split_trailing_regions(
     let mut out = Vec::with_capacity(lengths.len());
     for length in lengths {
         if *length < 0 || *length as usize > region.len() {
-            return Err(ProtocolError::Malformed("partition batches_length out of bounds"));
+            return Err(ProtocolError::Malformed(
+                "partition batches_length out of bounds",
+            ));
         }
         let mut partition_region = region.split_to(*length as usize);
         let mut batches = Vec::new();
@@ -230,7 +229,9 @@ fn split_trailing_regions(
             let header = validate_batch_header(&partition_region)?;
             let total = BATCH_HEADER_LEN + header.batch_length as usize;
             if total > partition_region.len() {
-                return Err(ProtocolError::Malformed("batch runs past its partition region"));
+                return Err(ProtocolError::Malformed(
+                    "batch runs past its partition region",
+                ));
             }
             batches.push(partition_region.copy_to_bytes(total));
         }

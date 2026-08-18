@@ -86,12 +86,7 @@ impl QuotaManager {
     /// A client that identifies itself as nothing shares one bucket: that
     /// is deliberate, since otherwise anonymity would be a way around the
     /// limit.
-    pub fn throttle_for(
-        &self,
-        client_id: Option<&str>,
-        kind: QuotaKind,
-        bytes: u64,
-    ) -> Duration {
+    pub fn throttle_for(&self, client_id: Option<&str>, kind: QuotaKind, bytes: u64) -> Duration {
         let Some(rate) = self.config.rate(kind) else {
             return Duration::ZERO;
         };
@@ -109,7 +104,9 @@ impl QuotaManager {
             last_refill: now,
         });
 
-        let elapsed = now.saturating_duration_since(bucket.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
         bucket.last_refill = now;
         // Refill, capped at one second of burst: allowing unbounded credit
         // to accumulate would let an idle client spike arbitrarily hard.

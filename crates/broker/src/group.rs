@@ -612,7 +612,8 @@ impl GroupCoordinator {
                 }
             }
             let watch = group.watch.subscribe();
-            let is_leader_with_assignment = group.leader.as_deref() == Some(request.member_id.as_str())
+            let is_leader_with_assignment = group.leader.as_deref()
+                == Some(request.member_id.as_str())
                 && !request.assignments.is_empty();
             if is_leader_with_assignment {
                 debug!(group = %request.group_id, member = %request.member_id, gen = group.generation, assignments = ?request.assignments, "leader sync installs assignment");
@@ -787,8 +788,12 @@ impl GroupCoordinator {
         let mut watermark = shard.handle.watermark_watch();
         watermark.borrow_and_update();
         let base = self.append_and_commit(broker, shard, records).await?;
-        if !wait_for_high_watermark(&mut watermark, base + record_count, COMMIT_WATERMARK_TIMEOUT)
-            .await
+        if !wait_for_high_watermark(
+            &mut watermark,
+            base + record_count,
+            COMMIT_WATERMARK_TIMEOUT,
+        )
+        .await
         {
             return Err(BrokerError::NotEnoughReplicas {
                 required: 1,
@@ -797,7 +802,11 @@ impl GroupCoordinator {
         }
         for entry in &request.offsets {
             shard.offsets.insert(
-                (request.group_id.clone(), entry.topic.clone(), entry.partition),
+                (
+                    request.group_id.clone(),
+                    entry.topic.clone(),
+                    entry.partition,
+                ),
                 entry.offset,
             );
         }
@@ -967,8 +976,7 @@ impl GroupCoordinator {
                         // The leader never distributed assignments: restart so
                         // a new leader is picked from the members that rejoin.
                         GroupState::AwaitingSync
-                            if now
-                                > group.rebalance_deadline_ms + group.rebalance_timeout_ms =>
+                            if now > group.rebalance_deadline_ms + group.rebalance_timeout_ms =>
                         {
                             debug!(group = %group_id, gen = group.generation, "awaiting-sync wedged; restarting rebalance");
                             restart_rebalance(&mut group, now);

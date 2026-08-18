@@ -131,7 +131,11 @@ impl QuicListener {
     }
 }
 
-async fn serve_connection(broker: Arc<Broker>, connection: quinn::Connection, max_frame_bytes: usize) {
+async fn serve_connection(
+    broker: Arc<Broker>,
+    connection: quinn::Connection,
+    max_frame_bytes: usize,
+) {
     let peer = connection.remote_address();
     debug!(%peer, "quic connection accepted");
     let mut streams = JoinSet::new();

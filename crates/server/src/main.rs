@@ -346,7 +346,9 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
                 flush_interval_ms: args.flush_interval_ms,
                 ..LogConfig::default()
             },
-            retention_check_interval: Duration::from_millis(args.retention_check_interval_ms.max(1)),
+            retention_check_interval: Duration::from_millis(
+                args.retention_check_interval_ms.max(1),
+            ),
             transport: args.transport,
             quota,
             metadata_cache: Some(metadata_cache.clone()),
@@ -1479,6 +1481,52 @@ fn duration_millis_i64(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
+/// Create the cluster session secret and first admin once this node is a
+/// registered broker (DESIGN.md §9.4).
+///
+/// Waits for the same broker-epoch signal as the offsets topic, so it only
+/// runs on a node whose registration has committed and therefore has a
+/// controller to write through.
+async fn ensure_admin_user(
+    controller: Arc<ControllerNode>,
+    metadata_cache: MetadataCache,
+    mut broker_epoch: watch::Receiver<u64>,
+    admin_password: Option<String>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return Ok(());
+        }
+        if *broker_epoch.borrow_and_update() > 0 {
+            break;
+        }
+        tokio::select! {
+            _ = shutdown.changed() => {}
+            changed = broker_epoch.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    let image = metadata_cache.snapshot();
+    if let Err(error) =
+        observability::bootstrap_admin(&controller, &image, admin_password.as_deref()).await
+    {
+        // A losing racer sees "already exists"; a real failure is worth
+        // surfacing but must not take the node down, since the data plane
+        // is unaffected by the dashboard having no users yet.
+        tracing::warn!(%error, "could not bootstrap the admin user");
+    }
+    // Park until shutdown, like ensure_offsets_topic: a component that
+    // returns is read by supervise_components as a stop signal for the
+    // whole node.
+    wait_for_shutdown(shutdown).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1790,50 +1838,4 @@ mod tests {
             last_heartbeat_ms,
         }
     }
-}
-
-/// Create the cluster session secret and first admin once this node is a
-/// registered broker (DESIGN.md §9.4).
-///
-/// Waits for the same broker-epoch signal as the offsets topic, so it only
-/// runs on a node whose registration has committed and therefore has a
-/// controller to write through.
-async fn ensure_admin_user(
-    controller: Arc<ControllerNode>,
-    metadata_cache: MetadataCache,
-    mut broker_epoch: watch::Receiver<u64>,
-    admin_password: Option<String>,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    loop {
-        if *shutdown.borrow_and_update() {
-            return Ok(());
-        }
-        if *broker_epoch.borrow_and_update() > 0 {
-            break;
-        }
-        tokio::select! {
-            _ = shutdown.changed() => {}
-            changed = broker_epoch.changed() => {
-                if changed.is_err() {
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    let image = metadata_cache.snapshot();
-    if let Err(error) =
-        observability::bootstrap_admin(&controller, &image, admin_password.as_deref()).await
-    {
-        // A losing racer sees "already exists"; a real failure is worth
-        // surfacing but must not take the node down, since the data plane
-        // is unaffected by the dashboard having no users yet.
-        tracing::warn!(%error, "could not bootstrap the admin user");
-    }
-    // Park until shutdown, like ensure_offsets_topic: a component that
-    // returns is read by supervise_components as a stop signal for the
-    // whole node.
-    wait_for_shutdown(shutdown).await;
-    Ok(())
 }

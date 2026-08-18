@@ -434,17 +434,14 @@ impl Inner {
             return;
         }
 
-        let body = match codec::encode_produce_multi(
-            self.config.acks,
-            self.config.timeout_ms,
-            &payload,
-        ) {
-            Ok(body) => body,
-            Err(error) => {
-                fail_all(waiters, ClientError::Protocol(error));
-                return;
-            }
-        };
+        let body =
+            match codec::encode_produce_multi(self.config.acks, self.config.timeout_ms, &payload) {
+                Ok(body) => body,
+                Err(error) => {
+                    fail_all(waiters, ClientError::Protocol(error));
+                    return;
+                }
+            };
 
         if self.config.acks == 0 {
             let _ = self
@@ -758,9 +755,8 @@ mod tests {
     /// part of the benchmark harness.
     #[test]
     fn murmur2_partitioner_is_stable_and_spreads_keys() {
-        let partition_of = |key: &[u8], partitions: usize| {
-            (murmur2(key) & 0x7fff_ffff) as usize % partitions
-        };
+        let partition_of =
+            |key: &[u8], partitions: usize| (murmur2(key) & 0x7fff_ffff) as usize % partitions;
 
         // Deterministic: the same key always maps to the same partition.
         for key in [&b""[..], b"a", b"ab", b"abc", b"abcd", b"orders-42"] {
@@ -785,10 +781,7 @@ mod tests {
 }
 
 /// Fail every waiter of a batched flush with the same error.
-fn fail_all(
-    waiters: Vec<Vec<oneshot::Sender<Result<i64, ClientError>>>>,
-    error: ClientError,
-) {
+fn fail_all(waiters: Vec<Vec<oneshot::Sender<Result<i64, ClientError>>>>, error: ClientError) {
     for senders in waiters {
         for sender in senders {
             let _ = sender.send(Err(clone_error(&error)));

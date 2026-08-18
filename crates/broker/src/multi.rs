@@ -13,13 +13,13 @@
 
 use std::time::Duration;
 
+use brahmaputra_metrics::names;
 use brahmaputra_protocol::codec;
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
     FetchMultiRequest, FetchMultiResult, ProduceMultiResponse, ProduceMultiResult,
 };
 use brahmaputra_protocol::{validate_batch_header, ApiKey};
-use brahmaputra_metrics::names;
 use bytes::Bytes;
 use tracing::warn;
 
@@ -49,12 +49,9 @@ pub(crate) async fn produce_multi(
     // run concurrently. Doing them in sequence would trade N round trips
     // for one round trip that takes N times as long, which is no trade at
     // all — batching has to shorten the request, not just merge it.
-    let outcomes = futures::future::join_all(
-        request
-            .partitions
-            .iter()
-            .zip(per_partition.iter())
-            .map(|(descriptor, batches)| {
+    let outcomes =
+        futures::future::join_all(request.partitions.iter().zip(per_partition.iter()).map(
+            |(descriptor, batches)| {
                 produce_one_partition(
                     broker,
                     &descriptor.topic,
@@ -63,9 +60,9 @@ pub(crate) async fn produce_multi(
                     acks,
                     request.timeout_ms,
                 )
-            }),
-    )
-    .await;
+            },
+        ))
+        .await;
 
     let mut results = Vec::with_capacity(request.partitions.len());
     let mut total_bytes = 0_u64;
@@ -103,7 +100,9 @@ pub(crate) async fn produce_multi(
         return None;
     }
     Some(Bytes::from(
-        ProduceMultiResponse { results }.encode().unwrap_or_default(),
+        ProduceMultiResponse { results }
+            .encode()
+            .unwrap_or_default(),
     ))
 }
 
@@ -217,7 +216,10 @@ async fn produce_one_partition(
     let mut required_high_watermark = -1;
     let mut records = 0_u64;
     for raw in batches {
-        match handle.append_producer_batch(raw.clone(), leader_epoch).await {
+        match handle
+            .append_producer_batch(raw.clone(), leader_epoch)
+            .await
+        {
             Ok((base, next)) => {
                 if first_base < 0 {
                     first_base = base;
@@ -274,11 +276,7 @@ async fn produce_one_partition(
     }
 }
 
-pub(crate) async fn fetch_multi(
-    broker: &Broker,
-    body: Bytes,
-    client_id: Option<&str>,
-) -> Bytes {
+pub(crate) async fn fetch_multi(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Bytes {
     let request = match FetchMultiRequest::decode(&body) {
         Ok(request) => request,
         Err(error) => {
@@ -317,9 +315,7 @@ pub(crate) async fn fetch_multi(
         metrics.count(names::THROTTLE_MS, throttle.as_millis() as u64);
     }
 
-    codec::encode_fetch_multi_response(&results)
-        .map(Bytes::from)
-        .unwrap_or_default()
+    codec::encode_fetch_multi_response(&results).unwrap_or_default()
 }
 
 /// Read every requested partition once. Returns the total bytes gathered.
@@ -376,7 +372,6 @@ async fn read_all_partitions(
     served
 }
 
-
 /// Wait until any requested partition has data or the deadline passes, then
 /// re-read. Polling rather than waking per partition keeps this simple; the
 /// wait is bounded by `max_wait_ms` either way.
@@ -388,9 +383,9 @@ async fn long_poll(
     let deadline = tokio::time::Instant::now() + Duration::from_millis(request.max_wait_ms as u64);
     let poll_interval = Duration::from_millis(5);
     while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(poll_interval.min(
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-        ))
+        tokio::time::sleep(
+            poll_interval.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
         .await;
         let mut served = 0_u64;
         for (index, descriptor) in request.partitions.iter().enumerate() {
@@ -398,7 +393,10 @@ async fn long_poll(
                 continue;
             };
             let Ok(outcome) = handle
-                .read(descriptor.fetch_offset, descriptor.max_bytes.max(0) as usize)
+                .read(
+                    descriptor.fetch_offset,
+                    descriptor.max_bytes.max(0) as usize,
+                )
                 .await
             else {
                 continue;

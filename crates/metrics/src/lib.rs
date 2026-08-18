@@ -21,6 +21,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use serde::Serialize;
 
+/// One metric name's kind plus every labelled series recorded under it,
+/// which is the grouping the Prometheus exposition format requires: HELP
+/// and TYPE are emitted once per name, then one line per label set.
+type NamedSeries = (MetricKind, Vec<(String, f64)>);
+
 /// Seconds between time-series samples.
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
 /// Samples retained per metric: six hours at the interval above.
@@ -208,11 +213,9 @@ impl Metrics {
     pub fn remove_matching(&self, name: &'static str, labels: &[(&str, &str)]) {
         let matches = |key: &MetricKey| {
             key.name == name
-                && labels.iter().all(|(label, value)| {
-                    key.labels
-                        .iter()
-                        .any(|(k, v)| k == label && v == value)
-                })
+                && labels
+                    .iter()
+                    .all(|(label, value)| key.labels.iter().any(|(k, v)| k == label && v == value))
         };
         self.inner.values.retain(|key, _| !matches(key));
         self.inner.series.retain(|key, _| !matches(key));
@@ -275,7 +278,7 @@ impl Metrics {
     pub fn prometheus(&self) -> String {
         // Group by metric name so HELP/TYPE are emitted once each, as the
         // exposition format requires.
-        let mut by_name: BTreeMap<&'static str, (MetricKind, Vec<(String, f64)>)> = BTreeMap::new();
+        let mut by_name: BTreeMap<&'static str, NamedSeries> = BTreeMap::new();
         for entry in self.inner.values.iter() {
             let key = entry.key();
             let rendered = key.render();
@@ -328,6 +331,16 @@ pub mod names {
     pub const GROUP_MEMBERS: &str = "brahmaputra_group_members";
     pub const GROUP_LAG: &str = "brahmaputra_group_lag";
     pub const LEADER_PARTITIONS: &str = "brahmaputra_leader_partitions";
+}
+
+impl std::fmt::Debug for Metrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Printing every series would be unreadable and would hold the map
+        // locked; the count is what a config dump actually wants.
+        f.debug_struct("Metrics")
+            .field("metrics", &self.inner.values.len())
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -400,21 +413,25 @@ mod tests {
 
         let text = metrics.prometheus();
         assert_eq!(
-            text.matches("# TYPE brahmaputra_produce_requests_total").count(),
+            text.matches("# TYPE brahmaputra_produce_requests_total")
+                .count(),
             1
         );
         assert!(text.contains("# HELP brahmaputra_produce_requests_total Produce requests served"));
         assert!(text.contains("brahmaputra_produce_requests_total 2"));
-        assert!(text.contains(
-            "brahmaputra_partition_log_end_offset{topic=\"t\",partition=\"0\"} 42"
-        ));
+        assert!(
+            text.contains("brahmaputra_partition_log_end_offset{topic=\"t\",partition=\"0\"} 42")
+        );
     }
 
     #[test]
     fn removing_a_partition_drops_its_series() {
         let metrics = Metrics::new();
         metrics.set_gauge(
-            MetricKey::with(names::LOG_END_OFFSET, &[("topic", "gone"), ("partition", "0")]),
+            MetricKey::with(
+                names::LOG_END_OFFSET,
+                &[("topic", "gone"), ("partition", "0")],
+            ),
             1,
         );
         metrics.sample();
@@ -423,15 +440,5 @@ mod tests {
         metrics.remove_matching(names::LOG_END_OFFSET, &[("topic", "gone")]);
         assert!(metrics.snapshot().is_empty());
         assert!(metrics.series_names().is_empty());
-    }
-}
-
-impl std::fmt::Debug for Metrics {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Printing every series would be unreadable and would hold the map
-        // locked; the count is what a config dump actually wants.
-        f.debug_struct("Metrics")
-            .field("metrics", &self.inner.values.len())
-            .finish()
     }
 }

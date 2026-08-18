@@ -159,7 +159,10 @@ async fn group_consumer_consumes_and_commits_positions() {
     // Every record arrived exactly once, offsets contiguous per partition.
     let mut by_partition: BTreeMap<i32, Vec<i64>> = BTreeMap::new();
     for record in &records {
-        by_partition.entry(record.partition).or_default().push(record.offset);
+        by_partition
+            .entry(record.partition)
+            .or_default()
+            .push(record.offset);
     }
     assert_eq!(by_partition.len(), PARTITIONS as usize);
     for offsets in by_partition.values_mut() {
@@ -196,7 +199,11 @@ async fn second_member_rebalances_and_splits_partitions() {
     }
     assert_eq!(
         first.assignment(),
-        &[(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1), (TOPIC.to_owned(), 2)]
+        &[
+            (TOPIC.to_owned(), 0),
+            (TOPIC.to_owned(), 1),
+            (TOPIC.to_owned(), 2)
+        ]
     );
 
     // Real consumers poll independently, so each gets its own task; the
@@ -312,7 +319,10 @@ async fn reconnect_resumes_from_committed_offsets() {
         .map(|record| String::from_utf8(record.value.to_vec()).unwrap())
         .collect();
     values.sort();
-    assert_eq!(values, vec!["rec-10", "rec-11", "rec-12", "rec-13", "rec-14"]);
+    assert_eq!(
+        values,
+        vec!["rec-10", "rec-11", "rec-12", "rec-13", "rec-14"]
+    );
     assert!(
         consumer
             .poll(Duration::from_millis(500))
@@ -366,7 +376,10 @@ async fn group_admin_lists_describes_and_reports_lag() {
         assert_eq!(entry.committed_offset, Some(10));
         assert_eq!(entry.log_end_offset, 10);
         assert_eq!(entry.lag, Some(0));
-        assert_eq!(entry.member_id.as_deref(), Some(consumer.member_id().as_str()));
+        assert_eq!(
+            entry.member_id.as_deref(),
+            Some(consumer.member_id().as_str())
+        );
     }
 
     // Produce without consuming: lag tracks the new log end offsets.

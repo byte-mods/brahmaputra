@@ -454,7 +454,8 @@ impl Log {
             .flush_interval_messages
             .is_some_and(|limit| limit > 0 && self.unflushed_records >= limit);
         let by_time = self.config.flush_interval_ms.is_some_and(|limit| {
-            self.unflushed_records > 0 && now_ms().saturating_sub(self.last_flush_ms) >= limit as i64
+            self.unflushed_records > 0
+                && now_ms().saturating_sub(self.last_flush_ms) >= limit as i64
         });
         if by_count || by_time {
             self.flush()?;
@@ -491,7 +492,8 @@ impl Log {
     /// `flush.interval.ms` still fires on an idle partition.
     pub fn flush_due(&self) -> bool {
         self.config.flush_interval_ms.is_some_and(|limit| {
-            self.unflushed_records > 0 && now_ms().saturating_sub(self.last_flush_ms) >= limit as i64
+            self.unflushed_records > 0
+                && now_ms().saturating_sub(self.last_flush_ms) >= limit as i64
         })
     }
 
@@ -509,7 +511,11 @@ impl Log {
         let appended = batch.records.len() as u64;
         self.next_offset += appended as i64;
         self.maybe_flush(appended)?;
-        if self.segments.last().is_some_and(|active| active.size >= self.config.segment_bytes) {
+        if self
+            .segments
+            .last()
+            .is_some_and(|active| active.size >= self.config.segment_bytes)
+        {
             self.roll_segment()?;
         }
         Ok(base_offset)
@@ -550,7 +556,11 @@ impl Log {
         active.append_batch(base_offset, &stamped, header.max_timestamp)?;
         self.next_offset = next_offset;
         self.maybe_flush((next_offset - base_offset) as u64)?;
-        if self.segments.last().is_some_and(|active| active.size >= self.config.segment_bytes) {
+        if self
+            .segments
+            .last()
+            .is_some_and(|active| active.size >= self.config.segment_bytes)
+        {
             self.roll_segment()?;
         }
         Ok((base_offset, next_offset))
@@ -573,7 +583,11 @@ impl Log {
         let appended = header.last_offset_delta as u64 + 1;
         self.next_offset = base_offset + appended as i64;
         self.maybe_flush(appended)?;
-        if self.segments.last().is_some_and(|active| active.size >= self.config.segment_bytes) {
+        if self
+            .segments
+            .last()
+            .is_some_and(|active| active.size >= self.config.segment_bytes)
+        {
             self.roll_segment()?;
         }
         Ok(base_offset)
@@ -1450,7 +1464,10 @@ mod flush_tests {
             log.append(batch(5)).unwrap();
         }
         assert_eq!(log.unflushed_records, 50);
-        assert!(!log.flush_due(), "no time policy means no flush is ever due");
+        assert!(
+            !log.flush_due(),
+            "no time policy means no flush is ever due"
+        );
     }
 
     /// `flush.interval.messages` resets the counter every time it fires, so
@@ -1544,7 +1561,10 @@ mod flush_tests {
                     .is_some_and(|ext| ext == "log")
             })
             .count();
-        assert!(segments >= 2, "the log actually rolled ({segments} segments)");
+        assert!(
+            segments >= 2,
+            "the log actually rolled ({segments} segments)"
+        );
     }
 }
 
@@ -1585,7 +1605,9 @@ mod hwm_checkpoint_cadence_tests {
         assert_eq!(log.high_watermark(), 20);
 
         let checkpoint = dir.path().join(HWM_FILE);
-        let written = fs::metadata(&checkpoint).map(|meta| meta.len()).unwrap_or(0);
+        let written = fs::metadata(&checkpoint)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         assert!(
             written <= size_of::<i64>() as u64,
             "checkpoint grew to {written} bytes inside the interval"
@@ -1621,7 +1643,9 @@ mod hwm_checkpoint_cadence_tests {
             log.flush().unwrap();
         }
         assert_eq!(
-            Log::open(dir.path(), config(60_000)).unwrap().high_watermark(),
+            Log::open(dir.path(), config(60_000))
+                .unwrap()
+                .high_watermark(),
             1
         );
     }

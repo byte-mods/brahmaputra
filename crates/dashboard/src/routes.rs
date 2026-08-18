@@ -369,11 +369,7 @@ async fn group_lag(
     }
     match state.broker.group_lag(&group).await {
         Ok(lag) => Json(json!({ "group": group, "partitions": lag })).into_response(),
-        Err(error) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": error })),
-        )
-            .into_response(),
+        Err(error) => (StatusCode::NOT_FOUND, Json(json!({ "error": error }))).into_response(),
     }
 }
 
@@ -523,7 +519,10 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/brokers", get(brokers))
         .route("/api/v1/topics", get(topics).post(create_topic))
-        .route("/api/v1/topics/{name}", get(topic_detail).delete(delete_topic))
+        .route(
+            "/api/v1/topics/{name}",
+            get(topic_detail).delete(delete_topic),
+        )
         .route("/api/v1/groups", get(groups))
         .route("/api/v1/groups/{group}/lag", get(group_lag))
         .route("/api/v1/metrics/snapshot", get(metrics_snapshot))

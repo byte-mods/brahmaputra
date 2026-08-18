@@ -349,7 +349,7 @@ impl Consumer {
             let (decoded, batches) =
                 codec::decode_fetch_multi_response(response).map_err(ClientError::Protocol)?;
 
-            for (result, raw_batches) in decoded.results.iter().zip(batches.into_iter()) {
+            for (result, raw_batches) in decoded.results.iter().zip(batches) {
                 let Some(slot) = out
                     .iter_mut()
                     .find(|slot| slot.topic == result.topic && slot.partition == result.partition)

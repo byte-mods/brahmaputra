@@ -7,11 +7,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use brahmaputra_protocol::codec;
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
-    ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, BrokerInfo, DescribeGroupRequest, DescribeGroupResponse, FetchRequest, FetchResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinGroupRequest, JoinGroupResponse, ListGroupsRequest,
-    ListGroupsResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
-    OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
-    PartitionInfo, ProduceResponse, SyncGroupRequest, SyncGroupResponse, TopicInfo,
+    ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, BrokerInfo, DescribeGroupRequest,
+    DescribeGroupResponse, FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinGroupRequest, JoinGroupResponse, ListGroupsRequest, ListGroupsResponse, ListOffsetsRequest,
+    ListOffsetsResponse, MetadataRequest, MetadataResponse, OffsetCommitRequest,
+    OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse, PartitionInfo, ProduceResponse,
+    SyncGroupRequest, SyncGroupResponse, TopicInfo,
 };
 use brahmaputra_protocol::producer::{InitProducerIdRequest, InitProducerIdResponse};
 use brahmaputra_protocol::replica::{
@@ -1172,7 +1173,9 @@ async fn api_versions(broker: &Broker, body: Bytes) -> Bytes {
             max_version: API_VERSION as i32,
         })
         .collect();
-    let throttle = broker.throttle(None, crate::quota::QuotaKind::Fetch, 0).await;
+    let throttle = broker
+        .throttle(None, crate::quota::QuotaKind::Fetch, 0)
+        .await;
     codec_bytes(
         ApiVersionsResponse {
             error_code: ec::NONE,
@@ -1384,6 +1387,29 @@ async fn describe_group(broker: &Broker, body: Bytes) -> Bytes {
     }
 }
 
+/// Stable metric label for an API key.
+fn api_name(api_key: ApiKey) -> &'static str {
+    match api_key {
+        ApiKey::Produce => "produce",
+        ApiKey::Fetch => "fetch",
+        ApiKey::ListOffsets => "list_offsets",
+        ApiKey::Metadata => "metadata",
+        ApiKey::ReplicaFetch => "replica_fetch",
+        ApiKey::OffsetsForLeaderEpoch => "offsets_for_leader_epoch",
+        ApiKey::InitProducerId => "init_producer_id",
+        ApiKey::JoinGroup => "join_group",
+        ApiKey::SyncGroup => "sync_group",
+        ApiKey::Heartbeat => "heartbeat",
+        ApiKey::OffsetCommit => "offset_commit",
+        ApiKey::OffsetFetch => "offset_fetch",
+        ApiKey::ListGroups => "list_groups",
+        ApiKey::DescribeGroup => "describe_group",
+        ApiKey::ApiVersions => "api_versions",
+        ApiKey::ProduceMulti => "produce_multi",
+        ApiKey::FetchMulti => "fetch_multi",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1423,28 +1449,5 @@ mod tests {
 
         drop(handle);
         task.await.unwrap();
-    }
-}
-
-/// Stable metric label for an API key.
-fn api_name(api_key: ApiKey) -> &'static str {
-    match api_key {
-        ApiKey::Produce => "produce",
-        ApiKey::Fetch => "fetch",
-        ApiKey::ListOffsets => "list_offsets",
-        ApiKey::Metadata => "metadata",
-        ApiKey::ReplicaFetch => "replica_fetch",
-        ApiKey::OffsetsForLeaderEpoch => "offsets_for_leader_epoch",
-        ApiKey::InitProducerId => "init_producer_id",
-        ApiKey::JoinGroup => "join_group",
-        ApiKey::SyncGroup => "sync_group",
-        ApiKey::Heartbeat => "heartbeat",
-        ApiKey::OffsetCommit => "offset_commit",
-        ApiKey::OffsetFetch => "offset_fetch",
-        ApiKey::ListGroups => "list_groups",
-        ApiKey::DescribeGroup => "describe_group",
-        ApiKey::ApiVersions => "api_versions",
-        ApiKey::ProduceMulti => "produce_multi",
-        ApiKey::FetchMulti => "fetch_multi",
     }
 }

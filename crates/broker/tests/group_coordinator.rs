@@ -262,7 +262,9 @@ fn assigned_tuples(assignment: &[AssignedPartition]) -> Vec<(String, i32)> {
         .collect()
 }
 
-fn offset_tuples(entries: &[brahmaputra_protocol::gen::OffsetFetchEntry]) -> Vec<(String, i32, i64)> {
+fn offset_tuples(
+    entries: &[brahmaputra_protocol::gen::OffsetFetchEntry],
+) -> Vec<(String, i32, i64)> {
     entries
         .iter()
         .map(|e| (e.topic.clone(), e.partition, e.offset))
@@ -315,7 +317,10 @@ async fn join_sync_rebalance_and_fencing() {
     )
     .await;
     assert_eq!(leader.error_code, ec::NONE);
-    assert_eq!(assigned_tuples(&leader.assignment), vec![("events".to_owned(), 0)]);
+    assert_eq!(
+        assigned_tuples(&leader.assignment),
+        vec![("events".to_owned(), 0)]
+    );
     assert_eq!(heartbeat(&conn, "g1", 1, "member-0").await, ec::NONE);
 
     // A second member joining a Stable group triggers a rebalance.
@@ -323,9 +328,10 @@ async fn join_sync_rebalance_and_fencing() {
     let second_join = tokio::spawn(async move { join(&second_conn, "g1", "", 10_000, 500).await });
     // The group bumps to generation 2, so member-0's stale-generation
     // heartbeat is fenced until it rejoins.
-    eventually(|| heartbeat(&conn, "g1", 1, "member-0").then(|code| async move {
-        code == ec::ILLEGAL_GENERATION
-    }))
+    eventually(|| {
+        heartbeat(&conn, "g1", 1, "member-0")
+            .then(|code| async move { code == ec::ILLEGAL_GENERATION })
+    })
     .await;
     // The awaited member rejoins, completing the rebalance at generation 2.
     let rejoin = join(&conn, "g1", "member-0", 10_000, 500).await;
@@ -366,10 +372,16 @@ async fn join_sync_rebalance_and_fencing() {
     )
     .await;
     assert_eq!(leader_sync.error_code, ec::NONE);
-    assert_eq!(assigned_tuples(&leader_sync.assignment), vec![("events".to_owned(), 0)]);
+    assert_eq!(
+        assigned_tuples(&leader_sync.assignment),
+        vec![("events".to_owned(), 0)]
+    );
     let follower_sync = sync(&conn, "g1", 2, "member-1", vec![]).await;
     assert_eq!(follower_sync.error_code, ec::NONE);
-    assert_eq!(assigned_tuples(&follower_sync.assignment), vec![("events".to_owned(), 1)]);
+    assert_eq!(
+        assigned_tuples(&follower_sync.assignment),
+        vec![("events".to_owned(), 1)]
+    );
     assert_eq!(heartbeat(&conn, "g1", 2, "member-0").await, ec::NONE);
     assert_eq!(heartbeat(&conn, "g1", 2, "member-1").await, ec::NONE);
 
@@ -400,15 +412,13 @@ async fn session_expiry_evicts_member_and_rebalances() {
     let first = join(&conn, "g2", "", 30_000, 500).await;
     assert_eq!(first.error_code, ec::NONE);
     let second_conn = connect(broker.addr, "expiry-two").await;
-    let second_join =
-        tokio::spawn(async move { join(&second_conn, "g2", "", 300, 500).await });
+    let second_join = tokio::spawn(async move { join(&second_conn, "g2", "", 300, 500).await });
     // Wait for the rebalance to actually start (member-0's generation-1
     // heartbeat gets fenced) so the rejoin below joins generation 2 rather
     // than starting a rebalance of its own.
     eventually(|| {
-        heartbeat(&conn, "g2", 1, "member-0").then(|code| async move {
-            code == ec::ILLEGAL_GENERATION
-        })
+        heartbeat(&conn, "g2", 1, "member-0")
+            .then(|code| async move { code == ec::ILLEGAL_GENERATION })
     })
     .await;
     let rejoin = join(&conn, "g2", "member-0", 30_000, 500).await;
@@ -433,16 +443,18 @@ async fn session_expiry_evicts_member_and_rebalances() {
     )
     .await;
     assert_eq!(leader_sync.error_code, ec::NONE);
-    assert_eq!(sync(&conn, "g2", 2, "member-1", vec![]).await.error_code, ec::NONE);
+    assert_eq!(
+        sync(&conn, "g2", 2, "member-1", vec![]).await.error_code,
+        ec::NONE
+    );
     assert_eq!(heartbeat(&conn, "g2", 2, "member-1").await, ec::NONE);
 
     // Stop member-1's heartbeats: the sweeper (100ms tick) evicts it and the
     // group rebalances into generation 3, fencing member-0's generation-2
     // heartbeat.
     eventually(|| {
-        heartbeat(&conn, "g2", 2, "member-0").then(|code| async move {
-            code == ec::ILLEGAL_GENERATION
-        })
+        heartbeat(&conn, "g2", 2, "member-0")
+            .then(|code| async move { code == ec::ILLEGAL_GENERATION })
     })
     .await;
     assert_eq!(

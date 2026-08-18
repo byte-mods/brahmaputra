@@ -1,16 +1,35 @@
-# Brahmaputra
+<div align="center">
 
-A distributed, disk-based log streaming platform in Rust — topics,
-partitions, replication, consumer groups — in the Kafka mould, with an
-embedded Raft control plane (no ZooKeeper), a TCP/TLS/QUIC data plane, and
-a built-in metrics dashboard with login and role-based access.
+# 🌊 Brahmaputra
 
-```
+**A distributed log streaming platform in Rust.**
+Kafka's model — partitioned, replicated, append-only logs — in one static
+binary, with no JVM, no ZooKeeper and no heap to tune.
+
+[![CI](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml/badge.svg)](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Tests](https://img.shields.io/badge/tests-194%20passing-brightgreen.svg)](#verification)
+[![Throughput](https://img.shields.io/badge/vs%20Kafka-3.0%C3%97%20produce%20%C2%B7%205.7%C3%97%20consume-brightgreen.svg)](#performance)
+[![Transports](https://img.shields.io/badge/transport-TCP%20%C2%B7%20TLS%201.3%20%C2%B7%20QUIC-informational.svg)](#transports)
+
+</div>
+
+```bash
 brahmaputra-server --data-dir ./data                    # a broker
 brahmaputra-cli produce --topic orders --value hello    # write
 brahmaputra-cli consume --topic orders --from earliest  # read
 open http://localhost:8080                              # dashboard
 ```
+
+|  | |
+|---|---|
+| 🚀 **Faster than Kafka on both sides** | At equal CPU: **3.0× produce**, **5.7× consume** at 256 B records, on **8–28× less memory**. [Measured, with method →](#performance) |
+| 🧩 **One static binary** | Broker, controller, dashboard and metrics compiled in. No JVM, no ZooKeeper, no Prometheus required. |
+| 🔁 **Kafka semantics, not just Kafka shape** | Leader/ISR replication, leader-epoch truncation (KIP-101), high-watermark visibility, `acks=0/1/all`, idempotent producer, consumer groups with generation fencing. |
+| 🔌 **Three transports, one flag** | Plain TCP, TLS 1.3, or QUIC — same wire format, same correctness suite. |
+| 🧪 **Verified by killing things** | Live scripts start real brokers, `kill -9` them mid-write, and audit what survived. Not only unit tests. |
+| 📊 **Operations built in** | Dashboard, Prometheus endpoint, six hours of in-process history, login and RBAC. |
 
 ---
 
@@ -42,13 +61,13 @@ open http://localhost:8080                              # dashboard
 
 | Milestone | Scope | Status |
 |---|---|---|
-| M1 | Single node: storage engine, wire protocol, producer/consumer client, CLI | complete |
-| M2 | Raft controller quorum, metadata, multi-broker | complete |
-| M3 | Replication: ISR, high watermark, leader-epoch failover | complete |
-| M4 | Consumer groups and offset management | complete |
-| M5 | Hardening: retention, fsync policies, quotas, TLS, fault injection, benchmarks | complete |
-| M6 | Metrics API, embedded dashboard, login and RBAC | complete |
-| M7 | Multi-partition Produce/Fetch, concurrent request handling, benchmark vs Kafka | complete |
+| M1 | Single node: storage engine, wire protocol, producer/consumer client, CLI | ✅ complete |
+| M2 | Raft controller quorum, metadata, multi-broker | ✅ complete |
+| M3 | Replication: ISR, high watermark, leader-epoch failover | ✅ complete |
+| M4 | Consumer groups and offset management | ✅ complete |
+| M5 | Hardening: retention, fsync policies, quotas, TLS, fault injection, benchmarks | ✅ complete |
+| M6 | Metrics API, embedded dashboard, login and RBAC | ✅ complete |
+| M7 | Multi-partition Produce/Fetch, concurrent request handling, benchmark vs Kafka | ✅ complete |
 
 Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
@@ -140,7 +159,7 @@ inter-broker replication, and all three pass the same correctness suite
 (`scripts/verify-transport-parity.sh`). TCP is the default because it is
 substantially faster on a LAN — QUIC's advantages appear on lossy or
 long-haul links, and its costs are measured in
-[docs/benchmarks.md §4](docs/benchmarks.md).
+[docs/benchmarks.md §5](docs/benchmarks.md).
 
 TLS uses a self-signed certificate generated at startup. That gives
 confidentiality and integrity, **not** authentication: the data plane has
@@ -519,6 +538,21 @@ killed broker rejoining the ISR byte-identical.
 Head-to-head with Apache Kafka 3.9.0, same host, same container limits
 (4 CPUs, 4 GiB), same record size, partition count and durability setting,
 each system driven by its own client from inside its own container.
+
+```
+256 B records · 4 CPUs each · both saturated at ~400 % CPU
+
+produce   Kafka  ████████                                 257 848 msgs/sec
+          TCP    ████████████████████████                 772 947  (3.0×)
+          QUIC   █████████████                            418 498  (1.6×)
+
+consume   Kafka  ████                                     572 656 msgs/sec
+          TCP    ████████████████████████████             3 238 866 (5.7×)
+          QUIC   ████████                                 924 642  (1.6×)
+
+memory    Kafka  ████████████████████████████             2 080–2 722 MiB
+          TCP    █                                        98–256 MiB
+```
 
 Throughput alone is a weak comparison, because a single client can leave a
 fast broker idle — that reads as "similar throughput" when it really means

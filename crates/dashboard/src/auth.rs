@@ -115,12 +115,16 @@ pub fn issue_token(secret: &str, username: &str, role: Role) -> Result<String, A
 pub fn verify_token(secret: &str, token: &str) -> Result<Claims, AuthError> {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
-    decode::<Claims>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
-        .map(|data| data.claims)
-        .map_err(|error| match error.kind() {
-            jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-            _ => AuthError::TokenInvalid,
-        })
+    decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map(|data| data.claims)
+    .map_err(|error| match error.kind() {
+        jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+        _ => AuthError::TokenInvalid,
+    })
 }
 
 /// Check a role against what a route requires.
