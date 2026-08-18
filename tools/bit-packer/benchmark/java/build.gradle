@@ -1,0 +1,19 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
+    implementation 'org.msgpack:jackson-dataformat-msgpack:0.9.3'
+    implementation 'com.google.protobuf:protobuf-java:4.29.3'
+    implementation 'com.google.flatbuffers:flatbuffers-java:25.2.10'
+}
+
+application {
+    mainClass = 'org.bitpacker.benchmark.Benchmark'
+}

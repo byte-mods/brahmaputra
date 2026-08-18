@@ -1,0 +1,39 @@
+version = 1.0.0
+
+class Vec3 {
+    int x;
+    int y;
+    int z;
+}
+
+class Item {
+    int id;
+    string name;
+    int value;
+    int weight;
+    string rarity;
+}
+
+class Character {
+    string name;
+    int level;
+    int hp;
+    int mp;
+    bool is_alive;
+    Vec3 position;
+    int[] skills;
+    Item[] inventory;
+}
+
+class Guild {
+    string name;
+    string description;
+    Character[] members;
+}
+
+class WorldState {
+    int world_id;
+    string seed;
+    Guild[] guilds;
+    Item[] loot_table;
+}

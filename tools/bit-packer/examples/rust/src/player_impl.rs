@@ -1,0 +1,350 @@
+// Generated Implementation
+use crate::player_structs::*;
+use std::convert::TryInto;
+use std::io::{Error, ErrorKind, Write};
+use std::str;
+
+pub const VERSION: &str = "1.0.2";
+
+// --- ZeroCopyByteBuff Implementation ---
+#[derive(Debug, Clone, Copy)]
+pub enum Endian {
+    Big,
+    Little,
+}
+
+pub struct ZeroCopyByteBuff<'a> {
+    data: &'a [u8],
+    write_buf: Vec<u8>,
+    cursor: usize,
+    multiplier: f64,
+    endian: Endian,
+}
+
+impl<'a> ZeroCopyByteBuff<'a> {
+    pub fn from_slice(slice: &'a [u8], endian: Endian) -> Self {
+        Self {
+            data: slice,
+            write_buf: Vec::new(),
+            cursor: 0,
+            multiplier: 10000.0,
+            endian,
+        }
+    }
+
+    pub fn new_writer(capacity: usize, endian: Endian) -> Self {
+        Self {
+            data: &[],
+            write_buf: Vec::with_capacity(capacity),
+            cursor: 0,
+            multiplier: 10000.0,
+            endian,
+        }
+    }
+
+    // zig-zag encoding: (n << 1) ^ (n >> 31)
+    #[inline(always)]
+    fn zigzag_encode32(n: i32) -> u32 {
+        ((n << 1) ^ (n >> 31)) as u32
+    }
+
+    #[inline(always)]
+    fn zigzag_decode32(n: u32) -> i32 {
+        ((n >> 1) as i32) ^ (-((n & 1) as i32))
+    }
+
+    #[inline(always)]
+    fn zigzag_encode64(n: i64) -> u64 {
+        ((n << 1) ^ (n >> 63)) as u64
+    }
+
+    #[inline(always)]
+    fn zigzag_decode64(n: u64) -> i64 {
+        ((n >> 1) as i64) ^ (-((n & 1) as i64))
+    }
+
+    #[inline(always)]
+    fn get_varint32(&mut self) -> u32 {
+        let mut result: u32 = 0;
+        let mut shift = 0;
+        // Optimization: Unrolled loop for common case (1-5 bytes)
+        loop {
+            // SAFETY: We trust the data source. Unchecked access is faster.
+            let byte = unsafe { *self.data.get_unchecked(self.cursor) };
+            self.cursor += 1;
+            result |= ((byte & 0x7F) as u32) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        result
+    }
+
+    #[inline(always)]
+    fn put_varint32(&mut self, mut value: u32) {
+        // FAST PATH: 1 byte
+        if (value & !0x7F) == 0 {
+            self.write_buf.push(value as u8);
+            return;
+        }
+        // General path: Unsafe writes
+        self.write_buf.reserve(5);
+        unsafe {
+            let mut ptr = self.write_buf.as_mut_ptr().add(self.write_buf.len());
+            let mut len = 0;
+            loop {
+                if (value & !0x7F) == 0 {
+                    ptr.write(value as u8);
+                    len += 1;
+                    break;
+                }
+                ptr.write((value as u8) | 0x80);
+                ptr = ptr.add(1);
+                len += 1;
+                value >>= 7;
+            }
+            self.write_buf.set_len(self.write_buf.len() + len);
+        }
+    }
+
+    #[inline(always)]
+    fn get_varint64(&mut self) -> u64 {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        loop {
+            // SAFETY: Unchecked access
+            let byte = unsafe { *self.data.get_unchecked(self.cursor) };
+            self.cursor += 1;
+            result |= ((byte & 0x7F) as u64) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        result
+    }
+
+    #[inline(always)]
+    fn put_varint64(&mut self, mut value: u64) {
+        // FAST PATH: 1 byte
+        if (value & !0x7F) == 0 {
+            self.write_buf.push(value as u8);
+            return;
+        }
+        // General path: Unsafe writes
+        self.write_buf.reserve(10);
+        unsafe {
+            let mut ptr = self.write_buf.as_mut_ptr().add(self.write_buf.len());
+            let mut len = 0;
+            loop {
+                if (value & !0x7F) == 0 {
+                    ptr.write(value as u8);
+                    len += 1;
+                    break;
+                }
+                ptr.write((value as u8) | 0x80);
+                ptr = ptr.add(1);
+                len += 1;
+                value >>= 7;
+            }
+            self.write_buf.set_len(self.write_buf.len() + len);
+        }
+    }
+
+    #[inline(always)]
+    pub fn get_i32(&mut self) -> i32 {
+        let val = self.get_varint32();
+        Self::zigzag_decode32(val)
+    }
+
+    #[inline(always)]
+    pub fn get_bool(&mut self) -> bool {
+        // SAFETY: Unchecked access
+        let b = unsafe { *self.data.get_unchecked(self.cursor) };
+        self.cursor += 1;
+        b != 0
+    }
+
+    #[inline(always)]
+    pub fn get_str(&mut self) -> Result<&'a str, &'static str> {
+        let len = self.get_i32() as usize;
+        if len == 0 {
+            return Ok("");
+        }
+        // SAFETY: We assume valid UTF-8 and sufficient length for speed.
+        let s_bytes = unsafe { self.data.get_unchecked(self.cursor..self.cursor + len) };
+        self.cursor += len;
+        // SAFETY: Skipping UTF-8 check
+        Ok(unsafe { str::from_utf8_unchecked(s_bytes) })
+    }
+
+    #[inline(always)]
+    pub fn get_float(&mut self) -> f64 {
+        let val = self.get_i64();
+        val as f64 / self.multiplier
+    }
+
+    #[inline(always)]
+    pub fn get_i64(&mut self) -> i64 {
+        let val = self.get_varint64();
+        Self::zigzag_decode64(val)
+    }
+
+    #[inline(always)]
+    pub fn put_i32(&mut self, value: i32) {
+        self.put_varint32(Self::zigzag_encode32(value));
+    }
+
+    #[inline(always)]
+    pub fn put_bool(&mut self, value: bool) {
+        self.write_buf.push(if value { 1 } else { 0 });
+    }
+
+    #[inline(always)]
+    pub fn put_str(&mut self, value: &str) {
+        let len = value.len();
+        self.put_i32(len as i32);
+        // Unsafe copy
+        self.write_buf.reserve(len);
+        unsafe {
+            let ptr = self.write_buf.as_mut_ptr().add(self.write_buf.len());
+            std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, len);
+            self.write_buf.set_len(self.write_buf.len() + len);
+        }
+    }
+
+    #[inline(always)]
+    pub fn put_float(&mut self, value: f64) {
+        let i_val = (value * self.multiplier) as i64;
+        self.put_varint64(Self::zigzag_encode64(i_val));
+    }
+
+    pub fn finish(self) -> Vec<u8> {
+        self.write_buf
+    }
+}
+
+// --- Generated Impl ---
+
+impl Player {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+        let wtr = buf.finish();
+
+        Ok(wtr)
+    }
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+        buf.put_str(&self.username);
+
+        buf.put_i32(*&self.level);
+
+        buf.put_i32(*&self.score);
+
+        buf.put_i32(self.inventory.len() as i32);
+        for item in &self.inventory {
+            buf.put_str(item);
+        }
+
+        Ok(())
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+
+        let v_str = buf
+            .get_str()
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        if v_str != VERSION {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Version Mismatch: Expected {}, got {}", VERSION, v_str),
+            ));
+        }
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+        let mut obj = Player::default();
+
+        obj.username = buf
+            .get_str()
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?
+            .to_string();
+
+        obj.level = buf.get_i32();
+
+        obj.score = buf.get_i32();
+
+        let inventory_len = buf.get_i32();
+        for _ in 0..inventory_len {
+            let val = buf
+                .get_str()
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e))?
+                .to_string();
+            obj.inventory.push(val);
+        }
+
+        Ok(obj)
+    }
+}
+
+impl GameState {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+        let wtr = buf.finish();
+
+        Ok(wtr)
+    }
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+        buf.put_i32(*&self.id);
+
+        buf.put_bool(*&self.isActive);
+
+        buf.put_i32(self.players.len() as i32);
+        for item in &self.players {
+            item.encode_to(buf)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+
+        let v_str = buf
+            .get_str()
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        if v_str != VERSION {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Version Mismatch: Expected {}, got {}", VERSION, v_str),
+            ));
+        }
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+        let mut obj = GameState::default();
+
+        obj.id = buf.get_i32();
+
+        obj.isActive = buf.get_bool();
+
+        let players_len = buf.get_i32();
+        for _ in 0..players_len {
+            let val = Player::decode_from(buf)?;
+            obj.players.push(val);
+        }
+
+        Ok(obj)
+    }
+}

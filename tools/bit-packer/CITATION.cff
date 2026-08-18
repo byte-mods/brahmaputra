@@ -1,0 +1,48 @@
+cff-version: 1.2.0
+message: "If you use ZeroCopyByteBuff in your research or project, please cite it as below."
+type: software
+
+title: "ZeroCopyByteBuff"
+abstract: >
+  ZeroCopyByteBuff is a zero-overhead binary serialization framework featuring
+  varint encoding, zig-zag signed integer compression, zero-copy string reads,
+  and schema-driven multi-language code generation (Rust, Go, C++, Java, C#,
+  JavaScript, Python). Designed for high-throughput systems where every
+  nanosecond and every byte counts.
+
+authors:
+  - family-names: "Dasgupta"
+    given-names: "Sudeep"
+    email: "sudeepdasgupta25@gmail.com"
+
+version: "1.0.0"
+date-released: "2026-02-18"
+
+license: MIT
+
+keywords:
+  - serialization
+  - binary-encoding
+  - varint
+  - zero-copy
+  - codegen
+  - high-performance
+  - rust
+  - go
+  - cpp
+  - java
+  - csharp
+  - javascript
+  - python
+
+repository-code: "https://github.com/byte-mods/bit-packer"
+
+references:
+  - type: article
+    title: "ZeroCopyByteBuff: A Zero-Overhead Binary Serialization Framework"
+    authors:
+      - family-names: "Dasgupta"
+        given-names: "Sudeep"
+        email: "sudeepdasgupta25@gmail.com"
+    year: 2026
+    notes: "Technical White Paper v1.0"

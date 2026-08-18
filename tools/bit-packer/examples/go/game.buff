@@ -1,0 +1,14 @@
+version = 1.0.2
+
+class Player {
+    string username;
+    int level;
+    int score;
+    string[] inventory;
+}
+
+class GameState {
+    int id;
+    bool isActive;
+    Player[] players;
+}

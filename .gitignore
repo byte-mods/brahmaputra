@@ -1,0 +1,40 @@
+# Rust build output.
+/target/
+**/*.rs.bk
+
+# Benchmark artefacts: the raw per-run client output and per-second
+# resource samples. The generated reports under docs/ are checked in; the
+# multi-gigabyte raw material behind them is not.
+/bench/results/
+/bench/.stage/
+
+# Local broker state produced by the verification scripts.
+/data/
+*.log
+
+# Vendored BitPacker compiler: the Go source is kept so the wire schemas
+# can be regenerated, but its compiled binaries and benchmark build output
+# are artefacts and are rebuilt by `cd tools/bit-packer && go build`.
+node_modules/
+/tools/bitpacker
+/tools/bitpacker.exe
+/tools/bit-packer/bitpacker
+/tools/bit-packer/main
+/tools/bit-packer/bench_large_cpp
+/tools/bit-packer/benchmark/**/build/
+/tools/bit-packer/benchmark/**/bin/
+/tools/bit-packer/benchmark/go/benchmark
+/tools/bit-packer/benchmark/go/benchmark_bin
+/tools/bit-packer/benchmark/cpp/bench_cpp
+/tools/bit-packer/benchmark/bench_large_cpp
+/tools/bit-packer/cross_lang_test/test_go_bin
+**/*.class
+**/*.tar
+**/*.zip
+
+# Editor and OS noise.
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

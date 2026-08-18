@@ -1,0 +1,15 @@
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/bin/Release/net10.0/csharp_large
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/bin/Release/net10.0/csharp_large.deps.json
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/bin/Release/net10.0/csharp_large.runtimeconfig.json
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/bin/Release/net10.0/csharp_large.dll
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/bin/Release/net10.0/csharp_large.pdb
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/obj/Release/net10.0/csharp_large.GeneratedMSBuildEditorConfig.editorconfig
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/obj/Release/net10.0/csharp_large.AssemblyInfoInputs.cache
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/obj/Release/net10.0/csharp_large.AssemblyInfo.cs
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/obj/Release/net10.0/csharp_large.csproj.CoreCompileInputs.cache
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/obj/Release/net10.0/csharp_large.sourcelink.json
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/obj/Release/net10.0/csharp_large.dll
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/obj/Release/net10.0/refint/csharp_large.dll
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/obj/Release/net10.0/csharp_large.pdb
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/obj/Release/net10.0/csharp_large.genruntimeconfig.cache
+/Users/sudeepdasgupta/projects/bit-packer/benchmark/csharp_large/obj/Release/net10.0/ref/csharp_large.dll

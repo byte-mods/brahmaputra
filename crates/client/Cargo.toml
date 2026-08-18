@@ -1,0 +1,20 @@
+[package]
+name = "brahmaputra-client"
+description = "Async Rust client for Brahmaputra: producer, consumer, metadata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+brahmaputra-protocol.workspace = true
+bytes.workspace = true
+crc32c.workspace = true
+futures.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+thiserror.workspace = true
+tokio-rustls.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true

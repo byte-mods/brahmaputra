@@ -1,0 +1,6 @@
+large_payload.bin
+.DS_Store
+cmd/bitpacker/benchmark/target/
+cmd/bitpacker/bitpacker
+__pycache__/
+*.pyc

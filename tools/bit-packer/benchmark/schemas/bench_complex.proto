@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package bench_proto;
+
+option go_package = "./;bench_proto";
+
+message Vec3 {
+  int32 x = 1;
+  int32 y = 2;
+  int32 z = 3;
+}
+
+message Item {
+  int32 id = 1;
+  string name = 2;
+  int32 value = 3;
+  int32 weight = 4;
+  string rarity = 5;
+}
+
+message Character {
+  string name = 1;
+  int32 level = 2;
+  int32 hp = 3;
+  int32 mp = 4;
+  bool is_alive = 5;
+  Vec3 position = 6;
+  repeated int32 skills = 7;
+  repeated Item inventory = 8;
+}
+
+message Guild {
+  string name = 1;
+  string description = 2;
+  repeated Character members = 3;
+}
+
+message WorldState {
+  int32 world_id = 1;
+  string seed = 2;
+  repeated Guild guilds = 3;
+  repeated Item loot_table = 4;
+}

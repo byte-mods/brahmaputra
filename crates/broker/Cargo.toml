@@ -1,0 +1,33 @@
+[package]
+name = "brahmaputra-broker"
+description = "Data-plane broker: TCP server, partition actors, produce/fetch handlers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+brahmaputra-client.workspace = true
+brahmaputra-metadata.workspace = true
+brahmaputra-metrics.workspace = true
+brahmaputra-protocol.workspace = true
+brahmaputra-storage.workspace = true
+bytes.workspace = true
+crc32c.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,35 @@
+[package]
+name = "benchmark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# BitPacker (Generated code uses std only, no external deps required generally for simple structs)
+# But generated code uses `byteorder` perhaps? Need to check template.
+# Assuming std is enough for basic serialization.
+
+# JSON
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# MsgPack
+rmp-serde = "1.1"
+
+# Protobuf using Prost
+prost = "0.12"
+
+# Random data generation
+rand = "0.8"
+flatbuffers = "25.12.19"
+
+[build-dependencies]
+prost-build = "0.12"
+
+[[bin]]
+name = "benchmark"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench_large"
+path = "src/bench_large.rs"
+

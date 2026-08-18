@@ -1,0 +1,27 @@
+[package]
+name = "brahmaputra-cli"
+description = "brahmaputra-cli: produce, consume, metadata, offsets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "brahmaputra-cli"
+path = "src/main.rs"
+
+[dependencies]
+brahmaputra-client.workspace = true
+brahmaputra-controller.workspace = true
+brahmaputra-protocol.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+brahmaputra-broker.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,296 @@
+//! End-to-end M1 verification (Blueprint 02, Verification section):
+//! real broker on an ephemeral port + tempdir, two independent producers
+//! issuing requests concurrently, 1000 exact records across 3 partitions,
+//! visible on-disk logs, and continued contiguous offsets after restart.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
+
+use brahmaputra_broker::{Broker, BrokerConfig};
+use brahmaputra_client::{Consumer, Producer, ProducerConfig};
+use brahmaputra_protocol::Compression;
+use bytes::Bytes;
+use tokio::sync::{oneshot, Barrier};
+use tokio::task::JoinHandle;
+
+const TOPIC: &str = "it-topic";
+const PARTITIONS: i32 = 3;
+const RECORDS_PER_PRODUCER: u64 = 500;
+const CONTINUATION_RECORDS: u64 = 10;
+
+type ExpectedPartition = BTreeMap<i64, (Option<Bytes>, Bytes)>;
+type ExpectedRecords = HashMap<i32, ExpectedPartition>;
+
+struct RunningBroker {
+    addr: std::net::SocketAddr,
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+async fn start_broker(data_dir: &std::path::Path) -> RunningBroker {
+    let config = BrokerConfig {
+        port: 0, // ephemeral
+        data_dir: data_dir.to_path_buf(),
+        default_partitions: PARTITIONS,
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::bind(config).await.expect("bind broker");
+    let addr = broker.local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        Arc::new(broker)
+            .run(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("broker run");
+    });
+    RunningBroker {
+        addr,
+        shutdown: shutdown_tx,
+        task,
+    }
+}
+
+async fn stop_broker(broker: RunningBroker) {
+    let _ = broker.shutdown.send(());
+    broker.task.await.expect("broker task");
+}
+
+async fn read_all(consumer: &Consumer, partition: i32) -> Vec<(i64, Option<Bytes>, Bytes)> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    loop {
+        let records = consumer
+            .fetch(TOPIC, partition, offset, 200)
+            .await
+            .expect("fetch");
+        if records.is_empty() {
+            break;
+        }
+        offset = records.last().unwrap().0 + 1;
+        out.extend(records);
+    }
+    out
+}
+
+fn assert_partition(
+    records: &[(i64, Option<Bytes>, Bytes)],
+    partition: i32,
+    expected: &ExpectedPartition,
+) {
+    assert_eq!(
+        records.len(),
+        expected.len(),
+        "partition {partition} record count"
+    );
+    for (i, (offset, key, value)) in records.iter().enumerate() {
+        assert_eq!(
+            *offset, i as i64,
+            "partition {partition}: contiguous offsets"
+        );
+        let (want_key, want_value) = &expected[offset];
+        assert_eq!(key, want_key, "partition {partition} offset {offset}");
+        assert_eq!(value, want_value, "partition {partition} offset {offset}");
+    }
+}
+
+fn assert_non_empty_log_files(data_dir: &std::path::Path) {
+    for partition in 0..PARTITIONS {
+        let partition_dir = data_dir.join(format!("{TOPIC}-{partition}"));
+        let logs = std::fs::read_dir(&partition_dir)
+            .unwrap_or_else(|error| panic!("read {}: {error}", partition_dir.display()))
+            .map(|entry| entry.expect("partition directory entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+            .collect::<Vec<_>>();
+        assert!(
+            !logs.is_empty(),
+            "partition {partition} must expose a .log file while the broker is running"
+        );
+        assert!(
+            logs.iter()
+                .any(|path| std::fs::metadata(path).expect("log metadata").len() > 0),
+            "partition {partition} must expose a non-empty .log file"
+        );
+    }
+}
+
+async fn concurrent_producer(
+    producer_id: &'static str,
+    producer: Producer,
+    round_barrier: Arc<Barrier>,
+) -> Vec<(i32, i64, Option<Bytes>, Bytes)> {
+    let mut acknowledged = Vec::with_capacity(RECORDS_PER_PRODUCER as usize);
+    for sequence in 0..RECORDS_PER_PRODUCER {
+        // Neither producer can begin the next request until both have reached
+        // this round, so every pair is issued concurrently over independent
+        // TCP connections rather than merely being awaited in sequence.
+        round_barrier.wait().await;
+        let partition = (sequence % PARTITIONS as u64) as i32;
+        let key = Some(Bytes::from(format!("{producer_id}-key-{sequence}")));
+        let value = Bytes::from(format!("{producer_id}-value-{sequence}"));
+        let offset = producer
+            .send(TOPIC, Some(partition), key.clone(), value.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{producer_id} send {sequence}: {error}"));
+        acknowledged.push((partition, offset, key, value));
+    }
+    producer.flush().await.expect("producer flush");
+    acknowledged
+}
+
+fn collect_expected(
+    acknowledged: impl IntoIterator<Item = (i32, i64, Option<Bytes>, Bytes)>,
+) -> ExpectedRecords {
+    let mut expected = (0..PARTITIONS)
+        .map(|partition| (partition, ExpectedPartition::new()))
+        .collect::<ExpectedRecords>();
+    let mut total = 0usize;
+    for (partition, offset, key, value) in acknowledged {
+        let old = expected
+            .get_mut(&partition)
+            .expect("known partition")
+            .insert(offset, (key, value));
+        assert!(
+            old.is_none(),
+            "duplicate acknowledgement for {partition}@{offset}"
+        );
+        total += 1;
+    }
+    assert_eq!(total, (RECORDS_PER_PRODUCER * 2) as usize);
+    for (partition, records) in &expected {
+        assert!(
+            !records.is_empty(),
+            "both producers should distribute records to partition {partition}"
+        );
+        assert_eq!(
+            records.keys().copied().collect::<Vec<_>>(),
+            (0..records.len() as i64).collect::<Vec<_>>(),
+            "acknowledged offsets for partition {partition}"
+        );
+    }
+    expected
+}
+
+#[tokio::test]
+async fn produce_consume_restart_durability() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+
+        // --- Boot 1: two producers concurrently write 1000 exact records. ---
+        let broker = start_broker(dir.path()).await;
+        let config = |client_id: &str| ProducerConfig {
+            client_id: client_id.to_owned(),
+            linger_ms: 0,
+            compression: Compression::Lz4,
+            ..ProducerConfig::default()
+        };
+        let producer_a = Producer::connect(broker.addr, config("integration-producer-a"))
+            .await
+            .expect("producer A connect");
+        let producer_b = Producer::connect(broker.addr, config("integration-producer-b"))
+            .await
+            .expect("producer B connect");
+        let round_barrier = Arc::new(Barrier::new(2));
+        let task_a = tokio::spawn(concurrent_producer(
+            "producer-a",
+            producer_a,
+            Arc::clone(&round_barrier),
+        ));
+        let task_b = tokio::spawn(concurrent_producer(
+            "producer-b",
+            producer_b,
+            Arc::clone(&round_barrier),
+        ));
+        let (acknowledged_a, acknowledged_b) = tokio::join!(task_a, task_b);
+        let expected = collect_expected(
+            acknowledged_a
+                .expect("producer A task")
+                .into_iter()
+                .chain(acknowledged_b.expect("producer B task")),
+        );
+
+        // Appends must be externally visible as real, non-empty log files
+        // before the broker is stopped.
+        assert_non_empty_log_files(dir.path());
+
+        // --- Consume everything back from earliest; exact content. ---
+        let consumer = Consumer::connect(broker.addr, "it-consumer")
+            .await
+            .expect("consumer connect");
+        for partition in 0..PARTITIONS {
+            let records = read_all(&consumer, partition).await;
+            assert_partition(&records, partition, &expected[&partition]);
+        }
+        // Offsets API agrees with what we produced.
+        for partition in 0..PARTITIONS {
+            let latest = consumer
+                .list_offsets(TOPIC, partition, brahmaputra_client::LATEST)
+                .await
+                .unwrap();
+            assert_eq!(latest, expected[&partition].len() as i64);
+        }
+        drop(consumer);
+        stop_broker(broker).await;
+
+        // --- Boot 2: exact durable prefix, then continued offsets/content. ---
+        let broker = start_broker(dir.path()).await;
+        let consumer = Consumer::connect(broker.addr, "it-consumer-2")
+            .await
+            .expect("consumer reconnect");
+        for partition in 0..PARTITIONS {
+            let records = read_all(&consumer, partition).await;
+            assert_partition(&records, partition, &expected[&partition]);
+        }
+        // Metadata survived the restart too (meta.toml).
+        let meta = consumer.metadata(&[]).await.unwrap();
+        let topic = meta.topics.iter().find(|t| t.name == TOPIC).unwrap();
+        assert_eq!(topic.partitions.len(), PARTITIONS as usize);
+
+        let continuation = Producer::connect(
+            broker.addr,
+            ProducerConfig {
+                client_id: "integration-continuation".into(),
+                linger_ms: 0,
+                ..ProducerConfig::default()
+            },
+        )
+        .await
+        .expect("continuation producer connect");
+        let mut expected = expected;
+        for partition in 0..PARTITIONS {
+            let first_offset = expected[&partition].len() as i64;
+            for sequence in 0..CONTINUATION_RECORDS {
+                let key = Some(Bytes::from(format!("continued-{partition}-key-{sequence}")));
+                let value = Bytes::from(format!("continued-{partition}-value-{sequence}"));
+                let offset = continuation
+                    .send(TOPIC, Some(partition), key.clone(), value.clone())
+                    .await
+                    .expect("continuation send");
+                assert_eq!(
+                    offset,
+                    first_offset + sequence as i64,
+                    "partition {partition} offset must continue after restart"
+                );
+                expected
+                    .get_mut(&partition)
+                    .unwrap()
+                    .insert(offset, (key, value));
+            }
+        }
+        continuation.flush().await.expect("continuation flush");
+        for partition in 0..PARTITIONS {
+            let records = read_all(&consumer, partition).await;
+            assert_partition(&records, partition, &expected[&partition]);
+            let latest = consumer
+                .list_offsets(TOPIC, partition, brahmaputra_client::LATEST)
+                .await
+                .expect("latest offset after continuation");
+            assert_eq!(latest, expected[&partition].len() as i64);
+        }
+        stop_broker(broker).await;
+    })
+    .await
+    .expect("test timed out");
+}

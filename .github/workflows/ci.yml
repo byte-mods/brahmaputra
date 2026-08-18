@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Fast gate: everything that does not need a running cluster.
+  check:
+    name: Build, lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  # The live suites: real brokers, real kills, real logs on disk. These are
+  # what actually catch replication and recovery regressions, so they gate
+  # merges rather than running on a schedule somewhere no one looks.
+  verify:
+    name: Live verification (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - verify-replication
+          - verify-retention
+          - verify-failures
+          - verify-transport-parity
+          - verify-m5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: cargo build -p brahmaputra-server -p brahmaputra-cli
+
+      - name: ${{ matrix.suite }}
+        run: bash scripts/${{ matrix.suite }}.sh
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suite }}-artifacts
+          path: /tmp/brahmaputra-*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Chaos is slower and deliberately randomised, so it runs on demand and on
+  # main rather than on every pull request.
+  chaos:
+    name: Chaos run
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build binaries
+        run: cargo build -p brahmaputra-server -p brahmaputra-cli
+      - name: Chaos
+        run: bash scripts/verify-chaos.sh
+        env:
+          ROUNDS: 8
+
+  # Benchmarks vs Kafka. Not a pass/fail gate — hardware varies too much
+  # between runners for a threshold to mean anything — but the report is
+  # published so a regression is visible in the run's artifacts.
+  benchmark:
+    name: Benchmark vs Kafka
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Small-record benchmark
+        run: bash scripts/bench-vs-kafka.sh
+        env:
+          RECORDS: 200000
+
+      - name: 1 MiB three-way benchmark
+        run: bash scripts/bench-three-way.sh
+        env:
+          RECORDS: 500
+
+      - name: Publish reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-reports
+          path: bench/results/
+          retention-days: 30
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Benchmark results'
+            cat bench/results/report.md 2>/dev/null || true
+            cat bench/results/three-way.md 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"

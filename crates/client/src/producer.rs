@@ -1,0 +1,870 @@
+//! Batching producer (Blueprint 02 §4).
+//!
+//! Records accumulate in a per-(topic, partition) buffer until it reaches
+//! `batch_size` bytes or `linger_ms` have passed, then go out as ONE
+//! Produce request carrying ONE `RecordBatch` (optionally LZ4-compressed).
+//! A background ticker implements the linger flush. Every `send` awaits
+//! its record's offset: batch base offset + index within the batch.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use brahmaputra_protocol::codec;
+use brahmaputra_protocol::error_code as ec;
+use brahmaputra_protocol::gen::{
+    ProduceMultiPartition, ProduceMultiResponse, ProduceRequest, ProduceResponse,
+};
+use brahmaputra_protocol::producer::{InitProducerIdRequest, InitProducerIdResponse};
+use brahmaputra_protocol::{ApiKey, Compression, Record, RecordBatch};
+use bytes::Bytes;
+use futures::future::join_all;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::task::JoinHandle;
+use tracing::{debug, trace};
+
+use crate::error::ClientError;
+use crate::router::BrokerRouter;
+use crate::transport::Transport;
+
+type TopicPartition = (String, i32);
+type PartitionSendLock = Arc<AsyncMutex<()>>;
+
+/// Producer configuration.
+#[derive(Debug, Clone)]
+pub struct ProducerConfig {
+    pub client_id: String,
+    /// Flush a partition buffer once it holds roughly this many bytes of
+    /// record payload.
+    pub batch_size: usize,
+    /// Flush every non-empty buffer at least this often. 0 = flush every
+    /// record immediately (sync send).
+    pub linger_ms: u64,
+    /// Compression applied to each flushed batch.
+    pub compression: Compression,
+    /// Max unacknowledged requests on the connection.
+    pub max_in_flight: usize,
+    /// 1 = ack after leader append (default); -1 behaves the same on a
+    /// single broker (M1); 0 = fire and forget, `send` returns -1.
+    pub acks: i32,
+    pub timeout_ms: i32,
+    /// Enable magic-v2 producer identity/sequence tracking and safe replay of
+    /// an ambiguous send. Requires acknowledgements and max_in_flight <= 5.
+    pub idempotence: bool,
+    /// Data-plane transport; must match the broker's.
+    pub transport: Transport,
+    /// Send partitions that share a broker in one request (api_key 15).
+    /// On by default: it is the difference between paying the per-request
+    /// cost once and paying it per partition.
+    pub batch_partitions: bool,
+}
+
+impl Default for ProducerConfig {
+    fn default() -> Self {
+        ProducerConfig {
+            client_id: "brahmaputra-client".into(),
+            batch_size: 16 * 1024,
+            linger_ms: 5,
+            compression: Compression::Lz4,
+            max_in_flight: 5,
+            acks: 1,
+            timeout_ms: 30_000,
+            idempotence: false,
+            transport: Transport::default(),
+            batch_partitions: true,
+        }
+    }
+}
+
+struct Buffer {
+    records: Vec<(Record, oneshot::Sender<Result<i64, ClientError>>)>,
+    size: usize,
+}
+
+impl Buffer {
+    fn new() -> Self {
+        Buffer {
+            records: Vec::new(),
+            size: 0,
+        }
+    }
+}
+
+struct Inner {
+    router: BrokerRouter,
+    config: ProducerConfig,
+    buffers: Mutex<HashMap<TopicPartition, Buffer>>,
+    rr_counter: AtomicUsize,
+    session: Option<ProducerSession>,
+    sequences: Mutex<HashMap<TopicPartition, SequenceState>>,
+    partition_sends: Mutex<HashMap<TopicPartition, PartitionSendLock>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProducerSession {
+    producer_id: i64,
+    producer_epoch: i16,
+}
+
+#[derive(Debug, Default)]
+struct SequenceState {
+    next_sequence: i32,
+    poisoned: bool,
+}
+
+/// A batching producer over one multiplexed connection.
+pub struct Producer {
+    inner: Arc<Inner>,
+    ticker: Option<JoinHandle<()>>,
+}
+
+impl Producer {
+    pub async fn connect(
+        addr: SocketAddr,
+        config: ProducerConfig,
+    ) -> Result<Producer, ClientError> {
+        if config.max_in_flight == 0 {
+            return Err(ClientError::Configuration(
+                "max_in_flight must be at least one".into(),
+            ));
+        }
+        if config.idempotence && config.acks == 0 {
+            return Err(ClientError::Configuration(
+                "idempotence requires acks=1 or acks=all".into(),
+            ));
+        }
+        if config.idempotence && config.max_in_flight > 5 {
+            return Err(ClientError::Configuration(
+                "idempotence supports at most five in-flight requests".into(),
+            ));
+        }
+        let router = BrokerRouter::connect_with(
+            config.transport,
+            addr,
+            Some(config.client_id.clone()),
+            config.max_in_flight,
+        )
+        .await?;
+        let session = if config.idempotence {
+            let response = router
+                .request_seed(
+                    ApiKey::InitProducerId,
+                    &InitProducerIdRequest::allocate().encode(),
+                )
+                .await?;
+            let response = InitProducerIdResponse::decode(&response)?;
+            ClientError::from_error_code(response.error_code)?;
+            if response.producer_id < 0 || response.producer_epoch < 0 {
+                return Err(ClientError::Idempotence(
+                    "broker returned an invalid producer identity".into(),
+                ));
+            }
+            Some(ProducerSession {
+                producer_id: response.producer_id,
+                producer_epoch: response.producer_epoch,
+            })
+        } else {
+            None
+        };
+        let inner = Arc::new(Inner {
+            router,
+            config,
+            buffers: Mutex::new(HashMap::new()),
+            rr_counter: AtomicUsize::new(0),
+            session,
+            sequences: Mutex::new(HashMap::new()),
+            partition_sends: Mutex::new(HashMap::new()),
+        });
+
+        // Linger ticker: periodically flush every non-empty buffer.
+        let ticker = if inner.config.linger_ms > 0 {
+            let weak = Arc::downgrade(&inner);
+            let interval = Duration::from_millis(inner.config.linger_ms);
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let Some(inner) = weak.upgrade() else { break };
+                    inner.flush_all().await;
+                }
+            }))
+        } else {
+            None
+        };
+
+        Ok(Producer { inner, ticker })
+    }
+
+    /// Send one record; returns its offset (batch base + position), or -1
+    /// with `acks=0`. When `partition` is `None`, a keyed record goes to
+    /// `murmur2(key) % partitions` — so records sharing a key share a
+    /// partition and therefore keep their relative order — and a keyless
+    /// record goes round-robin. This is Kafka's default partitioner.
+    pub async fn send(
+        &self,
+        topic: &str,
+        partition: Option<i32>,
+        key: Option<Bytes>,
+        value: Bytes,
+    ) -> Result<i64, ClientError> {
+        let partition = match (partition, key.as_ref()) {
+            (Some(p), _) => p,
+            (None, Some(key)) => self.key_partition(topic, key).await?,
+            (None, None) => self.round_robin_partition(topic).await?,
+        };
+        let record = Record {
+            key,
+            value,
+            timestamp_delta: 0,
+        };
+        let approx_size = record.value.len() + record.key.as_ref().map_or(0, |k| k.len()) + 16;
+
+        let (tx, rx) = oneshot::channel();
+        let full = {
+            let mut buffers = self.inner.buffers.lock().expect("buffers");
+            let buffer = buffers
+                .entry((topic.to_owned(), partition))
+                .or_insert_with(Buffer::new);
+            buffer.size += approx_size;
+            buffer.records.push((record, tx));
+            buffer.size >= self.inner.config.batch_size
+        };
+        if self.inner.config.linger_ms == 0 {
+            // Sync-send semantics: this record must go out now, so wait for
+            // the partition's turn rather than leaving it to the ticker.
+            self.inner.flush_partition(topic, partition).await;
+        } else if full {
+            // A batch is ready. If another caller is already flushing this
+            // partition, do NOT queue behind it: that flusher drains the
+            // buffer again before it finishes, so it will carry these
+            // records too. Queueing instead turns every concurrent sender
+            // into its own near-empty batch, and each one costs a full
+            // round trip. The linger ticker is the backstop.
+            self.inner.try_flush_partition(topic, partition).await;
+        }
+        rx.await.map_err(|_| ClientError::ConnectionClosed)?
+    }
+
+    /// Flush every buffer now; await before relying on delivery.
+    pub async fn flush(&self) -> Result<(), ClientError> {
+        self.inner.flush_all().await;
+        Ok(())
+    }
+
+    /// Allocated identity when idempotence is enabled.
+    pub fn producer_identity(&self) -> Option<(i64, i16)> {
+        self.inner
+            .session
+            .map(|session| (session.producer_id, session.producer_epoch))
+    }
+
+    async fn round_robin_partition(&self, topic: &str) -> Result<i32, ClientError> {
+        let partitions = self.inner.router.partitions(topic).await?;
+        let index = self.inner.rr_counter.fetch_add(1, Ordering::Relaxed) % partitions.len();
+        Ok(partitions[index])
+    }
+
+    async fn key_partition(&self, topic: &str, key: &[u8]) -> Result<i32, ClientError> {
+        let partitions = self.inner.router.partitions(topic).await?;
+        let index = (murmur2(key) & 0x7fff_ffff) as usize % partitions.len();
+        Ok(partitions[index])
+    }
+}
+
+/// Kafka's `murmur2` (the 32-bit variant its default partitioner uses), so
+/// a key lands on the same partition here as it would there.
+fn murmur2(data: &[u8]) -> u32 {
+    const SEED: u32 = 0x9747b28c;
+    const M: u32 = 0x5bd1_e995;
+    const R: u32 = 24;
+
+    let length = data.len();
+    let mut h: u32 = SEED ^ (length as u32);
+    let chunks = length / 4;
+
+    for i in 0..chunks {
+        let offset = i * 4;
+        let mut k = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        k = k.wrapping_mul(M);
+        k ^= k >> R;
+        k = k.wrapping_mul(M);
+        h = h.wrapping_mul(M);
+        h ^= k;
+    }
+
+    let tail = chunks * 4;
+    match length - tail {
+        3 => {
+            h ^= u32::from(data[tail + 2]) << 16;
+            h ^= u32::from(data[tail + 1]) << 8;
+            h ^= u32::from(data[tail]);
+            h = h.wrapping_mul(M);
+        }
+        2 => {
+            h ^= u32::from(data[tail + 1]) << 8;
+            h ^= u32::from(data[tail]);
+            h = h.wrapping_mul(M);
+        }
+        1 => {
+            h ^= u32::from(data[tail]);
+            h = h.wrapping_mul(M);
+        }
+        _ => {}
+    }
+
+    h ^= h >> 13;
+    h = h.wrapping_mul(M);
+    h ^= h >> 15;
+    h
+}
+
+impl Drop for Producer {
+    fn drop(&mut self) {
+        if let Some(ticker) = self.ticker.take() {
+            ticker.abort();
+        }
+    }
+}
+
+impl Inner {
+    /// Flush every non-empty buffer, batching partitions that share a
+    /// broker into one request.
+    ///
+    /// This is where the per-request cost gets amortised: six partitions on
+    /// one broker cost one round trip, not six. Partitions are still
+    /// serialised per partition (the send lock) so ordering within a
+    /// partition is unchanged — only the framing is shared.
+    async fn flush_all(&self) {
+        let keys: Vec<(String, i32)> = self
+            .buffers
+            .lock()
+            .expect("buffers")
+            .keys()
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        if !self.config.batch_partitions || self.session.is_some() {
+            // Idempotent sends carry per-partition sequences that the
+            // batched path deliberately does not implement, so they keep
+            // the one-request-per-partition route.
+            join_all(
+                keys.iter()
+                    .map(|(topic, partition)| self.flush_partition(topic, *partition)),
+            )
+            .await;
+            return;
+        }
+
+        let (grouped, unroutable) = self.router.group_by_leader(&keys).await;
+        // A partition whose leader is unknown falls back to the single
+        // path, which produces the routing error the caller needs to see.
+        join_all(
+            unroutable
+                .iter()
+                .map(|(topic, partition)| self.flush_partition(topic, *partition)),
+        )
+        .await;
+        // One request per broker would leave a single request in flight per
+        // connection, because a batched flush holds its partitions' send
+        // locks until the response lands. Splitting a broker's partitions
+        // into `max_in_flight` fixed shards keeps that ordering guarantee —
+        // a partition always travels in the same shard, so it still has at
+        // most one request outstanding — while letting the shards overlap.
+        join_all(
+            grouped
+                .into_iter()
+                .flat_map(|(address, partitions)| {
+                    shard_partitions(partitions, self.config.max_in_flight)
+                        .into_iter()
+                        .map(move |shard| (address, shard))
+                })
+                .map(|(address, partitions)| self.flush_broker(address, partitions)),
+        )
+        .await;
+    }
+
+    /// Flush one broker's worth of partitions in a single request.
+    async fn flush_broker(&self, address: SocketAddr, partitions: Vec<(String, i32)>) {
+        // Hold every partition's send lock for the duration: the batched
+        // request is that partition's next append, and a concurrent flush
+        // would reorder it.
+        let mut guards = Vec::with_capacity(partitions.len());
+        for (topic, partition) in &partitions {
+            guards.push(self.send_lock(topic, *partition).lock_owned().await);
+        }
+
+        let mut payload: Vec<(ProduceMultiPartition, Vec<Bytes>)> = Vec::new();
+        let mut waiters: Vec<Vec<oneshot::Sender<Result<i64, ClientError>>>> = Vec::new();
+        let mut counts: Vec<Vec<usize>> = Vec::new();
+        {
+            let mut buffers = self.buffers.lock().expect("buffers");
+            for (topic, partition) in &partitions {
+                let Some(buffer) = buffers.get_mut(&(topic.clone(), *partition)) else {
+                    continue;
+                };
+                if buffer.records.is_empty() {
+                    continue;
+                }
+                let taken = std::mem::replace(buffer, Buffer::new());
+                let (records, senders): (Vec<Record>, Vec<_>) = taken.records.into_iter().unzip();
+                let count = records.len();
+                let batch = RecordBatch::new(0, 0, now_ms(), records)
+                    .with_compression(self.config.compression);
+                payload.push((
+                    ProduceMultiPartition {
+                        topic: topic.clone(),
+                        partition: *partition,
+                        batches_length: 0,
+                    },
+                    vec![batch.encode()],
+                ));
+                waiters.push(senders);
+                counts.push(vec![count]);
+            }
+        }
+        if payload.is_empty() {
+            return;
+        }
+
+        let body = match codec::encode_produce_multi(
+            self.config.acks,
+            self.config.timeout_ms,
+            &payload,
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                fail_all(waiters, ClientError::Protocol(error));
+                return;
+            }
+        };
+
+        if self.config.acks == 0 {
+            let _ = self
+                .router
+                .send_address(address, ApiKey::ProduceMulti, &body)
+                .await;
+            for senders in waiters {
+                for sender in senders {
+                    let _ = sender.send(Ok(-1));
+                }
+            }
+            drop(guards);
+            return;
+        }
+
+        let response = match self
+            .router
+            .request_address(address, ApiKey::ProduceMulti, &body)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                fail_all(waiters, error);
+                drop(guards);
+                return;
+            }
+        };
+        let decoded = match ProduceMultiResponse::decode(&response) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                fail_all(waiters, ClientError::Io(error));
+                drop(guards);
+                return;
+            }
+        };
+
+        // Results come back in request order, so they line up with the
+        // waiters collected above.
+        for (index, senders) in waiters.into_iter().enumerate() {
+            let result = decoded.results.get(index);
+            match result {
+                Some(result) if result.error_code == ec::NONE => {
+                    for (position, sender) in senders.into_iter().enumerate() {
+                        let offset = if result.base_offset < 0 {
+                            -1
+                        } else {
+                            result.base_offset + position as i64
+                        };
+                        let _ = sender.send(Ok(offset));
+                    }
+                }
+                Some(result) => {
+                    let error = ClientError::from_error_code(result.error_code)
+                        .err()
+                        .unwrap_or(ClientError::ConnectionClosed);
+                    for sender in senders {
+                        let _ = sender.send(Err(clone_error(&error)));
+                    }
+                }
+                None => {
+                    for sender in senders {
+                        let _ = sender.send(Err(ClientError::ConnectionClosed));
+                    }
+                }
+            }
+            let _ = &counts;
+        }
+        drop(guards);
+    }
+
+    fn send_lock(&self, topic: &str, partition: i32) -> PartitionSendLock {
+        let mut locks = self.partition_sends.lock().expect("partition send locks");
+        locks
+            .entry((topic.to_owned(), partition))
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Flush this partition, waiting for any in-progress flush first.
+    ///
+    /// Even though the connection can multiplex several requests, a single
+    /// partition is sent strictly in sequence. Other partitions may use the
+    /// configured bounded max_in_flight concurrently.
+    async fn flush_partition(&self, topic: &str, partition: i32) {
+        let send_lock = self.send_lock(topic, partition);
+        let _send_guard = send_lock.lock().await;
+        self.drain_partition(topic, partition).await;
+    }
+
+    /// Flush only if no one else is already flushing this partition. The
+    /// holder drains until the buffer is empty, so skipping here loses
+    /// nothing: our records go out in the holder's next batch.
+    async fn try_flush_partition(&self, topic: &str, partition: i32) {
+        let send_lock = self.send_lock(topic, partition);
+        let Ok(_send_guard) = send_lock.try_lock() else {
+            return;
+        };
+        self.drain_partition(topic, partition).await;
+    }
+
+    /// Send batches back to back until the partition buffer is empty. The
+    /// caller holds the partition's send lock for the whole drain.
+    async fn drain_partition(&self, topic: &str, partition: i32) {
+        while self.send_one_batch(topic, partition).await {}
+    }
+
+    /// Send one batch; `false` means the buffer was empty and nothing went
+    /// out.
+    async fn send_one_batch(&self, topic: &str, partition: i32) -> bool {
+        let buffer = {
+            let mut buffers = self.buffers.lock().expect("buffers");
+            match buffers.get_mut(&(topic.to_owned(), partition)) {
+                Some(b) if !b.records.is_empty() => std::mem::replace(b, Buffer::new()),
+                _ => return false,
+            }
+        };
+        let count = buffer.records.len();
+        let (records, waiters): (Vec<Record>, Vec<_>) = buffer.records.into_iter().unzip();
+        let result = self.produce(topic, partition, records).await;
+        match result {
+            Ok(base) => {
+                trace!(topic, partition, base, count, "batch acked");
+                for (i, waiter) in waiters.into_iter().enumerate() {
+                    let offset = if base < 0 { -1 } else { base + i as i64 };
+                    let _ = waiter.send(Ok(offset));
+                }
+            }
+            Err(e) => {
+                debug!(topic, partition, error = %e, "batch failed");
+                for waiter in waiters {
+                    let _ = waiter.send(Err(ClientError::Server {
+                        code: match &e {
+                            ClientError::Server { code, .. } => *code,
+                            _ => -1,
+                        },
+                        message: e.to_string(),
+                    }));
+                }
+            }
+        }
+        true
+    }
+
+    /// One Produce request carrying one RecordBatch. Returns the batch's
+    /// base offset (-1 for acks=0).
+    async fn produce(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: Vec<Record>,
+    ) -> Result<i64, ClientError> {
+        let record_count = i32::try_from(records.len()).map_err(|_| {
+            ClientError::Idempotence("record count exceeds producer sequence space".into())
+        })?;
+        let sequence = if let Some(session) = self.session {
+            let mut sequences = self.sequences.lock().expect("producer sequences");
+            let state = sequences.entry((topic.to_owned(), partition)).or_default();
+            if state.poisoned {
+                return Err(ClientError::Idempotence(format!(
+                    "partition {topic}-{partition} has an unresolved or fatal prior send"
+                )));
+            }
+            let next = state
+                .next_sequence
+                .checked_add(record_count)
+                .ok_or_else(|| {
+                    ClientError::Idempotence("producer sequence space exhausted".into())
+                })?;
+            Some((session, state.next_sequence, next))
+        } else {
+            None
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut batch =
+            RecordBatch::new(0, 0, now_ms, records).with_compression(self.config.compression);
+        if let Some((session, base_sequence, _)) = sequence {
+            batch = batch.with_producer(session.producer_id, session.producer_epoch, base_sequence);
+        }
+        let req = ProduceRequest {
+            topic: topic.to_owned(),
+            partition,
+            acks: self.config.acks,
+            timeout_ms: self.config.timeout_ms,
+            batches_length: 0, // filled in by encode_produce_request
+        };
+        let body = codec::encode_produce_request(&req, &[batch.encode()])?;
+        if self.config.acks == 0 {
+            // Fire and forget: the broker sends no response.
+            self.router
+                .send_partition(topic, partition, ApiKey::Produce, &body)
+                .await?;
+            return Ok(-1);
+        }
+
+        let resp = match self
+            .produce_with_bounded_retries(topic, partition, &body, sequence.is_some())
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if sequence.is_some() && is_ambiguous_transport(&error) {
+                    self.poison_partition(topic, partition);
+                }
+                return Err(error);
+            }
+        };
+        if resp.error_code != ec::NONE {
+            if sequence.is_some()
+                && matches!(
+                    resp.error_code,
+                    ec::FENCED_PRODUCER_EPOCH
+                        | ec::OUT_OF_ORDER_SEQUENCE
+                        | ec::NOT_ENOUGH_REPLICAS
+                        | ec::INTERNAL
+                )
+            {
+                self.poison_partition(topic, partition);
+            }
+            ClientError::from_error_code(resp.error_code)?;
+        }
+        if let Some((_, base_sequence, next_sequence)) = sequence {
+            let mut sequences = self.sequences.lock().expect("producer sequences");
+            let state = sequences
+                .get_mut(&(topic.to_owned(), partition))
+                .expect("sequence state exists");
+            if state.next_sequence != base_sequence || state.poisoned {
+                return Err(ClientError::Idempotence(
+                    "partition sequence state changed while a send was in flight".into(),
+                ));
+            }
+            state.next_sequence = next_sequence;
+        }
+        Ok(resp.base_offset)
+    }
+
+    async fn produce_with_bounded_retries(
+        &self,
+        topic: &str,
+        partition: i32,
+        body: &[u8],
+        idempotent: bool,
+    ) -> Result<ProduceResponse, ClientError> {
+        let mut retried_stale_leader = false;
+        let mut retried_ambiguous = false;
+        loop {
+            match self.produce_once(topic, partition, body).await {
+                Ok(response)
+                    if response.error_code == ec::NOT_LEADER_OR_FOLLOWER
+                        && !retried_stale_leader =>
+                {
+                    // An explicit NOT_LEADER proves this broker did not append.
+                    retried_stale_leader = true;
+                    self.router.refresh_topic(topic).await?;
+                }
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if idempotent && is_ambiguous_transport(&error) && !retried_ambiguous =>
+                {
+                    // The same magic-v2 bytes (including sequence and
+                    // timestamp) may safely be replayed exactly once.
+                    retried_ambiguous = true;
+                    let _ = self.router.refresh_topic(topic).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn poison_partition(&self, topic: &str, partition: i32) {
+        self.sequences
+            .lock()
+            .expect("producer sequences")
+            .entry((topic.to_owned(), partition))
+            .or_default()
+            .poisoned = true;
+    }
+
+    async fn produce_once(
+        &self,
+        topic: &str,
+        partition: i32,
+        body: &[u8],
+    ) -> Result<ProduceResponse, ClientError> {
+        let response = self
+            .router
+            .request_partition(topic, partition, ApiKey::Produce, body)
+            .await?;
+        ProduceResponse::decode(&response).map_err(|error| {
+            ClientError::Protocol(brahmaputra_protocol::ProtocolError::Message(
+                error.to_string(),
+            ))
+        })
+    }
+}
+
+fn is_ambiguous_transport(error: &ClientError) -> bool {
+    matches!(error, ClientError::Io(_) | ClientError::ConnectionClosed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::murmur2;
+
+    /// The partitioner must be a pure function of the key (per-key
+    /// ordering), must cover the tail-length branches of murmur2, and must
+    /// spread distinct keys. Frozen digests catch accidental changes to the
+    /// `Utils.murmur2` pins the digests; comparing against a live Kafka is
+    /// part of the benchmark harness.
+    #[test]
+    fn murmur2_partitioner_is_stable_and_spreads_keys() {
+        let partition_of = |key: &[u8], partitions: usize| {
+            (murmur2(key) & 0x7fff_ffff) as usize % partitions
+        };
+
+        // Deterministic: the same key always maps to the same partition.
+        for key in [&b""[..], b"a", b"ab", b"abc", b"abcd", b"orders-42"] {
+            assert_eq!(partition_of(key, 6), partition_of(key, 6));
+        }
+
+        // Digests over every tail-length branch (len % 4 = 0..3), taken from
+        // an independent transcription of Kafka's `Utils.murmur2`.
+        assert_eq!(murmur2(b""), 0x106e_08d9);
+        assert_eq!(murmur2(b"a"), 0xa2d0_b27c);
+        assert_eq!(murmur2(b"ab"), 0x12d8_262a);
+        assert_eq!(murmur2(b"abc"), 0x1c94_221b);
+        assert_eq!(murmur2(b"abcd"), 0xb11a_b5f4);
+        assert_eq!(murmur2(b"orders-42"), 0x1c91_3191);
+
+        // Distinct keys are not funnelled into one partition.
+        let spread: std::collections::BTreeSet<usize> = (0..64)
+            .map(|i| partition_of(format!("k{i}").as_bytes(), 8))
+            .collect();
+        assert!(spread.len() > 4, "murmur2 spreads keys across partitions");
+    }
+}
+
+/// Fail every waiter of a batched flush with the same error.
+fn fail_all(
+    waiters: Vec<Vec<oneshot::Sender<Result<i64, ClientError>>>>,
+    error: ClientError,
+) {
+    for senders in waiters {
+        for sender in senders {
+            let _ = sender.send(Err(clone_error(&error)));
+        }
+    }
+}
+
+/// `ClientError` is not `Clone` (it wraps `io::Error`), but every waiter of
+/// a failed batch needs the same failure. Reconstructing preserves the
+/// error code, which is what callers actually branch on.
+fn clone_error(error: &ClientError) -> ClientError {
+    match error {
+        ClientError::Server { code, message } => ClientError::Server {
+            code: *code,
+            message: message.clone(),
+        },
+        ClientError::ConnectionClosed => ClientError::ConnectionClosed,
+        other => ClientError::Server {
+            code: -1,
+            message: other.to_string(),
+        },
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Split one broker's partitions into at most `shards` groups, assigning a
+/// partition to a group by hash so it always lands in the same one.
+fn shard_partitions(partitions: Vec<(String, i32)>, shards: usize) -> Vec<Vec<(String, i32)>> {
+    let shards = shards.max(1).min(partitions.len().max(1));
+    if shards == 1 {
+        return vec![partitions];
+    }
+    let mut groups: Vec<Vec<(String, i32)>> = vec![Vec::new(); shards];
+    for (topic, partition) in partitions {
+        let mut hash = 2166136261_u32;
+        for byte in topic.as_bytes() {
+            hash = (hash ^ u32::from(*byte)).wrapping_mul(16777619);
+        }
+        for byte in partition.to_le_bytes() {
+            hash = (hash ^ u32::from(byte)).wrapping_mul(16777619);
+        }
+        groups[hash as usize % shards].push((topic, partition));
+    }
+    groups.retain(|group| !group.is_empty());
+    groups
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::shard_partitions;
+
+    #[test]
+    fn a_partition_always_lands_in_the_same_shard() {
+        let partitions: Vec<(String, i32)> =
+            (0..12).map(|index| ("orders".to_string(), index)).collect();
+        let first = shard_partitions(partitions.clone(), 4);
+        let second = shard_partitions(partitions.clone(), 4);
+        assert_eq!(first, second);
+        // Every partition is placed exactly once.
+        let mut placed: Vec<(String, i32)> = first.into_iter().flatten().collect();
+        placed.sort();
+        let mut expected = partitions;
+        expected.sort();
+        assert_eq!(placed, expected);
+    }
+
+    #[test]
+    fn fewer_partitions_than_shards_yields_no_empty_groups() {
+        let groups = shard_partitions(vec![("t".to_string(), 0), ("t".to_string(), 1)], 8);
+        assert!(groups.iter().all(|group| !group.is_empty()));
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 2);
+    }
+}

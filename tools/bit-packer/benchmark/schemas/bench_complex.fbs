@@ -1,0 +1,41 @@
+namespace bench_fb;
+
+struct Vec3 {
+  x: int;
+  y: int;
+  z: int;
+}
+
+table Item {
+  id: int;
+  name: string;
+  value: int;
+  weight: int;
+  rarity: string;
+}
+
+table Character {
+  name: string;
+  level: int;
+  hp: int;
+  mp: int;
+  is_alive: bool;
+  position: Vec3;
+  skills: [int];
+  inventory: [Item];
+}
+
+table Guild {
+  name: string;
+  description: string;
+  members: [Character];
+}
+
+table WorldState {
+  world_id: int;
+  seed: string;
+  guilds: [Guild];
+  loot_table: [Item];
+}
+
+root_type WorldState;

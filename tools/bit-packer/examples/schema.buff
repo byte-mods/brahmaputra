@@ -1,0 +1,6 @@
+version = 1.2.2
+class Player {
+  string name;
+  int level;
+  string[] inventory;
+}

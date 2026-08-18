@@ -1,0 +1,34 @@
+version = 1.0.5
+
+class Address {
+    string street;
+    string city;
+    string state;
+    string zipCode;
+    string country;
+}
+
+class Product {
+    int productId;
+    string sku;
+    string name;
+    string description;
+    int priceCents;
+}
+
+class OrderItem {
+    Product product;
+    int quantity;
+    int taxCents;
+    string discountCode;
+}
+
+class Order {
+    int orderId;
+    int timestamp;
+    string customerName;
+    string customerEmail;
+    Address shippingAddress;
+    OrderItem[] items;
+    string internalNotes;
+}

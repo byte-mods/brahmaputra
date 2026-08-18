@@ -1,0 +1,21 @@
+[package]
+name = "brahmaputra-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+brahmaputra-metadata.workspace = true
+openraft.workspace = true
+redb.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

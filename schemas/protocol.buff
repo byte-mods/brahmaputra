@@ -1,0 +1,373 @@
+// Brahmaputra data-plane message schemas (BitPacker).
+//
+// Frame layout on the wire:
+//   length:i32  api_key:i16  api_version:i16  correlation_id:i32  client_id:string  body
+//
+// `body` is a BitPacker-encoded struct from this schema. For requests that
+// carry record batches (Produce) or return them (Fetch), the batch bytes are
+// NOT inside the BitPacker struct — they are appended after the encoded
+// struct as opaque raw bytes, with `batches_length` giving their total size.
+// BitPacker v1.0 has no native bytes type (only int/long/float/double/bool/
+// string/classes/arrays), and varint-encoding bytes would inflate binary
+// payloads ~1.6x — so batches stay zero-copy raw bytes on the wire.
+//
+// Type mapping note: BitPacker `int` -> Rust i32 (zigzag varint),
+// `long` -> Rust i64. All offsets and timestamps are `long`.
+//
+// Generated Rust API per struct:
+//   encode(&self) -> Result<Vec<u8>>
+//   encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<()>
+//   decode(data: &[u8]) -> Result<Self>
+//   decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self>
+//
+// Regenerate: bitpacker --file schemas/protocol.buff --lang rust --out crates/protocol/src/gen --sep
+
+version = 1.0.0
+
+// ---------- Produce (api_key 0) ----------
+
+class ProduceRequest {
+    string topic;
+    int partition;
+    int acks;              // 0, 1, -1 (all)
+    int timeout_ms;
+    long batches_length;   // bytes of raw record-batch data trailing the struct
+}
+
+class ProduceResponse {
+    string topic;
+    int partition;
+    int error_code;        // 0 = none
+    long base_offset;
+    long log_append_time_ms;
+}
+
+// ---------- Fetch (api_key 1) ----------
+
+class FetchRequest {
+    string topic;
+    int partition;
+    long fetch_offset;
+    int max_bytes;
+    int max_wait_ms;       // long poll
+    int min_bytes;         // return early when at least this many bytes ready
+}
+
+class FetchResponse {
+    string topic;
+    int partition;
+    int error_code;
+    long high_watermark;
+    long last_stable_offset;
+    long batches_length;   // bytes of raw record-batch data trailing the struct
+}
+
+// ---------- ListOffsets (api_key 2) ----------
+
+class ListOffsetsRequest {
+    string topic;
+    int partition;
+    long timestamp;        // -1 = latest, -2 = earliest, else unix ms
+}
+
+class ListOffsetsResponse {
+    string topic;
+    int partition;
+    int error_code;
+    long offset;
+    long timestamp;
+}
+
+// ---------- Metadata (api_key 3) ----------
+
+class BrokerInfo {
+    int broker_id;
+    string host;
+    int port;
+}
+
+class PartitionInfo {
+    int partition;
+    int leader;            // broker_id, -1 = no leader
+    int[] replicas;
+    int[] isr;
+    int leader_epoch;
+}
+
+class TopicInfo {
+    string name;
+    int error_code;
+    PartitionInfo[] partitions;
+}
+
+class MetadataRequest {
+    string[] topics;       // empty = all topics
+}
+
+class MetadataResponse {
+    BrokerInfo[] brokers;
+    int controller_id;
+    TopicInfo[] topics;
+}
+
+// ---------- JoinGroup (api_key 7) ----------
+
+class GroupMemberInfo {
+    string member_id;
+    string[] subscription_topics;
+}
+
+class JoinGroupRequest {
+    string group_id;
+    int session_timeout_ms;
+    int rebalance_timeout_ms;
+    string member_id;        // empty = new member, coordinator assigns one
+    string[] subscription_topics;
+}
+
+class JoinGroupResponse {
+    int error_code;
+    int generation;
+    string member_id;
+    string leader_member_id;
+    GroupMemberInfo[] members;   // populated only for the group leader
+}
+
+// ---------- SyncGroup (api_key 8) ----------
+
+class AssignedPartition {
+    string topic;
+    int partition;
+}
+
+class MemberAssignment {
+    string member_id;
+    AssignedPartition[] partitions;
+}
+
+class SyncGroupRequest {
+    string group_id;
+    int generation;
+    string member_id;
+    MemberAssignment[] assignments;  // set by group leader only, empty from others
+}
+
+class SyncGroupResponse {
+    int error_code;
+    AssignedPartition[] assignment;  // this member's assignment
+}
+
+// ---------- Heartbeat (api_key 9) ----------
+
+class HeartbeatRequest {
+    string group_id;
+    int generation;
+    string member_id;
+}
+
+class HeartbeatResponse {
+    int error_code;
+}
+
+// ---------- OffsetCommit (api_key 10) ----------
+
+class OffsetCommitEntry {
+    string topic;
+    int partition;
+    long offset;
+}
+
+class OffsetCommitRequest {
+    string group_id;
+    int generation;          // -1 = commit outside an active membership
+    string member_id;
+    OffsetCommitEntry[] offsets;
+}
+
+class OffsetCommitResponse {
+    int error_code;
+}
+
+// ---------- OffsetFetch (api_key 11) ----------
+
+class OffsetFetchRequest {
+    string group_id;
+    AssignedPartition[] partitions;  // empty = all partitions of the group
+}
+
+class OffsetFetchEntry {
+    string topic;
+    int partition;
+    long offset;             // -1 = no committed offset
+}
+
+class OffsetFetchResponse {
+    int error_code;
+    OffsetFetchEntry[] offsets;
+}
+
+// ---------- ListGroups (api_key 12) ----------
+// Answered per broker: a broker reports only the groups whose coordinator
+// partition it currently leads, so a cluster-wide listing is the union of
+// every broker's response.
+
+class ListedGroup {
+    string group_id;
+    string state;                    // Empty|PreparingRebalance|AwaitingSync|Stable|Dead
+    int generation;
+    int member_count;
+    int coordinator_partition;       // __consumer_offsets partition
+}
+
+class ListGroupsRequest {
+    string[] states;                 // empty = every state
+}
+
+class ListGroupsResponse {
+    int error_code;
+    ListedGroup[] groups;
+}
+
+// ---------- DescribeGroup (api_key 13) ----------
+// Answered by the group's coordinator only; carries membership plus every
+// committed offset the coordinator holds for the group. Lag is derived by
+// the caller against each partition's log end offset (ListOffsets).
+
+class DescribedMember {
+    string member_id;
+    string[] subscription_topics;
+    AssignedPartition[] assignment;
+}
+
+class DescribeGroupRequest {
+    string group_id;
+}
+
+class DescribeGroupResponse {
+    int error_code;
+    string group_id;
+    string state;
+    int generation;
+    string leader_member_id;
+    int coordinator_partition;
+    DescribedMember[] members;
+    OffsetFetchEntry[] offsets;      // committed offsets, -1 = none
+}
+
+// ---------- ProduceMulti (api_key 15) / FetchMulti (api_key 16) ----------
+// The multi-partition forms of Produce and Fetch, and the ones clients
+// should use. A client talking to one broker about six partitions sends
+// one request instead of six, which is the difference between paying the
+// per-request cost once and paying it per partition — the dominant cost
+// at small record sizes.
+//
+// Raw record batches trail the encoded struct exactly as they do for the
+// single-partition APIs, concatenated in the order the partitions appear;
+// each partition's `batches_length` says how many bytes belong to it.
+
+class ProduceMultiPartition {
+    string topic;
+    int partition;
+    long batches_length;
+}
+
+class ProduceMultiRequest {
+    int acks;
+    int timeout_ms;
+    ProduceMultiPartition[] partitions;
+}
+
+class ProduceMultiResult {
+    string topic;
+    int partition;
+    int error_code;
+    long base_offset;
+    long log_append_time_ms;
+}
+
+class ProduceMultiResponse {
+    ProduceMultiResult[] results;
+}
+
+class FetchMultiPartition {
+    string topic;
+    int partition;
+    long fetch_offset;
+    int max_bytes;
+}
+
+class FetchMultiRequest {
+    int max_wait_ms;          // long poll, applied across the whole request
+    int min_bytes;            // return early once this many bytes are ready
+    FetchMultiPartition[] partitions;
+}
+
+class FetchMultiResult {
+    string topic;
+    int partition;
+    int error_code;
+    long high_watermark;
+    long last_stable_offset;
+    long batches_length;      // bytes of this partition's trailing batches
+}
+
+class FetchMultiResponse {
+    FetchMultiResult[] results;
+}
+
+// ---------- ApiVersions (api_key 14) ----------
+// The one API a broker must answer regardless of the requested api_version:
+// it is how a client discovers what the broker speaks before sending
+// anything else, which is what makes a rolling upgrade possible.
+
+class ApiVersionRange {
+    int api_key;
+    int min_version;
+    int max_version;
+}
+
+class ApiVersionsRequest {
+    string client_software_name;
+    string client_software_version;
+}
+
+class ApiVersionsResponse {
+    int error_code;
+    ApiVersionRange[] api_versions;
+    string broker_version;
+    int throttle_time_ms;          // >0 when a quota delayed this response
+}
+
+// ---------- Internal __consumer_offsets record payloads ----------
+// Not wire APIs: encoded with the same generated code and stored as record
+// values in the internal offsets topic. The record value is prefixed with a
+// one-byte kind tag: 1 = OffsetCommitRecord, 2 = GroupMetadataRecord,
+// 3 = TombstoneRecord. The record key carries "group/topic/partition"
+// (or just "group" for metadata) to enable later log compaction.
+
+class OffsetCommitRecord {
+    string group_id;
+    string topic;
+    int partition;
+    long offset;
+    long commit_timestamp_ms;
+}
+
+class GroupMemberRecord {
+    string member_id;
+    string[] subscription_topics;
+    AssignedPartition[] assignment;
+}
+
+class GroupMetadataRecord {
+    string group_id;
+    int generation;
+    string leader_member_id;
+    GroupMemberRecord[] members;
+}
+
+class TombstoneRecord {
+    string group_id;
+    string topic;            // empty = whole-group tombstone
+    int partition;
+}

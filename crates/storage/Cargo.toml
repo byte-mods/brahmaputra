@@ -1,0 +1,15 @@
+[package]
+name = "brahmaputra-storage"
+description = "Segmented append-only per-partition log for Brahmaputra (pure, sync, no tokio)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+brahmaputra-protocol.workspace = true
+bytes.workspace = true
+crc32c.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

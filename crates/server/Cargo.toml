@@ -1,0 +1,27 @@
+[package]
+name = "brahmaputra-server"
+description = "Brahmaputra broker binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "brahmaputra-server"
+path = "src/main.rs"
+
+[dependencies]
+brahmaputra-broker.workspace = true
+brahmaputra-client.workspace = true
+brahmaputra-controller.workspace = true
+brahmaputra-dashboard.workspace = true
+brahmaputra-metrics.workspace = true
+brahmaputra-metadata.workspace = true
+brahmaputra-storage.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+getrandom = "0.3"
+serde_json.workspace = true
+tracing-subscriber.workspace = true

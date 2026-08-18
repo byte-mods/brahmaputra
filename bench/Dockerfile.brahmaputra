@@ -1,0 +1,18 @@
+# Runtime image for the benchmark: a Linux release build of the broker and
+# CLI, so Brahmaputra and Kafka are measured under the same kernel, the same
+# container limits and the same filesystem.
+#
+# Built by scripts/bench-vs-kafka.sh, which compiles the workspace in a
+# cargo-cached builder container first.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY brahmaputra-server /usr/local/bin/brahmaputra-server
+COPY brahmaputra-cli /usr/local/bin/brahmaputra-cli
+RUN chmod +x /usr/local/bin/brahmaputra-server /usr/local/bin/brahmaputra-cli
+
+EXPOSE 9092
+ENTRYPOINT ["/usr/local/bin/brahmaputra-server"]

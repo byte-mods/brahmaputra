@@ -1,0 +1,9 @@
+Brahmaputra
+Copyright 2026 The Brahmaputra Authors
+
+This product includes software developed at
+The Brahmaputra project (https://github.com/brahmaputra).
+
+This product bundles the BitPacker schema compiler source under
+tools/bit-packer/, which is distributed under its own license; see
+tools/bit-packer/LICENSE for details.

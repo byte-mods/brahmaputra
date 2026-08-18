@@ -1,0 +1,10 @@
+[package]
+name = "brahmaputra-metrics"
+description = "In-process metric registry, time-series ring store and Prometheus export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dashmap.workspace = true
+serde.workspace = true
