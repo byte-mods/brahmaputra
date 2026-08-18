@@ -132,6 +132,7 @@ fn cluster_image() -> ClusterMetadata {
             },
         )]),
         users: BTreeMap::new(),
+        acls: Default::default(),
         jwt_secret: None,
     }
 }

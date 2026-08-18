@@ -391,3 +391,18 @@ pub struct TombstoneRecord {
 	pub partition: i32,
 	
 }
+
+#[derive(Debug, Default, Clone)]
+pub struct AuthenticateRequest {
+	pub username: String,
+	pub password: String,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AuthenticateResponse {
+	pub error_code: i32,
+	pub principal: String,
+	pub role: String,
+	
+}

@@ -13,8 +13,6 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
 use brahmaputra_metadata::Role;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -73,25 +71,18 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Hash a password for storage. Each call salts randomly, so the same
-/// password never produces the same hash twice.
+/// Hash a password for storage.
+///
+/// The implementation lives in `brahmaputra-metadata`, beside the user
+/// records it protects, so the data plane can check the same passwords
+/// without depending on this HTTP layer.
 pub fn hash_password(password: &str) -> Result<String, AuthError> {
-    let salt = SaltString::generate(&mut rand_core::OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|_| AuthError::InvalidCredentials)
+    brahmaputra_metadata::password::hash(password).map_err(|_| AuthError::InvalidCredentials)
 }
 
-/// Constant-time-ish verification via argon2; a wrong password and an
-/// unparseable hash both fail the same way.
+/// Verify a password against a stored hash. See [`hash_password`].
 pub fn verify_password(password: &str, stored_hash: &str) -> bool {
-    let Ok(parsed) = PasswordHash::new(stored_hash) else {
-        return false;
-    };
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok()
+    brahmaputra_metadata::password::verify(password, stored_hash)
 }
 
 /// Issue a session token for a user the caller has already authenticated.

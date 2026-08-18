@@ -248,6 +248,7 @@ fn proxy_cluster_image(proxy_port: u16) -> ClusterMetadata {
             },
         )]),
         users: BTreeMap::new(),
+        acls: Default::default(),
         jwt_secret: None,
     }
 }

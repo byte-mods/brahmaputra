@@ -3419,3 +3419,117 @@ impl TombstoneRecord {
 		Ok(obj)
 	}
 }
+
+impl AuthenticateRequest {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_str(&self.username);
+		
+		
+		
+		buf.put_str(&self.password);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = AuthenticateRequest::default();
+		
+		
+		obj.username = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.password = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		Ok(obj)
+	}
+}
+
+impl AuthenticateResponse {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_i32(*&self.error_code);
+		
+		
+		
+		buf.put_str(&self.principal);
+		
+		
+		
+		buf.put_str(&self.role);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = AuthenticateResponse::default();
+		
+		
+		obj.error_code = buf.get_i32();
+		
+		
+		
+		obj.principal = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.role = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		Ok(obj)
+	}
+}

@@ -65,6 +65,9 @@ pub enum ApiKey {
     ProduceMulti = 15,
     /// Fetch from many partitions in one request. The form clients use.
     FetchMulti = 16,
+    /// Bind a principal to this connection; everything after is
+    /// authorized as that principal.
+    Authenticate = 17,
 }
 
 impl ApiKey {
@@ -87,6 +90,7 @@ impl ApiKey {
             14 => Ok(ApiKey::ApiVersions),
             15 => Ok(ApiKey::ProduceMulti),
             16 => Ok(ApiKey::FetchMulti),
+            17 => Ok(ApiKey::Authenticate),
             other => Err(ProtocolError::UnknownApiKey(other)),
         }
     }
@@ -149,6 +153,12 @@ pub mod error_code {
     pub const ILLEGAL_GENERATION: i32 = 16;
     /// The coordinator is still replaying the offsets log; retry shortly.
     pub const COORDINATOR_LOAD_IN_PROGRESS: i32 = 17;
+    /// No valid credentials were presented, or the broker requires
+    /// authentication and this connection has not authenticated.
+    pub const SASL_AUTHENTICATION_FAILED: i32 = 18;
+    /// The principal is known but not permitted this operation on this
+    /// resource.
+    pub const AUTHORIZATION_FAILED: i32 = 19;
 }
 
 /// Encode `header` + `body` as a complete frame including the `length:i32`

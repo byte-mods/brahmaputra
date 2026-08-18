@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brahmaputra_protocol::{
-    validate_batch_header, RecordBatch, BATCH_HEADER_LEN, MIN_BATCH_LENGTH,
+    validate_batch_header, Record, RecordBatch, BATCH_HEADER_LEN, MIN_BATCH_LENGTH,
 };
 use bytes::{Bytes, BytesMut};
 
@@ -335,6 +335,10 @@ pub struct LogConfig {
     pub flush_interval_messages: Option<u64>,
     /// fsync the active segment at least this often, in milliseconds.
     pub flush_interval_ms: Option<u64>,
+    /// Keep only the latest record per key instead of deleting whole aged
+    /// segments — Kafka's `cleanup.policy=compact`. Set for the internal
+    /// offsets topic, whose keys are rewritten forever.
+    pub compact: bool,
     /// How often the high-watermark checkpoint reaches disk, in
     /// milliseconds. Kafka's equivalent is
     /// `replica.high.watermark.checkpoint.interval.ms`, default 5 s. Zero
@@ -354,6 +358,7 @@ impl Default for LogConfig {
             retention_bytes: None,
             flush_interval_messages: None,
             flush_interval_ms: None,
+            compact: false,
             hwm_checkpoint_interval_ms: DEFAULT_HWM_CHECKPOINT_INTERVAL_MS,
         }
     }
@@ -1992,5 +1997,348 @@ mod region_tests {
             .map(|region| region.len)
             .sum();
         assert_eq!(all, on_disk);
+    }
+}
+
+impl Log {
+    /// Keep only the most recent record for each key among the sealed
+    /// segments, discarding the versions it supersedes.
+    ///
+    /// This is what stops a keyed topic — `__consumer_offsets` above all —
+    /// from growing without bound. A group that commits every five seconds
+    /// writes the same key forever; without compaction the disk fills, and
+    /// coordinator failover gets slower without limit because it replays
+    /// every superseded commit.
+    ///
+    /// Offsets are preserved exactly. A surviving record is rewritten as a
+    /// single-record batch at its original offset, so compaction leaves
+    /// gaps rather than renumbering anything — a consumer's committed
+    /// offset still means what it meant before. Records without a key
+    /// cannot be superseded and are always kept.
+    ///
+    /// Only sealed segments below the high watermark are touched: the
+    /// active segment is still being appended to, and uncommitted records
+    /// are not ours to discard.
+    pub fn compact(&mut self) -> Result<usize, StorageError> {
+        if self.segments.len() < 2 {
+            return Ok(0);
+        }
+        let boundary = self
+            .segments
+            .last()
+            .map(|active| active.base_offset)
+            .unwrap_or(self.next_offset)
+            .min(self.high_watermark);
+        if boundary <= self.start_offset {
+            return Ok(0);
+        }
+
+        // Pass one: the offset of the last record written for each key.
+        let mut latest: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
+        let mut survivors: Vec<(i64, Record, i64)> = Vec::new();
+        for segment_index in 0..self.segments.len() - 1 {
+            let mut position = 0u64;
+            let segment = &self.segments[segment_index];
+            while position + BATCH_HEADER_LEN as u64 <= segment.size {
+                let mut header = [0u8; BATCH_HEADER_LEN];
+                segment.read_at(position, &mut header)?;
+                let batch_length = i32::from_be_bytes(header[8..12].try_into().unwrap());
+                if batch_length < MIN_BATCH_LENGTH as i32 {
+                    break;
+                }
+                let total_len = BATCH_HEADER_LEN + batch_length as usize;
+                if position + total_len as u64 > segment.size {
+                    break;
+                }
+                let mut buf = BytesMut::zeroed(total_len);
+                segment.read_at(position, &mut buf)?;
+                let mut bytes = buf.freeze();
+                let batch = RecordBatch::decode(&mut bytes)?;
+                let base = batch.base_offset;
+                let max_timestamp = batch.max_timestamp;
+                for (index, record) in batch.records.into_iter().enumerate() {
+                    let offset = base + index as i64;
+                    // Records at or above the boundary are uncommitted or
+                    // belong to the still-open range: collect them so they
+                    // are rewritten untouched, but never let them supersede
+                    // anything, and never discard them.
+                    if offset < boundary {
+                        if let Some(key) = record.key.as_ref() {
+                            latest.insert(key.to_vec(), offset);
+                        }
+                    }
+                    survivors.push((offset, record, max_timestamp));
+                }
+                position += total_len as u64;
+            }
+        }
+
+        // Pass two: drop every record a later one supersedes.
+        let before = survivors.len();
+        survivors.retain(|(offset, record, _)| {
+            // Above the boundary nothing is eligible; below it, a record
+            // survives only if it is the latest for its key. A record with
+            // no key has no successor that could replace it.
+            if *offset >= boundary {
+                return true;
+            }
+            match record.key.as_ref() {
+                Some(key) => latest.get(key.as_ref() as &[u8]) == Some(offset),
+                None => true,
+            }
+        });
+        let removed = before - survivors.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+
+        // Rewrite the sealed range as one segment based at the first
+        // surviving offset. Gaps are expected and are what a fetch already
+        // copes with: it returns the first batch covering the requested
+        // offset.
+        let new_base = survivors
+            .first()
+            .map(|(offset, _, _)| *offset)
+            .unwrap_or(boundary);
+        let staging = self.dir.join("compaction");
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        fs::create_dir_all(&staging)?;
+        let mut rebuilt = Segment::open(&staging, new_base, self.config.index_interval_bytes)?;
+        for (offset, record, max_timestamp) in &survivors {
+            let batch = RecordBatch::new(*offset, 0, *max_timestamp, vec![record.clone()]);
+            rebuilt.append_batch(*offset, &batch.encode(), *max_timestamp)?;
+        }
+        rebuilt.sync()?;
+        drop(rebuilt);
+
+        // Swap: remove the old sealed segments, move the rebuilt one into
+        // place, and reopen it.
+        let active = self.segments.pop().expect("active segment");
+        for segment in self.segments.drain(..) {
+            segment.delete()?;
+        }
+        for suffix in ["log", "index", "timeindex"] {
+            let from = staging.join(format!("{new_base:020}.{suffix}"));
+            let to = self.dir.join(format!("{new_base:020}.{suffix}"));
+            if from.exists() {
+                fs::rename(&from, &to)?;
+            }
+        }
+        fs::remove_dir_all(&staging)?;
+        let reopened = Segment::open(&self.dir, new_base, self.config.index_interval_bytes)?;
+        self.segments.push(reopened);
+        self.segments.push(active);
+        self.start_offset = new_base;
+        Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use brahmaputra_protocol::Record;
+
+    fn config() -> LogConfig {
+        LogConfig {
+            // Small segments so a handful of records seal several of them.
+            segment_bytes: 256,
+            index_interval_bytes: 64,
+            hwm_checkpoint_interval_ms: 0,
+            ..LogConfig::default()
+        }
+    }
+
+    fn keyed(key: &str, value: &str) -> RecordBatch {
+        RecordBatch::new(
+            0,
+            0,
+            1,
+            vec![Record::with_key(
+                Bytes::from(key.to_string()),
+                Bytes::from(value.to_string()),
+                0,
+            )],
+        )
+    }
+
+    fn read_all(log: &Log) -> Vec<(i64, Option<Vec<u8>>, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut offset = log.log_start_offset();
+        while offset < log.log_end_offset() {
+            let batches = log.read(offset, 1 << 20).expect("read");
+            if batches.is_empty() {
+                break;
+            }
+            for raw in batches {
+                let mut bytes = raw;
+                let batch = RecordBatch::decode(&mut bytes).expect("decode");
+                for (index, record) in batch.records.into_iter().enumerate() {
+                    let record_offset = batch.base_offset + index as i64;
+                    offset = record_offset + 1;
+                    out.push((
+                        record_offset,
+                        record.key.map(|key| key.to_vec()),
+                        record.value.to_vec(),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// The point of compaction: repeated writes to one key stop
+    /// accumulating, and the surviving value is the newest.
+    #[test]
+    fn only_the_latest_value_per_key_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for round in 0..12 {
+            log.append(keyed("group-a", &format!("v{round}"))).unwrap();
+            log.append(keyed("group-b", &format!("w{round}"))).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        let before = read_all(&log).len();
+
+        let removed = log.compact().unwrap();
+        assert!(removed > 0, "compaction must remove superseded records");
+
+        let after = read_all(&log);
+        assert!(
+            after.len() < before,
+            "the log must shrink: {before} -> {}",
+            after.len()
+        );
+        for key in ["group-a", "group-b"] {
+            let surviving: Vec<_> = after
+                .iter()
+                .filter(|(_, k, _)| k.as_deref() == Some(key.as_bytes()))
+                .collect();
+            assert_eq!(surviving.len(), 1, "one record must survive for {key}");
+        }
+        // The newest values, not the oldest.
+        let values: Vec<String> = after
+            .iter()
+            .map(|(_, _, value)| String::from_utf8_lossy(value).into_owned())
+            .collect();
+        assert!(values.contains(&"v11".to_string()), "got {values:?}");
+        assert!(values.contains(&"w11".to_string()), "got {values:?}");
+    }
+
+    /// Offsets must not be renumbered: a committed offset has to keep
+    /// meaning the same record after compaction runs.
+    #[test]
+    fn surviving_records_keep_their_original_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for round in 0..10 {
+            log.append(keyed("k", &format!("v{round}"))).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        let end_before = log.log_end_offset();
+        let before = read_all(&log);
+        let newest = before.last().cloned().expect("a last record");
+
+        log.compact().unwrap();
+
+        assert_eq!(
+            log.log_end_offset(),
+            end_before,
+            "the log end must not move"
+        );
+        let after = read_all(&log);
+
+        // Nothing is renumbered: every record still sits at an offset it
+        // originally occupied, carrying the value it originally had. That
+        // is what makes a previously committed offset still meaningful.
+        for (offset, key, value) in &after {
+            assert!(
+                before.contains(&(*offset, key.clone(), value.clone())),
+                "offset {offset} was renumbered or its value changed"
+            );
+        }
+        // Compaction only touches sealed segments, so the newest write —
+        // which is still in the open active segment — is untouched.
+        assert!(
+            after.contains(&newest),
+            "the newest record must still be readable at its own offset"
+        );
+        assert!(after.len() < before.len(), "the log must still shrink");
+    }
+
+    /// Records with no key have nothing that can supersede them.
+    #[test]
+    fn keyless_records_are_never_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for round in 0..10 {
+            log.append(RecordBatch::new(
+                0,
+                0,
+                1,
+                vec![Record::new(format!("plain-{round}").into_bytes())],
+            ))
+            .unwrap();
+            log.append(keyed("k", &format!("v{round}"))).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+
+        log.compact().unwrap();
+
+        let keyless = read_all(&log)
+            .into_iter()
+            .filter(|(_, key, _)| key.is_none())
+            .count();
+        assert_eq!(keyless, 10, "every keyless record must survive");
+    }
+
+    /// Uncommitted records are not ours to discard.
+    #[test]
+    fn records_above_the_high_watermark_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for round in 0..12 {
+            log.append(keyed("k", &format!("v{round}"))).unwrap();
+        }
+        // Commit only the first few.
+        log.set_high_watermark(3).unwrap();
+        let end_before = log.log_end_offset();
+
+        log.compact().unwrap();
+
+        assert_eq!(log.log_end_offset(), end_before);
+        // Everything at or above the watermark is still on disk.
+        log.set_high_watermark(end_before).unwrap();
+        let offsets: Vec<i64> = read_all(&log)
+            .into_iter()
+            .map(|(offset, _, _)| offset)
+            .collect();
+        for offset in 3..end_before {
+            assert!(offsets.contains(&offset), "offset {offset} must survive");
+        }
+    }
+
+    /// Compacting a log with nothing to remove must not disturb it.
+    #[test]
+    fn compaction_is_a_no_op_when_every_key_is_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for round in 0..10 {
+            log.append(keyed(&format!("k{round}"), "v")).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        let before = read_all(&log);
+
+        assert_eq!(log.compact().unwrap(), 0);
+        assert_eq!(read_all(&log), before);
+    }
+}
+
+impl Log {
+    /// Whether this log keeps the latest record per key rather than
+    /// deleting aged segments.
+    pub fn is_compacted(&self) -> bool {
+        self.config.compact
     }
 }

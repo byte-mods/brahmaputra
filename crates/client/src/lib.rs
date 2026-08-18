@@ -26,6 +26,6 @@ pub use group_consumer::{Assignor, ConsumedRecord, GroupConsumer};
 pub use producer::{Producer, ProducerConfig};
 pub use quic::tune_for_datacenter as tune_quic_transport;
 pub use replica::{ReplicaClient, ReplicaFetchResult};
-pub use transport::{Connection, Transport};
+pub use transport::{Connection, Credentials, Transport};
 
 pub use brahmaputra_protocol::gen::{BrokerInfo, MetadataResponse, PartitionInfo, TopicInfo};

@@ -36,6 +36,85 @@ impl Role {
     }
 }
 
+/// What an ACL rule governs.
+///
+/// Deliberately narrower than Kafka's resource taxonomy: topics and groups
+/// are what a client actually touches on this data plane, and `Cluster`
+/// covers the operations that are not scoped to either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceType {
+    Topic,
+    Group,
+    Cluster,
+}
+
+/// What a principal may do to a resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AclOperation {
+    /// Consume from a topic, or use a consumer group.
+    Read,
+    /// Produce to a topic.
+    Write,
+    /// See that a resource exists, and read its offsets and metadata.
+    Describe,
+    /// Any of the above.
+    All,
+}
+
+impl AclOperation {
+    /// Whether a rule granting `self` covers a request needing `wanted`.
+    pub fn covers(self, wanted: AclOperation) -> bool {
+        self == AclOperation::All || self == wanted
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AclPermission {
+    Allow,
+    Deny,
+}
+
+/// One access-control rule.
+///
+/// `principal` and `resource_name` accept `*` as "any". Evaluation is
+/// deny-overrides-allow, and the default with no matching rule is denial —
+/// so adding authentication cannot silently widen access.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AclRule {
+    pub principal: String,
+    pub resource_type: ResourceType,
+    pub resource_name: String,
+    pub operation: AclOperation,
+    pub permission: AclPermission,
+}
+
+impl AclRule {
+    /// A stable identity for the rule, so adding the same rule twice does
+    /// not accumulate duplicates in the metadata log.
+    pub fn key(&self) -> String {
+        format!(
+            "{}|{:?}|{}|{:?}|{:?}",
+            self.principal, self.resource_type, self.resource_name, self.operation, self.permission
+        )
+    }
+
+    fn matches(
+        &self,
+        principal: &str,
+        resource_type: ResourceType,
+        resource_name: &str,
+        operation: AclOperation,
+    ) -> bool {
+        (self.principal == "*" || self.principal == principal)
+            && self.resource_type == resource_type
+            && (self.resource_name == "*" || self.resource_name == resource_name)
+            && self.operation.covers(operation)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserRecord {
     pub username: String,
@@ -87,6 +166,10 @@ pub struct ClusterMetadata {
     pub topics: BTreeMap<String, TopicMetadata>,
     #[serde(default)]
     pub users: BTreeMap<String, UserRecord>,
+    /// Access-control rules, keyed by [`AclRule::key`] so re-adding a rule
+    /// replaces it rather than duplicating it.
+    #[serde(default)]
+    pub acls: BTreeMap<String, AclRule>,
     pub jwt_secret: Option<String>,
 }
 
@@ -167,6 +250,7 @@ impl ClusterMetadata {
             brokers: BTreeMap::new(),
             topics: BTreeMap::new(),
             users: BTreeMap::new(),
+            acls: BTreeMap::new(),
             jwt_secret: None,
         }
     }
@@ -386,6 +470,15 @@ impl ClusterMetadata {
                     leader_epoch: partition_metadata.leader_epoch,
                 }
             }
+            MetadataCommand::PutAcl { rule } => {
+                let key = rule.key();
+                self.acls.insert(key.clone(), rule);
+                MetadataEvent::AclChanged { key }
+            }
+            MetadataCommand::DeleteAcl { key } => {
+                self.acls.remove(&key);
+                MetadataEvent::AclChanged { key }
+            }
             MetadataCommand::PutUser { user } => {
                 validate_username(&user.username)?;
                 let username = user.username.clone();
@@ -508,6 +601,12 @@ pub enum MetadataCommand {
     PutUser {
         user: UserRecord,
     },
+    PutAcl {
+        rule: AclRule,
+    },
+    DeleteAcl {
+        key: String,
+    },
     DeleteUser {
         username: String,
     },
@@ -547,6 +646,9 @@ pub enum MetadataEvent {
     },
     UserChanged {
         username: String,
+    },
+    AclChanged {
+        key: String,
     },
     UserDeleted {
         username: String,
@@ -949,5 +1051,224 @@ mod tests {
         assert_eq!(error, MetadataError::UnknownBroker(99));
         assert_eq!(cache.offset(), 1);
         assert_eq!(cache.snapshot().controller_id, None);
+    }
+}
+
+impl ClusterMetadata {
+    /// Whether `principal` may perform `operation` on a resource.
+    ///
+    /// Deny rules win over allow rules, and the default is denial. An
+    /// `Admin` is exempt: someone who can already rewrite the ACLs gains
+    /// nothing from being blocked by them, and it keeps a cluster
+    /// recoverable after a bad rule.
+    pub fn is_authorized(
+        &self,
+        principal: &str,
+        resource_type: ResourceType,
+        resource_name: &str,
+        operation: AclOperation,
+    ) -> bool {
+        if self
+            .users
+            .get(principal)
+            .is_some_and(|user| user.role == Role::Admin)
+        {
+            return true;
+        }
+        let matching = || {
+            self.acls
+                .values()
+                .filter(|rule| rule.matches(principal, resource_type, resource_name, operation))
+        };
+        if matching().any(|rule| rule.permission == AclPermission::Deny) {
+            return false;
+        }
+        matching().any(|rule| rule.permission == AclPermission::Allow)
+    }
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+
+    fn cluster() -> ClusterMetadata {
+        ClusterMetadata::new("test")
+    }
+
+    fn rule(
+        principal: &str,
+        resource_name: &str,
+        operation: AclOperation,
+        permission: AclPermission,
+    ) -> AclRule {
+        AclRule {
+            principal: principal.to_string(),
+            resource_type: ResourceType::Topic,
+            resource_name: resource_name.to_string(),
+            operation,
+            permission,
+        }
+    }
+
+    fn put(cluster: &mut ClusterMetadata, rule: AclRule) {
+        cluster.acls.insert(rule.key(), rule);
+    }
+
+    /// The default has to be denial. Adding authentication must never be
+    /// able to widen access by accident.
+    #[test]
+    fn no_rule_means_denied() {
+        let cluster = cluster();
+        assert!(!cluster.is_authorized("alice", ResourceType::Topic, "orders", AclOperation::Read));
+    }
+
+    #[test]
+    fn an_allow_rule_grants_exactly_its_operation() {
+        let mut cluster = cluster();
+        put(
+            &mut cluster,
+            rule("alice", "orders", AclOperation::Read, AclPermission::Allow),
+        );
+        assert!(cluster.is_authorized("alice", ResourceType::Topic, "orders", AclOperation::Read));
+        assert!(!cluster.is_authorized(
+            "alice",
+            ResourceType::Topic,
+            "orders",
+            AclOperation::Write
+        ));
+        assert!(!cluster.is_authorized("alice", ResourceType::Topic, "other", AclOperation::Read));
+        assert!(!cluster.is_authorized("bob", ResourceType::Topic, "orders", AclOperation::Read));
+    }
+
+    #[test]
+    fn deny_beats_allow_however_the_rules_were_added() {
+        let mut cluster = cluster();
+        put(
+            &mut cluster,
+            rule("*", "*", AclOperation::All, AclPermission::Allow),
+        );
+        put(
+            &mut cluster,
+            rule(
+                "mallory",
+                "secrets",
+                AclOperation::Read,
+                AclPermission::Deny,
+            ),
+        );
+        assert!(cluster.is_authorized(
+            "mallory",
+            ResourceType::Topic,
+            "orders",
+            AclOperation::Read
+        ));
+        assert!(!cluster.is_authorized(
+            "mallory",
+            ResourceType::Topic,
+            "secrets",
+            AclOperation::Read
+        ));
+    }
+
+    #[test]
+    fn all_covers_every_operation_and_wildcards_match_any_name() {
+        let mut cluster = cluster();
+        put(
+            &mut cluster,
+            rule("service", "*", AclOperation::All, AclPermission::Allow),
+        );
+        for operation in [
+            AclOperation::Read,
+            AclOperation::Write,
+            AclOperation::Describe,
+        ] {
+            assert!(cluster.is_authorized("service", ResourceType::Topic, "anything", operation));
+        }
+        // Still scoped by resource type.
+        assert!(!cluster.is_authorized("service", ResourceType::Group, "g", AclOperation::Read));
+    }
+
+    /// An admin must not be able to lock themselves out with a bad rule.
+    #[test]
+    fn an_admin_is_exempt_from_deny_rules() {
+        let mut cluster = cluster();
+        cluster.users.insert(
+            "root".to_string(),
+            UserRecord {
+                username: "root".to_string(),
+                password_hash: "x".to_string(),
+                role: Role::Admin,
+                force_password_change: false,
+            },
+        );
+        put(
+            &mut cluster,
+            rule("*", "*", AclOperation::All, AclPermission::Deny),
+        );
+        assert!(cluster.is_authorized("root", ResourceType::Topic, "orders", AclOperation::Write));
+    }
+
+    /// Re-adding an identical rule replaces it rather than accumulating.
+    #[test]
+    fn rules_are_idempotent() {
+        let mut cluster = cluster();
+        let same = rule("alice", "orders", AclOperation::Read, AclPermission::Allow);
+        put(&mut cluster, same.clone());
+        put(&mut cluster, same);
+        assert_eq!(cluster.acls.len(), 1);
+    }
+}
+
+/// Password hashing for the cluster user store.
+///
+/// This lives beside [`UserRecord`] rather than in the dashboard because
+/// the data plane authenticates against the same users, and a broker must
+/// not have to depend on the HTTP layer to check a password.
+pub mod password {
+    use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+    use argon2::Argon2;
+
+    /// Hash a password for storage. Each call salts randomly, so the same
+    /// password never produces the same hash twice.
+    pub fn hash(password: &str) -> Result<String, &'static str> {
+        let salt = SaltString::generate(&mut rand_core::OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|hash| hash.to_string())
+            .map_err(|_| "cannot hash password")
+    }
+
+    /// Verify a password against a stored hash. A wrong password and an
+    /// unparseable hash fail identically, so neither is distinguishable to
+    /// a caller probing for valid accounts.
+    pub fn verify(password: &str, stored_hash: &str) -> bool {
+        let Ok(parsed) = PasswordHash::new(stored_hash) else {
+            return false;
+        };
+        Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_hash_verifies_only_against_its_own_password() {
+            let stored = hash("correct horse").expect("hash");
+            assert!(verify("correct horse", &stored));
+            assert!(!verify("wrong horse", &stored));
+        }
+
+        #[test]
+        fn the_same_password_hashes_differently_each_time() {
+            assert_ne!(hash("repeat").unwrap(), hash("repeat").unwrap());
+        }
+
+        #[test]
+        fn a_corrupt_hash_fails_rather_than_panicking() {
+            assert!(!verify("anything", "not-a-hash"));
+        }
     }
 }

@@ -92,6 +92,10 @@ pub struct BrokerConfig {
     /// Shared metric registry. The broker records into it; the dashboard
     /// and Prometheus endpoint read from it.
     pub metrics: Metrics,
+    /// Refuse any request from a connection that has not authenticated, and
+    /// authorize every request against the cluster ACLs. Off by default,
+    /// matching Kafka PLAINTEXT listeners; production must turn it on.
+    pub require_auth: bool,
 }
 
 impl Default for BrokerConfig {
@@ -112,6 +116,7 @@ impl Default for BrokerConfig {
             transport: Transport::default(),
             quota: QuotaConfig::default(),
             metrics: Metrics::default(),
+            require_auth: false,
         }
     }
 }
@@ -677,13 +682,17 @@ impl Broker {
                 actor::complete_pending_replica_reset(&dir)?;
                 let mut log_config = self.config.log_config.clone();
                 if topic == crate::group::OFFSETS_TOPIC {
+                    // Every commit rewrites the same key, so this topic
+                    // must be compacted or it grows without bound and
+                    // coordinator failover slows without limit.
+                    log_config.compact = true;
                     // A committed consumer offset that disappears on restart
                     // is a correctness break, not a lost optimisation, and
                     // commits arrive far too slowly for an eager checkpoint
                     // to cost anything. User topics keep the periodic one.
                     log_config.hwm_checkpoint_interval_ms = 0;
                 }
-                let mut log = Log::open(&dir, log_config)?;
+                let mut log = Log::open(&dir, log_config.clone())?;
                 if !self.config.replication_enabled {
                     // A standalone leader owns the only replica, so every
                     // complete batch recovered from disk is committed. A
@@ -698,9 +707,12 @@ impl Broker {
                 }
                 // The same periodic tick drives retention and the time-based
                 // flush policy, so either one being configured starts it.
-                let retention_enabled = self.config.log_config.retention_ms.is_some()
-                    || self.config.log_config.retention_bytes.is_some()
-                    || self.config.log_config.flush_interval_ms.is_some();
+                // The same tick drives retention, the timed flush and
+                // compaction, so any of them being configured starts it.
+                let retention_enabled = log_config.retention_ms.is_some()
+                    || log_config.retention_bytes.is_some()
+                    || log_config.flush_interval_ms.is_some()
+                    || log_config.compact;
                 let replicated_commit =
                     self.config.metadata_cache.is_some() && self.config.replication_enabled;
                 let (handle, task) = match (replicated_commit, retention_enabled) {
@@ -709,13 +721,13 @@ impl Broker {
                         self.config.channel_capacity,
                         Some(self.config.retention_check_interval),
                         dir.clone(),
-                        self.config.log_config.clone(),
+                        log_config.clone(),
                     ),
                     (true, false) => actor::spawn_cluster(
                         log,
                         self.config.channel_capacity,
                         dir.clone(),
-                        self.config.log_config.clone(),
+                        log_config.clone(),
                     ),
                     (false, true) => actor::spawn_with_retention(
                         log,
@@ -1187,6 +1199,8 @@ where
     // Bound how many requests one connection may have in flight, so a
     // single client cannot spawn unbounded work on the broker.
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_CONNECTION));
+    // One identity per connection, shared by its concurrent requests.
+    let session = Arc::new(handlers::ConnectionSession::new());
     let mut requests = JoinSet::new();
 
     while let Some(frame) = stream.next().await {
@@ -1205,9 +1219,10 @@ where
         };
         let broker = Arc::clone(&broker);
         let responses = responses_tx.clone();
+        let session = Arc::clone(&session);
         requests.spawn(async move {
             let _permit = permit;
-            if let Some(body) = handlers::dispatch(&broker, &header, payload).await {
+            if let Some(body) = handlers::dispatch(&broker, &header, payload, &session).await {
                 let response_header = FrameHeader {
                     api_key: header.api_key,
                     api_version: header.api_version,

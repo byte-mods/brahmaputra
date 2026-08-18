@@ -18,6 +18,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use brahmaputra_protocol::gen::{AuthenticateRequest, AuthenticateResponse};
 use brahmaputra_protocol::ApiKey;
 use bytes::Bytes;
 
@@ -128,5 +129,35 @@ mod tests {
         }
         assert!("udp".parse::<Transport>().is_err());
         assert_eq!(Transport::default(), Transport::Tcp);
+    }
+}
+
+/// Credentials a client presents when the broker requires authentication.
+///
+/// The password crosses the wire in the clear, exactly as SASL/PLAIN does,
+/// so a broker refuses this on a plaintext listener. Use `tcp-tls` or
+/// `quic`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl Connection {
+    /// Bind a principal to this connection. Every later request on it is
+    /// authorized as that principal.
+    pub async fn authenticate(&self, credentials: &Credentials) -> Result<String, ClientError> {
+        let request = AuthenticateRequest {
+            username: credentials.username.clone(),
+            password: credentials.password.clone(),
+        };
+        let body = request
+            .encode()
+            .map_err(|error| ClientError::Configuration(error.to_string()))?;
+        let response = self.request(ApiKey::Authenticate, &body).await?;
+        let response = AuthenticateResponse::decode(&response)
+            .map_err(|error| ClientError::Configuration(error.to_string()))?;
+        ClientError::from_error_code(response.error_code)?;
+        Ok(response.principal)
     }
 }

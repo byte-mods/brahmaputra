@@ -4,11 +4,13 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use brahmaputra_client::Transport;
 use brahmaputra_protocol::codec;
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
-    ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, BrokerInfo, DescribeGroupRequest,
-    DescribeGroupResponse, FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse,
+    ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, AuthenticateRequest,
+    AuthenticateResponse, BrokerInfo, DescribeGroupRequest, DescribeGroupResponse,
+    FetchMultiRequest, FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse,
     JoinGroupRequest, JoinGroupResponse, ListGroupsRequest, ListGroupsResponse, ListOffsetsRequest,
     ListOffsetsResponse, MetadataRequest, MetadataResponse, OffsetCommitRequest,
     OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse, PartitionInfo, ProduceResponse,
@@ -30,11 +32,221 @@ use crate::group::{coordinator_partition, CoordinatorShard, OFFSETS_TOPIC};
 use crate::producer_id::ProducerIdError;
 use crate::quota::QuotaKind;
 use crate::server::Broker;
+use brahmaputra_metadata::{AclOperation, ResourceType};
 use brahmaputra_metrics::{names, MetricKey};
 
 /// Sentinels for `ListOffsetsRequest.timestamp` (Kafka convention).
 const TIMESTAMP_LATEST: i64 = -1;
 const TIMESTAMP_EARLIEST: i64 = -2;
+
+/// Who a connection is acting as.
+///
+/// A connection starts anonymous. `Authenticate` binds a principal to it,
+/// and every later request on that connection is authorized as that
+/// principal. Requests are dispatched concurrently, so the identity lives
+/// behind a lock — set once, read often.
+#[derive(Debug, Default)]
+pub struct ConnectionSession {
+    principal: std::sync::RwLock<Option<String>>,
+}
+
+impl ConnectionSession {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn principal(&self) -> Option<String> {
+        self.principal
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_principal(&self, principal: String) {
+        *self
+            .principal
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(principal);
+    }
+}
+
+/// Authorize `operation` on a resource for whoever this connection is.
+///
+/// With authentication disabled this is a no-op, which is what keeps a
+/// single-node development broker usable. With it enabled the default is
+/// denial: an unauthenticated connection is refused, and an authenticated
+/// one still needs a matching ACL.
+pub(crate) fn authorize(
+    broker: &Broker,
+    session: &ConnectionSession,
+    resource_type: ResourceType,
+    resource_name: &str,
+    operation: AclOperation,
+) -> Result<(), i32> {
+    if !broker.config().require_auth {
+        return Ok(());
+    }
+    let Some(principal) = session.principal() else {
+        return Err(ec::SASL_AUTHENTICATION_FAILED);
+    };
+    let Some(cache) = broker.metadata_cache() else {
+        // Authentication was demanded but there is no user store to check
+        // against: refuse rather than fall open.
+        return Err(ec::AUTHORIZATION_FAILED);
+    };
+    if cache
+        .snapshot()
+        .is_authorized(&principal, resource_type, resource_name, operation)
+    {
+        Ok(())
+    } else {
+        Err(ec::AUTHORIZATION_FAILED)
+    }
+}
+
+/// What a request needs permission to do, derived from its body.
+///
+/// Authorization is decided in one place rather than inside each handler:
+/// a security check that is scattered is a security check that is one day
+/// forgotten. The cost is decoding the small request struct here as well
+/// as in the handler — never the record batches, which are the bulk.
+fn required_access(api_key: ApiKey, body: &Bytes) -> Vec<(ResourceType, String, AclOperation)> {
+    match api_key {
+        ApiKey::Produce => codec::decode_produce_request(body.clone())
+            .map(|(request, _)| vec![(ResourceType::Topic, request.topic, AclOperation::Write)])
+            .unwrap_or_default(),
+        ApiKey::ProduceMulti => codec::decode_produce_multi(body.clone())
+            .map(|(request, _)| {
+                request
+                    .partitions
+                    .into_iter()
+                    .map(|partition| (ResourceType::Topic, partition.topic, AclOperation::Write))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ApiKey::Fetch => FetchRequest::decode(body)
+            .map(|request| vec![(ResourceType::Topic, request.topic, AclOperation::Read)])
+            .unwrap_or_default(),
+        ApiKey::FetchMulti => FetchMultiRequest::decode(body)
+            .map(|request| {
+                request
+                    .partitions
+                    .into_iter()
+                    .map(|partition| (ResourceType::Topic, partition.topic, AclOperation::Read))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ApiKey::ListOffsets => ListOffsetsRequest::decode(body)
+            .map(|request| vec![(ResourceType::Topic, request.topic, AclOperation::Describe)])
+            .unwrap_or_default(),
+        ApiKey::JoinGroup => JoinGroupRequest::decode(body)
+            .map(|request| vec![(ResourceType::Group, request.group_id, AclOperation::Read)])
+            .unwrap_or_default(),
+        ApiKey::SyncGroup => SyncGroupRequest::decode(body)
+            .map(|request| vec![(ResourceType::Group, request.group_id, AclOperation::Read)])
+            .unwrap_or_default(),
+        ApiKey::Heartbeat => HeartbeatRequest::decode(body)
+            .map(|request| vec![(ResourceType::Group, request.group_id, AclOperation::Read)])
+            .unwrap_or_default(),
+        ApiKey::OffsetCommit => OffsetCommitRequest::decode(body)
+            .map(|request| vec![(ResourceType::Group, request.group_id, AclOperation::Read)])
+            .unwrap_or_default(),
+        ApiKey::OffsetFetch => OffsetFetchRequest::decode(body)
+            .map(|request| {
+                vec![(
+                    ResourceType::Group,
+                    request.group_id,
+                    AclOperation::Describe,
+                )]
+            })
+            .unwrap_or_default(),
+        ApiKey::DescribeGroup => DescribeGroupRequest::decode(body)
+            .map(|request| {
+                vec![(
+                    ResourceType::Group,
+                    request.group_id,
+                    AclOperation::Describe,
+                )]
+            })
+            .unwrap_or_default(),
+        // Cluster-wide reads, and the inter-broker replication APIs. The
+        // replication APIs serve raw log bytes above the high watermark, so
+        // leaving them open would hand out every topic to anyone who can
+        // speak the protocol.
+        ApiKey::ReplicaFetch | ApiKey::OffsetsForLeaderEpoch => {
+            vec![(
+                ResourceType::Cluster,
+                "cluster".to_string(),
+                AclOperation::Read,
+            )]
+        }
+        ApiKey::ListGroups => vec![(
+            ResourceType::Cluster,
+            "cluster".to_string(),
+            AclOperation::Describe,
+        )],
+        ApiKey::Metadata => vec![(
+            ResourceType::Cluster,
+            "cluster".to_string(),
+            AclOperation::Describe,
+        )],
+        ApiKey::InitProducerId => vec![(
+            ResourceType::Cluster,
+            "cluster".to_string(),
+            AclOperation::Write,
+        )],
+        // Answered before authentication: a client has to be able to
+        // discover versions and to authenticate at all.
+        ApiKey::ApiVersions | ApiKey::Authenticate => Vec::new(),
+    }
+}
+
+/// Bind a principal to this connection.
+async fn authenticate(broker: &Broker, body: Bytes, session: &ConnectionSession) -> Bytes {
+    let respond = |error_code, principal: &str, role: &str| {
+        Bytes::from(
+            AuthenticateResponse {
+                error_code,
+                principal: principal.to_owned(),
+                role: role.to_owned(),
+            }
+            .encode()
+            .unwrap_or_default(),
+        )
+    };
+    let request = match AuthenticateRequest::decode(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(%error, "undecodable Authenticate request");
+            return respond(ec::INVALID_REQUEST, "", "");
+        }
+    };
+    // A password in the clear is only meaningful under encryption. Refusing
+    // it on a plaintext listener stops a deployment from believing it has
+    // authentication when it is handing credentials to the network.
+    if broker.config().transport == Transport::Tcp {
+        warn!("Authenticate refused on a plaintext listener");
+        return respond(ec::SASL_AUTHENTICATION_FAILED, "", "");
+    }
+    let Some(cache) = broker.metadata_cache() else {
+        return respond(ec::SASL_AUTHENTICATION_FAILED, "", "");
+    };
+    let image = cache.snapshot();
+    let Some(user) = image.users.get(&request.username) else {
+        // Same response as a wrong password: do not reveal which accounts
+        // exist.
+        return respond(ec::SASL_AUTHENTICATION_FAILED, "", "");
+    };
+    if !brahmaputra_metadata::password::verify(&request.password, &user.password_hash) {
+        return respond(ec::SASL_AUTHENTICATION_FAILED, "", "");
+    }
+    session.set_principal(user.username.clone());
+    respond(
+        ec::NONE,
+        &user.username,
+        &format!("{:?}", user.role).to_lowercase(),
+    )
+}
 
 /// A response as the buffers it will be written from.
 ///
@@ -99,7 +311,12 @@ impl From<Vec<Bytes>> for ResponseBody {
 
 /// Dispatch one decoded frame to its handler. `None` means "no response"
 /// (only `Produce` with `acks=0`).
-pub async fn dispatch(broker: &Broker, header: &FrameHeader, body: Bytes) -> Option<ResponseBody> {
+pub async fn dispatch(
+    broker: &Broker,
+    header: &FrameHeader,
+    body: Bytes,
+    session: &ConnectionSession,
+) -> Option<ResponseBody> {
     // ApiVersions answers at any requested version on purpose: it is how a
     // client discovers what this broker speaks, so refusing it for a version
     // mismatch would make version negotiation impossible — the exact
@@ -107,8 +324,23 @@ pub async fn dispatch(broker: &Broker, header: &FrameHeader, body: Bytes) -> Opt
     if header.api_key == ApiKey::ApiVersions {
         return Some(api_versions(broker, body).await.into());
     }
+    // Authenticating is how a connection stops being anonymous, so it
+    // cannot itself require a principal.
+    if header.api_key == ApiKey::Authenticate {
+        return Some(authenticate(broker, body, session).await.into());
+    }
     if header.api_version != API_VERSION {
         return Some(encode_error_for(header.api_key, ec::UNSUPPORTED_VERSION).into());
+    }
+    // Everything past this point is authorized. With authentication off
+    // this costs one branch; with it on, an unauthenticated or unpermitted
+    // request never reaches a handler.
+    if broker.config().require_auth {
+        for (resource_type, name, operation) in required_access(header.api_key, &body) {
+            if let Err(error_code) = authorize(broker, session, resource_type, &name, operation) {
+                return Some(encode_error_for(header.api_key, error_code).into());
+            }
+        }
     }
     let client_id = header.client_id.as_deref();
     broker.metrics().increment(
@@ -136,6 +368,7 @@ pub async fn dispatch(broker: &Broker, header: &FrameHeader, body: Bytes) -> Opt
         ApiKey::ListGroups => Some(list_groups(broker, body).await.into()),
         ApiKey::DescribeGroup => Some(describe_group(broker, body).await.into()),
         ApiKey::ApiVersions => Some(api_versions(broker, body).await.into()),
+        ApiKey::Authenticate => Some(authenticate(broker, body, session).await.into()),
         ApiKey::ProduceMulti => crate::multi::produce_multi(broker, body, client_id)
             .await
             .map(ResponseBody::from),
@@ -229,6 +462,11 @@ pub(crate) fn encode_error_for(api_key: ApiKey, error_code: i32) -> Bytes {
             error_code,
             generation: -1,
             coordinator_partition: -1,
+            ..Default::default()
+        }
+        .encode(),
+        ApiKey::Authenticate => AuthenticateResponse {
+            error_code,
             ..Default::default()
         }
         .encode(),
@@ -1474,6 +1712,7 @@ fn api_name(api_key: ApiKey) -> &'static str {
         ApiKey::ApiVersions => "api_versions",
         ApiKey::ProduceMulti => "produce_multi",
         ApiKey::FetchMulti => "fetch_multi",
+        ApiKey::Authenticate => "authenticate",
     }
 }
 

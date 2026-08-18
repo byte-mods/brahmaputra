@@ -681,6 +681,18 @@ async fn run(
                 }
             } => {
                 let current = log.as_mut().expect("partition log");
+                // A compacted topic keeps the latest record per key rather
+                // than dropping whole aged segments; deleting by age would
+                // throw away offsets a group still depends on.
+                if current.is_compacted() {
+                    match current.compact() {
+                        Ok(removed) if removed > 0 => {
+                            debug!(removed, "compaction removed superseded records");
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!(%error, "compaction pass failed"),
+                    }
+                }
                 match current.apply_retention() {
                     Ok(deleted) if deleted > 0 => {
                         debug!(deleted, start = current.log_start_offset(), "retention applied");

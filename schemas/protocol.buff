@@ -371,3 +371,24 @@ class TombstoneRecord {
     string topic;            // empty = whole-group tombstone
     int partition;
 }
+
+// ---------- Authenticate (api_key 17) ----------
+// Binds a principal to the connection. Every later request on that
+// connection is authorized as that principal; a connection that never
+// authenticates is anonymous, which is refused outright when the broker
+// runs with authentication required.
+//
+// The password crosses the wire in the clear, so this is only meaningful
+// over `tcp-tls` or `quic`. That is the same trade SASL/PLAIN makes in
+// Kafka, and the broker refuses it on a plaintext listener.
+
+class AuthenticateRequest {
+    string username;
+    string password;
+}
+
+class AuthenticateResponse {
+    int error_code;
+    string principal;
+    string role;
+}

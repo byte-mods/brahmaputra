@@ -136,6 +136,9 @@ async fn serve_connection(
     connection: quinn::Connection,
     max_frame_bytes: usize,
 ) {
+    // QUIC multiplexes every request of a connection onto its own stream,
+    // so the identity belongs to the connection, not the stream.
+    let session = Arc::new(handlers::ConnectionSession::new());
     let peer = connection.remote_address();
     debug!(%peer, "quic connection accepted");
     let mut streams = JoinSet::new();
@@ -144,8 +147,11 @@ async fn serve_connection(
             bi = connection.accept_bi() => match bi {
                 Ok((send, recv)) => {
                     let broker = Arc::clone(&broker);
+                    let session = Arc::clone(&session);
                     streams.spawn(async move {
-                        if let Err(error) = serve_request(broker, send, recv, max_frame_bytes).await {
+                        if let Err(error) =
+                            serve_request(broker, send, recv, max_frame_bytes, &session).await
+                        {
                             debug!(%error, "quic request stream failed");
                         }
                     });
@@ -158,8 +164,11 @@ async fn serve_connection(
             uni = connection.accept_uni() => match uni {
                 Ok(recv) => {
                     let broker = Arc::clone(&broker);
+                    let session = Arc::clone(&session);
                     streams.spawn(async move {
-                        if let Err(error) = serve_oneway(broker, recv, max_frame_bytes).await {
+                        if let Err(error) =
+                            serve_oneway(broker, recv, max_frame_bytes, &session).await
+                        {
                             debug!(%error, "quic oneway stream failed");
                         }
                     });
@@ -180,9 +189,10 @@ async fn serve_request(
     mut send: quinn::SendStream,
     recv: quinn::RecvStream,
     max_frame_bytes: usize,
+    session: &handlers::ConnectionSession,
 ) -> Result<(), String> {
     let (header, body) = read_frame(recv, max_frame_bytes).await?;
-    let Some(response) = handlers::dispatch(&broker, &header, body).await else {
+    let Some(response) = handlers::dispatch(&broker, &header, body, session).await else {
         return Ok(());
     };
     // Write the prefix and then each of the response's own buffers, rather
@@ -227,9 +237,10 @@ async fn serve_oneway(
     broker: Arc<Broker>,
     recv: quinn::RecvStream,
     max_frame_bytes: usize,
+    session: &handlers::ConnectionSession,
 ) -> Result<(), String> {
     let (header, body) = read_frame(recv, max_frame_bytes).await?;
-    if let Some(_response) = handlers::dispatch(&broker, &header, body).await {
+    if let Some(_response) = handlers::dispatch(&broker, &header, body, session).await {
         warn!(api_key = ?header.api_key, "response dropped: request arrived on a oneway stream");
     }
     Ok(())

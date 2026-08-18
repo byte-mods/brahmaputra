@@ -103,6 +103,14 @@ struct Args {
     #[arg(long, default_value_t = 30_000)]
     quota_max_throttle_ms: u64,
 
+    /// Require every data-plane connection to authenticate, and authorize
+    /// each request against the cluster ACLs. Off by default, matching a
+    /// Kafka PLAINTEXT listener; production should enable it. Needs a
+    /// cluster (the user store lives in the Raft metadata) and an
+    /// encrypted transport, since credentials cross the wire in the clear.
+    #[arg(long, default_value_t = false)]
+    require_auth: bool,
+
     /// Port for the metrics API and dashboard (DESIGN.md §9.2). 0
     /// disables it.
     #[arg(long, default_value_t = DEFAULT_HTTP_PORT)]
@@ -260,6 +268,7 @@ async fn run_standalone(args: Args) -> Result<()> {
         retention_check_interval: Duration::from_millis(args.retention_check_interval_ms.max(1)),
         transport: args.transport,
         quota,
+        require_auth: args.require_auth,
         ..BrokerConfig::default()
     };
 
@@ -351,6 +360,7 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
             ),
             transport: args.transport,
             quota,
+            require_auth: args.require_auth,
             metadata_cache: Some(metadata_cache.clone()),
             replication_enabled: true,
             ..BrokerConfig::default()

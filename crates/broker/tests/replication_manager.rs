@@ -71,6 +71,7 @@ fn cluster_image(
             },
         )]),
         users: BTreeMap::new(),
+        acls: Default::default(),
         jwt_secret: None,
     }
 }
