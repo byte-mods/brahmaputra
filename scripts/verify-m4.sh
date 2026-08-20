@@ -36,6 +36,8 @@ WORK_DIR="$(mktemp -d "$TEMP_ROOT/brahmaputra-m4.XXXXXX")"
 CLUSTER_ID="m4-live-$(perl -e 'printf "%08x%04x", time, int(rand(65536))')"
 SERVER_EXE="$ROOT/target/debug/brahmaputra-server.exe"
 CLI_EXE="$ROOT/target/debug/brahmaputra-cli.exe"
+[[ -x "$SERVER_EXE" ]] || SERVER_EXE="$ROOT/target/debug/brahmaputra-server"
+[[ -x "$CLI_EXE" ]] || CLI_EXE="$ROOT/target/debug/brahmaputra-cli"
 
 declare -A DATA_PORT CONTROL_PORT NODE_PID NODE_DATA NODE_STDOUT NODE_STDERR NODE_RESTARTS
 declare -A CONSUMER_PID CONSUMER_LOG CONSUMER_ERR

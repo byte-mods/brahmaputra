@@ -33,7 +33,7 @@ ACKS="${ACKS:-1}"
 IN_FLIGHT="${IN_FLIGHT:-4096}"
 CPUS="${CPUS:-4}"
 MEMORY="${MEMORY:-4g}"
-KAFKA_IMAGE="${KAFKA_IMAGE:-apache/kafka:3.9.0}"
+KAFKA_IMAGE="${KAFKA_IMAGE:-apache/kafka:4.3.1}"
 NETWORK="${NETWORK:-brahma-bench}"
 MAX_BYTES="${MAX_BYTES:-16777216}"
 

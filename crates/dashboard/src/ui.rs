@@ -395,7 +395,9 @@ function topicChanged() {
 function fillTopicPicker(topics) {
   knownTopics = topics.map(t => ({
     name: t.name,
-    partitions: (t.partitions && t.partitions.length) || t.partition_count || 0
+    partitions: typeof t.partitions === "number"
+      ? t.partitions
+      : (t.partitions && t.partitions.length) || t.partition_count || 0
   }));
   const select = document.getElementById("mtopic");
   const previous = select.value;

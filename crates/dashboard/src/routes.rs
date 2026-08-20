@@ -638,7 +638,12 @@ async fn read_partition_messages(
     from: Option<i64>,
     limit: usize,
 ) -> Vec<BrowsedMessage> {
-    let Ok(handle) = broker.partition(topic, partition) else {
+    // The dashboard is a read-only observer of the broker it is served by.
+    // In cluster mode `partition()` is deliberately leader-only for client
+    // requests, which made an "all partitions" browse silently omit every
+    // locally replicated follower partition. Replica reads are still capped
+    // at the committed high watermark, so expose any local replica here.
+    let Ok(handle) = broker.replica_partition(topic, partition) else {
         return Vec::new();
     };
     let Ok((log_start, _log_end, high_watermark)) = handle.offsets().await else {
@@ -784,7 +789,7 @@ async fn topic_stream(
     // rather than replaying history the operator did not ask for.
     let mut positions: Vec<(i32, i64)> = Vec::new();
     for partition in &partitions {
-        let position = match broker.partition(&stream_topic, *partition) {
+        let position = match broker.replica_partition(&stream_topic, *partition) {
             Ok(handle) => handle
                 .offsets()
                 .await

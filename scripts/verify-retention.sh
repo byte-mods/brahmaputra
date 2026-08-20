@@ -122,7 +122,8 @@ segment_count() {
 }
 
 log_bytes() {
-  find "$DATA_DIR/$1-0" -name '*.log' -printf '%s\n' 2>/dev/null \
+  find "$DATA_DIR/$1-0" -name '*.log' \
+    -exec sh -c 'for file do wc -c < "$file"; done' sh {} + 2>/dev/null \
     | awk '{ total += $1 } END { print total + 0 }'
 }
 

@@ -22,7 +22,9 @@ ACKS="${ACKS:-1}"
 IN_FLIGHT="${IN_FLIGHT:-64}"
 CPUS="${CPUS:-4}"
 MEMORY="${MEMORY:-4g}"
-KAFKA_IMAGE="${KAFKA_IMAGE:-apache/kafka:3.9.0}"
+KAFKA_IMAGE="${KAFKA_IMAGE:-apache/kafka:4.3.1}"
+KAFKA_BROKER_HEAP="${KAFKA_BROKER_HEAP:--Xmx2g -Xms2g}"
+KAFKA_BROKER_GC="${KAFKA_BROKER_GC:--XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:G1HeapRegionSize=16M -XX:MetaspaceSize=96m -XX:MinMetaspaceFreeRatio=50 -XX:MaxMetaspaceFreeRatio=80 -XX:+ExplicitGCInvokesConcurrent -Djava.awt.headless=true}"
 NETWORK="${NETWORK:-brahma-bench}"
 # One record is 1 MiB, so frames and fetches must be allowed past the
 # defaults on both sides or the run is a config error, not a measurement.
@@ -113,7 +115,8 @@ start_kafka() {
     -e KAFKA_MESSAGE_MAX_BYTES="$MAX_BYTES" \
     -e KAFKA_REPLICA_FETCH_MAX_BYTES="$MAX_BYTES" \
     -e KAFKA_SOCKET_REQUEST_MAX_BYTES=104857600 \
-    -e KAFKA_HEAP_OPTS="-Xmx3g -Xms3g" \
+    -e KAFKA_HEAP_OPTS="$KAFKA_BROKER_HEAP" \
+    -e KAFKA_JVM_PERFORMANCE_OPTS="$KAFKA_BROKER_GC" \
     "$KAFKA_IMAGE" >/dev/null || die "cannot start Kafka"
   local deadline=$((SECONDS + 150))
   while (( SECONDS < deadline )); do

@@ -32,6 +32,7 @@ tracing.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 
-[target."cfg(unix)".dependencies]
-# Only for `sendfile` on the plaintext fetch path.
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only for Linux `sendfile` on the plaintext fetch path. Other platforms use
+# the portable buffered fallback because their sendfile APIs differ.
 libc = "0.2"

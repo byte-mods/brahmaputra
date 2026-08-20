@@ -334,12 +334,22 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
         .local_addr()
         .context("failed to read controller listener address")?;
 
+    // Keep coalesced heartbeat checkpoints inside the configured lease
+    // margin. At the defaults this remains one second; tight but valid
+    // sub-second sessions checkpoint more often instead of being fenced by a
+    // fixed one-second batching window.
+    let heartbeat_checkpoint_interval = Duration::from_millis(
+        args.session_timeout_ms
+            .saturating_sub(args.heartbeat_interval_ms)
+            .clamp(1, 1_000),
+    );
     let controller_config = ControllerConfig::new(
         cluster.node_id,
         cluster.cluster_id.clone(),
         cluster.peers.clone(),
     )
-    .with_data_dir(args.data_dir.join("controller"));
+    .with_data_dir(args.data_dir.join("controller"))
+    .with_heartbeat_checkpoint_interval(heartbeat_checkpoint_interval);
     let controller = ControllerNode::new(controller_config)
         .await
         .context("failed to start controller")?;
@@ -444,7 +454,6 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
 
     let lifecycle_controller = Arc::clone(&controller);
     let lifecycle_broker = Arc::clone(&broker);
-    let lifecycle_cache = metadata_cache.clone();
     let lifecycle_settings = cluster.clone();
     let lifecycle_shutdown = shutdown_rx.clone();
     let lifecycle_epoch = broker_epoch_tx;
@@ -452,11 +461,27 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
         broker_lifecycle(
             lifecycle_controller,
             lifecycle_broker,
-            lifecycle_cache,
             lifecycle_settings,
             registration,
             lifecycle_epoch,
             lifecycle_shutdown,
+        )
+        .await
+    });
+
+    // Controller/expiry maintenance may wait on a lagging local Raft state
+    // machine or a remote metadata write. Keep it independent from broker
+    // lease renewal so neither operation can starve heartbeats.
+    let maintenance_controller = Arc::clone(&controller);
+    let maintenance_settings = cluster.clone();
+    let maintenance_epoch = broker_epoch_rx.clone();
+    let maintenance_shutdown = shutdown_rx.clone();
+    components.spawn(async move {
+        controller_maintenance(
+            maintenance_controller,
+            maintenance_settings,
+            maintenance_epoch,
+            maintenance_shutdown,
         )
         .await
     });
@@ -616,7 +641,6 @@ fn node_id_to_broker_id(node_id: NodeId) -> Result<i32> {
 async fn broker_lifecycle(
     controller: Arc<ControllerNode>,
     broker: Arc<Broker>,
-    metadata_cache: MetadataCache,
     settings: ClusterSettings,
     registration: BrokerRegistration,
     broker_epoch: watch::Sender<BrokerEpoch>,
@@ -645,6 +669,7 @@ async fn broker_lifecycle(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut epoch: Option<BrokerEpoch> = None;
     let mut last_renewal = None;
+    let mut prefer_remote_heartbeat = false;
 
     loop {
         let lease_expiry = last_renewal.map(|renewed: Instant| renewed + settings.session_timeout);
@@ -674,32 +699,8 @@ async fn broker_lifecycle(
                     broker_epoch.send_replace(0);
                     bail!("broker {} was irreversibly fenced", registration.broker_id);
                 }
-                let image = controller
-                    .local_metadata()
-                    .await
-                    .context("failed to read locally applied controller metadata")?;
-                publish_if_newer(&metadata_cache, image.clone());
 
                 if let Some(current_epoch) = epoch {
-                    if local_registration_is_fenced(
-                        &image,
-                        registration.broker_id,
-                        current_epoch,
-                    ) {
-                        let controller_epoch = image
-                            .brokers
-                            .get(&registration.broker_id)
-                            .map_or(0, |registered| registered.broker_epoch);
-                        broker.fence();
-                        broker_epoch.send_replace(0);
-                        bail!(
-                            "broker {} epoch {} is fenced by controller epoch {}",
-                            registration.broker_id,
-                            current_epoch,
-                            controller_epoch,
-                        );
-                    }
-
                     let deadline = last_renewal
                         .expect("an active broker epoch always has a renewal time")
                         + settings.session_timeout;
@@ -708,6 +709,7 @@ async fn broker_lifecycle(
                             &controller,
                             registration.broker_id,
                             current_epoch,
+                            prefer_remote_heartbeat,
                             &mut shutdown,
                         ) => result,
                         _ = sleep_until(deadline) => {
@@ -721,7 +723,25 @@ async fn broker_lifecycle(
                         }
                     };
                     match outcome {
-                        Ok(Some(true)) => last_renewal = Some(Instant::now()),
+                        Ok(Some(true)) => {
+                            last_renewal = Some(Instant::now());
+                            if prefer_remote_heartbeat {
+                                let visibility = tokio::time::timeout(
+                                    Duration::from_millis(10),
+                                    controller.local_metadata(),
+                                )
+                                .await;
+                                if let Ok(Ok(image)) = visibility {
+                                    prefer_remote_heartbeat = image
+                                        .brokers
+                                        .get(&registration.broker_id)
+                                        .is_none_or(|registered| {
+                                            registered.broker_epoch != current_epoch
+                                                || !registered.alive
+                                        });
+                                }
+                            }
+                        }
                         Ok(Some(false)) => {}
                         Ok(None) => return Ok(()),
                         Err(error) => {
@@ -737,17 +757,33 @@ async fn broker_lifecycle(
                         broker.activate_broker_epoch(registered_epoch)?;
                         epoch = Some(registered_epoch);
                         last_renewal = Some(Instant::now());
+                        prefer_remote_heartbeat = true;
                     }
                 }
                 broker_epoch.send_replace(epoch.unwrap_or(0));
+            }
+        }
+    }
+}
 
-                if epoch.is_some() {
-                    run_leader_maintenance(
-                        &controller,
-                        &settings,
-                        &mut shutdown,
-                    )
-                    .await?;
+async fn controller_maintenance(
+    controller: Arc<ControllerNode>,
+    settings: ClusterSettings,
+    mut broker_epoch: watch::Receiver<BrokerEpoch>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut maintenance = interval(settings.heartbeat_interval);
+    maintenance.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = maintenance.tick() => {
+                if *broker_epoch.borrow_and_update() != 0 {
+                    run_leader_maintenance(&controller, &settings, &mut shutdown).await?;
                 }
             }
         }
@@ -791,6 +827,7 @@ async fn heartbeat_broker(
     controller: &ControllerNode,
     broker_id: i32,
     broker_epoch: BrokerEpoch,
+    prefer_remote_leader: bool,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Option<bool>> {
     let command = MetadataCommand::Heartbeat {
@@ -798,7 +835,21 @@ async fn heartbeat_broker(
         broker_epoch,
         now_ms: unix_time_ms(),
     };
-    let Some(result) = write_or_shutdown(controller, command, shutdown).await else {
+    let write = async {
+        if prefer_remote_leader {
+            controller.write_metadata_via_remote_leader(command).await
+        } else {
+            controller.write_metadata(command).await
+        }
+    };
+    // Keep one heartbeat write in flight until it completes or the lifecycle's
+    // absolute lease deadline fires. Short per-attempt cancellation is unsafe:
+    // the Raft request can still commit after its waiter is dropped, and rapid
+    // retries can flood the controller with ambiguous writes during recovery.
+    let Some(result) = (tokio::select! {
+        result = write => Some(result),
+        _ = wait_for_shutdown(shutdown.clone()) => None,
+    }) else {
         return Ok(None);
     };
     match result {
@@ -811,7 +862,32 @@ async fn heartbeat_broker(
             tracing::warn!(%error, "broker heartbeat could not reach the active controller");
             Ok(Some(false))
         }
-        Err(error) => Err(anyhow!("broker heartbeat was rejected: {error}")),
+        Err(error) => {
+            // A follower may still believe it is the leader immediately after
+            // restart and pre-validate this heartbeat against its stale local
+            // broker epoch. The registration itself already committed on the
+            // active leader, so let the lifecycle retry until the local image
+            // catches up or the independently enforced lease deadline expires.
+            let image = controller
+                .local_metadata()
+                .await
+                .context("failed to inspect local metadata after heartbeat rejection")?;
+            let locally_older = image
+                .brokers
+                .get(&broker_id)
+                .is_none_or(|registered| registered.broker_epoch < broker_epoch);
+            if locally_older {
+                tracing::warn!(
+                    %error,
+                    broker_id,
+                    broker_epoch,
+                    "broker heartbeat was rejected by a stale local controller image; retrying"
+                );
+                Ok(Some(false))
+            } else {
+                Err(anyhow!("broker heartbeat was rejected: {error}"))
+            }
+        }
     }
 }
 
@@ -1306,6 +1382,7 @@ fn leader_maintenance_commands(
     commands
 }
 
+#[cfg(test)]
 fn local_registration_is_fenced(
     image: &ClusterMetadata,
     broker_id: i32,

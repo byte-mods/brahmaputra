@@ -453,7 +453,7 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
             MetadataCommand::Heartbeat {
                 broker_id: 10,
                 broker_epoch: 1,
-                now_ms: 1_000 + sequence,
+                now_ms: 1_000 + sequence * 1_000,
             },
         )
         .await?;
@@ -477,7 +477,7 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
             MetadataCommand::Heartbeat {
                 broker_id: 10,
                 broker_epoch: 1,
-                now_ms: 1_000 + sequence,
+                now_ms: 1_000 + sequence * 1_000,
             },
         )
         .await?;

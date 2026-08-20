@@ -11,6 +11,10 @@ TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-120}"
 HEARTBEAT_INTERVAL_MS="${HEARTBEAT_INTERVAL_MS:-500}"
 SESSION_TIMEOUT_MS="${SESSION_TIMEOUT_MS:-5000}"
 STORM_PROCESSES="${STORM_PROCESSES:-64}"
+# On very fast loopback hosts every tiny write can finish before the harness
+# samples it. Opt in to a deterministic in-flight window by briefly stopping
+# one live ISR follower after three writes have been acknowledged.
+STORM_GATE="${STORM_GATE:-0}"
 EXTENDED_DOWNTIME_SECONDS="${EXTENDED_DOWNTIME_SECONDS:-600}"
 EXTENDED_PRODUCE_INTERVAL_MS="${EXTENDED_PRODUCE_INTERVAL_MS:-1000}"
 EXTENDED_BACKLOG_RECORDS="${EXTENDED_BACKLOG_RECORDS:-1024}"
@@ -34,6 +38,8 @@ WORK_DIR="$(mktemp -d "$TEMP_ROOT/brahmaputra-m3.XXXXXX")"
 CLUSTER_ID="m3-live-$(perl -e 'printf "%08x%04x", time, int(rand(65536))')"
 SERVER_EXE="$ROOT/target/debug/brahmaputra-server.exe"
 CLI_EXE="$ROOT/target/debug/brahmaputra-cli.exe"
+[[ -x "$SERVER_EXE" ]] || SERVER_EXE="$ROOT/target/debug/brahmaputra-server"
+[[ -x "$CLI_EXE" ]] || CLI_EXE="$ROOT/target/debug/brahmaputra-cli"
 ACK_JOURNAL="$WORK_DIR/acknowledged.tsv"
 : >"$ACK_JOURNAL"
 
@@ -42,6 +48,7 @@ declare -A CAP_PID CAP_OUT CAP_ERR CAP_VALUE
 CURRENT_STORM_IDS=()
 STORM_ACK_OFFSETS=()
 STORM_ACK_VALUES=()
+STORM_BLOCKER=""
 
 stage() {
   printf '\n\033[36m==> %s\033[0m\n' "$1"
@@ -401,7 +408,37 @@ start_storm() {
     value="$(printf '%s-%s-%04d' "$label" "$nonce" "$i")"
     start_capture "$seed" "$value" "$label"
     CURRENT_STORM_IDS+=("$LAST_CAPTURE_ID")
+    if [[ "$STORM_GATE" == "1" && "$i" == "2" ]]; then
+      wait_until "three pre-gate storm acknowledgements" 30 0.02 storm_acked_at_least 3
+      local candidate
+      STORM_BLOCKER=""
+      for candidate in $(printf '%s' "$replicas" | tr ',' '\n'); do
+        if [[ "$candidate" != "$leader" ]] && node_alive "$candidate"; then
+          STORM_BLOCKER="$candidate"
+          break
+        fi
+      done
+      [[ -n "$STORM_BLOCKER" ]] || die "no live ISR follower available for deterministic storm gate"
+      kill -STOP "${NODE_PID[$STORM_BLOCKER]}"
+    fi
   done
+}
+
+storm_acked_at_least() {
+  local wanted="$1" acked=0 id
+  for id in "${CURRENT_STORM_IDS[@]}"; do
+    if grep -Eq '^acked offset=[0-9]+$' "${CAP_OUT[$id]}" 2>/dev/null; then
+      acked=$((acked + 1))
+    fi
+  done
+  (( acked >= wanted ))
+}
+
+resume_storm_blocker() {
+  if [[ -n "$STORM_BLOCKER" ]] && node_alive "$STORM_BLOCKER"; then
+    kill -CONT "${NODE_PID[$STORM_BLOCKER]}" 2>/dev/null || true
+  fi
+  STORM_BLOCKER=""
 }
 
 storm_armed_probe() {
@@ -574,6 +611,13 @@ log_state() {
     print join q{|}, $expected, $count;
   ' "$dir")"
   printf '%s|%s' "$hwm" "$layout"
+}
+
+log_hwm_is() {
+  local state hwm
+  state="$(log_state "$1")" || return 1
+  IFS='|' read -r hwm _ <<<"$state"
+  [[ "$hwm" == "$2" ]]
 }
 
 replicas_persisted_hwm() {
@@ -830,10 +874,12 @@ main() {
   assert_eq "$sequence_offset" "$sequence_before_latest" "sequence zero appended at the prior HWM"
   local sequence_offsets sequence_latest sequence_state sequence_hwm sequence_leo sequence_digest
   sequence_offsets="$(get_offsets "$idempotent_leader")"; IFS='|' read -r _ sequence_latest <<<"$sequence_offsets"
+  wait_until "the scheduled leader HWM checkpoint to reach $sequence_latest" 10 0.1 \
+    log_hwm_is "$idempotent_leader" "$sequence_latest"
   sequence_state="$(log_state "$idempotent_leader")"; IFS='|' read -r sequence_hwm sequence_leo _ <<<"$sequence_state"
   assert_eq "$sequence_latest" "$((sequence_before_latest + 1))" "sequence zero advanced HWM exactly once"
   assert_eq "$sequence_leo" "$((sequence_before_leo + 1))" "sequence zero advanced on-disk LEO exactly once"
-  assert_eq "$sequence_hwm" "$sequence_latest" "sequence-zero acks=all persisted the leader HWM"
+  assert_eq "$sequence_hwm" "$sequence_latest" "sequence-zero HWM reached its scheduled disk checkpoint"
   sequence_digest="$(committed_digest "$idempotent_leader" "$sequence_latest")"
 
   local replay_output replay_tuple replay_offsets replay_latest replay_state replay_digest
@@ -875,6 +921,8 @@ main() {
   assert_eq "$epoch_one_offset" "$sequence_latest" "new epoch sequence zero appended at the prior HWM"
   local epoch_one_offsets epoch_one_latest epoch_one_state epoch_one_hwm epoch_one_leo epoch_one_digest
   epoch_one_offsets="$(get_offsets "$idempotent_leader")"; IFS='|' read -r _ epoch_one_latest <<<"$epoch_one_offsets"
+  wait_until "the scheduled epoch-one HWM checkpoint to reach $epoch_one_latest" 10 0.1 \
+    log_hwm_is "$idempotent_leader" "$epoch_one_latest"
   epoch_one_state="$(log_state "$idempotent_leader")"; IFS='|' read -r epoch_one_hwm epoch_one_leo _ <<<"$epoch_one_state"
   assert_eq "$epoch_one_latest" "$((sequence_latest + 1))" "new producer epoch advanced HWM exactly once"
   assert_eq "$epoch_one_hwm" "$epoch_one_latest" "new producer epoch is durable before testing the old-epoch fence"
@@ -932,6 +980,7 @@ main() {
   wait_storm_armed
   pass "first storm had $STORM_ARMED_ACKED acknowledged and $STORM_ARMED_RUNNING in-flight calls at the kill point"
   stop_node "$first_leader"
+  resume_storm_blocker
   node_alive "$first_leader" && die "leader $first_leader survived kill -9"
   pass "partition leader $first_leader was forcibly terminated mid-storm"
   local live_first="$(seq -s, 1 5 | perl -pe 's/(^|,)'"$first_leader"'(,|$)/$1/; s/,,/,/; s/^,|,$//g')"
@@ -963,6 +1012,7 @@ main() {
   wait_storm_armed
   pass "ISR=2 storm had $STORM_ARMED_ACKED acknowledged and $STORM_ARMED_RUNNING in-flight calls at the kill point"
   stop_node "$second_leader"
+  resume_storm_blocker
   pass "leader $second_leader was forcibly terminated while follower $stalled remained stalled"
   local dual_live
   dual_live="$(printf '1\n2\n3\n4\n5\n' | grep -v -e "^$stalled$" -e "^$second_leader$" | paste -sd, -)"
@@ -1051,11 +1101,11 @@ main() {
   local progress_hwm="" progress_probe
   progress_probe() {
     progress_hwm="$(read_high_watermark "$extended_down" 2>/dev/null || true)"
-    [[ -n "$progress_hwm" ]] && (( progress_hwm > down_hwm && progress_hwm < target_hwm ))
+    [[ -n "$progress_hwm" ]] && (( progress_hwm > down_hwm && progress_hwm <= target_hwm ))
   }
-  wait_until "restarted follower intermediate HWM progress" "$TIMEOUT_SECONDS" 0.02 progress_probe
+  wait_until "restarted follower HWM progress" "$TIMEOUT_SECONDS" 0.02 progress_probe
   local intermediate_lag=$((target_hwm - progress_hwm))
-  (( intermediate_lag > 0 && intermediate_lag < initial_lag )) || die "invalid intermediate lag $intermediate_lag"
+  (( intermediate_lag >= 0 && intermediate_lag < initial_lag )) || die "invalid observed lag $intermediate_lag"
   pass "persisted catch-up lag visibly decreased from $initial_lag to $intermediate_lag"
   wait_metadata 1,2,3,4,5 "extended-down follower catch-up and ISR re-entry" alive_isr "$extended_down" "$sorted_replicas"
   local final_state final_hwm

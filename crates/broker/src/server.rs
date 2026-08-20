@@ -705,17 +705,19 @@ impl Broker {
                         log.set_high_watermark(recovered_end)?;
                     }
                 }
-                // The same periodic tick drives retention and the time-based
-                // flush policy, so either one being configured starts it.
-                // The same tick drives retention, the timed flush and
-                // compaction, so any of them being configured starts it.
-                let retention_enabled = log_config.retention_ms.is_some()
+                // One maintenance tick drives retention, timed flushes,
+                // compaction, and the periodic high-watermark checkpoint.
+                // User topics need the tick even when all optional retention
+                // and flush policies are disabled, otherwise the default
+                // five-second HWM checkpoint would never reach disk.
+                let maintenance_enabled = log_config.retention_ms.is_some()
                     || log_config.retention_bytes.is_some()
                     || log_config.flush_interval_ms.is_some()
-                    || log_config.compact;
+                    || log_config.compact
+                    || log_config.hwm_checkpoint_interval_ms > 0;
                 let replicated_commit =
                     self.config.metadata_cache.is_some() && self.config.replication_enabled;
-                let (handle, task) = match (replicated_commit, retention_enabled) {
+                let (handle, task) = match (replicated_commit, maintenance_enabled) {
                     (true, true) => actor::spawn_cluster_with_retention(
                         log,
                         self.config.channel_capacity,
@@ -1053,7 +1055,7 @@ impl ResponseSink {
 /// them without our help. Only plaintext TCP can do this — TLS and QUIC
 /// must see the bytes to encrypt them, which is exactly where Kafka draws
 /// the same line.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 async fn send_region(
     sink: &tokio::net::tcp::OwnedWriteHalf,
     region: &LogRegion,
@@ -1098,7 +1100,7 @@ async fn send_region(
 
 /// Where `sendfile` does not exist, read the range and write it. Correct
 /// everywhere, just not free.
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 async fn send_region(
     sink: &mut tokio::net::tcp::OwnedWriteHalf,
     region: &LogRegion,

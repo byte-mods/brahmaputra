@@ -14,9 +14,10 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use openraft::error::{ClientWriteError, InitializeError, RaftError};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, InitializeError, RaftError};
 use openraft::storage::Adaptor;
 use openraft::{Config as RaftConfig, RaftMetrics};
 use reqwest::StatusCode;
@@ -37,6 +38,7 @@ pub type ControllerCommandResult = Result<MetadataEvent, ControllerErrorBody>;
 
 const METADATA_STATUS_KEY: &str = "__brahmaputra_cluster_metadata__";
 const WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(40);
+const DEFAULT_HEARTBEAT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Static configuration for one controller process.
 ///
@@ -50,6 +52,10 @@ pub struct ControllerConfig {
     pub raft: RaftConfig,
     pub raft_rpc_timeout: Duration,
     pub command_timeout: Duration,
+    /// Maximum age of a quorum-confirmed heartbeat before it is included in
+    /// the next durable metadata checkpoint. Several brokers that reach this
+    /// boundary together are folded into one Raft write.
+    pub heartbeat_checkpoint_interval: Duration,
     /// Persistent controller directory. `None` creates an isolated temporary
     /// on-disk store, which is convenient for tests but intentionally cannot be
     /// rediscovered by a later process.
@@ -78,6 +84,7 @@ impl ControllerConfig {
             raft,
             raft_rpc_timeout: Duration::from_secs(2),
             command_timeout: Duration::from_secs(10),
+            heartbeat_checkpoint_interval: DEFAULT_HEARTBEAT_CHECKPOINT_INTERVAL,
             data_dir: None,
         }
     }
@@ -85,6 +92,12 @@ impl ControllerConfig {
     /// Select a restart-stable controller data directory.
     pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
         self.data_dir = Some(data_dir.into());
+        self
+    }
+
+    /// Bound heartbeat checkpoint coalescing for the broker lease settings.
+    pub fn with_heartbeat_checkpoint_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_checkpoint_interval = interval.max(Duration::from_millis(1));
         self
     }
 }
@@ -131,6 +144,7 @@ pub struct ControllerNode {
     data_dir: PathBuf,
     _ephemeral_data_dir: Option<tempfile::TempDir>,
     write_mutex: Mutex<()>,
+    confirmed_heartbeats: StdMutex<BTreeMap<i32, (u64, i64)>>,
     forwarding_client: reqwest::Client,
 }
 
@@ -209,6 +223,7 @@ impl ControllerNode {
             data_dir,
             _ephemeral_data_dir: ephemeral_data_dir,
             write_mutex: Mutex::new(()),
+            confirmed_heartbeats: StdMutex::new(BTreeMap::new()),
             forwarding_client,
         }))
     }
@@ -304,10 +319,21 @@ impl ControllerNode {
     /// observed leader, and both forwarding and direct writes retry across a
     /// leader election until `command_timeout` expires.
     pub async fn write_metadata(&self, command: MetadataCommand) -> ControllerCommandResult {
-        let _guard = self.write_mutex.lock().await;
         let deadline = Instant::now() + self.config.command_timeout;
         let mut leader_hint = self.raft_metrics().current_leader;
+        if leader_hint == Some(self.config.node_id)
+            && self.command_outpaces_local_broker_epoch(&command).await
+        {
+            let discovered_leader = self.discover_remote_leader().await;
+            tracing::debug!(
+                node_id = self.config.node_id,
+                ?discovered_leader,
+                "routing a future-epoch broker heartbeat around a stale local leader hint"
+            );
+            leader_hint = discovered_leader.or(leader_hint);
+        }
         let mut last_error: ControllerErrorBody;
+        let mut preserve_discovered_leader_once = false;
 
         loop {
             if let Some(leader_id) = leader_hint {
@@ -325,6 +351,11 @@ impl ControllerNode {
                         Ok(event) => return Ok(event),
                         Err(LocalWriteError::Rejected(error)) => return Err(error),
                         Err(LocalWriteError::Retry { leader_id, error }) => {
+                            preserve_discovered_leader_once = matches!(
+                                error.code.as_str(),
+                                "leader_check" | "leader_check_timeout"
+                            ) && leader_id
+                                .is_some_and(|node_id| node_id != self.config.node_id);
                             leader_hint = leader_id;
                             last_error = error;
                         }
@@ -347,25 +378,110 @@ impl ControllerNode {
             }
 
             tokio::time::sleep(WRITE_RETRY_INTERVAL).await;
-            leader_hint = self.raft_metrics().current_leader.or(leader_hint);
+            if preserve_discovered_leader_once {
+                preserve_discovered_leader_once = false;
+            } else {
+                leader_hint = self.raft_metrics().current_leader.or(leader_hint);
+            }
         }
+    }
+
+    /// Route a lease-sensitive command directly to the leader reported by a
+    /// remote Raft witness. This is used while a restarted node's local state
+    /// machine is still installing the broker epoch that just committed.
+    pub async fn write_metadata_via_remote_leader(
+        &self,
+        command: MetadataCommand,
+    ) -> ControllerCommandResult {
+        if let Some(leader_id) = self.discover_remote_leader().await {
+            self.forward_command(leader_id, &command).await
+        } else {
+            self.write_metadata(command).await
+        }
+    }
+
+    /// Broker registration can commit on a remote leader before this node's
+    /// state machine installs the new epoch. This cheap check lets heartbeats
+    /// bypass an obviously stale self-leader hint without first spending a
+    /// Raft RPC timeout proving that the local validation result is obsolete.
+    async fn command_outpaces_local_broker_epoch(&self, command: &MetadataCommand) -> bool {
+        let MetadataCommand::Heartbeat {
+            broker_id,
+            broker_epoch,
+            ..
+        } = command
+        else {
+            return false;
+        };
+        let Ok(metadata) = self.local_metadata().await else {
+            return false;
+        };
+        metadata
+            .brokers
+            .get(broker_id)
+            .is_none_or(|registered| registered.broker_epoch < *broker_epoch)
     }
 
     async fn write_on_local_leader(
         &self,
         command: MetadataCommand,
     ) -> Result<MetadataEvent, LocalWriteError> {
+        // A coalesced heartbeat still needs a quorum-confirmed leader, but the
+        // confirmation is a network operation. Do it before taking the local
+        // write mutex so one slow ReadIndex round cannot block every broker's
+        // lease behind it. The post-confirmation metadata read in the helper
+        // also prevents an obsolete broker epoch from being acknowledged.
+        let heartbeat_preflight = match self.preflight_heartbeat(&command).await? {
+            HeartbeatPreflight::Coalesced(event) => return Ok(event),
+            preflight => preflight,
+        };
+
+        // Serialize only the local state-machine read/apply/write sequence.
+        // Holding this mutex while a follower forwards or retries can make an
+        // unrelated broker heartbeat wait behind a slow remote operation and
+        // expire an otherwise healthy broker lease.
+        let guard = self.write_mutex.lock().await;
         let mut next_metadata = self
             .local_metadata()
             .await
             .map_err(LocalWriteError::Rejected)?;
-        let event = next_metadata.apply(command).map_err(|error| {
-            LocalWriteError::Rejected(ControllerErrorBody::new(
-                "metadata_rejected",
-                error.to_string(),
-                false,
-            ))
-        })?;
+        if let HeartbeatPreflight::Checkpoint {
+            observed_offset,
+            broker_id,
+            broker_epoch,
+            now_ms,
+        } = heartbeat_preflight
+        {
+            // Another heartbeat checkpoint won the mutex after this request's
+            // quorum confirmation. If it carried this broker's observation,
+            // the request is already represented durably and needs no second
+            // serialized Raft write.
+            if next_metadata.offset > observed_offset
+                && heartbeat_can_coalesce(
+                    &next_metadata,
+                    broker_id,
+                    broker_epoch,
+                    now_ms,
+                    self.config.heartbeat_checkpoint_interval,
+                )
+            {
+                return Ok(MetadataEvent::BrokerHeartbeat {
+                    broker_id,
+                    broker_epoch,
+                });
+            }
+        }
+        self.merge_confirmed_heartbeats(&mut next_metadata);
+        let event = match next_metadata.apply(command) {
+            Ok(event) => event,
+            Err(error) => {
+                // Leadership confirmation can wait on quorum I/O. It must not
+                // retain the write mutex or one stale maintenance command can
+                // prevent every broker from renewing its lease.
+                drop(guard);
+                return Err(self.classify_metadata_rejection(error).await);
+            }
+        };
         let status = serde_json::to_string(&next_metadata).map_err(|error| {
             LocalWriteError::Rejected(ControllerErrorBody::new(
                 "metadata_encoding",
@@ -402,6 +518,230 @@ impl ControllerNode {
                 })
             }
         }
+    }
+
+    async fn preflight_heartbeat(
+        &self,
+        command: &MetadataCommand,
+    ) -> Result<HeartbeatPreflight, LocalWriteError> {
+        let MetadataCommand::Heartbeat {
+            broker_id,
+            broker_epoch,
+            now_ms,
+        } = command
+        else {
+            return Ok(HeartbeatPreflight::NotHeartbeat);
+        };
+
+        let metadata = self
+            .local_metadata()
+            .await
+            .map_err(LocalWriteError::Rejected)?;
+        if !heartbeat_epoch_is_live(&metadata, *broker_id, *broker_epoch) {
+            return Ok(HeartbeatPreflight::NotHeartbeat);
+        }
+
+        self.confirm_coalesced_heartbeat(*broker_id, *broker_epoch)
+            .await?;
+
+        // `ensure_linearizable` orders this read after everything committed
+        // before the confirmation. Revalidate the broker incarnation so a
+        // concurrent re-registration cannot receive an old-epoch heartbeat.
+        let metadata = self
+            .local_metadata()
+            .await
+            .map_err(LocalWriteError::Rejected)?;
+        if !heartbeat_epoch_is_live(&metadata, *broker_id, *broker_epoch) {
+            return Ok(HeartbeatPreflight::NotHeartbeat);
+        }
+        self.confirmed_heartbeats
+            .lock()
+            .expect("confirmed heartbeat mutex poisoned")
+            .insert(*broker_id, (*broker_epoch, *now_ms));
+
+        if heartbeat_can_coalesce(
+            &metadata,
+            *broker_id,
+            *broker_epoch,
+            *now_ms,
+            self.config.heartbeat_checkpoint_interval,
+        ) {
+            Ok(HeartbeatPreflight::Coalesced(
+                MetadataEvent::BrokerHeartbeat {
+                    broker_id: *broker_id,
+                    broker_epoch: *broker_epoch,
+                },
+            ))
+        } else {
+            Ok(HeartbeatPreflight::Checkpoint {
+                observed_offset: metadata.offset,
+                broker_id: *broker_id,
+                broker_epoch: *broker_epoch,
+                now_ms: *now_ms,
+            })
+        }
+    }
+
+    fn merge_confirmed_heartbeats(&self, metadata: &mut ClusterMetadata) {
+        let observations = self
+            .confirmed_heartbeats
+            .lock()
+            .expect("confirmed heartbeat mutex poisoned");
+        for (&broker_id, &(broker_epoch, now_ms)) in observations.iter() {
+            if let Some(registered) = metadata.brokers.get_mut(&broker_id) {
+                if registered.alive && registered.broker_epoch == broker_epoch {
+                    registered.last_heartbeat_ms = registered.last_heartbeat_ms.max(now_ms);
+                }
+            }
+        }
+    }
+
+    async fn confirm_coalesced_heartbeat(
+        &self,
+        broker_id: i32,
+        broker_epoch: u64,
+    ) -> Result<MetadataEvent, LocalWriteError> {
+        match tokio::time::timeout(
+            self.config.raft_rpc_timeout,
+            self.raft.ensure_linearizable(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(MetadataEvent::BrokerHeartbeat {
+                broker_id,
+                broker_epoch,
+            }),
+            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))) => {
+                Err(LocalWriteError::Retry {
+                    leader_id: forward.leader_id,
+                    error: ControllerErrorBody::new(
+                        "not_leader",
+                        "coalesced heartbeat reached an unconfirmed Raft leader",
+                        true,
+                    )
+                    .with_leader(forward.leader_id),
+                })
+            }
+            Ok(Err(error)) => {
+                let leader_id = self
+                    .raft_metrics()
+                    .current_leader
+                    .filter(|node_id| *node_id != self.config.node_id);
+                Err(LocalWriteError::Retry {
+                    leader_id,
+                    error: ControllerErrorBody::new("leader_check", error.to_string(), true)
+                        .with_leader(leader_id),
+                })
+            }
+            Err(_) => Err(LocalWriteError::Retry {
+                leader_id: None,
+                error: ControllerErrorBody::new(
+                    "leader_check_timeout",
+                    "timed out confirming leadership for a coalesced broker heartbeat",
+                    true,
+                ),
+            }),
+        }
+    }
+
+    /// A metadata validation failure is authoritative only on a confirmed
+    /// leader. A restarted follower can retain a stale self-leader metric and
+    /// an older state-machine image; in that case route the original command
+    /// to another fixed peer rather than returning a false rejection.
+    async fn classify_metadata_rejection(&self, metadata_error: MetadataError) -> LocalWriteError {
+        match tokio::time::timeout(
+            self.config.raft_rpc_timeout,
+            self.raft.ensure_linearizable(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => LocalWriteError::Rejected(ControllerErrorBody::new(
+                "metadata_rejected",
+                metadata_error.to_string(),
+                false,
+            )),
+            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))) => {
+                LocalWriteError::Retry {
+                    leader_id: forward.leader_id,
+                    error: ControllerErrorBody::new(
+                        "not_leader",
+                        "local metadata rejection came from an unconfirmed Raft leader",
+                        true,
+                    )
+                    .with_leader(forward.leader_id),
+                }
+            }
+            Ok(Err(error)) => {
+                let leader_id = self.discover_remote_leader().await.or_else(|| {
+                    self.raft_metrics()
+                        .current_leader
+                        .filter(|node_id| *node_id != self.config.node_id)
+                });
+                LocalWriteError::Retry {
+                    leader_id,
+                    error: ControllerErrorBody::new("leader_check", error.to_string(), true)
+                        .with_leader(leader_id),
+                }
+            }
+            Err(_) => {
+                let leader_id = self.discover_remote_leader().await.or_else(|| {
+                    self.raft_metrics()
+                        .current_leader
+                        .filter(|node_id| *node_id != self.config.node_id)
+                });
+                LocalWriteError::Retry {
+                    leader_id,
+                    error: ControllerErrorBody::new(
+                        "leader_check_timeout",
+                        "timed out confirming a local metadata rejection with the Raft quorum",
+                        true,
+                    )
+                    .with_leader(leader_id),
+                }
+            }
+        }
+    }
+
+    /// Ask the fixed peers for their read-only Raft view and return the first
+    /// non-local leader they report. Probes run concurrently so a dead peer
+    /// cannot consume the broker's heartbeat lease before a live witness
+    /// identifies the active leader.
+    async fn discover_remote_leader(&self) -> Option<NodeId> {
+        let mut probes = tokio::task::JoinSet::new();
+        for (&node_id, address) in &self.config.peers {
+            if node_id == self.config.node_id {
+                continue;
+            }
+            let client = self.forwarding_client.clone();
+            let url = format!("{}/api/v1/controller/raft", address.trim_end_matches('/'));
+            probes.spawn(async move {
+                let response = client.get(url).send().await.ok()?.error_for_status().ok()?;
+                let leader = response
+                    .json::<ControllerRaftMetrics>()
+                    .await
+                    .ok()?
+                    .current_leader;
+                Some((node_id, leader))
+            });
+        }
+
+        while let Some(result) = probes.join_next().await {
+            if let Ok(Some((witness_id, observed_leader))) = result {
+                tracing::debug!(
+                    node_id = self.config.node_id,
+                    witness_id,
+                    ?observed_leader,
+                    "remote Raft leader probe completed"
+                );
+                let Some(leader_id) = observed_leader else {
+                    continue;
+                };
+                if leader_id != self.config.node_id && self.config.peers.contains_key(&leader_id) {
+                    return Some(leader_id);
+                }
+            }
+        }
+        None
     }
 
     async fn forward_command(
@@ -494,6 +834,38 @@ enum LocalWriteError {
     Rejected(ControllerErrorBody),
 }
 
+enum HeartbeatPreflight {
+    NotHeartbeat,
+    Coalesced(MetadataEvent),
+    Checkpoint {
+        observed_offset: u64,
+        broker_id: i32,
+        broker_epoch: u64,
+        now_ms: i64,
+    },
+}
+
+fn heartbeat_epoch_is_live(metadata: &ClusterMetadata, broker_id: i32, broker_epoch: u64) -> bool {
+    metadata
+        .brokers
+        .get(&broker_id)
+        .is_some_and(|registered| registered.alive && registered.broker_epoch == broker_epoch)
+}
+
+fn heartbeat_can_coalesce(
+    metadata: &ClusterMetadata,
+    broker_id: i32,
+    broker_epoch: u64,
+    now_ms: i64,
+    checkpoint_interval: Duration,
+) -> bool {
+    let checkpoint_interval_ms = i64::try_from(checkpoint_interval.as_millis()).unwrap_or(i64::MAX);
+    metadata.brokers.get(&broker_id).is_some_and(|registered| {
+        heartbeat_epoch_is_live(metadata, broker_id, broker_epoch)
+            && now_ms.saturating_sub(registered.last_heartbeat_ms) < checkpoint_interval_ms
+    })
+}
+
 fn normalize_base_url(address: String) -> String {
     let address = address.trim_end_matches('/');
     if address.starts_with("http://") || address.starts_with("https://") {
@@ -529,7 +901,10 @@ fn validate_controller_config(config: &ControllerConfig) -> Result<(), Controlle
             false,
         ));
     }
-    if config.command_timeout.is_zero() || config.raft_rpc_timeout.is_zero() {
+    if config.command_timeout.is_zero()
+        || config.raft_rpc_timeout.is_zero()
+        || config.heartbeat_checkpoint_interval.is_zero()
+    {
         return Err(ControllerErrorBody::new(
             "invalid_config",
             "controller timeouts must be non-zero",
@@ -555,5 +930,39 @@ mod tests {
         );
         assert_eq!(config.peers[&1], "http://127.0.0.1:9001");
         assert_eq!(config.peers[&2], "https://controller.example:9002");
+    }
+
+    #[test]
+    fn heartbeat_coalescing_respects_the_configured_checkpoint_boundary() {
+        let mut metadata = ClusterMetadata::new("cluster-a");
+        let event = metadata
+            .apply(MetadataCommand::RegisterBroker {
+                broker_id: 7,
+                host: "127.0.0.1".to_owned(),
+                data_port: 9092,
+                control_port: 19092,
+                roles: vec![],
+                rack: None,
+                now_ms: 1_000,
+            })
+            .unwrap();
+        let MetadataEvent::BrokerRegistered { broker_epoch, .. } = event else {
+            panic!("registration returned the wrong metadata event");
+        };
+
+        assert!(heartbeat_can_coalesce(
+            &metadata,
+            7,
+            broker_epoch,
+            1_499,
+            Duration::from_millis(500),
+        ));
+        assert!(!heartbeat_can_coalesce(
+            &metadata,
+            7,
+            broker_epoch,
+            1_500,
+            Duration::from_millis(500),
+        ));
     }
 }
