@@ -1,0 +1,14 @@
+{
+  "name": "brahmaputra",
+  "version": "0.1.0",
+  "description": "Brahmaputra client for Node.js",
+  "main": "src/index.js",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test:manual": "node test_manual.js"
+  },
+  "files": ["src"]
+}
