@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use brahmaputra_broker::{Broker, BrokerConfig};
 use brahmaputra_client::{
-    Connection, ConsumedRecord, GroupAdmin, GroupConsumer, Producer, ProducerConfig,
+    AutoOffsetReset, Connection, ConsumedRecord, GroupAdmin, GroupConsumer, Producer,
+    ProducerConfig,
 };
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{OffsetFetchRequest, OffsetFetchResponse};
@@ -440,5 +441,103 @@ async fn max_poll_records_bounds_what_a_commit_can_cover() {
     assert_eq!(all.len(), 30, "every record delivered exactly once overall");
 
     drop(resumed);
+    stop_broker(broker).await;
+}
+
+/// `auto.offset.reset` decides where a brand-new group starts. The two
+/// policies must disagree on exactly the records produced before the group
+/// existed: earliest replays them, latest does not.
+#[tokio::test]
+async fn auto_offset_reset_chooses_where_a_new_group_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_broker(dir.path()).await;
+    produce_records(broker.addr, 0, 40).await;
+
+    // Earliest: history is there to be replayed.
+    let mut from_earliest = GroupConsumer::connect(broker.addr, "reset-earliest", "g-earliest")
+        .await
+        .expect("connect")
+        .with_session_timeout(6_000)
+        .with_rebalance_timeout(2_500)
+        .with_auto_commit(None)
+        .with_auto_offset_reset(AutoOffsetReset::Earliest);
+    from_earliest.subscribe(&[TOPIC]);
+    let replayed = poll_until(&mut from_earliest, 40, Duration::from_secs(15)).await;
+    assert_eq!(replayed.len(), 40, "earliest replays the whole log");
+
+    // Latest: the same log, and nothing to deliver, because everything in
+    // it predates the group.
+    let mut from_latest = GroupConsumer::connect(broker.addr, "reset-latest", "g-latest")
+        .await
+        .expect("connect")
+        .with_session_timeout(6_000)
+        .with_rebalance_timeout(2_500)
+        .with_auto_commit(None)
+        .with_auto_offset_reset(AutoOffsetReset::Latest);
+    from_latest.subscribe(&[TOPIC]);
+    let mut skipped = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        skipped.extend(
+            from_latest
+                .poll(Duration::from_millis(200))
+                .await
+                .expect("poll"),
+        );
+    }
+    assert!(
+        skipped.is_empty(),
+        "latest must skip records produced before the group existed, saw {}",
+        skipped.len()
+    );
+
+    // But it does see what comes next — it started at the end, it did not
+    // stop working.
+    produce_records(broker.addr, 100, 10).await;
+    let fresh = poll_until(&mut from_latest, 10, Duration::from_secs(15)).await;
+    assert_eq!(fresh.len(), 10, "latest still delivers new records");
+
+    stop_broker(broker).await;
+}
+
+/// `none` refuses to guess. A consumer that must neither reprocess nor
+/// skip needs the decision surfaced, not made for it silently.
+#[tokio::test]
+async fn auto_offset_reset_none_reports_rather_than_guessing() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_broker(dir.path()).await;
+    produce_records(broker.addr, 0, 10).await;
+
+    let mut strict = GroupConsumer::connect(broker.addr, "reset-none", "g-none")
+        .await
+        .expect("connect")
+        .with_session_timeout(6_000)
+        .with_rebalance_timeout(2_500)
+        .with_auto_commit(None)
+        .with_auto_offset_reset(AutoOffsetReset::None);
+    strict.subscribe(&[TOPIC]);
+
+    // The group has never committed, so there is no position to resume
+    // from and the poll must say so rather than pick one.
+    let mut saw_error = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match strict.poll(Duration::from_millis(200)).await {
+            Err(brahmaputra_client::ClientError::NoOffsetForPartition { .. }) => {
+                saw_error = true;
+                break;
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(records) => assert!(
+                records.is_empty(),
+                "none must not deliver records it had to guess a position for"
+            ),
+        }
+    }
+    assert!(
+        saw_error,
+        "auto.offset.reset=none must surface NoOffsetForPartition"
+    );
+
     stop_broker(broker).await;
 }

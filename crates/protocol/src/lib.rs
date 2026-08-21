@@ -21,7 +21,8 @@ mod varint;
 
 pub use batch::{
     validate_batch_header, BatchHeader, Compression, ProducerMetadata, Record, RecordBatch,
-    BATCH_HEADER_LEN, MAGIC_V1, MAGIC_V2, MIN_BATCH_LENGTH, PRODUCER_EXTENSION_LEN,
+    RecordHeader, BATCH_HEADER_LEN, MAGIC_V1, MAGIC_V2, MAX_DECOMPRESSED_BYTES, MIN_BATCH_LENGTH,
+    PRODUCER_EXTENSION_LEN,
 };
 pub use error::ProtocolError;
 pub use frame::{

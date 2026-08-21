@@ -9,4 +9,7 @@ license.workspace = true
 bytes.workspace = true
 crc32c.workspace = true
 lz4_flex.workspace = true
+zstd.workspace = true
+snap.workspace = true
+flate2.workspace = true
 thiserror.workspace = true

@@ -8,7 +8,7 @@
 //! leader_epoch:      i32
 //! magic:             u8    (MAGIC_V1 or MAGIC_V2)
 //! crc32c:            u32   (covers everything after this field)
-//! attributes:        u16   (bits 0..=2: compression type)
+//! attributes:        u16   (bits 0..=2: compression type; bit 3: headers)
 //! last_offset_delta: i32
 //! max_timestamp:     i64
 //! producer_id:       i64   (magic v2 only)
@@ -17,8 +17,7 @@
 //! records:           [Record]  (possibly compressed, per attributes)
 //! ```
 //!
-//! Record layout (magic v1; record headers are not implemented yet — the
-//! magic byte allows the format to evolve):
+//! Record layout:
 //!
 //! ```text
 //! record_length:    uvarint  (bytes following this field)
@@ -27,7 +26,21 @@
 //! value_len:        uvarint
 //! value:            [u8]
 //! timestamp_delta:  uvarint  (zigzag-encoded i64)
+//! header_count:     uvarint  (only when the batch's HEADERS_BIT is set)
+//!   key_len:            uvarint
+//!   key:                [u8]     (UTF-8)
+//!   value_len_plus_one: uvarint  (0 => null value, else value length + 1)
+//!   value:              [u8]
 //! ```
+//!
+//! The header section is governed by an attributes bit rather than a magic
+//! bump because the two are not the same question: magic already means "does
+//! this batch carry producer metadata", and overloading it would make
+//! "headers, no idempotence" unrepresentable. The bit is set only when some
+//! record in the batch actually carries a header, so a batch without headers
+//! encodes to exactly the bytes it did before headers existed — existing logs
+//! decode unchanged, and adding the feature costs nothing to anyone who does
+//! not use it.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -51,6 +64,8 @@ pub const MIN_BATCH_LENGTH: usize = 4 + 1 + 4 + 2 + 4 + 8;
 pub const PRODUCER_EXTENSION_LEN: usize = 8 + 2 + 4;
 
 const COMPRESSION_MASK: u16 = 0x0007;
+/// Attributes bit 3: the records in this batch carry a header section.
+const HEADERS_BIT: u16 = 0x0008;
 
 /// Compression applied to the records payload inside a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -58,7 +73,9 @@ pub enum Compression {
     #[default]
     None = 0,
     Lz4 = 1,
-    // Reserved for later: Zstd = 2, Snappy = 3 (see DESIGN.md §9).
+    Zstd = 2,
+    Snappy = 3,
+    Gzip = 4,
 }
 
 impl Compression {
@@ -70,7 +87,142 @@ impl Compression {
         match bits {
             0 => Ok(Compression::None),
             1 => Ok(Compression::Lz4),
+            2 => Ok(Compression::Zstd),
+            3 => Ok(Compression::Snappy),
+            4 => Ok(Compression::Gzip),
             other => Err(ProtocolError::UnsupportedCompression(other)),
+        }
+    }
+
+    /// Parse the `compression.type` spelling Kafka uses.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "none" => Some(Compression::None),
+            "lz4" => Some(Compression::Lz4),
+            "zstd" => Some(Compression::Zstd),
+            "snappy" => Some(Compression::Snappy),
+            "gzip" => Some(Compression::Gzip),
+            _ => None,
+        }
+    }
+
+    /// The name `parse` accepts, for config echo and error messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Compression::None => "none",
+            Compression::Lz4 => "lz4",
+            Compression::Zstd => "zstd",
+            Compression::Snappy => "snappy",
+            Compression::Gzip => "gzip",
+        }
+    }
+}
+
+/// Compress `payload` with `codec`.
+///
+/// Every codec is length-prepended or self-describing, so the decoder never
+/// has to be told the uncompressed size out of band.
+fn compress(codec: Compression, payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    use std::io::Write;
+    match codec {
+        Compression::None => Ok(payload.to_vec()),
+        Compression::Lz4 => Ok(lz4_flex::compress_prepend_size(payload)),
+        // Level 3 is zstd's default: the knee of the ratio/CPU curve, and
+        // the level Kafka's own default maps to.
+        Compression::Zstd => {
+            zstd::stream::encode_all(payload, 3).map_err(|e| ProtocolError::Compress(e.to_string()))
+        }
+        Compression::Snappy => snap::raw::Encoder::new()
+            .compress_vec(payload)
+            .map_err(|e| ProtocolError::Compress(e.to_string())),
+        Compression::Gzip => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(payload)
+                .map_err(|e| ProtocolError::Compress(e.to_string()))?;
+            encoder
+                .finish()
+                .map_err(|e| ProtocolError::Compress(e.to_string()))
+        }
+    }
+}
+
+/// Decompress a records payload produced by [`compress`].
+///
+/// A corrupt or hostile payload must fail rather than allocate without
+/// bound, so every codec that can be asked for an arbitrary output size is
+/// capped at [`MAX_DECOMPRESSED_BYTES`].
+fn decompress(codec: Compression, body: &[u8]) -> Result<Bytes, ProtocolError> {
+    use std::io::Read;
+    match codec {
+        Compression::None => Ok(Bytes::copy_from_slice(body)),
+        Compression::Lz4 => Ok(Bytes::from(
+            lz4_flex::decompress_size_prepended(body)
+                .map_err(|e| ProtocolError::Lz4(e.to_string()))?,
+        )),
+        Compression::Zstd => {
+            let mut out = Vec::new();
+            zstd::stream::Decoder::new(body)
+                .map_err(|e| ProtocolError::Compress(e.to_string()))?
+                .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
+                .read_to_end(&mut out)
+                .map_err(|e| ProtocolError::Compress(e.to_string()))?;
+            check_decompressed_len(out)
+        }
+        Compression::Snappy => {
+            // The decoder reads the length from the frame itself, so check it
+            // before allocating rather than after.
+            let len = snap::raw::decompress_len(body)
+                .map_err(|e| ProtocolError::Compress(e.to_string()))?;
+            if len > MAX_DECOMPRESSED_BYTES {
+                return Err(ProtocolError::Malformed("decompressed payload too large"));
+            }
+            snap::raw::Decoder::new()
+                .decompress_vec(body)
+                .map(Bytes::from)
+                .map_err(|e| ProtocolError::Compress(e.to_string()))
+        }
+        Compression::Gzip => {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(body)
+                .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
+                .read_to_end(&mut out)
+                .map_err(|e| ProtocolError::Compress(e.to_string()))?;
+            check_decompressed_len(out)
+        }
+    }
+}
+
+fn check_decompressed_len(out: Vec<u8>) -> Result<Bytes, ProtocolError> {
+    if out.len() > MAX_DECOMPRESSED_BYTES {
+        return Err(ProtocolError::Malformed("decompressed payload too large"));
+    }
+    Ok(Bytes::from(out))
+}
+
+/// Ceiling on what one batch may decompress to. A compressed batch is a
+/// decompression bomb otherwise: a few KiB on the wire can name gigabytes of
+/// output, and the broker allocates it before it can reject anything.
+pub const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+
+/// A key/value annotation on a record, carried beside the payload rather
+/// than inside it.
+///
+/// Keys are UTF-8 and may repeat — this is Kafka's model, where headers are
+/// an ordered list rather than a map, because tracing systems legitimately
+/// attach several values under one name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordHeader {
+    pub key: String,
+    pub value: Option<Bytes>,
+}
+
+impl RecordHeader {
+    pub fn new(key: impl Into<String>, value: impl Into<Bytes>) -> Self {
+        RecordHeader {
+            key: key.into(),
+            value: Some(value.into()),
         }
     }
 }
@@ -81,7 +233,17 @@ pub struct Record {
     pub key: Option<Bytes>,
     pub value: Bytes,
     /// Milliseconds relative to the batch's `max_timestamp` base.
+    ///
+    /// The base is `max_timestamp` rather than a first-record timestamp, so
+    /// a delta is normally zero or negative. That is deliberate: every
+    /// record written before per-record timestamps existed has a delta of
+    /// zero, which under this base still means exactly what it meant then —
+    /// the batch timestamp. Changing the base would silently re-date every
+    /// record already on disk.
     pub timestamp_delta: i64,
+    /// Ordered, possibly repeating annotations. Empty for most records, and
+    /// costs nothing to encode when empty.
+    pub headers: Vec<RecordHeader>,
 }
 
 /// Identity and per-partition ordering metadata carried by magic-v2 batches.
@@ -98,6 +260,7 @@ impl Record {
             key: None,
             value: value.into(),
             timestamp_delta: 0,
+            headers: Vec::new(),
         }
     }
 
@@ -106,7 +269,26 @@ impl Record {
             key: Some(key.into()),
             value: value.into(),
             timestamp_delta,
+            headers: Vec::new(),
         }
+    }
+
+    pub fn with_headers(mut self, headers: Vec<RecordHeader>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// This record's absolute timestamp, given its batch's base.
+    pub fn timestamp(&self, max_timestamp: i64) -> i64 {
+        max_timestamp.saturating_add(self.timestamp_delta)
+    }
+
+    /// The first value stored under `key`, if any.
+    pub fn header(&self, key: &str) -> Option<&Bytes> {
+        self.headers
+            .iter()
+            .find(|header| header.key == key)
+            .and_then(|header| header.value.as_ref())
     }
 }
 
@@ -129,6 +311,47 @@ impl RecordBatch {
         max_timestamp: i64,
         records: Vec<Record>,
     ) -> Self {
+        RecordBatch {
+            base_offset,
+            leader_epoch,
+            max_timestamp,
+            records,
+            compression: Compression::None,
+            producer: None,
+        }
+    }
+
+    /// Build a batch from records carrying *absolute* create timestamps.
+    ///
+    /// The batch stores one base timestamp and a delta per record, so the
+    /// rebasing has to happen somewhere; doing it here means both producer
+    /// paths cannot disagree about it. `max_timestamp` becomes the newest
+    /// record's time, which is what makes it a truthful answer to "how
+    /// recent is this batch" for retention and timestamp seeks.
+    ///
+    /// An empty batch keeps `fallback_timestamp`, since there is no record
+    /// to take a time from.
+    pub fn from_timestamped(
+        base_offset: i64,
+        leader_epoch: i32,
+        records: Vec<(Record, i64)>,
+        fallback_timestamp: i64,
+    ) -> Self {
+        let max_timestamp = records
+            .iter()
+            .map(|(_, timestamp)| *timestamp)
+            .max()
+            .unwrap_or(fallback_timestamp);
+        let records = records
+            .into_iter()
+            .map(|(mut record, timestamp)| {
+                // Negative or zero by construction, since the base is the
+                // maximum. A clock that jumped backwards mid-batch is still
+                // representable rather than saturating.
+                record.timestamp_delta = timestamp.saturating_sub(max_timestamp);
+                record
+            })
+            .collect();
         RecordBatch {
             base_offset,
             leader_epoch,
@@ -179,6 +402,11 @@ impl RecordBatch {
 
     /// Serialize the batch to its on-disk/on-wire byte form.
     pub fn encode(&self) -> Bytes {
+        // Only pay for the header section if some record actually uses it.
+        // A batch with no headers must encode byte-identically to the way it
+        // did before headers existed.
+        let has_headers = self.records.iter().any(|r| !r.headers.is_empty());
+
         // Records payload.
         let mut payload = BytesMut::new();
         for record in &self.records {
@@ -193,14 +421,30 @@ impl RecordBatch {
             put_uvarint(&mut rec, record.value.len() as u64);
             rec.extend_from_slice(&record.value);
             put_uvarint(&mut rec, zigzag_encode(record.timestamp_delta));
+            if has_headers {
+                put_uvarint(&mut rec, record.headers.len() as u64);
+                for header in &record.headers {
+                    put_uvarint(&mut rec, header.key.len() as u64);
+                    rec.extend_from_slice(header.key.as_bytes());
+                    match &header.value {
+                        None => put_uvarint(&mut rec, 0),
+                        Some(value) => {
+                            put_uvarint(&mut rec, value.len() as u64 + 1);
+                            rec.extend_from_slice(value);
+                        }
+                    }
+                }
+            }
             put_uvarint(&mut payload, rec.len() as u64);
             payload.extend_from_slice(&rec);
         }
-        let payload = match self.compression {
-            Compression::None => payload,
-            Compression::Lz4 => {
-                BytesMut::from(lz4_flex::compress_prepend_size(&payload).as_slice())
-            }
+        // Compression cannot fail for any codec here (all are pure encoders
+        // over an in-memory buffer), but an encoder that did fail must not
+        // silently ship uncompressed bytes under a compressed attribute —
+        // that would be unreadable. Fall back to `None` honestly instead.
+        let (payload, compression) = match compress(self.compression, &payload) {
+            Ok(compressed) => (BytesMut::from(compressed.as_slice()), self.compression),
+            Err(_) => (payload, Compression::None),
         };
 
         let extension_len = self.producer.map_or(0, |_| PRODUCER_EXTENSION_LEN);
@@ -216,7 +460,11 @@ impl RecordBatch {
         });
         let crc_pos = out.len();
         out.put_u32(0); // crc placeholder, backfilled below
-        out.put_u16(self.compression.to_bits() & COMPRESSION_MASK);
+        let mut attributes = compression.to_bits() & COMPRESSION_MASK;
+        if has_headers {
+            attributes |= HEADERS_BIT;
+        }
+        out.put_u16(attributes);
         out.put_i32(self.last_offset_delta());
         out.put_i64(self.max_timestamp);
         if let Some(producer) = self.producer {
@@ -287,14 +535,13 @@ impl RecordBatch {
         };
 
         let payload: Bytes = match compression {
+            // The uncompressed case already owns the right bytes; copying
+            // them again would undo the zero-copy property of a read.
             Compression::None => body,
-            Compression::Lz4 => Bytes::from(
-                lz4_flex::decompress_size_prepended(&body)
-                    .map_err(|e| ProtocolError::Lz4(e.to_string()))?,
-            ),
+            codec => decompress(codec, &body)?,
         };
 
-        let records = decode_records(&payload)?;
+        let records = decode_records(&payload, attributes & HEADERS_BIT != 0)?;
         if !records.is_empty() && last_offset_delta != records.len() as i32 - 1 {
             return Err(ProtocolError::Malformed("last_offset_delta mismatch"));
         }
@@ -310,7 +557,7 @@ impl RecordBatch {
     }
 }
 
-fn decode_records(payload: &[u8]) -> Result<Vec<Record>, ProtocolError> {
+fn decode_records(payload: &[u8], has_headers: bool) -> Result<Vec<Record>, ProtocolError> {
     let mut records = Vec::new();
     let mut slice = payload;
     while !slice.is_empty() {
@@ -352,6 +599,52 @@ fn decode_records(payload: &[u8]) -> Result<Vec<Record>, ProtocolError> {
         let value = Bytes::copy_from_slice(v);
 
         let timestamp_delta = zigzag_decode(get_uvarint(&mut rec)?);
+
+        let mut headers = Vec::new();
+        if has_headers {
+            let count = get_uvarint(&mut rec)?;
+            // A count is a promise about bytes that follow; if it exceeds
+            // what is left it is corrupt, and reserving on it would let a
+            // 2-byte record ask for gigabytes.
+            if count > rec.len() as u64 {
+                return Err(ProtocolError::Malformed(
+                    "record header count exceeds record",
+                ));
+            }
+            headers.reserve(count as usize);
+            for _ in 0..count {
+                let key_len = get_uvarint(&mut rec)? as usize;
+                if rec.len() < key_len {
+                    return Err(ProtocolError::Truncated {
+                        needed: key_len,
+                        available: rec.len(),
+                    });
+                }
+                let (raw_key, r) = rec.split_at(key_len);
+                rec = r;
+                let key = std::str::from_utf8(raw_key)
+                    .map_err(|_| ProtocolError::Malformed("record header key is not UTF-8"))?
+                    .to_string();
+
+                let value_len_plus_one = get_uvarint(&mut rec)?;
+                let value = if value_len_plus_one == 0 {
+                    None
+                } else {
+                    let len = (value_len_plus_one - 1) as usize;
+                    if rec.len() < len {
+                        return Err(ProtocolError::Truncated {
+                            needed: len,
+                            available: rec.len(),
+                        });
+                    }
+                    let (v, r) = rec.split_at(len);
+                    rec = r;
+                    Some(Bytes::copy_from_slice(v))
+                };
+                headers.push(RecordHeader { key, value });
+            }
+        }
+
         if !rec.is_empty() {
             return Err(ProtocolError::Malformed("trailing bytes in record"));
         }
@@ -359,6 +652,7 @@ fn decode_records(payload: &[u8]) -> Result<Vec<Record>, ProtocolError> {
             key,
             value,
             timestamp_delta,
+            headers,
         });
     }
     Ok(records)
@@ -471,6 +765,204 @@ mod tests {
 
     fn sample_batch(n: usize) -> RecordBatch {
         RecordBatch::new(42, 7, 1_700_000_000_000, sample_records(n))
+    }
+
+    /// Every codec must return exactly what it was given, and must do so
+    /// through the framing — a codec that round-trips in isolation but
+    /// disagrees with the attributes bits is still broken.
+    #[test]
+    fn every_codec_round_trips() {
+        for codec in [
+            Compression::None,
+            Compression::Lz4,
+            Compression::Zstd,
+            Compression::Snappy,
+            Compression::Gzip,
+        ] {
+            let batch = sample_batch(40).with_compression(codec);
+            let mut bytes = batch.encode();
+            let decoded = RecordBatch::decode(&mut bytes).unwrap();
+            assert_eq!(decoded.records, batch.records, "{codec:?} lost record data");
+            assert_eq!(decoded.compression, codec, "{codec:?} lost its attribute");
+        }
+    }
+
+    /// Compression has to actually compress, or the attribute is a lie that
+    /// costs CPU. Highly repetitive input is the easy case; if a codec
+    /// cannot win here it is misconfigured.
+    #[test]
+    fn compressible_input_gets_smaller() {
+        let records: Vec<Record> = (0..200).map(|_| Record::new(vec![b'a'; 512])).collect();
+        let plain = RecordBatch::new(0, 0, 1, records.clone()).encode().len();
+        for codec in [
+            Compression::Lz4,
+            Compression::Zstd,
+            Compression::Snappy,
+            Compression::Gzip,
+        ] {
+            let compressed = RecordBatch::new(0, 0, 1, records.clone())
+                .with_compression(codec)
+                .encode()
+                .len();
+            assert!(
+                compressed < plain / 2,
+                "{codec:?} produced {compressed} bytes from {plain}"
+            );
+        }
+    }
+
+    #[test]
+    fn compression_names_round_trip() {
+        for codec in [
+            Compression::None,
+            Compression::Lz4,
+            Compression::Zstd,
+            Compression::Snappy,
+            Compression::Gzip,
+        ] {
+            assert_eq!(Compression::parse(codec.name()), Some(codec));
+        }
+        assert_eq!(Compression::parse("brotli"), None);
+    }
+
+    #[test]
+    fn headers_round_trip() {
+        let record = Record::new(b"payload".to_vec()).with_headers(vec![
+            RecordHeader::new("trace-id", b"abc123".to_vec()),
+            RecordHeader::new("content-type", b"application/json".to_vec()),
+            // A null value is distinct from an empty one, and both are legal.
+            RecordHeader {
+                key: "tombstone-reason".into(),
+                value: None,
+            },
+            RecordHeader::new("empty", Vec::new()),
+        ]);
+        let batch = RecordBatch::new(0, 0, 1_700_000_000_000, vec![record.clone()]);
+        let mut bytes = batch.encode();
+        let decoded = RecordBatch::decode(&mut bytes).unwrap();
+        assert_eq!(decoded.records[0], record);
+        assert_eq!(
+            decoded.records[0].header("trace-id").unwrap().as_ref(),
+            b"abc123"
+        );
+        assert_eq!(decoded.records[0].headers[2].value, None);
+        assert_eq!(
+            decoded.records[0].headers[3].value.as_deref(),
+            Some(&b""[..])
+        );
+    }
+
+    /// Kafka's header list is ordered and may repeat a key; a map would
+    /// silently drop the duplicates that tracing systems rely on.
+    #[test]
+    fn headers_keep_order_and_duplicates() {
+        let record = Record::new(b"v".to_vec()).with_headers(vec![
+            RecordHeader::new("tag", b"first".to_vec()),
+            RecordHeader::new("tag", b"second".to_vec()),
+        ]);
+        let mut bytes = RecordBatch::new(0, 0, 1, vec![record]).encode();
+        let decoded = RecordBatch::decode(&mut bytes).unwrap();
+        let tags: Vec<_> = decoded.records[0]
+            .headers
+            .iter()
+            .map(|h| h.value.clone().unwrap())
+            .collect();
+        assert_eq!(tags, vec![Bytes::from("first"), Bytes::from("second")]);
+        assert_eq!(decoded.records[0].header("tag").unwrap().as_ref(), b"first");
+    }
+
+    /// The whole point of the attributes bit: a batch nobody attached a
+    /// header to must encode to the bytes it always did, so existing logs
+    /// stay readable and the feature costs non-users nothing.
+    #[test]
+    fn a_batch_without_headers_is_byte_identical_to_the_old_format() {
+        let batch = sample_batch(10);
+        let encoded = batch.encode();
+        // Attributes sit after base_offset(8) + batch_length(4) +
+        // leader_epoch(4) + magic(1) + crc(4).
+        let attributes = u16::from_be_bytes([encoded[21], encoded[22]]);
+        assert_eq!(
+            attributes & HEADERS_BIT,
+            0,
+            "the headers bit must stay clear when no record uses headers"
+        );
+
+        let with_headers = RecordBatch::new(
+            42,
+            7,
+            1_700_000_000_000,
+            vec![Record::new(b"v".to_vec())
+                .with_headers(vec![RecordHeader::new("k", b"v".to_vec())])],
+        );
+        let encoded = with_headers.encode();
+        let attributes = u16::from_be_bytes([encoded[21], encoded[22]]);
+        assert_ne!(attributes & HEADERS_BIT, 0, "the bit must be set when used");
+    }
+
+    /// A record's timestamp is its own, not its batch's. Rebasing against
+    /// the maximum is what lets the old on-disk delta of zero keep meaning
+    /// exactly what it always meant.
+    #[test]
+    fn per_record_timestamps_survive_a_round_trip() {
+        let base = 1_700_000_000_000i64;
+        let batch = RecordBatch::from_timestamped(
+            0,
+            0,
+            vec![
+                (Record::new(b"a".to_vec()), base),
+                (Record::new(b"b".to_vec()), base + 250),
+                (Record::new(b"c".to_vec()), base + 100),
+            ],
+            0,
+        );
+        assert_eq!(batch.max_timestamp, base + 250, "the newest record wins");
+
+        let mut bytes = batch.encode();
+        let decoded = RecordBatch::decode(&mut bytes).unwrap();
+        let times: Vec<i64> = decoded
+            .records
+            .iter()
+            .map(|r| r.timestamp(decoded.max_timestamp))
+            .collect();
+        assert_eq!(times, vec![base, base + 250, base + 100]);
+    }
+
+    /// A record written before per-record timestamps existed has a delta of
+    /// zero and must still read back as the batch timestamp.
+    #[test]
+    fn a_zero_delta_still_means_the_batch_timestamp() {
+        let base = 1_700_000_000_000i64;
+        let record = Record::new(b"legacy".to_vec());
+        assert_eq!(record.timestamp_delta, 0);
+        assert_eq!(record.timestamp(base), base);
+    }
+
+    #[test]
+    fn an_empty_batch_keeps_the_fallback_timestamp() {
+        let batch = RecordBatch::from_timestamped(0, 0, Vec::new(), 99);
+        assert_eq!(batch.max_timestamp, 99);
+    }
+
+    /// A corrupt header count must be refused rather than used to size an
+    /// allocation.
+    #[test]
+    fn an_impossible_header_count_is_refused() {
+        // header_count = 200 in a record with only a couple of bytes left.
+        let mut payload = BytesMut::new();
+        let mut rec = BytesMut::new();
+        put_uvarint(&mut rec, 0); // null key
+        put_uvarint(&mut rec, 1); // value length
+        rec.extend_from_slice(b"v");
+        put_uvarint(&mut rec, zigzag_encode(0));
+        put_uvarint(&mut rec, 200); // header count, a lie
+        put_uvarint(&mut payload, rec.len() as u64);
+        payload.extend_from_slice(&rec);
+
+        let error = decode_records(&payload, true).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Malformed(_)),
+            "expected a malformed error, got {error:?}"
+        );
     }
 
     #[test]

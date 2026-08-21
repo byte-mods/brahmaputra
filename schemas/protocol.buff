@@ -392,3 +392,21 @@ class AuthenticateResponse {
     string principal;
     string role;
 }
+
+// ---------- LeaveGroup (api_key 18) ----------
+// A member announcing its own departure, so the coordinator can rebalance
+// immediately instead of waiting out the session timeout.
+//
+// Without this a clean shutdown is indistinguishable from a crash, and the
+// group stalls for `session.timeout.ms` before the departing member's
+// partitions move — which is pure downtime during a rolling restart, the
+// most common planned operation there is.
+
+class LeaveGroupRequest {
+    string group_id;
+    string member_id;
+}
+
+class LeaveGroupResponse {
+    int error_code;
+}

@@ -9,6 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use brahmaputra_storage::LogConfig;
+use tracing::warn;
+
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
@@ -210,5 +213,217 @@ mod tests {
             assert_eq!(reloaded.partitions(&format!("concurrent-{index}")), Some(3));
         }
         assert!(!dir.path().join(META_TEMP_FILE).exists());
+    }
+}
+
+/// Build the log configuration for one topic: broker defaults, overridden by
+/// whatever that topic sets.
+///
+/// Topic configs used to be stored and ignored, which is worse than not
+/// supporting them — an operator who sets `retention.ms` on a topic and sees
+/// it echoed back reasonably believes it took effect. Anything unset or
+/// unparseable falls back to the broker-wide value rather than to zero, so a
+/// typo cannot silently delete a log.
+pub(crate) fn log_config_for_topic(
+    defaults: &LogConfig,
+    topic: &str,
+    configs: Option<&std::collections::BTreeMap<String, String>>,
+) -> LogConfig {
+    let mut config = defaults.clone();
+
+    if topic == crate::group::OFFSETS_TOPIC {
+        // Every commit rewrites the same key, so this topic must be
+        // compacted or it grows without bound and coordinator failover
+        // slows without limit.
+        config.compact = true;
+        // A committed consumer offset that disappears on restart is a
+        // correctness break, not a lost optimisation, and commits arrive
+        // far too slowly for an eager checkpoint to cost anything. User
+        // topics keep the periodic one.
+        config.hwm_checkpoint_interval_ms = 0;
+        return config;
+    }
+
+    let Some(configs) = configs else {
+        return config;
+    };
+
+    // `-1` is Kafka's "unlimited" for retention, and means the same here.
+    if let Some(value) = configs.get("retention.ms") {
+        match value.parse::<i64>() {
+            Ok(-1) => config.retention_ms = None,
+            Ok(ms) if ms >= 0 => config.retention_ms = Some(ms as u64),
+            _ => warn!(topic, value, "ignoring unparseable retention.ms"),
+        }
+    }
+    if let Some(value) = configs.get("retention.bytes") {
+        match value.parse::<i64>() {
+            Ok(-1) => config.retention_bytes = None,
+            Ok(bytes) if bytes >= 0 => config.retention_bytes = Some(bytes as u64),
+            _ => warn!(topic, value, "ignoring unparseable retention.bytes"),
+        }
+    }
+    if let Some(value) = configs.get("segment.bytes") {
+        match value.parse::<u64>() {
+            // A segment has to be able to hold at least one batch header,
+            // and a pathologically small value would roll on every append.
+            Ok(bytes) if bytes >= 1024 => config.segment_bytes = bytes,
+            _ => warn!(topic, value, "ignoring unusable segment.bytes"),
+        }
+    }
+    if let Some(value) = configs.get("segment.ms") {
+        match value.parse::<i64>() {
+            Ok(-1) => config.segment_ms = None,
+            Ok(ms) if ms > 0 => config.segment_ms = Some(ms as u64),
+            _ => warn!(topic, value, "ignoring unparseable segment.ms"),
+        }
+    }
+    if let Some(value) = configs.get("cleanup.policy") {
+        match value.as_str() {
+            "compact" => config.compact = true,
+            "delete" => config.compact = false,
+            _ => warn!(topic, value, "ignoring unknown cleanup.policy"),
+        }
+    }
+    if let Some(value) = configs.get("flush.messages") {
+        match value.parse::<u64>() {
+            Ok(0) => config.flush_interval_messages = None,
+            Ok(count) => config.flush_interval_messages = Some(count),
+            _ => warn!(topic, value, "ignoring unparseable flush.messages"),
+        }
+    }
+    if let Some(value) = configs.get("flush.ms") {
+        match value.parse::<u64>() {
+            Ok(0) => config.flush_interval_ms = None,
+            Ok(ms) => config.flush_interval_ms = Some(ms),
+            _ => warn!(topic, value, "ignoring unparseable flush.ms"),
+        }
+    }
+    config
+}
+
+#[cfg(test)]
+mod topic_config_tests {
+    use super::*;
+
+    fn configs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    fn defaults() -> LogConfig {
+        LogConfig {
+            segment_bytes: 64 * 1024 * 1024,
+            retention_ms: Some(7 * 24 * 60 * 60 * 1000),
+            ..LogConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_topic_overrides_the_broker_default() {
+        let resolved = log_config_for_topic(
+            &defaults(),
+            "orders",
+            Some(&configs(&[
+                ("retention.ms", "60000"),
+                ("retention.bytes", "1048576"),
+                ("segment.bytes", "32768"),
+                ("segment.ms", "120000"),
+            ])),
+        );
+        assert_eq!(resolved.retention_ms, Some(60_000));
+        assert_eq!(resolved.retention_bytes, Some(1_048_576));
+        assert_eq!(resolved.segment_bytes, 32_768);
+        assert_eq!(resolved.segment_ms, Some(120_000));
+    }
+
+    #[test]
+    fn an_unset_key_keeps_the_broker_default() {
+        let resolved = log_config_for_topic(
+            &defaults(),
+            "orders",
+            Some(&configs(&[("segment.bytes", "8192")])),
+        );
+        assert_eq!(resolved.segment_bytes, 8_192);
+        assert_eq!(
+            resolved.retention_ms,
+            defaults().retention_ms,
+            "an unset key must not clear the broker default"
+        );
+    }
+
+    /// A typo must not be read as zero — that would delete a log rather
+    /// than leave it alone.
+    #[test]
+    fn an_unparseable_value_is_ignored_not_treated_as_zero() {
+        for bad in ["", "soon", "-5", "1e6"] {
+            let resolved = log_config_for_topic(
+                &defaults(),
+                "orders",
+                Some(&configs(&[("retention.ms", bad)])),
+            );
+            assert_eq!(
+                resolved.retention_ms,
+                defaults().retention_ms,
+                "{bad:?} must fall back to the broker default"
+            );
+        }
+    }
+
+    /// Kafka spells "keep forever" as -1, and so does this.
+    #[test]
+    fn minus_one_means_unlimited() {
+        let resolved = log_config_for_topic(
+            &defaults(),
+            "orders",
+            Some(&configs(&[("retention.ms", "-1")])),
+        );
+        assert_eq!(resolved.retention_ms, None);
+    }
+
+    #[test]
+    fn cleanup_policy_selects_compaction() {
+        let compacted = log_config_for_topic(
+            &defaults(),
+            "orders",
+            Some(&configs(&[("cleanup.policy", "compact")])),
+        );
+        assert!(compacted.compact, "a user topic can now be compacted");
+
+        let deleted = log_config_for_topic(
+            &defaults(),
+            "orders",
+            Some(&configs(&[("cleanup.policy", "delete")])),
+        );
+        assert!(!deleted.compact);
+    }
+
+    /// The offsets topic keeps its own rules whatever anyone configures:
+    /// it must compact, and it must checkpoint eagerly.
+    #[test]
+    fn the_offsets_topic_is_not_overridable() {
+        let resolved = log_config_for_topic(
+            &defaults(),
+            "__consumer_offsets",
+            Some(&configs(&[
+                ("cleanup.policy", "delete"),
+                ("retention.ms", "1000"),
+            ])),
+        );
+        assert!(resolved.compact);
+        assert_eq!(resolved.hwm_checkpoint_interval_ms, 0);
+    }
+
+    /// A segment too small to hold a batch would roll on every append.
+    #[test]
+    fn an_absurd_segment_size_is_refused() {
+        let resolved = log_config_for_topic(
+            &defaults(),
+            "orders",
+            Some(&configs(&[("segment.bytes", "16")])),
+        );
+        assert_eq!(resolved.segment_bytes, defaults().segment_bytes);
     }
 }

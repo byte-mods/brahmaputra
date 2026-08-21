@@ -11,10 +11,10 @@ use brahmaputra_protocol::gen::{
     ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, AuthenticateRequest,
     AuthenticateResponse, BrokerInfo, DescribeGroupRequest, DescribeGroupResponse,
     FetchMultiRequest, FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinGroupRequest, JoinGroupResponse, ListGroupsRequest, ListGroupsResponse, ListOffsetsRequest,
-    ListOffsetsResponse, MetadataRequest, MetadataResponse, OffsetCommitRequest,
-    OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse, PartitionInfo, ProduceResponse,
-    SyncGroupRequest, SyncGroupResponse, TopicInfo,
+    JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest,
+    ListGroupsResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
+    OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
+    PartitionInfo, ProduceResponse, SyncGroupRequest, SyncGroupResponse, TopicInfo,
 };
 use brahmaputra_protocol::producer::{InitProducerIdRequest, InitProducerIdResponse};
 use brahmaputra_protocol::replica::{
@@ -146,6 +146,9 @@ fn required_access(api_key: ApiKey, body: &Bytes) -> Vec<(ResourceType, String, 
             .map(|request| vec![(ResourceType::Group, request.group_id, AclOperation::Read)])
             .unwrap_or_default(),
         ApiKey::Heartbeat => HeartbeatRequest::decode(body)
+            .map(|request| vec![(ResourceType::Group, request.group_id, AclOperation::Read)])
+            .unwrap_or_default(),
+        ApiKey::LeaveGroup => LeaveGroupRequest::decode(body)
             .map(|request| vec![(ResourceType::Group, request.group_id, AclOperation::Read)])
             .unwrap_or_default(),
         ApiKey::OffsetCommit => OffsetCommitRequest::decode(body)
@@ -363,6 +366,7 @@ pub async fn dispatch(
         ApiKey::JoinGroup => Some(join_group(broker, body).await.into()),
         ApiKey::SyncGroup => Some(sync_group(broker, body).await.into()),
         ApiKey::Heartbeat => Some(heartbeat(broker, body).await.into()),
+        ApiKey::LeaveGroup => Some(leave_group(broker, body).await.into()),
         ApiKey::OffsetCommit => Some(offset_commit(broker, body).await.into()),
         ApiKey::OffsetFetch => Some(offset_fetch(broker, body).await.into()),
         ApiKey::ListGroups => Some(list_groups(broker, body).await.into()),
@@ -447,6 +451,7 @@ pub(crate) fn encode_error_for(api_key: ApiKey, error_code: i32) -> Bytes {
         }
         .encode(),
         ApiKey::Heartbeat => HeartbeatResponse { error_code }.encode(),
+        ApiKey::LeaveGroup => LeaveGroupResponse { error_code }.encode(),
         ApiKey::OffsetCommit => OffsetCommitResponse { error_code }.encode(),
         ApiKey::OffsetFetch => OffsetFetchResponse {
             error_code,
@@ -912,6 +917,24 @@ async fn produce(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Optio
             return None;
         }
         return Some(respond(ec::INVALID_REQUEST, -1));
+    }
+    // `max.message.bytes`, per topic. Refusing here means an oversized
+    // record is rejected with an error the producer can act on, rather
+    // than being written and then breaking every consumer that has a
+    // smaller fetch budget than the record.
+    if let Some(limit) = broker.max_message_bytes(&req.topic) {
+        if let Some(oversized) = raw_batches.iter().find(|raw| raw.len() > limit) {
+            warn!(
+                topic = %req.topic,
+                size = oversized.len(),
+                limit,
+                "rejecting a batch larger than max.message.bytes"
+            );
+            if acks == 0 {
+                return None;
+            }
+            return Some(respond(ec::INVALID_REQUEST, -1));
+        }
     }
     let idempotent = headers[0].producer.is_some();
     if headers
@@ -1504,6 +1527,7 @@ const SUPPORTED_APIS: &[ApiKey] = &[
     ApiKey::JoinGroup,
     ApiKey::SyncGroup,
     ApiKey::Heartbeat,
+    ApiKey::LeaveGroup,
     ApiKey::OffsetCommit,
     ApiKey::OffsetFetch,
     ApiKey::ListGroups,
@@ -1616,6 +1640,24 @@ async fn heartbeat(broker: &Broker, body: Bytes) -> Bytes {
     codec_bytes(HeartbeatResponse { error_code }.encode())
 }
 
+async fn leave_group(broker: &Broker, body: Bytes) -> Bytes {
+    let request = match LeaveGroupRequest::decode(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(%error, "undecodable LeaveGroup request");
+            return encode_error_for(ApiKey::LeaveGroup, ec::INVALID_REQUEST);
+        }
+    };
+    let result = match coordinator_shard(broker, &request.group_id).await {
+        Ok(shard) => broker.groups().leave(broker, &shard, request).await,
+        Err(error) => Err(error),
+    };
+    let error_code = match &result {
+        Ok(()) => ec::NONE,
+        Err(error) => code_of(error),
+    };
+    codec_bytes(LeaveGroupResponse { error_code }.encode())
+}
 async fn offset_commit(broker: &Broker, body: Bytes) -> Bytes {
     let request = match OffsetCommitRequest::decode(&body) {
         Ok(request) => request,
@@ -1705,6 +1747,7 @@ fn api_name(api_key: ApiKey) -> &'static str {
         ApiKey::JoinGroup => "join_group",
         ApiKey::SyncGroup => "sync_group",
         ApiKey::Heartbeat => "heartbeat",
+        ApiKey::LeaveGroup => "leave_group",
         ApiKey::OffsetCommit => "offset_commit",
         ApiKey::OffsetFetch => "offset_fetch",
         ApiKey::ListGroups => "list_groups",

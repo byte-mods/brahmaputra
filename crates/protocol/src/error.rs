@@ -30,6 +30,10 @@ pub enum ProtocolError {
     #[error("lz4 error: {0}")]
     Lz4(String),
 
+    /// zstd / snappy / gzip (de)compression failure.
+    #[error("compression error: {0}")]
+    Compress(String),
+
     /// Unknown `api_key` in a frame header.
     #[error("unknown api key: {0}")]
     UnknownApiKey(i16),

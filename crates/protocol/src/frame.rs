@@ -68,6 +68,9 @@ pub enum ApiKey {
     /// Bind a principal to this connection; everything after is
     /// authorized as that principal.
     Authenticate = 17,
+    /// Announce a member's own departure so the coordinator can
+    /// rebalance now rather than after its session timeout.
+    LeaveGroup = 18,
 }
 
 impl ApiKey {
@@ -91,6 +94,7 @@ impl ApiKey {
             15 => Ok(ApiKey::ProduceMulti),
             16 => Ok(ApiKey::FetchMulti),
             17 => Ok(ApiKey::Authenticate),
+            18 => Ok(ApiKey::LeaveGroup),
             other => Err(ProtocolError::UnknownApiKey(other)),
         }
     }

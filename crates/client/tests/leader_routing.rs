@@ -294,7 +294,7 @@ async fn follower_seed_routes_all_client_io_and_refreshes_once_after_leader_chan
     );
     assert_eq!(consumer.list_offsets(TOPIC, 0, LATEST).await.unwrap(), 1);
     let fetched = consumer.fetch(TOPIC, 0, 0, 0).await.unwrap();
-    assert_eq!(fetched[0].2, Bytes::from_static(b"leader-two"));
+    assert_eq!(fetched[0].value, Bytes::from_static(b"leader-two"));
     assert_eq!(state.count(1).produce.load(Ordering::SeqCst), 0);
     assert_eq!(state.count(1).fetch.load(Ordering::SeqCst), 0);
     assert_eq!(state.count(1).list_offsets.load(Ordering::SeqCst), 0);
@@ -312,7 +312,7 @@ async fn follower_seed_routes_all_client_io_and_refreshes_once_after_leader_chan
     );
     assert_eq!(consumer.list_offsets(TOPIC, 0, LATEST).await.unwrap(), 1);
     let fetched = consumer.fetch(TOPIC, 0, 0, 0).await.unwrap();
-    assert_eq!(fetched[0].2, Bytes::from_static(b"leader-one"));
+    assert_eq!(fetched[0].value, Bytes::from_static(b"leader-one"));
     assert_eq!(state.count(2).not_leader.load(Ordering::SeqCst), 2);
     assert_eq!(state.count(2).produce.load(Ordering::SeqCst), 2);
     assert_eq!(state.count(2).fetch.load(Ordering::SeqCst), 1);

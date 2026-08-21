@@ -368,8 +368,8 @@ async fn idempotent_client_retries_lost_response_without_duplicate_append() {
             .unwrap();
         let records = consumer.fetch(TOPIC, 0, 0, 100).await.unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].0, 0);
-        assert_eq!(records[0].2, Bytes::from_static(b"exactly-once"));
+        assert_eq!(records[0].offset, 0);
+        assert_eq!(records[0].value, Bytes::from_static(b"exactly-once"));
         assert_eq!(consumer.list_offsets(TOPIC, 0, LATEST).await.unwrap(), 1);
 
         let _ = proxy_shutdown.send(true);

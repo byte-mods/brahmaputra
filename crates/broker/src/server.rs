@@ -680,18 +680,19 @@ impl Broker {
             Entry::Vacant(e) => {
                 let dir = partition_dir(&self.config.data_dir, topic, partition);
                 actor::complete_pending_replica_reset(&dir)?;
-                let mut log_config = self.config.log_config.clone();
-                if topic == crate::group::OFFSETS_TOPIC {
-                    // Every commit rewrites the same key, so this topic
-                    // must be compacted or it grows without bound and
-                    // coordinator failover slows without limit.
-                    log_config.compact = true;
-                    // A committed consumer offset that disappears on restart
-                    // is a correctness break, not a lost optimisation, and
-                    // commits arrive far too slowly for an eager checkpoint
-                    // to cost anything. User topics keep the periodic one.
-                    log_config.hwm_checkpoint_interval_ms = 0;
-                }
+                // Broker defaults, overridden by whatever this topic sets.
+                // Reading them here is what makes `retention.ms` on a topic
+                // mean something rather than being stored and ignored.
+                let image = self.config.metadata_cache.as_ref().map(|c| c.snapshot());
+                let topic_configs = image
+                    .as_ref()
+                    .and_then(|image| image.topics.get(topic))
+                    .map(|meta| &meta.configs);
+                let log_config = crate::state::log_config_for_topic(
+                    &self.config.log_config,
+                    topic,
+                    topic_configs,
+                );
                 let mut log = Log::open(&dir, log_config.clone())?;
                 if !self.config.replication_enabled {
                     // A standalone leader owns the only replica, so every
@@ -705,14 +706,15 @@ impl Broker {
                         log.set_high_watermark(recovered_end)?;
                     }
                 }
-                // One maintenance tick drives retention, timed flushes,
-                // compaction, and the periodic high-watermark checkpoint.
+                // One maintenance tick drives retention, timed flushes, segment
+                // rolls, compaction, and the periodic high-watermark checkpoint.
                 // User topics need the tick even when all optional retention
                 // and flush policies are disabled, otherwise the default
                 // five-second HWM checkpoint would never reach disk.
                 let maintenance_enabled = log_config.retention_ms.is_some()
                     || log_config.retention_bytes.is_some()
                     || log_config.flush_interval_ms.is_some()
+                    || log_config.segment_ms.is_some()
                     || log_config.compact
                     || log_config.hwm_checkpoint_interval_ms > 0;
                 let replicated_commit =
@@ -1285,4 +1287,20 @@ async fn resolve_bind_addr(host: &str, port: u16) -> Result<SocketAddr, BrokerEr
         .await?
         .next()
         .ok_or_else(|| BrokerError::Meta(format!("host {host:?} resolved to no addresses")))
+}
+
+impl Broker {
+    /// The largest batch this topic accepts, if it sets `max.message.bytes`.
+    ///
+    /// `None` means only the frame limit applies, which is the broker-wide
+    /// ceiling every request is already bounded by.
+    pub(crate) fn max_message_bytes(&self, topic: &str) -> Option<usize> {
+        let image = self.config.metadata_cache.as_ref()?.snapshot();
+        let configs = &image.topics.get(topic)?.configs;
+        configs
+            .get("max.message.bytes")?
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| *limit > 0)
+    }
 }

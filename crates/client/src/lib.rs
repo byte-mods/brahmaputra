@@ -17,12 +17,12 @@ mod router;
 mod transport;
 
 pub use connection::TcpConnection;
-pub use consumer::{BrokerApiVersions, Consumer, EARLIEST, LATEST};
+pub use consumer::{BrokerApiVersions, Consumer, FetchedRecord, EARLIEST, LATEST};
 pub use error::ClientError;
 pub use group_admin::{
     GroupAdmin, GroupDescription, GroupListing, GroupListingReport, GroupMember, PartitionLag,
 };
-pub use group_consumer::{Assignor, ConsumedRecord, GroupConsumer};
+pub use group_consumer::{Assignor, AutoOffsetReset, ConsumedRecord, GroupConsumer};
 pub use producer::{Producer, ProducerConfig};
 pub use quic::tune_for_datacenter as tune_quic_transport;
 pub use replica::{ReplicaClient, ReplicaFetchResult};

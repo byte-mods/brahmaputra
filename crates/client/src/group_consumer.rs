@@ -15,15 +15,15 @@ use std::time::{Duration, Instant};
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
     AssignedPartition, GroupMemberInfo, HeartbeatRequest, HeartbeatResponse, JoinGroupRequest,
-    JoinGroupResponse, MemberAssignment, OffsetCommitEntry, OffsetCommitRequest,
-    OffsetCommitResponse, OffsetFetchEntry, OffsetFetchRequest, OffsetFetchResponse,
-    SyncGroupRequest, SyncGroupResponse,
+    JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, MemberAssignment, OffsetCommitEntry,
+    OffsetCommitRequest, OffsetCommitResponse, OffsetFetchEntry, OffsetFetchRequest,
+    OffsetFetchResponse, SyncGroupRequest, SyncGroupResponse,
 };
-use brahmaputra_protocol::{ApiKey, ProtocolError};
+use brahmaputra_protocol::{ApiKey, ProtocolError, RecordHeader};
 use bytes::Bytes;
 use tokio::task::JoinHandle;
 
-use crate::consumer::{Consumer, EARLIEST};
+use crate::consumer::{Consumer, EARLIEST, LATEST};
 use crate::error::ClientError;
 use crate::router::BrokerRouter;
 use crate::transport::Transport;
@@ -42,6 +42,29 @@ const DEFAULT_MAX_POLL_RECORDS: usize = 500;
 type TopicPartition = (String, i32);
 type Positions = Arc<Mutex<BTreeMap<TopicPartition, i64>>>;
 
+/// What to do when a partition has no valid position to start from —
+/// either the group never committed one, or the committed one has fallen
+/// off the front of the log because retention deleted it.
+///
+/// These are the same situation from the consumer's point of view ("the
+/// offset I want is not there"), so they take one policy, as Kafka's
+/// `auto.offset.reset` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutoOffsetReset {
+    /// Start from the oldest record still retained. Reprocesses history;
+    /// never silently skips records.
+    #[default]
+    Earliest,
+    /// Start from the end. Skips whatever was missed; never reprocesses.
+    Latest,
+    /// Refuse to guess and surface [`ClientError::NoOffsetForPartition`].
+    ///
+    /// The honest choice when neither reprocessing nor skipping is safe —
+    /// a consumer that must not double-count and must not miss data needs
+    /// a human to decide, and this is what makes that decision reachable
+    /// instead of silently made for it.
+    None,
+}
 /// Partition assignment strategy used by the group leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Assignor {
@@ -153,6 +176,20 @@ pub struct ConsumedRecord {
     pub offset: i64,
     pub key: Option<Bytes>,
     pub value: Bytes,
+    /// Absolute create time in unix milliseconds, already resolved against
+    /// the batch base so a caller never has to know the batch existed.
+    pub timestamp: i64,
+    pub headers: Vec<RecordHeader>,
+}
+
+impl ConsumedRecord {
+    /// The first value stored under `key`, if any.
+    pub fn header(&self, key: &str) -> Option<&Bytes> {
+        self.headers
+            .iter()
+            .find(|header| header.key == key)
+            .and_then(|header| header.value.as_ref())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -279,6 +316,25 @@ impl GroupCoordinator {
         .await
     }
 
+    /// Tell the coordinator this member is going away.
+    ///
+    /// Best effort by nature: the caller is shutting down, so a failure
+    /// here costs only the session timeout it was trying to avoid, and
+    /// must never turn a clean close into an error.
+    async fn leave(&self, member_id: &str) -> Result<LeaveGroupResponse, ClientError> {
+        let request = LeaveGroupRequest {
+            group_id: self.group_id.clone(),
+            member_id: member_id.to_owned(),
+        };
+        let body = request.encode().map_err(msg_err)?;
+        self.request(
+            ApiKey::LeaveGroup,
+            &body,
+            |bytes| LeaveGroupResponse::decode(bytes).map_err(msg_err),
+            |response| response.error_code,
+        )
+        .await
+    }
     async fn commit(
         &self,
         generation: i32,
@@ -378,6 +434,8 @@ pub struct GroupConsumer {
     rebalance_timeout_ms: i32,
     assignor: Assignor,
     auto_commit: Option<Duration>,
+    /// What to do when a partition has no valid position; see [`AutoOffsetReset`].
+    auto_offset_reset: AutoOffsetReset,
     max_poll_records: usize,
     subscribed: Vec<String>,
     membership: Arc<Mutex<Membership>>,
@@ -425,6 +483,7 @@ impl GroupConsumer {
             rebalance_timeout_ms: 3_000,
             assignor: Assignor::Range,
             auto_commit: Some(Duration::from_secs(5)),
+            auto_offset_reset: AutoOffsetReset::default(),
             max_poll_records: DEFAULT_MAX_POLL_RECORDS,
             subscribed: Vec::new(),
             membership: Arc::new(Mutex::new(Membership::default())),
@@ -438,6 +497,13 @@ impl GroupConsumer {
             auto_commit_task: None,
         };
         Ok(group)
+    }
+
+    /// What to do when a partition has no valid position — never committed,
+    /// or committed then aged off the log (`auto.offset.reset`).
+    pub fn with_auto_offset_reset(mut self, policy: AutoOffsetReset) -> Self {
+        self.auto_offset_reset = policy;
+        self
     }
 
     /// Broker-side session timeout; heartbeats go out every timeout/3.
@@ -570,25 +636,27 @@ impl GroupConsumer {
             for fetched in self.consumer.fetch_many(&requests, wait_ms).await? {
                 match fetched.error_code {
                     ec::NONE => {
-                        for (offset, key, value) in fetched.records {
-                            self.fetch_positions
-                                .insert((fetched.topic.clone(), fetched.partition), offset + 1);
+                        for record in fetched.records {
+                            self.fetch_positions.insert(
+                                (fetched.topic.clone(), fetched.partition),
+                                record.offset + 1,
+                            );
                             self.buffered.push_back(ConsumedRecord {
                                 topic: fetched.topic.clone(),
                                 partition: fetched.partition,
-                                offset,
-                                key,
-                                value,
+                                offset: record.offset,
+                                key: record.key,
+                                value: record.value,
+                                timestamp: record.timestamp,
+                                headers: record.headers,
                             });
                         }
                     }
                     ec::OFFSET_OUT_OF_RANGE => {
-                        // The committed offset fell off the log: restart at
-                        // earliest, dropping anything buffered for it.
-                        let earliest = self
-                            .consumer
-                            .list_offsets(&fetched.topic, fetched.partition, EARLIEST)
-                            .await?;
+                        // The committed offset fell off the log: restart
+                        // where the policy says, dropping anything buffered
+                        // for the partition.
+                        let earliest = self.reset_offset(&fetched.topic, fetched.partition).await?;
                         self.buffered.retain(|record| {
                             record.topic != fetched.topic || record.partition != fetched.partition
                         });
@@ -640,12 +708,63 @@ impl GroupConsumer {
         .await
     }
 
-    /// Commit current positions, then stop the background tasks (also
-    /// aborted on drop).
-    pub async fn close(self) -> Result<(), ClientError> {
-        self.commit_sync().await
+    /// Commit current positions, then leave the group so its partitions
+    /// move immediately, then stop the background tasks.
+    ///
+    /// Leaving is what separates a clean shutdown from a crash. Without it
+    /// the coordinator cannot tell the difference and must wait out
+    /// `session.timeout.ms` before reassigning — so a rolling restart of N
+    /// instances costs N session timeouts of stalled partitions for no
+    /// reason. Dropping a `GroupConsumer` cannot do this (no async in
+    /// `Drop`), so a caller that cares about handover latency closes
+    /// explicitly, exactly as Kafka's own consumer requires.
+    ///
+    /// A failed leave is not an error: the group still converges via the
+    /// timeout, and the commit that precedes it is the part that matters
+    /// for correctness.
+    pub async fn close(mut self) -> Result<(), ClientError> {
+        let result = self.commit_sync().await;
+
+        let member_id = self
+            .membership
+            .lock()
+            .expect("membership")
+            .member_id
+            .clone();
+        if !member_id.is_empty() {
+            if let Err(error) = self.coordinator.leave(&member_id).await {
+                tracing::debug!(%error, "leave-group failed; falling back to session timeout");
+            }
+        }
+        // Stop heartbeating before returning, or the background task can
+        // re-register the member we just removed.
+        if let Some(task) = self.heartbeat_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.auto_commit_task.take() {
+            task.abort();
+        }
+        result
     }
 
+    /// Resolve the start offset for a partition with no usable position,
+    /// per [`AutoOffsetReset`].
+    ///
+    /// Both callers — a first assignment with nothing committed, and a
+    /// committed offset that retention has deleted — route through here so
+    /// the policy cannot be honoured in one place and ignored in the other.
+    async fn reset_offset(&self, topic: &str, partition: i32) -> Result<i64, ClientError> {
+        match self.auto_offset_reset {
+            AutoOffsetReset::Earliest => {
+                self.consumer.list_offsets(topic, partition, EARLIEST).await
+            }
+            AutoOffsetReset::Latest => self.consumer.list_offsets(topic, partition, LATEST).await,
+            AutoOffsetReset::None => Err(ClientError::NoOffsetForPartition {
+                topic: topic.to_owned(),
+                partition,
+            }),
+        }
+    }
     fn is_joined(&self) -> bool {
         self.membership.lock().expect("membership").joined
     }
@@ -796,11 +915,9 @@ impl GroupConsumer {
         for (topic, partition) in needed {
             let offset = match committed.get(&(topic.clone(), partition)) {
                 Some(&offset) if offset >= 0 => offset,
-                _ => {
-                    self.consumer
-                        .list_offsets(&topic, partition, EARLIEST)
-                        .await?
-                }
+                // Never committed, or committed a negative sentinel:
+                // there is no position to resume from.
+                _ => self.reset_offset(&topic, partition).await?,
             };
             seeded.push(((topic, partition), offset));
         }

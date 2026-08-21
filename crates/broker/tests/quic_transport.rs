@@ -105,13 +105,13 @@ async fn drain(addr: SocketAddr, transport: Transport) -> Vec<(i32, i64, String)
             if records.is_empty() {
                 break;
             }
-            for (offset, _key, value) in records {
+            for record in records {
                 out.push((
                     partition,
-                    offset,
-                    String::from_utf8(value.to_vec()).expect("utf8 value"),
+                    record.offset,
+                    String::from_utf8(record.value.to_vec()).expect("utf8 value"),
                 ));
-                next = offset + 1;
+                next = record.offset + 1;
             }
         }
     }

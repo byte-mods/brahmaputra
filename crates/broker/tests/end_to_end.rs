@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brahmaputra_broker::{Broker, BrokerConfig};
-use brahmaputra_client::{Consumer, Producer, ProducerConfig};
+use brahmaputra_client::{Consumer, FetchedRecord, Producer, ProducerConfig};
 use brahmaputra_protocol::Compression;
 use bytes::Bytes;
 use tokio::sync::{oneshot, Barrier};
@@ -58,7 +58,7 @@ async fn stop_broker(broker: RunningBroker) {
     broker.task.await.expect("broker task");
 }
 
-async fn read_all(consumer: &Consumer, partition: i32) -> Vec<(i64, Option<Bytes>, Bytes)> {
+async fn read_all(consumer: &Consumer, partition: i32) -> Vec<FetchedRecord> {
     let mut out = Vec::new();
     let mut offset = 0;
     loop {
@@ -69,30 +69,33 @@ async fn read_all(consumer: &Consumer, partition: i32) -> Vec<(i64, Option<Bytes
         if records.is_empty() {
             break;
         }
-        offset = records.last().unwrap().0 + 1;
+        offset = records.last().unwrap().offset + 1;
         out.extend(records);
     }
     out
 }
 
-fn assert_partition(
-    records: &[(i64, Option<Bytes>, Bytes)],
-    partition: i32,
-    expected: &ExpectedPartition,
-) {
+fn assert_partition(records: &[FetchedRecord], partition: i32, expected: &ExpectedPartition) {
     assert_eq!(
         records.len(),
         expected.len(),
         "partition {partition} record count"
     );
-    for (i, (offset, key, value)) in records.iter().enumerate() {
+    for (i, record) in records.iter().enumerate() {
+        let offset = &record.offset;
         assert_eq!(
             *offset, i as i64,
             "partition {partition}: contiguous offsets"
         );
         let (want_key, want_value) = &expected[offset];
-        assert_eq!(key, want_key, "partition {partition} offset {offset}");
-        assert_eq!(value, want_value, "partition {partition} offset {offset}");
+        assert_eq!(
+            &record.key, want_key,
+            "partition {partition} offset {offset}"
+        );
+        assert_eq!(
+            &record.value, want_value,
+            "partition {partition} offset {offset}"
+        );
     }
 }
 
@@ -382,9 +385,9 @@ async fn large_records_across_partitions_stay_inside_the_frame_limit() {
             .expect("batched fetch must not tear the connection down");
         let mut progressed = false;
         for (_, partition, records) in fetched {
-            for (offset, _, value) in records {
-                assert_eq!(value.len(), RECORD_BYTES);
-                positions[partition as usize] = offset + 1;
+            for record in records {
+                assert_eq!(record.value.len(), RECORD_BYTES);
+                positions[partition as usize] = record.offset + 1;
                 seen[partition as usize] += 1;
                 progressed = true;
             }
@@ -396,4 +399,90 @@ async fn large_records_across_partitions_stay_inside_the_frame_limit() {
     }
 
     stop_broker(running).await;
+}
+
+/// Headers and per-record timestamps must survive the whole path: producer
+/// buffer, batch encode, broker append, disk, fetch, decode. Unit tests
+/// cover the codec; this covers everything between it and a consumer.
+#[tokio::test]
+async fn headers_and_timestamps_survive_a_real_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_broker(dir.path()).await;
+
+    let producer = Producer::connect(
+        broker.addr,
+        ProducerConfig {
+            linger_ms: 0,
+            ..ProducerConfig::default()
+        },
+    )
+    .await
+    .expect("connect producer");
+
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    producer
+        .send_with_headers(
+            TOPIC,
+            Some(0),
+            Some(Bytes::from_static(b"k")),
+            Bytes::from_static(b"with-headers"),
+            vec![
+                brahmaputra_protocol::RecordHeader::new("trace-id", b"abc-123".to_vec()),
+                brahmaputra_protocol::RecordHeader::new("content-type", b"application/json".to_vec()),
+            ],
+        )
+        .await
+        .expect("send");
+    // A record with no headers shares the batch; the batch-level headers
+    // bit must not invent headers for it.
+    producer
+        .send(TOPIC, Some(0), None, Bytes::from_static(b"no-headers"))
+        .await
+        .expect("send");
+    producer.flush().await.expect("flush");
+
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let consumer = Consumer::connect(broker.addr, "header-reader")
+        .await
+        .expect("connect consumer");
+    let records = consumer.fetch(TOPIC, 0, 0, 500).await.expect("fetch");
+    assert_eq!(records.len(), 2);
+
+    let first = &records[0];
+    assert_eq!(first.value, Bytes::from_static(b"with-headers"));
+    assert_eq!(first.headers.len(), 2, "both headers survived");
+    assert_eq!(first.headers[0].key, "trace-id");
+    assert_eq!(
+        first.headers[0].value.as_deref(),
+        Some(&b"abc-123"[..]),
+        "header values are bytes, unchanged"
+    );
+    assert_eq!(first.headers[1].key, "content-type");
+
+    let second = &records[1];
+    assert_eq!(second.value, Bytes::from_static(b"no-headers"));
+    assert!(
+        second.headers.is_empty(),
+        "a record with no headers must not gain any from its batch"
+    );
+
+    // Timestamps are real wall-clock values bracketed by the send, not
+    // zero and not the fetch time.
+    for record in &records {
+        assert!(
+            record.timestamp >= before && record.timestamp <= after,
+            "timestamp {} outside the send window {before}..={after}",
+            record.timestamp
+        );
+    }
+
+    stop_broker(broker).await;
 }

@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
     AssignedPartition, DescribeGroupResponse, DescribedMember, GroupMemberInfo, GroupMemberRecord,
-    GroupMetadataRecord, HeartbeatRequest, JoinGroupRequest, JoinGroupResponse, ListedGroup,
-    OffsetCommitRecord, OffsetCommitRequest, OffsetFetchEntry, OffsetFetchRequest,
+    GroupMetadataRecord, HeartbeatRequest, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest,
+    ListedGroup, OffsetCommitRecord, OffsetCommitRequest, OffsetFetchEntry, OffsetFetchRequest,
     OffsetFetchResponse, SyncGroupRequest, SyncGroupResponse, TombstoneRecord,
 };
 use brahmaputra_protocol::{Record, RecordBatch};
@@ -733,6 +733,51 @@ impl GroupCoordinator {
         Ok(())
     }
 
+    /// LeaveGroup: remove one member on its own request and rebalance now.
+    ///
+    /// This is the same transition the session-timeout sweeper performs,
+    /// taken immediately because the member told us rather than because we
+    /// waited long enough to infer it. That difference is the whole point:
+    /// a rolling restart otherwise stalls each group for a full
+    /// `session.timeout.ms` per instance, which is downtime bought for no
+    /// information — the member already knew it was leaving.
+    ///
+    /// Leaving is idempotent. A member that is already gone (evicted, or a
+    /// retried request) is a success, not an error: the caller's intent —
+    /// "I am not in this group" — already holds, and failing it would make
+    /// a clean shutdown log spurious errors.
+    pub(crate) async fn leave(
+        &self,
+        broker: &Broker,
+        shard: &Arc<CoordinatorShard>,
+        request: LeaveGroupRequest,
+    ) -> Result<(), BrokerError> {
+        let persist = {
+            let Some(mut group) = shard.groups.get_mut(&request.group_id) else {
+                return Ok(());
+            };
+            if group.members.remove(&request.member_id).is_none() {
+                return Ok(());
+            }
+            group.pending_rejoin.remove(&request.member_id);
+            debug!(group = %request.group_id, member = %request.member_id, "member left");
+            if group.members.is_empty() {
+                group.state = GroupState::Empty;
+                group.leader = None;
+                group.watch.send_replace(());
+            } else {
+                // The survivors need a new assignment covering the
+                // partitions this member held, and the leader may itself
+                // be the member that just left.
+                restart_rebalance(&mut group, now_ms());
+            }
+            true
+        };
+        if persist {
+            self.persist_group(broker, shard, &request.group_id).await?;
+        }
+        Ok(())
+    }
     /// OffsetCommit: generation-fenced when part of a membership
     /// (`generation >= 0`); the batch must be covered by the partition high
     /// watermark before the in-memory offsets move.

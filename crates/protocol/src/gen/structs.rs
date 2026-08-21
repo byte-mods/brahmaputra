@@ -406,3 +406,16 @@ pub struct AuthenticateResponse {
 	pub role: String,
 	
 }
+
+#[derive(Debug, Default, Clone)]
+pub struct LeaveGroupRequest {
+	pub group_id: String,
+	pub member_id: String,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct LeaveGroupResponse {
+	pub error_code: i32,
+	
+}

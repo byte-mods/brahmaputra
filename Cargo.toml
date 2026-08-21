@@ -25,6 +25,12 @@ license = "Apache-2.0"
 bytes = "1"
 crc32c = "0.6"
 lz4_flex = "0.11"
+# The remaining codecs Kafka offers. lz4 stays the default: it is the best
+# ratio-per-CPU for the streaming case, and zstd/gzip trade throughput for
+# size on cold or bandwidth-bound topics.
+zstd = "0.13"
+snap = "1"
+flate2 = "1"
 thiserror = "2"
 tokio = { version = "1", features = [
     "rt-multi-thread",

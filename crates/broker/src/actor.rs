@@ -711,6 +711,14 @@ async fn run(
                         warn!(%error, "time-based flush failed");
                     }
                 }
+                // A partition that has gone quiet must still seal its
+                // segment when `segment.ms` expires, or retention has
+                // nothing to delete and the topic never expires anything.
+                if current.roll_due() {
+                    if let Err(error) = current.roll_now() {
+                        warn!(%error, "time-based segment roll failed");
+                    }
+                }
                 // Same reasoning for the watermark checkpoint: a partition
                 // that has gone quiet should still persist the watermark it
                 // reached rather than wait for the next append.

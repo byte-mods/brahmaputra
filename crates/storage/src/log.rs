@@ -321,6 +321,13 @@ pub struct LogConfig {
     /// Roll the active segment once it reaches this many bytes.
     /// Must fit in a `u32` (index positions are 32-bit, as in Kafka).
     pub segment_bytes: u64,
+    /// Roll the active segment once it is this old, even if it never
+    /// reaches `segment_bytes`. `None` disables it.
+    ///
+    /// Retention only ever deletes *sealed* segments, so without this a
+    /// low-volume partition keeps one segment open forever and nothing it
+    /// contains can expire, no matter what `retention.ms` says.
+    pub segment_ms: Option<u64>,
     /// Add a sparse-index entry at least every this many log bytes.
     pub index_interval_bytes: u64,
     /// Delete sealed segments whose newest batch is older than this many
@@ -353,6 +360,7 @@ impl Default for LogConfig {
     fn default() -> Self {
         LogConfig {
             segment_bytes: 64 * 1024 * 1024,
+            segment_ms: None,
             index_interval_bytes: 4096,
             retention_ms: None,
             retention_bytes: None,
@@ -379,6 +387,10 @@ pub struct Log {
     unflushed_records: u64,
     /// When the last fsync happened (`flush.interval.ms`).
     last_flush_ms: i64,
+    /// When the active segment was opened, for `segment.ms`. Set on open
+    /// and on every roll; a restart therefore restarts the clock, which
+    /// only ever delays a roll rather than losing data.
+    active_segment_created_ms: i64,
 }
 
 impl Log {
@@ -456,6 +468,7 @@ impl Log {
             leader_epochs,
             unflushed_records: 0,
             last_flush_ms: now_ms(),
+            active_segment_created_ms: now_ms(),
         })
     }
 
@@ -526,11 +539,7 @@ impl Log {
         let appended = batch.records.len() as u64;
         self.next_offset += appended as i64;
         self.maybe_flush(appended)?;
-        if self
-            .segments
-            .last()
-            .is_some_and(|active| active.size >= self.config.segment_bytes)
-        {
+        if self.should_roll() {
             self.roll_segment()?;
         }
         Ok(base_offset)
@@ -571,11 +580,7 @@ impl Log {
         active.append_batch(base_offset, &stamped, header.max_timestamp)?;
         self.next_offset = next_offset;
         self.maybe_flush((next_offset - base_offset) as u64)?;
-        if self
-            .segments
-            .last()
-            .is_some_and(|active| active.size >= self.config.segment_bytes)
-        {
+        if self.should_roll() {
             self.roll_segment()?;
         }
         Ok((base_offset, next_offset))
@@ -598,11 +603,7 @@ impl Log {
         let appended = header.last_offset_delta as u64 + 1;
         self.next_offset = base_offset + appended as i64;
         self.maybe_flush(appended)?;
-        if self
-            .segments
-            .last()
-            .is_some_and(|active| active.size >= self.config.segment_bytes)
-        {
+        if self.should_roll() {
             self.roll_segment()?;
         }
         Ok(base_offset)
@@ -849,6 +850,7 @@ impl Log {
         self.segments.push(seg);
         self.unflushed_records = 0;
         self.last_flush_ms = now_ms();
+        self.active_segment_created_ms = now_ms();
         Ok(())
     }
 }
@@ -2340,5 +2342,128 @@ impl Log {
     /// deleting aged segments.
     pub fn is_compacted(&self) -> bool {
         self.config.compact
+    }
+}
+
+impl Log {
+    /// Whether the active segment should be sealed now.
+    ///
+    /// Size or age. The age rule matters more than it looks: retention only
+    /// deletes sealed segments, so a partition that never reaches
+    /// `segment_bytes` would otherwise keep one segment open forever and
+    /// expire nothing at all, however short `retention.ms` was set.
+    fn should_roll(&self) -> bool {
+        let Some(active) = self.segments.last() else {
+            return false;
+        };
+        if active.size >= self.config.segment_bytes {
+            return true;
+        }
+        // An empty segment is not worth rolling: doing so on a timer would
+        // produce an unbounded run of empty segments on an idle partition.
+        if active.size == 0 {
+            return false;
+        }
+        self.config.segment_ms.is_some_and(|limit| {
+            now_ms().saturating_sub(self.active_segment_created_ms) >= limit as i64
+        })
+    }
+
+    /// Whether the active segment is old enough to roll even though nothing
+    /// is being appended. The partition actor polls this so a topic that
+    /// goes quiet still seals its segment and lets retention work.
+    pub fn roll_due(&self) -> bool {
+        self.should_roll()
+    }
+}
+
+impl Log {
+    /// Seal the active segment now, if there is anything in it.
+    ///
+    /// Called by the partition actor when `segment.ms` has elapsed on an
+    /// otherwise idle partition.
+    pub fn roll_now(&mut self) -> Result<(), StorageError> {
+        if self.segments.last().is_some_and(|active| active.size > 0) {
+            self.roll_segment()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod segment_ms_tests {
+    use super::*;
+    use brahmaputra_protocol::Record;
+
+    fn config(segment_ms: Option<u64>) -> LogConfig {
+        LogConfig {
+            // Large enough that only age can trigger a roll.
+            segment_bytes: 16 * 1024 * 1024,
+            segment_ms,
+            index_interval_bytes: 64,
+            hwm_checkpoint_interval_ms: 0,
+            ..LogConfig::default()
+        }
+    }
+
+    fn batch(value: &str) -> RecordBatch {
+        RecordBatch::new(0, 0, 1, vec![Record::new(value.as_bytes().to_vec())])
+    }
+
+    /// Without a time limit a small partition keeps one segment forever,
+    /// which is what left retention with nothing to delete.
+    #[test]
+    fn size_alone_never_rolls_a_small_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config(None)).unwrap();
+        for index in 0..20 {
+            log.append(batch(&format!("v{index}"))).unwrap();
+        }
+        assert_eq!(log.segment_count(), 1);
+        assert!(!log.roll_due());
+    }
+
+    #[test]
+    fn an_aged_segment_becomes_due_and_rolls() {
+        let dir = tempfile::tempdir().unwrap();
+        // Long enough that the append itself cannot trip the age limit —
+        // with a 1 ms limit the write lands after the clock has already
+        // expired and seals immediately, which makes the test race.
+        let mut log = Log::open(dir.path(), config(Some(120))).unwrap();
+        log.append(batch("first")).unwrap();
+        assert!(!log.roll_due(), "a fresh segment is not due yet");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(log.roll_due(), "an aged non-empty segment must be due");
+        log.roll_now().unwrap();
+        assert_eq!(log.segment_count(), 2, "the aged segment was sealed");
+
+        // Everything written before the roll is still readable at the same
+        // offsets: sealing must not lose or renumber anything.
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        let batches = log.read(0, 1 << 20).unwrap();
+        assert!(!batches.is_empty());
+    }
+
+    /// Rolling an empty segment on a timer would produce an unbounded run
+    /// of empty segments on a partition nobody writes to.
+    #[test]
+    fn an_empty_segment_is_never_rolled_on_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config(Some(1))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(!log.roll_due());
+        log.roll_now().unwrap();
+        assert_eq!(log.segment_count(), 1);
+    }
+
+    /// The age clock restarts with each segment, so a busy partition does
+    /// not roll on every append once it has been alive a while.
+    #[test]
+    fn the_age_clock_restarts_after_a_roll() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config(Some(3_600_000))).unwrap();
+        log.append(batch("a")).unwrap();
+        assert!(!log.roll_due());
     }
 }

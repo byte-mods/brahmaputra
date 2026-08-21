@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 
 use brahmaputra_protocol::codec;
 use brahmaputra_protocol::error_code as ec;
@@ -18,7 +19,7 @@ use brahmaputra_protocol::gen::{
     ProduceMultiPartition, ProduceMultiResponse, ProduceRequest, ProduceResponse,
 };
 use brahmaputra_protocol::producer::{InitProducerIdRequest, InitProducerIdResponse};
-use brahmaputra_protocol::{ApiKey, Compression, Record, RecordBatch};
+use brahmaputra_protocol::{ApiKey, Compression, Record, RecordBatch, RecordHeader};
 use bytes::Bytes;
 use futures::future::join_all;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -59,6 +60,35 @@ pub struct ProducerConfig {
     /// On by default: it is the difference between paying the per-request
     /// cost once and paying it per partition.
     pub batch_partitions: bool,
+    /// How many times to retry a send the broker refused with a *retriable*
+    /// error (`retries`). Retriable means the broker proved it did not
+    /// durably append — a stale leader, an ISR momentarily too small, a
+    /// coordinator still loading. Retrying one of those cannot duplicate a
+    /// record.
+    ///
+    /// Non-retriable errors are returned immediately: a malformed request
+    /// or a failed authorization fails identically however often it is
+    /// sent, so retrying only delays the report.
+    pub retries: u32,
+    /// Wait between retries (`retry.backoff.ms`). A tight retry loop
+    /// against a recovering broker is indistinguishable from an attack on
+    /// it, and slows the recovery it is waiting for.
+    pub retry_backoff_ms: u64,
+    /// Ceiling on the whole send, first attempt through last retry
+    /// (`delivery.timeout.ms`). This bounds worst-case latency, which
+    /// `retries` alone does not: N retries that each take `timeout_ms` is
+    /// an unbounded wait in practice.
+    pub delivery_timeout_ms: u64,
+    /// Ceiling on unflushed record bytes held client-side
+    /// (`buffer.memory`). Once reached, `send` waits rather than
+    /// allocating: a producer faster than its broker must be slowed down,
+    /// not allowed to consume the whole heap holding records nobody has
+    /// acknowledged.
+    pub buffer_memory: usize,
+    /// How long `send` may block on a full buffer before failing
+    /// (`max.block.ms`). Bounding it means a wedged broker surfaces as a
+    /// visible error rather than an application that quietly stopped.
+    pub max_block_ms: u64,
 }
 
 impl Default for ProducerConfig {
@@ -74,12 +104,21 @@ impl Default for ProducerConfig {
             idempotence: false,
             transport: Transport::default(),
             batch_partitions: true,
+            retries: 5,
+            retry_backoff_ms: 100,
+            delivery_timeout_ms: 120_000,
+            buffer_memory: 32 * 1024 * 1024,
+            max_block_ms: 60_000,
         }
     }
 }
 
 struct Buffer {
-    records: Vec<(Record, oneshot::Sender<Result<i64, ClientError>>)>,
+    /// Each record is buffered with the wall-clock time it was *sent*, not
+    /// the time its batch happens to flush. Those differ by up to
+    /// `linger.ms`, and it is the send time that a consumer filtering by
+    /// timestamp is asking about.
+    records: Vec<(Record, i64, oneshot::Sender<Result<i64, ClientError>>)>,
     size: usize,
 }
 
@@ -92,10 +131,103 @@ impl Buffer {
     }
 }
 
+/// Bounds unflushed record bytes held client-side (`buffer.memory` /
+/// `max.block.ms`).
+///
+/// Separate from the producer because it depends on nothing else: no
+/// routing, no connection, no partition map. Keeping it that way is what
+/// lets the blocking behaviour be tested directly rather than inferred
+/// from a live broker's timing.
+struct BufferBudget {
+    /// Total unflushed record bytes across every partition buffer. Kept as
+    /// a counter rather than summed on demand: every `send` consults it,
+    /// and walking every partition per record would cost more than the
+    /// work it guards.
+    used: AtomicUsize,
+    /// Woken whenever a flush frees space, so blocked senders proceed as
+    /// soon as there is room instead of polling for it.
+    available: tokio::sync::Notify,
+    limit: usize,
+    max_block: Duration,
+}
+
+impl BufferBudget {
+    fn new(limit: usize, max_block_ms: u64) -> Self {
+        BufferBudget {
+            used: AtomicUsize::new(0),
+            available: tokio::sync::Notify::new(),
+            limit,
+            max_block: Duration::from_millis(max_block_ms.max(1)),
+        }
+    }
+    /// Wait until `bytes` more may be buffered, then account for them.
+    ///
+    /// This is what makes `buffer.memory` real. Without it a producer that
+    /// outruns its broker buffers without limit and dies holding records
+    /// nobody has acknowledged — the failure mode where the data is lost
+    /// *and* there is no error to point at. Blocking the caller instead
+    /// pushes back on the source, which is the only place the pressure can
+    /// actually be relieved.
+    ///
+    /// A single record larger than the whole budget is admitted rather than
+    /// deadlocking forever on a condition that can never hold; refusing
+    /// oversized records is the broker's job, via `max.message.bytes`.
+    async fn reserve(&self, bytes: usize) -> Result<(), ClientError> {
+        if self.limit == 0 || bytes >= self.limit {
+            self.used.fetch_add(bytes, Ordering::AcqRel);
+            return Ok(());
+        }
+        let deadline = Instant::now() + self.max_block;
+        loop {
+            // Register for the wakeup *before* re-reading the counter, or a
+            // flush landing between the read and the wait is missed and
+            // this sender sleeps to the deadline for no reason.
+            let notified = self.available.notified();
+            let current = self.used.load(Ordering::Acquire);
+            if current + bytes <= self.limit {
+                // Racing senders can both pass this check; the overshoot is
+                // bounded by one record each and self-corrects on the next
+                // flush, which beats holding a lock across an await.
+                self.used.fetch_add(bytes, Ordering::AcqRel);
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ClientError::Configuration(format!(
+                    "producer buffer full: {current} of {} bytes unflushed after \
+                     max.block.ms={}",
+                    self.limit,
+                    self.max_block.as_millis()
+                )));
+            }
+            let _ = tokio::time::timeout(remaining, notified).await;
+        }
+    }
+
+    /// Release space a flush has taken ownership of, waking any waiters.
+    fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        // Saturating: the reservation overshoot above means the counter can
+        // briefly exceed what a single flush accounts for, and wrapping a
+        // usize here would wedge every future send permanently.
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(bytes))
+            })
+            .ok();
+        self.available.notify_waiters();
+    }
+}
+
 struct Inner {
     router: BrokerRouter,
     config: ProducerConfig,
     buffers: Mutex<HashMap<TopicPartition, Buffer>>,
+    /// Bounds unflushed bytes so a producer outrunning its broker is
+    /// slowed down rather than allowed to buffer without limit.
+    budget: BufferBudget,
     rr_counter: AtomicUsize,
     session: Option<ProducerSession>,
     sequences: Mutex<HashMap<TopicPartition, SequenceState>>,
@@ -170,6 +302,7 @@ impl Producer {
         };
         let inner = Arc::new(Inner {
             router,
+            budget: BufferBudget::new(config.buffer_memory, config.max_block_ms),
             config,
             buffers: Mutex::new(HashMap::new()),
             rr_counter: AtomicUsize::new(0),
@@ -208,6 +341,23 @@ impl Producer {
         key: Option<Bytes>,
         value: Bytes,
     ) -> Result<i64, ClientError> {
+        self.send_with_headers(topic, partition, key, value, Vec::new())
+            .await
+    }
+
+    /// As [`send`](Self::send), with headers attached to the record.
+    ///
+    /// Headers travel beside the payload rather than inside it, which is
+    /// what lets a consumer route or filter on them without deserialising
+    /// a value it may not have the schema for.
+    pub async fn send_with_headers(
+        &self,
+        topic: &str,
+        partition: Option<i32>,
+        key: Option<Bytes>,
+        value: Bytes,
+        headers: Vec<RecordHeader>,
+    ) -> Result<i64, ClientError> {
         let partition = match (partition, key.as_ref()) {
             (Some(p), _) => p,
             (None, Some(key)) => self.key_partition(topic, key).await?,
@@ -216,9 +366,24 @@ impl Producer {
         let record = Record {
             key,
             value,
+            // Rebased against the batch's max_timestamp at flush; the
+            // absolute time travels beside the record until then.
             timestamp_delta: 0,
+            headers,
         };
-        let approx_size = record.value.len() + record.key.as_ref().map_or(0, |k| k.len()) + 16;
+        let approx_size = record.value.len()
+            + record.key.as_ref().map_or(0, |k| k.len())
+            + record
+                .headers
+                .iter()
+                .map(|h| h.key.len() + h.value.as_ref().map_or(0, |v| v.len()) + 4)
+                .sum::<usize>()
+            + 16;
+        let created_ms = now_ms();
+        // Admission control before the record enters a buffer: past this
+        // point the producer owns it and the caller cannot take it back, so
+        // the waiting has to happen here.
+        self.inner.budget.reserve(approx_size).await?;
 
         let (tx, rx) = oneshot::channel();
         let full = {
@@ -227,7 +392,7 @@ impl Producer {
                 .entry((topic.to_owned(), partition))
                 .or_insert_with(Buffer::new);
             buffer.size += approx_size;
-            buffer.records.push((record, tx));
+            buffer.records.push((record, created_ms, tx));
             buffer.size >= self.inner.config.batch_size
         };
         if self.inner.config.linger_ms == 0 {
@@ -414,9 +579,17 @@ impl Inner {
                     continue;
                 }
                 let taken = std::mem::replace(buffer, Buffer::new());
-                let (records, senders): (Vec<Record>, Vec<_>) = taken.records.into_iter().unzip();
-                let count = records.len();
-                let batch = RecordBatch::new(0, 0, now_ms(), records)
+                // The records belong to this flush now, so the buffer space
+                // they occupied is free for new sends.
+                self.budget.release(taken.size);
+                let mut timestamped = Vec::with_capacity(taken.records.len());
+                let mut senders = Vec::with_capacity(taken.records.len());
+                for (record, created_ms, sender) in taken.records {
+                    timestamped.push((record, created_ms));
+                    senders.push(sender);
+                }
+                let count = timestamped.len();
+                let batch = RecordBatch::from_timestamped(0, 0, timestamped, now_ms())
                     .with_compression(self.config.compression);
                 payload.push((
                     ProduceMultiPartition {
@@ -558,8 +731,14 @@ impl Inner {
                 _ => return false,
             }
         };
+        self.budget.release(buffer.size);
         let count = buffer.records.len();
-        let (records, waiters): (Vec<Record>, Vec<_>) = buffer.records.into_iter().unzip();
+        let mut records = Vec::with_capacity(count);
+        let mut waiters = Vec::with_capacity(count);
+        for (record, created_ms, waiter) in buffer.records {
+            records.push((record, created_ms));
+            waiters.push(waiter);
+        }
         let result = self.produce(topic, partition, records).await;
         match result {
             Ok(base) => {
@@ -591,7 +770,7 @@ impl Inner {
         &self,
         topic: &str,
         partition: i32,
-        records: Vec<Record>,
+        records: Vec<(Record, i64)>,
     ) -> Result<i64, ClientError> {
         let record_count = i32::try_from(records.len()).map_err(|_| {
             ClientError::Idempotence("record count exceeds producer sequence space".into())
@@ -618,8 +797,8 @@ impl Inner {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let mut batch =
-            RecordBatch::new(0, 0, now_ms, records).with_compression(self.config.compression);
+        let mut batch = RecordBatch::from_timestamped(0, 0, records, now_ms)
+            .with_compression(self.config.compression);
         if let Some((session, base_sequence, _)) = sequence {
             batch = batch.with_producer(session.producer_id, session.producer_epoch, base_sequence);
         }
@@ -680,6 +859,14 @@ impl Inner {
         Ok(resp.base_offset)
     }
 
+    /// Send one already-encoded batch, retrying while the broker's answer
+    /// says the record was not stored and the budget allows.
+    ///
+    /// Two budgets, because they bound different things: `retries` caps how
+    /// many times we ask, and `delivery_timeout_ms` caps how long the
+    /// caller waits in total. Without the deadline, N retries of a request
+    /// that each take `timeout_ms` is an unbounded wait; without the count,
+    /// a fast-failing broker gets hammered.
     async fn produce_with_bounded_retries(
         &self,
         topic: &str,
@@ -687,17 +874,38 @@ impl Inner {
         body: &[u8],
         idempotent: bool,
     ) -> Result<ProduceResponse, ClientError> {
-        let mut retried_stale_leader = false;
+        let deadline =
+            Instant::now() + Duration::from_millis(self.config.delivery_timeout_ms.max(1));
         let mut retried_ambiguous = false;
+        let mut attempts_left = self.config.retries;
         loop {
             match self.produce_once(topic, partition, body).await {
-                Ok(response)
-                    if response.error_code == ec::NOT_LEADER_OR_FOLLOWER
-                        && !retried_stale_leader =>
-                {
-                    // An explicit NOT_LEADER proves this broker did not append.
-                    retried_stale_leader = true;
-                    self.router.refresh_topic(topic).await?;
+                Ok(response) if is_retriable_error_code(response.error_code) => {
+                    let code = response.error_code;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if attempts_left == 0 || remaining.is_zero() {
+                        // Out of budget: return the broker's own answer
+                        // rather than inventing a client-side error, so the
+                        // caller sees why it actually failed.
+                        return Ok(response);
+                    }
+                    attempts_left -= 1;
+                    // A stale route is the most common retriable cause, and
+                    // resending to the same broker would just repeat it.
+                    if matches!(
+                        code,
+                        ec::NOT_LEADER_OR_FOLLOWER
+                            | ec::FENCED_LEADER_EPOCH
+                            | ec::UNKNOWN_LEADER_EPOCH
+                    ) {
+                        let _ = self.router.refresh_topic(topic).await;
+                    }
+                    debug!(
+                        topic,
+                        partition, code, attempts_left, "retriable produce error; backing off"
+                    );
+                    let backoff = Duration::from_millis(self.config.retry_backoff_ms);
+                    tokio::time::sleep(backoff.min(remaining)).await;
                 }
                 Ok(response) => return Ok(response),
                 Err(error)
@@ -740,6 +948,38 @@ impl Inner {
     }
 }
 
+/// Whether a broker error code means "this send did not happen, try again".
+///
+/// The distinction that matters is *durability*, not severity. Each code
+/// here is one the broker returns strictly before it appends anything:
+///
+/// - `NOT_LEADER_OR_FOLLOWER` / `FENCED_LEADER_EPOCH` /
+///   `UNKNOWN_LEADER_EPOCH`: the request reached a broker that does not
+///   lead the partition, so it appended nothing and the client's routing
+///   is stale.
+/// - `NOT_ENOUGH_REPLICAS`: `acks=all` was refused because the ISR is
+///   below `min.insync.replicas`. Deliberately refused, never partially
+///   written — and it recovers on its own when a follower catches up.
+/// - `COORDINATOR_LOAD_IN_PROGRESS`: the coordinator is replaying its log
+///   and is not ready to answer yet.
+/// - `INTERNAL`: the broker failed the request rather than completing it.
+///
+/// Everything else is returned to the caller as-is. `INVALID_REQUEST` and
+/// `AUTHORIZATION_FAILED` will fail identically on every attempt, so
+/// retrying them only delays the report; the idempotence codes
+/// (`FENCED_PRODUCER_EPOCH`, `OUT_OF_ORDER_SEQUENCE`) mean the producer's
+/// sequence state is already broken and a blind retry would make it worse.
+fn is_retriable_error_code(code: i32) -> bool {
+    matches!(
+        code,
+        ec::NOT_LEADER_OR_FOLLOWER
+            | ec::FENCED_LEADER_EPOCH
+            | ec::UNKNOWN_LEADER_EPOCH
+            | ec::NOT_ENOUGH_REPLICAS
+            | ec::COORDINATOR_LOAD_IN_PROGRESS
+            | ec::INTERNAL
+    )
+}
 fn is_ambiguous_transport(error: &ClientError) -> bool {
     matches!(error, ClientError::Io(_) | ClientError::ConnectionClosed)
 }
@@ -859,5 +1099,145 @@ mod shard_tests {
         let groups = shard_partitions(vec![("t".to_string(), 0), ("t".to_string(), 1)], 8);
         assert!(groups.iter().all(|group| !group.is_empty()));
         assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 2);
+    }
+}
+
+#[cfg(test)]
+mod retry_classification_tests {
+    use super::is_retriable_error_code;
+    use brahmaputra_protocol::error_code as ec;
+
+    /// Every code here is one the broker returns *before* appending, so a
+    /// retry cannot duplicate a record. This is the property that makes
+    /// automatic retry safe at all; if a code that could have been durably
+    /// written appeared in this list, retrying would silently duplicate.
+    #[test]
+    fn only_codes_that_prove_no_append_are_retried() {
+        for code in [
+            ec::NOT_LEADER_OR_FOLLOWER,
+            ec::FENCED_LEADER_EPOCH,
+            ec::UNKNOWN_LEADER_EPOCH,
+            ec::NOT_ENOUGH_REPLICAS,
+            ec::COORDINATOR_LOAD_IN_PROGRESS,
+            ec::INTERNAL,
+        ] {
+            assert!(is_retriable_error_code(code), "code {code} must be retried");
+        }
+    }
+
+    /// Retrying these is either pointless or actively harmful.
+    #[test]
+    fn permanent_and_idempotence_errors_are_never_retried() {
+        for code in [
+            ec::INVALID_REQUEST,
+            ec::UNSUPPORTED_VERSION,
+            ec::AUTHORIZATION_FAILED,
+            ec::SASL_AUTHENTICATION_FAILED,
+            ec::UNKNOWN_TOPIC_OR_PARTITION,
+            ec::OFFSET_OUT_OF_RANGE,
+            // These two mean the producer's sequence state is already
+            // broken; a blind retry makes it worse, not better.
+            ec::FENCED_PRODUCER_EPOCH,
+            ec::OUT_OF_ORDER_SEQUENCE,
+        ] {
+            assert!(
+                !is_retriable_error_code(code),
+                "code {code} must not be retried"
+            );
+        }
+    }
+
+    /// Success is not an error; retrying it would resend an acknowledged
+    /// record. Worth asserting because the check is easy to invert.
+    #[test]
+    fn success_is_not_retriable() {
+        assert!(!is_retriable_error_code(ec::NONE));
+    }
+}
+
+#[cfg(test)]
+mod buffer_budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reservations_below_the_limit_are_admitted_immediately() {
+        let budget = BufferBudget::new(1000, 50);
+        budget.reserve(400).await.unwrap();
+        budget.reserve(400).await.unwrap();
+        assert_eq!(budget.used.load(Ordering::Acquire), 800);
+    }
+
+    /// The whole point: a producer that outruns its broker is slowed down
+    /// and then told, rather than buffering without limit until it dies.
+    #[tokio::test]
+    async fn a_full_buffer_blocks_and_then_fails_within_max_block_ms() {
+        let budget = BufferBudget::new(1000, 100);
+        budget.reserve(900).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let error = budget.reserve(200).await.unwrap_err();
+        assert!(
+            started.elapsed() >= Duration::from_millis(90),
+            "must actually wait for space before giving up"
+        );
+        assert!(
+            error.to_string().contains("buffer full"),
+            "the error should name the cause, got: {error}"
+        );
+    }
+
+    /// A flush frees space, and a sender waiting on it proceeds rather than
+    /// sitting out the whole timeout.
+    #[tokio::test]
+    async fn releasing_space_wakes_a_blocked_sender() {
+        let budget = Arc::new(BufferBudget::new(1000, 5_000));
+        budget.reserve(900).await.unwrap();
+
+        let waiter = {
+            let budget = Arc::clone(&budget);
+            tokio::spawn(async move { budget.reserve(200).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        budget.release(900);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("a woken sender must not wait out max.block.ms")
+            .expect("task");
+        assert!(result.is_ok(), "space was freed, so the send must proceed");
+    }
+
+    /// A record bigger than the entire budget is admitted rather than
+    /// deadlocking on a condition that can never become true. Refusing
+    /// oversized records is the broker's job (`max.message.bytes`).
+    #[tokio::test]
+    async fn a_record_larger_than_the_budget_does_not_deadlock() {
+        let budget = BufferBudget::new(100, 5_000);
+        tokio::time::timeout(Duration::from_secs(1), budget.reserve(5_000))
+            .await
+            .expect("must not block forever")
+            .expect("an oversized single record is admitted");
+    }
+
+    /// Releasing more than was reserved must not wrap the counter — a
+    /// wrapped usize here would wedge every later send permanently.
+    #[tokio::test]
+    async fn over_release_saturates_instead_of_wrapping() {
+        let budget = BufferBudget::new(1000, 50);
+        budget.reserve(100).await.unwrap();
+        budget.release(100_000);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        budget.reserve(900).await.unwrap();
+    }
+
+    /// A zero limit means "unbounded", which must not accidentally mean
+    /// "block everything".
+    #[tokio::test]
+    async fn a_zero_limit_disables_the_bound() {
+        let budget = BufferBudget::new(0, 50);
+        tokio::time::timeout(Duration::from_millis(500), budget.reserve(1 << 30))
+            .await
+            .expect("an unbounded budget must never block")
+            .expect("admitted");
     }
 }

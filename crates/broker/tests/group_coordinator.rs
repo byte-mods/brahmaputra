@@ -14,9 +14,10 @@ use brahmaputra_metadata::{
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
     AssignedPartition, DescribeGroupRequest, DescribeGroupResponse, HeartbeatRequest,
-    HeartbeatResponse, JoinGroupRequest, JoinGroupResponse, ListGroupsRequest, ListGroupsResponse,
-    MemberAssignment, OffsetCommitEntry, OffsetCommitRequest, OffsetCommitResponse,
-    OffsetFetchRequest, OffsetFetchResponse, SyncGroupRequest, SyncGroupResponse,
+    HeartbeatResponse, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse,
+    ListGroupsRequest, ListGroupsResponse, MemberAssignment, OffsetCommitEntry,
+    OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
+    SyncGroupRequest, SyncGroupResponse,
 };
 use brahmaputra_protocol::ApiKey;
 use futures::FutureExt;
@@ -791,4 +792,163 @@ async fn list_groups_reports_only_locally_coordinated_groups() {
 
     stop_broker(broker_one).await;
     stop_broker(broker_two).await;
+}
+
+async fn leave(conn: &Connection, group: &str, member_id: &str) -> LeaveGroupResponse {
+    let request = LeaveGroupRequest {
+        group_id: group.into(),
+        member_id: member_id.into(),
+    };
+    let body = request.encode().unwrap();
+    let response = conn.request(ApiKey::LeaveGroup, &body).await.unwrap();
+    LeaveGroupResponse::decode(&response).unwrap()
+}
+
+/// The point of LeaveGroup: a departing member's partitions move now, not
+/// after its session timeout. Both members here hold a 600-second session,
+/// far longer than the assertion window, so a pass cannot be the expiry
+/// sweeper doing the work — only an explicit leave can produce it in time.
+#[tokio::test]
+async fn leaving_rebalances_without_waiting_for_the_session_timeout() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone(&temp.path().join("broker"), 4).await;
+    let conn = connect(broker.addr, "leave-group").await;
+
+    // Bring two members to a stable generation 2. The second join blocks
+    // until the first rejoins, so the rejoin is what completes the group.
+    let first = join(&conn, "lg", "", 600_000, 500).await;
+    assert_eq!(first.error_code, ec::NONE);
+    let second_conn = connect(broker.addr, "leave-group-two").await;
+    let second_join = tokio::spawn(async move { join(&second_conn, "lg", "", 600_000, 500).await });
+    eventually(|| {
+        heartbeat(&conn, "lg", 1, "member-0")
+            .then(|code| async move { code == ec::ILLEGAL_GENERATION })
+    })
+    .await;
+    let rejoin = join(&conn, "lg", "member-0", 600_000, 500).await;
+    assert_eq!(rejoin.generation, 2);
+    let second = second_join.await.unwrap();
+    assert_eq!(second.generation, 2);
+    sync(
+        &conn,
+        "lg",
+        2,
+        "member-0",
+        vec![
+            MemberAssignment {
+                member_id: "member-0".into(),
+                partitions: vec![assigned("events", 0)],
+            },
+            MemberAssignment {
+                member_id: "member-1".into(),
+                partitions: vec![assigned("events", 1)],
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        sync(&conn, "lg", 2, "member-1", vec![]).await.error_code,
+        ec::NONE
+    );
+
+    let described = describe_group(&conn, "lg").await;
+    assert_eq!(described.members.len(), 2, "both members are in the group");
+
+    // member-1 leaves.
+    let response = leave(&conn, "lg", "member-1").await;
+    assert_eq!(response.error_code, ec::NONE);
+
+    // Immediately — without sleeping out the 600 s session timeout — the
+    // member is gone and the survivor is fenced into a new generation.
+    let described = describe_group(&conn, "lg").await;
+    assert_eq!(
+        described.members.len(),
+        1,
+        "the departed member is gone at once"
+    );
+    assert!(
+        !described
+            .members
+            .iter()
+            .any(|member| member.member_id == "member-1"),
+        "the member that left must not still be listed"
+    );
+    assert_eq!(
+        heartbeat(&conn, "lg", 2, "member-0").await,
+        ec::ILLEGAL_GENERATION,
+        "a departure must start a new generation, fencing the old one"
+    );
+
+    stop_broker(broker).await;
+}
+/// Leaving is idempotent: a retried request, or one from a member the
+/// sweeper already evicted, is a success. The caller's intent — "I am not
+/// in this group" — already holds, and erroring would make every clean
+/// shutdown log a spurious failure.
+#[tokio::test]
+async fn leaving_twice_and_leaving_nothing_both_succeed() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone(&temp.path().join("broker"), 4).await;
+    let conn = connect(broker.addr, "leave-twice").await;
+
+    let member = join(&conn, "lg2", "", 600_000, 500).await;
+    assert_eq!(member.error_code, ec::NONE);
+
+    assert_eq!(
+        leave(&conn, "lg2", &member.member_id).await.error_code,
+        ec::NONE
+    );
+    assert_eq!(
+        leave(&conn, "lg2", &member.member_id).await.error_code,
+        ec::NONE,
+        "leaving twice is not an error"
+    );
+    assert_eq!(
+        leave(&conn, "no-such-group", "member-0").await.error_code,
+        ec::NONE,
+        "leaving a group that does not exist is not an error"
+    );
+    assert_eq!(
+        leave(&conn, "lg2", "member-never-joined").await.error_code,
+        ec::NONE,
+        "leaving as an unknown member is not an error"
+    );
+
+    stop_broker(broker).await;
+}
+
+/// The last member leaving empties the group rather than leaving a stale
+/// leader pointing at a member that is gone.
+#[tokio::test]
+async fn the_last_member_leaving_empties_the_group() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone(&temp.path().join("broker"), 4).await;
+    let conn = connect(broker.addr, "leave-last").await;
+
+    let member = join(&conn, "lg3", "", 600_000, 500).await;
+    sync(
+        &conn,
+        "lg3",
+        member.generation,
+        &member.member_id,
+        vec![MemberAssignment {
+            member_id: member.member_id.clone(),
+            partitions: vec![AssignedPartition {
+                topic: "events".into(),
+                partition: 0,
+            }],
+        }],
+    )
+    .await;
+
+    assert_eq!(
+        leave(&conn, "lg3", &member.member_id).await.error_code,
+        ec::NONE
+    );
+
+    let described = describe_group(&conn, "lg3").await;
+    assert_eq!(described.state, "Empty", "an emptied group reports Empty");
+    assert!(described.members.is_empty());
+
+    stop_broker(broker).await;
 }

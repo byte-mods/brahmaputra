@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use brahmaputra_client::{
-    Assignor, Connection, Consumer, GroupAdmin, GroupConsumer, Producer, ProducerConfig, Transport,
-    EARLIEST, LATEST,
+    Assignor, AutoOffsetReset, Connection, Consumer, FetchedRecord, GroupAdmin, GroupConsumer,
+    Producer, ProducerConfig, Transport, EARLIEST, LATEST,
 };
 use brahmaputra_controller::{ControllerCommandResult, MetadataCommand, MetadataEvent};
 use brahmaputra_protocol::codec;
 use brahmaputra_protocol::gen::{ProduceRequest, ProduceResponse};
 use brahmaputra_protocol::producer::{InitProducerIdRequest, InitProducerIdResponse};
-use brahmaputra_protocol::{ApiKey, Compression, Record, RecordBatch};
+use brahmaputra_protocol::{ApiKey, Compression, Record, RecordBatch, RecordHeader};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use futures::{stream, StreamExt};
@@ -97,8 +97,15 @@ enum Command {
         #[arg(long = "linger-ms", default_value_t = 5)]
         linger_ms: u64,
         /// Batch compression (`compression.type`).
-        #[arg(long, value_parser = ["none", "lz4"], default_value = "lz4")]
+        #[arg(
+            long,
+            value_parser = ["none", "lz4", "zstd", "snappy", "gzip"],
+            default_value = "lz4"
+        )]
         compression: String,
+        /// Attach a record header, `key=value`. Repeatable; keys may repeat.
+        #[arg(long = "header")]
+        headers: Vec<String>,
         /// Records kept in flight by --file/--count mode. Batches fill by
         /// size only if this exceeds batch.size/record.size, otherwise every
         /// batch waits out linger.ms.
@@ -176,6 +183,15 @@ enum Command {
         /// Partition assignor for group consumption.
         #[arg(long, value_parser = ["range", "roundrobin"], default_value = "range", requires = "group")]
         assignor: String,
+        /// Where a group starts when a partition has no committed offset,
+        /// or its committed offset has aged off the log (`auto.offset.reset`).
+        #[arg(
+            long = "auto-offset-reset",
+            value_parser = ["earliest", "latest", "none"],
+            default_value = "earliest",
+            requires = "group"
+        )]
+        auto_offset_reset: String,
         /// Print only a throughput summary, not every record. Use for
         /// benchmarks, where per-record stdout dominates the measurement.
         #[arg(long)]
@@ -293,6 +309,7 @@ struct ProduceOptions {
     batch_size: usize,
     linger_ms: u64,
     compression: String,
+    headers: Vec<String>,
     idempotent: bool,
     producer_id: Option<i64>,
     producer_epoch: Option<i16>,
@@ -370,10 +387,19 @@ fn producer_config(
 }
 
 fn parse_compression(value: &str) -> Result<Compression> {
-    match value {
-        "none" => Ok(Compression::None),
-        "lz4" => Ok(Compression::Lz4),
-        other => anyhow::bail!("unknown compression {other:?}"),
+    Compression::parse(value).ok_or_else(|| {
+        anyhow::anyhow!("unknown compression {value:?} (none, lz4, zstd, snappy, gzip)")
+    })
+}
+
+/// Parse a `--header key=value` argument.
+///
+/// Splitting on the *first* `=` only, because a header value is arbitrary
+/// bytes and may well contain one.
+fn parse_header(value: &str) -> Result<RecordHeader> {
+    match value.split_once('=') {
+        Some((key, value)) => Ok(RecordHeader::new(key, value.as_bytes().to_vec())),
+        None => anyhow::bail!("header {value:?} is not in key=value form"),
     }
 }
 
@@ -447,6 +473,7 @@ async fn run(cli: Cli) -> Result<()> {
             batch_size,
             linger_ms,
             compression,
+            headers,
             timeout_ms,
             idempotent,
             producer_id,
@@ -470,6 +497,7 @@ async fn run(cli: Cli) -> Result<()> {
                 batch_size,
                 linger_ms,
                 compression,
+                headers,
                 idempotent,
                 producer_id,
                 producer_epoch,
@@ -487,6 +515,7 @@ async fn run(cli: Cli) -> Result<()> {
             group,
             commit_interval_ms,
             assignor,
+            auto_offset_reset,
             quiet,
         } => {
             let broker = broker.expect("data-plane commands resolve a broker");
@@ -499,6 +528,7 @@ async fn run(cli: Cli) -> Result<()> {
                         GroupConsumeOptions {
                             commit_interval_ms,
                             assignor: &assignor,
+                            auto_offset_reset: &auto_offset_reset,
                             max,
                             follow,
                             quiet,
@@ -772,6 +802,7 @@ async fn produce(options: ProduceOptions) -> Result<()> {
         batch_size,
         linger_ms,
         compression,
+        headers,
         idempotent,
         producer_id,
         producer_epoch,
@@ -828,11 +859,15 @@ async fn produce(options: ProduceOptions) -> Result<()> {
         println!("producer_id={producer_id} producer_epoch={producer_epoch}");
     }
     let key = key.map(Bytes::from);
+    let headers = headers
+        .iter()
+        .map(|header| parse_header(header))
+        .collect::<Result<Vec<_>>>()?;
 
     match (value, file, count) {
         (Some(value), _, _) => {
             let offset = producer
-                .send(&topic, partition, key, Bytes::from(value))
+                .send_with_headers(&topic, partition, key, Bytes::from(value), headers)
                 .await?;
             println!("acked offset={offset}");
         }
@@ -841,10 +876,15 @@ async fn produce(options: ProduceOptions) -> Result<()> {
                 std::fs::read_to_string(&path).with_context(|| format!("cannot read {path:?}"))?;
             let sends = text.lines().map(|line| {
                 let key = key.clone();
+                let headers = headers.clone();
                 let value = Bytes::from(line.to_owned());
                 let producer = &producer;
                 let topic = &topic;
-                async move { producer.send(topic, partition, key, value).await }
+                async move {
+                    producer
+                        .send_with_headers(topic, partition, key, value, headers)
+                        .await
+                }
             });
             let sent = drive_ordered(sends, in_flight.max(1), |_| {}).await?;
             producer.flush().await?;
@@ -898,6 +938,7 @@ async fn explicit_produce(
         key: key.map(|key| Bytes::copy_from_slice(key.as_bytes())),
         value: Bytes::copy_from_slice(value.as_bytes()),
         timestamp_delta: 0,
+        headers: Vec::new(),
     };
     // A fixed timestamp makes repeated CLI invocations with identical
     // explicit fields/content byte-identical, which is the intended manual
@@ -1067,6 +1108,7 @@ fn report_consume_rate(quiet: bool, records: u64, bytes: u64, started: Instant) 
 struct GroupConsumeOptions<'a> {
     commit_interval_ms: u64,
     assignor: &'a str,
+    auto_offset_reset: &'a str,
     max: Option<u64>,
     follow: bool,
     quiet: bool,
@@ -1081,6 +1123,7 @@ async fn consume_group(
     let GroupConsumeOptions {
         commit_interval_ms,
         assignor,
+        auto_offset_reset,
         max,
         follow,
         quiet,
@@ -1098,10 +1141,17 @@ async fn consume_group(
         "roundrobin" => Assignor::RoundRobin,
         other => anyhow::bail!("unknown assignor {other:?}"),
     };
+    let auto_offset_reset = match auto_offset_reset {
+        "earliest" => AutoOffsetReset::Earliest,
+        "latest" => AutoOffsetReset::Latest,
+        "none" => AutoOffsetReset::None,
+        other => anyhow::bail!("unknown auto-offset-reset {other:?}"),
+    };
     let auto_commit = (commit_interval_ms > 0).then_some(Duration::from_millis(commit_interval_ms));
     let mut consumer = GroupConsumer::connect_with(transport(), broker, "brahmaputra-cli", &group)
         .await?
         .with_assignor(assignor)
+        .with_auto_offset_reset(auto_offset_reset)
         .with_auto_commit(auto_commit);
     consumer.subscribe(&topics);
 
@@ -1191,23 +1241,45 @@ fn emit_records(
     next: &mut i64,
     printed: &mut u64,
     max: Option<u64>,
-    records: Vec<(i64, Option<Bytes>, Bytes)>,
+    records: Vec<FetchedRecord>,
     quiet: bool,
     bytes: &mut u64,
 ) -> bool {
-    for (offset, key, value) in records {
-        *bytes += (value.len() + key.as_ref().map_or(0, |key| key.len())) as u64;
+    for record in records {
+        *bytes += (record.value.len() + record.key.as_ref().map_or(0, |key| key.len())) as u64;
         if !quiet {
-            let key = key
+            let key = record
+                .key
                 .map(|key| String::from_utf8_lossy(&key).into_owned())
                 .unwrap_or_else(|| "-".into());
+            // Headers are printed only when present, so the common output
+            // stays exactly as narrow as it was.
+            let headers = if record.headers.is_empty() {
+                String::new()
+            } else {
+                let rendered: Vec<String> = record
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        let value = header
+                            .value
+                            .as_ref()
+                            .map(|value| String::from_utf8_lossy(value).into_owned())
+                            .unwrap_or_else(|| "null".into());
+                        format!("{}={}", header.key, value)
+                    })
+                    .collect();
+                format!(" headers=[{}]", rendered.join(","))
+            };
             println!(
-                "partition={partition} offset={offset} key={key} value={}",
-                String::from_utf8_lossy(&value)
+                "partition={partition} offset={} timestamp={} key={key} value={}{headers}",
+                record.offset,
+                record.timestamp,
+                String::from_utf8_lossy(&record.value)
             );
         }
         *printed += 1;
-        *next = offset + 1;
+        *next = record.offset + 1;
         if max.is_some_and(|max| *printed >= max) {
             return true;
         }
@@ -1988,8 +2060,8 @@ mod tests {
         let consumer = Consumer::connect(addr, "cli-acks-test").await.unwrap();
         let records = consumer.fetch("acks-all", 0, 0, 500).await.unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].0, 0);
-        assert_eq!(records[0].2, Bytes::from_static(b"replicated-value"));
+        assert_eq!(records[0].offset, 0);
+        assert_eq!(records[0].value, Bytes::from_static(b"replicated-value"));
 
         let _ = shutdown_tx.send(());
         tokio::time::timeout(Duration::from_secs(2), server)
@@ -2054,7 +2126,7 @@ mod tests {
             .unwrap();
         let records = consumer.fetch("cli-idempotent", 0, 0, 100).await.unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].2, Bytes::from_static(b"one"));
+        assert_eq!(records[0].value, Bytes::from_static(b"one"));
 
         let _ = shutdown_tx.send(());
         server.await.unwrap().unwrap();

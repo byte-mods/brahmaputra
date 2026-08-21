@@ -8,7 +8,7 @@ use brahmaputra_protocol::gen::{
     ApiVersionsRequest, ApiVersionsResponse, FetchMultiPartition, FetchMultiRequest, FetchRequest,
     FetchResponse, ListOffsetsRequest,
 };
-use brahmaputra_protocol::{ApiKey, ProtocolError, RecordBatch};
+use brahmaputra_protocol::{ApiKey, ProtocolError, RecordBatch, RecordHeader};
 use bytes::Bytes;
 
 use crate::error::ClientError;
@@ -82,15 +82,15 @@ impl Consumer {
     }
 
     /// Fetch records starting at `offset`, waiting up to `max_wait_ms` for
-    /// data when the partition is caught up. Returns
-    /// `(offset, key, value)` triples; offsets are contiguous per partition.
+    /// data when the partition is caught up. Offsets are contiguous per
+    /// partition.
     pub async fn fetch(
         &self,
         topic: &str,
         partition: i32,
         offset: i64,
         max_wait_ms: i32,
-    ) -> Result<Vec<(i64, Option<Bytes>, Bytes)>, ClientError> {
+    ) -> Result<Vec<FetchedRecord>, ClientError> {
         Ok(self
             .fetch_verbose(topic, partition, offset, max_wait_ms)
             .await?
@@ -105,7 +105,7 @@ impl Consumer {
         partition: i32,
         offset: i64,
         max_wait_ms: i32,
-    ) -> Result<(Vec<(i64, Option<Bytes>, Bytes)>, i64), ClientError> {
+    ) -> Result<(Vec<FetchedRecord>, i64), ClientError> {
         let req = FetchRequest {
             topic: topic.to_owned(),
             partition,
@@ -128,7 +128,13 @@ impl Consumer {
             let batch = RecordBatch::decode(&mut buf)?;
             for (record_offset, record) in batch.iter() {
                 if record_offset >= offset {
-                    records.push((record_offset, record.key.clone(), record.value.clone()));
+                    records.push(FetchedRecord {
+                        offset: record_offset,
+                        key: record.key.clone(),
+                        value: record.value.clone(),
+                        timestamp: record.timestamp(batch.max_timestamp),
+                        headers: record.headers.clone(),
+                    });
                 }
             }
         }
@@ -267,7 +273,7 @@ impl Consumer {
         &self,
         requests: &[(String, i32, i64)],
         max_wait_ms: i32,
-    ) -> Result<Vec<(String, i32, Vec<(i64, Option<Bytes>, Bytes)>)>, ClientError> {
+    ) -> Result<Vec<(String, i32, Vec<FetchedRecord>)>, ClientError> {
         Ok(self
             .fetch_many(requests, max_wait_ms)
             .await?
@@ -372,6 +378,7 @@ impl Consumer {
                     let mut buffer = raw;
                     let batch = RecordBatch::decode(&mut buffer)?;
                     let base = batch.base_offset;
+                    let max_timestamp = batch.max_timestamp;
                     for (index, record) in batch.records.into_iter().enumerate() {
                         let offset = base + index as i64;
                         // A batch can start before the requested offset;
@@ -379,7 +386,13 @@ impl Consumer {
                         if offset < fetch_offset {
                             continue;
                         }
-                        slot.records.push((offset, record.key, record.value));
+                        slot.records.push(FetchedRecord {
+                            offset,
+                            timestamp: record.timestamp(max_timestamp),
+                            key: record.key,
+                            value: record.value,
+                            headers: record.headers,
+                        });
                     }
                 }
             }
@@ -395,12 +408,24 @@ impl Consumer {
     }
 }
 
+/// One record as it comes off the wire, with the batch context already
+/// resolved away — the caller gets an absolute offset and an absolute
+/// timestamp and never has to know a batch was involved.
+#[derive(Debug, Clone)]
+pub struct FetchedRecord {
+    pub offset: i64,
+    pub key: Option<Bytes>,
+    pub value: Bytes,
+    pub timestamp: i64,
+    pub headers: Vec<RecordHeader>,
+}
+
 /// One partition's slice of a multi-partition fetch.
 #[derive(Debug)]
 pub(crate) struct PartitionFetch {
     pub topic: String,
     pub partition: i32,
-    pub records: Vec<(i64, Option<Bytes>, Bytes)>,
+    pub records: Vec<FetchedRecord>,
     pub high_watermark: i64,
     pub error_code: i32,
 }
