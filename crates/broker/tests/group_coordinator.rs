@@ -134,6 +134,7 @@ fn cluster_image() -> ClusterMetadata {
         leader,
         isr: vec![leader],
         leader_epoch: 1,
+        target_replicas: None,
     };
     ClusterMetadata {
         cluster_id: "group-coordinator-test".into(),

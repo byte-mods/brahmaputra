@@ -394,6 +394,84 @@ impl Broker {
         self.replication.snapshot()
     }
 
+    /// Delete local data for partitions this broker no longer replicates.
+    ///
+    /// Reassignment moves a partition by adding the new brokers and then
+    /// dropping the old ones from `replicas`. Without this the dropped
+    /// broker keeps every byte forever, so a cluster can be rebalanced but
+    /// never reclaims disk — which is half the reason to rebalance.
+    ///
+    /// Deleting data is the one operation that cannot be undone, so the
+    /// conditions are deliberately narrow. Every one of these must hold:
+    ///
+    /// * the image knows this broker, and lists it as alive — a partial or
+    ///   pre-registration image is not evidence of anything;
+    /// * the image contains the topic, and the topic contains the
+    ///   partition — "the topic is missing" is indistinguishable from "the
+    ///   image has not caught up", and deleting on that reading would lose
+    ///   data on any lagging follower;
+    /// * `replicas` genuinely omits this broker, with a reassignment
+    ///   settled rather than in flight.
+    ///
+    /// A partition still being reassigned is skipped: `replicas` is the
+    /// union during a move, so a broker that appears absent is a broker
+    /// the controller has not finished with.
+    pub(crate) fn drain_unowned_partitions(&self, image: &ClusterMetadata) {
+        let local_id = self.config.broker_id;
+        let registered = image
+            .brokers
+            .get(&local_id)
+            .is_some_and(|broker| broker.alive);
+        if !registered {
+            return;
+        }
+
+        let owned: Vec<(String, i32)> = self
+            .handles
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for (topic_name, partition) in owned {
+            // The offsets topic is coordinator state, not a reassignable
+            // user partition; leave it alone.
+            if topic_name == crate::group::OFFSETS_TOPIC {
+                continue;
+            }
+            let Some(topic) = image.topics.get(&topic_name) else {
+                continue; // topic unknown to this image: not evidence
+            };
+            let Some(assignment) = topic.partitions.get(&partition) else {
+                continue;
+            };
+            if assignment.is_reassigning() || assignment.replicas.contains(&local_id) {
+                continue;
+            }
+
+            // Close the actor before touching the directory: deleting files
+            // out from under a running log would surface as corruption
+            // rather than as a clean removal.
+            let Some((_, handle)) = self.handles.remove(&(topic_name.clone(), partition)) else {
+                continue;
+            };
+            drop(handle);
+            let dir = crate::state::partition_dir(&self.config.data_dir, &topic_name, partition);
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => tracing::info!(
+                    topic = %topic_name,
+                    partition,
+                    "dropped local data for a partition this broker no longer replicates"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    topic = %topic_name,
+                    partition,
+                    "could not remove drained partition data"
+                ),
+            }
+        }
+    }
     pub(crate) fn replication_tracker(&self) -> &ReplicationTracker {
         &self.replication
     }

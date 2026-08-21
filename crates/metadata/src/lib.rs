@@ -144,6 +144,84 @@ pub struct PartitionMetadata {
     pub leader: BrokerId,
     pub isr: Vec<BrokerId>,
     pub leader_epoch: i32,
+    /// Where this partition is being moved to, while a reassignment is in
+    /// flight. `None` when the replica set is settled.
+    ///
+    /// A reassignment cannot simply overwrite `replicas`: the new brokers
+    /// hold none of the data yet, so switching to them would drop the
+    /// partition's durability to zero for as long as the catch-up takes.
+    /// Instead `replicas` becomes the *union* of old and new — every
+    /// existing copy is kept while the new ones catch up — and this field
+    /// records where it is heading. The controller narrows `replicas` to
+    /// the target only once the target replicas are all in the ISR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_replicas: Option<Vec<BrokerId>>,
+}
+
+impl PartitionMetadata {
+    /// Whether a reassignment is in flight for this partition.
+    pub fn is_reassigning(&self) -> bool {
+        self.target_replicas.is_some()
+    }
+}
+
+/// Choose `count` brokers for one partition, spreading across racks first.
+///
+/// Replicas that share a rack share a failure domain, so RF=3 inside one
+/// rack survives no more than RF=1 does — the partition is lost when that
+/// rack goes. Kafka calls this rack-aware assignment; the effect is that
+/// `--rack` stops being a label nobody reads and starts being the thing
+/// that makes a replication factor mean what an operator thinks it means.
+///
+/// Brokers are ordered by taking one from each rack in turn, so
+/// consecutive picks land in different racks for as long as there are
+/// racks left. Racks are visited in a rotation that shifts with
+/// `partition`, which keeps leadership from piling onto whichever rack
+/// happens to sort first.
+///
+/// With no racks configured this degrades to the previous round-robin,
+/// which is what an unlabelled cluster should get.
+pub fn place_replicas(
+    brokers: &[BrokerId],
+    racks: &BTreeMap<BrokerId, Option<String>>,
+    partition: i32,
+    count: usize,
+) -> Vec<BrokerId> {
+    if brokers.is_empty() || count == 0 {
+        return Vec::new();
+    }
+
+    // Group by rack, preserving broker order inside each. An unlabelled
+    // broker is its own rack: assuming two unlabelled brokers are in
+    // different failure domains is the safe reading, because assuming they
+    // share one would refuse placements that are probably fine, while the
+    // reverse only matches today's behaviour.
+    let mut by_rack: BTreeMap<String, Vec<BrokerId>> = BTreeMap::new();
+    for broker in brokers {
+        let rack = racks
+            .get(broker)
+            .and_then(|rack| rack.clone())
+            .unwrap_or_else(|| format!("\u{0}unlabelled-{broker}"));
+        by_rack.entry(rack).or_default().push(*broker);
+    }
+
+    let mut lanes: Vec<Vec<BrokerId>> = by_rack.into_values().collect();
+    // Rotate which rack leads, per partition, so leadership spreads.
+    let rotation = (partition.max(0) as usize) % lanes.len();
+    lanes.rotate_left(rotation);
+
+    // Interleave: one from each rack, then the next from each, and so on.
+    let mut ordered = Vec::with_capacity(brokers.len());
+    let deepest = lanes.iter().map(Vec::len).max().unwrap_or(0);
+    for depth in 0..deepest {
+        for lane in &lanes {
+            if let Some(broker) = lane.get(depth) {
+                ordered.push(*broker);
+            }
+        }
+    }
+    ordered.truncate(count.min(ordered.len()));
+    ordered
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +338,14 @@ impl ClusterMetadata {
             .values()
             .filter(|broker| broker.alive && broker.roles.contains(&NodeRole::Broker))
             .map(|broker| broker.broker_id)
+            .collect()
+    }
+
+    /// Every registered broker's rack label, for rack-aware placement.
+    pub fn broker_racks(&self) -> BTreeMap<BrokerId, Option<String>> {
+        self.brokers
+            .values()
+            .map(|broker| (broker.broker_id, broker.rack.clone()))
             .collect()
     }
 
@@ -392,12 +478,11 @@ impl ClusterMetadata {
                         live_brokers: live.len(),
                     });
                 }
+                let racks = self.broker_racks();
                 let mut placed = BTreeMap::new();
                 for partition in 0..partitions {
-                    let start = partition as usize % live.len();
-                    let replicas: Vec<_> = (0..replication_factor as usize)
-                        .map(|index| live[(start + index) % live.len()])
-                        .collect();
+                    let replicas =
+                        place_replicas(&live, &racks, partition, replication_factor as usize);
                     placed.insert(
                         partition,
                         PartitionMetadata {
@@ -406,6 +491,7 @@ impl ClusterMetadata {
                             isr: replicas.clone(),
                             replicas,
                             leader_epoch: 0,
+                            target_replicas: None,
                         },
                     );
                 }
@@ -472,6 +558,7 @@ impl ClusterMetadata {
             }
             MetadataCommand::AddPartitions { name, count } => {
                 let live = self.live_broker_ids();
+                let racks = self.broker_racks();
                 if live.is_empty() {
                     return Err(MetadataError::InvalidReplicationFactor {
                         requested: 1,
@@ -497,10 +584,7 @@ impl ClusterMetadata {
                     .min(live.len())
                     .max(1);
                 for partition in current..count {
-                    let start = partition as usize % live.len();
-                    let replicas: Vec<_> = (0..replication_factor)
-                        .map(|index| live[(start + index) % live.len()])
-                        .collect();
+                    let replicas = place_replicas(&live, &racks, partition, replication_factor);
                     topic.partitions.insert(
                         partition,
                         PartitionMetadata {
@@ -509,10 +593,97 @@ impl ClusterMetadata {
                             isr: replicas.clone(),
                             replicas,
                             leader_epoch: 0,
+                            target_replicas: None,
                         },
                     );
                 }
                 MetadataEvent::TopicCreated { name }
+            }
+            MetadataCommand::ReassignPartition {
+                topic,
+                partition,
+                mut replicas,
+            } => {
+                let alive: BTreeSet<_> = self.live_broker_ids().into_iter().collect();
+                replicas.sort_unstable();
+                replicas.dedup();
+                if replicas.is_empty() {
+                    return Err(MetadataError::InvalidIsr);
+                }
+                // Every target must be a live broker. Placing a replica on a
+                // broker that is not there means a partition that can never
+                // reach its replication factor, and the reassignment would
+                // hang rather than fail.
+                if let Some(missing) = replicas.iter().find(|id| !alive.contains(id)) {
+                    return Err(MetadataError::UnknownBroker(*missing));
+                }
+                let current = self.partition_mut(&topic, partition)?;
+                if current.is_reassigning() {
+                    return Err(MetadataError::ReassignmentInProgress { topic, partition });
+                }
+                if current.replicas == replicas {
+                    // Already where it was asked to go. Treated as done
+                    // rather than as an error so a retried or idempotent
+                    // request is not a failure.
+                    return Ok(MetadataEvent::PartitionReassigned {
+                        topic,
+                        partition,
+                        replicas,
+                    });
+                }
+                // The union, not the target: the target brokers hold no data
+                // yet, so narrowing now would leave the partition with fewer
+                // usable copies than it started with for the whole catch-up.
+                let mut union = current.replicas.clone();
+                for broker in &replicas {
+                    if !union.contains(broker) {
+                        union.push(*broker);
+                    }
+                }
+                current.replicas = union;
+                current.target_replicas = Some(replicas.clone());
+                MetadataEvent::PartitionReassigned {
+                    topic,
+                    partition,
+                    replicas,
+                }
+            }
+            MetadataCommand::CompleteReassignment { topic, partition } => {
+                let alive: BTreeSet<_> = self.live_broker_ids().into_iter().collect();
+                let current = self.partition_mut(&topic, partition)?;
+                let Some(target) = current.target_replicas.clone() else {
+                    return Err(MetadataError::NoReassignmentInProgress { topic, partition });
+                };
+                // The condition that makes dropping the old replicas safe:
+                // every target replica is caught up and in the ISR, so the
+                // data exists on all of them already.
+                if !target.iter().all(|broker| current.isr.contains(broker)) {
+                    return Err(MetadataError::ReassignmentNotCaughtUp { topic, partition });
+                }
+                current.replicas = target.clone();
+                current.isr.retain(|broker| target.contains(broker));
+                current.target_replicas = None;
+                // The leader may be one of the replicas being dropped. Move
+                // it to a target replica before the old set disappears,
+                // rather than leaving the partition pointing at a broker
+                // that no longer holds it.
+                if !target.contains(&current.leader) {
+                    let Some(next) = current
+                        .isr
+                        .iter()
+                        .copied()
+                        .find(|broker| alive.contains(broker))
+                    else {
+                        return Err(MetadataError::ReassignmentNotCaughtUp { topic, partition });
+                    };
+                    current.leader = next;
+                }
+                current.leader_epoch += 1;
+                MetadataEvent::PartitionReassigned {
+                    topic,
+                    partition,
+                    replicas: target,
+                }
             }
             MetadataCommand::SetTopicConfig { name, configs } => {
                 let Some(topic) = self.topics.get_mut(&name) else {
@@ -660,6 +831,32 @@ pub enum MetadataCommand {
         name: String,
         count: i32,
     },
+    /// Move a partition to a different set of brokers.
+    ///
+    /// This is what makes a cluster reshapeable: without it a partition
+    /// lives on whichever brokers it was created on, forever, so a cluster
+    /// can be neither grown, shrunk, nor rebalanced.
+    ///
+    /// Applying it does *not* switch `replicas` to the target. The target
+    /// brokers hold none of the data yet, so switching would drop the
+    /// partition's durability to nothing for the length of the catch-up.
+    /// `replicas` becomes the union of current and target — every existing
+    /// copy survives — and the controller narrows it to the target once
+    /// the target replicas are caught up and in the ISR.
+    ReassignPartition {
+        topic: String,
+        partition: i32,
+        replicas: Vec<BrokerId>,
+    },
+    /// Finish a reassignment whose target replicas have all caught up.
+    ///
+    /// Issued by the controller, not by an operator: only the controller
+    /// can see that the ISR now covers the target, which is the condition
+    /// that makes dropping the old replicas safe.
+    CompleteReassignment {
+        topic: String,
+        partition: i32,
+    },
     SetTopicConfig {
         name: String,
         configs: BTreeMap<String, String>,
@@ -699,6 +896,11 @@ pub enum MetadataEvent {
     TopicCreated {
         name: String,
     },
+    PartitionReassigned {
+        topic: String,
+        partition: i32,
+        replicas: Vec<BrokerId>,
+    },
     TopicDeleted {
         name: String,
     },
@@ -735,6 +937,12 @@ pub enum MetadataError {
     InvalidReplicationFactor { requested: i32, live_brokers: usize },
     #[error("unknown broker: {0}")]
     UnknownBroker(BrokerId),
+    #[error("a reassignment is already in flight for {topic}-{partition}")]
+    ReassignmentInProgress { topic: String, partition: i32 },
+    #[error("no reassignment is in flight for {topic}-{partition}")]
+    NoReassignmentInProgress { topic: String, partition: i32 },
+    #[error("the target replicas for {topic}-{partition} have not caught up yet")]
+    ReassignmentNotCaughtUp { topic: String, partition: i32 },
     #[error("broker {0} is not an eligible live controller")]
     InvalidController(BrokerId),
     #[error("stale broker epoch for {broker_id}: expected {expected}, got {actual}")]
@@ -1451,5 +1659,335 @@ mod partition_and_config_tests {
             configs["min.insync.replicas"], "2",
             "an untouched key must survive"
         );
+    }
+}
+
+#[cfg(test)]
+mod placement_and_reassignment_tests {
+    use super::*;
+
+    fn racks(pairs: &[(BrokerId, Option<&str>)]) -> BTreeMap<BrokerId, Option<String>> {
+        pairs
+            .iter()
+            .map(|(id, rack)| (*id, rack.map(str::to_string)))
+            .collect()
+    }
+
+    /// The point of rack awareness: RF=3 spread across one rack survives
+    /// exactly as much as RF=1 does, because the rack is the failure
+    /// domain. Every replica must land in a different rack while there are
+    /// racks to use.
+    #[test]
+    fn replicas_spread_across_racks_before_repeating_one() {
+        let brokers = vec![1, 2, 3, 4, 5, 6];
+        let racks = racks(&[
+            (1, Some("a")),
+            (2, Some("a")),
+            (3, Some("b")),
+            (4, Some("b")),
+            (5, Some("c")),
+            (6, Some("c")),
+        ]);
+        for partition in 0..6 {
+            let placed = place_replicas(&brokers, &racks, partition, 3);
+            assert_eq!(placed.len(), 3);
+            let chosen: BTreeSet<&str> = placed
+                .iter()
+                .map(|broker| racks[broker].as_deref().unwrap())
+                .collect();
+            assert_eq!(
+                chosen.len(),
+                3,
+                "partition {partition} put two replicas in one rack: {placed:?}"
+            );
+        }
+    }
+
+    /// More replicas than racks has to reuse racks, but must still use all
+    /// of them rather than piling into one.
+    #[test]
+    fn more_replicas_than_racks_still_uses_every_rack() {
+        let brokers = vec![1, 2, 3, 4];
+        let racks = racks(&[
+            (1, Some("a")),
+            (2, Some("b")),
+            (3, Some("a")),
+            (4, Some("b")),
+        ]);
+        let placed = place_replicas(&brokers, &racks, 0, 4);
+        assert_eq!(placed.len(), 4);
+        let chosen: BTreeSet<&str> = placed
+            .iter()
+            .map(|broker| racks[broker].as_deref().unwrap())
+            .collect();
+        assert_eq!(chosen.len(), 2, "both racks must be used");
+    }
+
+    /// Leadership is the first replica, so if every partition led from the
+    /// same rack, that rack would carry all the write traffic.
+    #[test]
+    fn leadership_rotates_across_racks() {
+        let brokers = vec![1, 2, 3];
+        let racks = racks(&[(1, Some("a")), (2, Some("b")), (3, Some("c"))]);
+        let leaders: BTreeSet<BrokerId> = (0..3)
+            .map(|partition| place_replicas(&brokers, &racks, partition, 3)[0])
+            .collect();
+        assert_eq!(leaders.len(), 3, "every rack should lead some partition");
+    }
+
+    /// An unlabelled cluster must keep working, and must not decide that
+    /// every broker shares one failure domain.
+    #[test]
+    fn unlabelled_brokers_are_treated_as_distinct() {
+        let brokers = vec![1, 2, 3];
+        let racks = racks(&[(1, None), (2, None), (3, None)]);
+        let placed = place_replicas(&brokers, &racks, 0, 3);
+        assert_eq!(placed.len(), 3);
+        let unique: BTreeSet<BrokerId> = placed.iter().copied().collect();
+        assert_eq!(unique.len(), 3, "no broker may appear twice");
+    }
+
+    fn cluster_with(brokers: &[(BrokerId, &str)]) -> ClusterMetadata {
+        let mut image = ClusterMetadata::default();
+        for (id, rack) in brokers {
+            image
+                .apply(MetadataCommand::RegisterBroker {
+                    broker_id: *id,
+                    host: "127.0.0.1".into(),
+                    data_port: 9092 + *id as u16,
+                    control_port: 19092 + *id as u16,
+                    roles: vec![NodeRole::Broker, NodeRole::Controller],
+                    rack: Some((*rack).to_string()),
+                    now_ms: 1,
+                })
+                .expect("register");
+        }
+        image
+    }
+
+    /// A reassignment must never shrink the set of brokers holding data.
+    /// Until the targets catch up, `replicas` is the union — every existing
+    /// copy survives the whole move.
+    #[test]
+    fn a_reassignment_keeps_every_existing_replica_until_the_targets_catch_up() {
+        let mut image = cluster_with(&[(1, "a"), (2, "b"), (3, "c"), (4, "a"), (5, "b")]);
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "orders".into(),
+                partitions: 1,
+                replication_factor: 3,
+                configs: BTreeMap::new(),
+            })
+            .expect("create");
+
+        let before = image.topics["orders"].partitions[&0].replicas.clone();
+        assert_eq!(before.len(), 3);
+
+        image
+            .apply(MetadataCommand::ReassignPartition {
+                topic: "orders".into(),
+                partition: 0,
+                replicas: vec![4, 5, 1],
+            })
+            .expect("reassign");
+
+        let during = &image.topics["orders"].partitions[&0];
+        assert!(during.is_reassigning());
+        for broker in &before {
+            assert!(
+                during.replicas.contains(broker),
+                "existing replica {broker} was dropped mid-move: {:?}",
+                during.replicas
+            );
+        }
+        for broker in [4, 5, 1] {
+            assert!(during.replicas.contains(&broker), "target {broker} missing");
+        }
+        assert_eq!(during.target_replicas.as_deref(), Some(&[1, 4, 5][..]));
+    }
+
+    /// Completing before the targets are in the ISR would discard the only
+    /// copies of the data, so it must be refused.
+    #[test]
+    fn completing_before_the_targets_are_in_sync_is_refused() {
+        let mut image = cluster_with(&[(1, "a"), (2, "b"), (3, "c"), (4, "a")]);
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "orders".into(),
+                partitions: 1,
+                replication_factor: 3,
+                configs: BTreeMap::new(),
+            })
+            .expect("create");
+        image
+            .apply(MetadataCommand::ReassignPartition {
+                topic: "orders".into(),
+                partition: 0,
+                replicas: vec![2, 3, 4],
+            })
+            .expect("reassign");
+
+        let error = image
+            .apply(MetadataCommand::CompleteReassignment {
+                topic: "orders".into(),
+                partition: 0,
+            })
+            .expect_err("must refuse while broker 4 is not in the ISR");
+        assert!(
+            matches!(error, MetadataError::ReassignmentNotCaughtUp { .. }),
+            "expected not-caught-up, got {error:?}"
+        );
+        assert!(image.topics["orders"].partitions[&0].is_reassigning());
+    }
+
+    /// Once the targets are in the ISR the old replicas can go, and the
+    /// leader moves with them if it was one of the departing brokers.
+    #[test]
+    fn completion_narrows_the_replicas_and_moves_the_leader() {
+        let mut image = cluster_with(&[(1, "a"), (2, "b"), (3, "c"), (4, "a"), (5, "b")]);
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "orders".into(),
+                partitions: 1,
+                replication_factor: 3,
+                configs: BTreeMap::new(),
+            })
+            .expect("create");
+        let original_leader = image.topics["orders"].partitions[&0].leader;
+
+        // Move somewhere that excludes the current leader.
+        let target: Vec<BrokerId> = [1, 2, 3, 4, 5]
+            .into_iter()
+            .filter(|broker| *broker != original_leader)
+            .take(3)
+            .collect();
+        image
+            .apply(MetadataCommand::ReassignPartition {
+                topic: "orders".into(),
+                partition: 0,
+                replicas: target.clone(),
+            })
+            .expect("reassign");
+
+        // Simulate the targets catching up: the controller would issue this
+        // once it observed their fetch progress.
+        let union = image.topics["orders"].partitions[&0].replicas.clone();
+        let epoch = image.topics["orders"].partitions[&0].leader_epoch;
+        image
+            .apply(MetadataCommand::ChangePartition {
+                topic: "orders".into(),
+                partition: 0,
+                leader: original_leader,
+                isr: union,
+                expected_leader_epoch: epoch,
+            })
+            .expect("isr grows to the union");
+
+        image
+            .apply(MetadataCommand::CompleteReassignment {
+                topic: "orders".into(),
+                partition: 0,
+            })
+            .expect("complete");
+
+        let after = &image.topics["orders"].partitions[&0];
+        let mut sorted_target = target.clone();
+        sorted_target.sort_unstable();
+        assert_eq!(after.replicas, sorted_target, "replicas narrowed to target");
+        assert!(!after.is_reassigning());
+        assert!(
+            sorted_target.contains(&after.leader),
+            "leader {} is not in the target set {sorted_target:?}",
+            after.leader
+        );
+        assert!(
+            after
+                .isr
+                .iter()
+                .all(|broker| sorted_target.contains(broker)),
+            "the ISR still lists departed replicas: {:?}",
+            after.isr
+        );
+    }
+
+    /// Targeting a broker that is not in the cluster would produce a
+    /// partition that can never reach its replication factor.
+    #[test]
+    fn reassigning_onto_an_unknown_broker_is_refused() {
+        let mut image = cluster_with(&[(1, "a"), (2, "b"), (3, "c")]);
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "orders".into(),
+                partitions: 1,
+                replication_factor: 3,
+                configs: BTreeMap::new(),
+            })
+            .expect("create");
+        let error = image
+            .apply(MetadataCommand::ReassignPartition {
+                topic: "orders".into(),
+                partition: 0,
+                replicas: vec![1, 2, 99],
+            })
+            .expect_err("broker 99 does not exist");
+        assert!(matches!(error, MetadataError::UnknownBroker(99)));
+    }
+
+    /// Two overlapping reassignments would race over the same replica set.
+    #[test]
+    fn a_second_reassignment_is_refused_while_one_is_in_flight() {
+        let mut image = cluster_with(&[(1, "a"), (2, "b"), (3, "c"), (4, "a")]);
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "orders".into(),
+                partitions: 1,
+                replication_factor: 3,
+                configs: BTreeMap::new(),
+            })
+            .expect("create");
+        image
+            .apply(MetadataCommand::ReassignPartition {
+                topic: "orders".into(),
+                partition: 0,
+                replicas: vec![1, 2, 4],
+            })
+            .expect("first");
+        let error = image
+            .apply(MetadataCommand::ReassignPartition {
+                topic: "orders".into(),
+                partition: 0,
+                replicas: vec![2, 3, 4],
+            })
+            .expect_err("second must be refused");
+        assert!(matches!(
+            error,
+            MetadataError::ReassignmentInProgress { .. }
+        ));
+    }
+
+    /// Asking for the placement a partition already has is a no-op, not a
+    /// failure: a retried or idempotent request must not error.
+    #[test]
+    fn reassigning_to_the_current_placement_is_a_no_op() {
+        let mut image = cluster_with(&[(1, "a"), (2, "b"), (3, "c")]);
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "orders".into(),
+                partitions: 1,
+                replication_factor: 3,
+                configs: BTreeMap::new(),
+            })
+            .expect("create");
+        let current = image.topics["orders"].partitions[&0].replicas.clone();
+        image
+            .apply(MetadataCommand::ReassignPartition {
+                topic: "orders".into(),
+                partition: 0,
+                replicas: current.clone(),
+            })
+            .expect("no-op reassignment");
+        let after = &image.topics["orders"].partitions[&0];
+        assert!(!after.is_reassigning(), "nothing should be in flight");
+        assert_eq!(after.replicas, current);
     }
 }

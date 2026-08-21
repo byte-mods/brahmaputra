@@ -1037,6 +1037,27 @@ async fn replication_maintenance(
                 );
                 drop(image);
                 for command in commands {
+                    // Completing a reassignment is a partition mutation but
+                    // not an ISR mutation: the gate below exists to serialise
+                    // an ISR change against Produce, and its preflight is
+                    // written entirely in terms of ChangePartition. Routing
+                    // this through it would only find a command it does not
+                    // understand. It is safe to submit directly because the
+                    // metadata state machine re-checks the ISR condition when
+                    // it applies, so a completion that raced a shrinking ISR
+                    // is rejected there rather than here.
+                    if matches!(command, MetadataCommand::CompleteReassignment { .. }) {
+                        match controller.write_metadata(command).await {
+                            Ok(event) => {
+                                tracing::info!(?event, "partition reassignment completed")
+                            }
+                            Err(error) => tracing::debug!(
+                                ?error,
+                                "reassignment completion deferred; will retry next tick"
+                            ),
+                        }
+                        continue;
+                    }
                     match apply_partition_change(
                         &broker,
                         &controller,
@@ -1349,9 +1370,26 @@ fn replication_maintenance_commands(
                     topic: topic.name.clone(),
                     partition: assignment.partition,
                     leader: assignment.leader,
-                    isr: desired_isr,
+                    isr: desired_isr.clone(),
                     expected_leader_epoch: assignment.leader_epoch,
                 });
+            }
+
+            // Finish a reassignment whose targets have caught up.
+            //
+            // Only the leader can see this: the ISR is what proves the new
+            // replicas actually hold the data, and until they do, dropping
+            // the old ones would discard the only copies. Checked against
+            // the ISR this tick is about to produce rather than the one in
+            // the image, so completion does not wait an extra round for the
+            // ChangePartition above to land.
+            if let Some(target) = assignment.target_replicas.as_ref() {
+                if target.iter().all(|broker| desired_isr.contains(broker)) {
+                    commands.push(MetadataCommand::CompleteReassignment {
+                        topic: topic.name.clone(),
+                        partition: assignment.partition,
+                    });
+                }
             }
         }
     }
@@ -1800,6 +1838,7 @@ mod tests {
                         replicas: vec![1, 2, 3],
                         isr: vec![1, 2, 3],
                         leader_epoch: 4,
+                        target_replicas: None,
                     },
                 )]),
                 configs: BTreeMap::new(),

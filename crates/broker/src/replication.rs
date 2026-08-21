@@ -298,6 +298,12 @@ impl ReplicaManager {
                 _ = &mut shutdown => break,
                 _ = tick.tick() => {
                     self.reconcile_workers(&mut workers).await;
+                    // A partition dropped from this broker's replica set by a
+                    // completed reassignment still has its data here; free it,
+                    // or a drained broker never gives its disk back.
+                    if let Some(cache) = self.broker.metadata_cache() {
+                        self.broker.drain_unowned_partitions(&cache.snapshot());
+                    }
                 }
             }
         }

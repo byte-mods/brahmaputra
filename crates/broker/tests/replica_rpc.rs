@@ -60,6 +60,7 @@ fn cluster_image() -> ClusterMetadata {
                         leader: LEADER_ID,
                         isr: vec![LEADER_ID, FOLLOWER_ID],
                         leader_epoch: LEADER_EPOCH,
+                        target_replicas: None,
                     },
                 )]),
                 configs: BTreeMap::new(),

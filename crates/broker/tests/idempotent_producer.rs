@@ -242,6 +242,7 @@ fn proxy_cluster_image(proxy_port: u16) -> ClusterMetadata {
                         leader: 1,
                         isr: vec![1],
                         leader_epoch: 0,
+                        target_replicas: None,
                     },
                 )]),
                 configs: BTreeMap::new(),

@@ -295,6 +295,19 @@ enum TopicCommand {
         #[arg(long = "config", value_parser = parse_topic_config)]
         configs: Vec<TopicConfig>,
     },
+    /// Move a partition to a different set of brokers.
+    ///
+    /// The partition keeps every copy it already has until the new brokers
+    /// have caught up, so durability never dips during the move.
+    Reassign {
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_parser = clap::value_parser!(i32).range(0..))]
+        partition: i32,
+        /// Target broker ids, comma-separated (e.g. `--replicas 2,3,4`).
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        replicas: Vec<i32>,
+    },
     /// Delete a topic and its metadata.
     Delete {
         #[arg(long)]
@@ -741,6 +754,27 @@ async fn topic_admin(controller: &str, command: TopicCommand) -> Result<()> {
                 success,
             )
         }
+        TopicCommand::Reassign {
+            name,
+            partition,
+            replicas,
+        } => {
+            if replicas.is_empty() {
+                anyhow::bail!("--replicas needs at least one broker id");
+            }
+            let success = format!(
+                "reassignment started topic={name:?} partition={partition} replicas={replicas:?} \
+                 (the partition keeps its current replicas until the targets catch up)"
+            );
+            (
+                MetadataCommand::ReassignPartition {
+                    topic: name,
+                    partition,
+                    replicas,
+                },
+                success,
+            )
+        }
         TopicCommand::Delete { name } => {
             let success = format!("topic deleted name={name:?}");
             (MetadataCommand::DeleteTopic { name }, success)
@@ -753,6 +787,20 @@ async fn topic_admin(controller: &str, command: TopicCommand) -> Result<()> {
             MetadataEvent::TopicCreated { name: name.clone() }
         }
         MetadataCommand::DeleteTopic { name } => MetadataEvent::TopicDeleted { name: name.clone() },
+        MetadataCommand::ReassignPartition {
+            topic,
+            partition,
+            replicas,
+        } => MetadataEvent::PartitionReassigned {
+            topic: topic.clone(),
+            partition: *partition,
+            replicas: {
+                let mut sorted = replicas.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                sorted
+            },
+        },
         _ => unreachable!("topic admin builds only topic commands"),
     };
     if event != expected_event {

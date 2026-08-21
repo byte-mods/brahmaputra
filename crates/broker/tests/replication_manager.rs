@@ -65,6 +65,7 @@ fn cluster_image(
                         leader,
                         isr,
                         leader_epoch,
+                        target_replicas: None,
                     },
                 )]),
                 configs,
