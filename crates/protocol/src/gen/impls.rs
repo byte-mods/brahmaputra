@@ -1064,6 +1064,13 @@ impl GroupMemberInfo {
 		}
 		
 		
+		
+		buf.put_i32(self.assignment.len() as i32);
+		for item in &self.assignment {
+			item.encode_to(buf)?;
+		}
+		
+		
         Ok(())
     }
 
@@ -1092,6 +1099,14 @@ impl GroupMemberInfo {
 		for _ in 0..subscription_topics_len {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.subscription_topics.push(val);
+		}
+		
+		
+		
+		let assignment_len = buf.get_i32();
+		for _ in 0..assignment_len {
+			let val = AssignedPartition::decode_from(buf)?;
+			obj.assignment.push(val);
 		}
 		
 		

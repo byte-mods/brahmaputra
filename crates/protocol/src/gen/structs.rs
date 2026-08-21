@@ -105,6 +105,7 @@ pub struct MetadataResponse {
 pub struct GroupMemberInfo {
 	pub member_id: String,
 	pub subscription_topics: Vec<String>,
+	pub assignment: Vec<AssignedPartition>,
 	
 }
 

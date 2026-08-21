@@ -181,7 +181,12 @@ enum Command {
         )]
         commit_interval_ms: u64,
         /// Partition assignor for group consumption.
-        #[arg(long, value_parser = ["range", "roundrobin"], default_value = "range", requires = "group")]
+        #[arg(
+            long,
+            value_parser = ["range", "roundrobin", "sticky"],
+            default_value = "range",
+            requires = "group"
+        )]
         assignor: String,
         /// Where a group starts when a partition has no committed offset,
         /// or its committed offset has aged off the log (`auto.offset.reset`).
@@ -1139,6 +1144,7 @@ async fn consume_group(
     let assignor = match assignor {
         "range" => Assignor::Range,
         "roundrobin" => Assignor::RoundRobin,
+        "sticky" => Assignor::Sticky,
         other => anyhow::bail!("unknown assignor {other:?}"),
     };
     let auto_offset_reset = match auto_offset_reset {
@@ -1713,6 +1719,25 @@ mod tests {
             );
         }
 
+        // Every assignor the group consumer implements must be reachable
+        // from the CLI, or the flag silently lags the library.
+        for assignor in ["range", "roundrobin", "sticky"] {
+            assert!(
+                Cli::try_parse_from([
+                    "brahmaputra-cli",
+                    "consume",
+                    "--topic",
+                    "orders",
+                    "--group",
+                    "shoppers",
+                    "--assignor",
+                    assignor,
+                ])
+                .is_ok(),
+                "{assignor} should be accepted"
+            );
+        }
+
         assert!(Cli::try_parse_from([
             "brahmaputra-cli",
             "consume",
@@ -1721,7 +1746,7 @@ mod tests {
             "--group",
             "shoppers",
             "--assignor",
-            "sticky",
+            "cooperative-sticky",
         ])
         .is_err());
     }

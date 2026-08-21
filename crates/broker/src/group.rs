@@ -1193,6 +1193,9 @@ fn join_response(group: &Group, member_id: &str) -> JoinGroupResponse {
             .map(|(member_id, member)| GroupMemberInfo {
                 member_id: member_id.clone(),
                 subscription_topics: member.subscription_topics.clone(),
+                // Carried so the leader can compute a sticky assignment;
+                // empty for a member joining for the first time.
+                assignment: member.assignment.clone(),
             })
             .collect();
         members.sort_by(|a, b| a.member_id.cmp(&b.member_id));

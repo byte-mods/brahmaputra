@@ -115,6 +115,10 @@ class MetadataResponse {
 class GroupMemberInfo {
     string member_id;
     string[] subscription_topics;
+    // What this member holds right now. The group leader needs it to
+    // compute a sticky assignment: without it, "minimise movement" has
+    // nothing to measure movement against.
+    AssignedPartition[] assignment;
 }
 
 class JoinGroupRequest {

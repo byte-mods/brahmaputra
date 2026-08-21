@@ -72,21 +72,33 @@ pub enum Assignor {
     Range,
     /// Partitions dealt one at a time across members sorted by id.
     RoundRobin,
+    /// Keep members on the partitions they already hold, moving only what
+    /// rebalancing actually requires. Prefer this when consumers carry
+    /// per-partition state, because every partition that moves throws that
+    /// state away.
+    Sticky,
 }
 
 impl Assignor {
     /// Compute each member's assignment. `members` is `(member_id,
     /// subscribed_topics)`; `topic_partitions` maps each subscribed topic to
-    /// its sorted partition ids. Every member appears in the result, possibly
-    /// with an empty assignment.
+    /// its sorted partition ids; `previous` is what each member currently
+    /// holds. Every member appears in the result, possibly with an empty
+    /// assignment.
+    ///
+    /// `previous` is ignored by the stateless strategies, which is the
+    /// point of passing it uniformly: the caller does not have to know
+    /// which strategy needs history.
     fn assign(
         &self,
         members: &[(String, Vec<String>)],
         topic_partitions: &BTreeMap<String, Vec<i32>>,
+        previous: &BTreeMap<String, Vec<TopicPartition>>,
     ) -> BTreeMap<String, Vec<TopicPartition>> {
         match self {
             Assignor::Range => range_assign(members, topic_partitions),
             Assignor::RoundRobin => roundrobin_assign(members, topic_partitions),
+            Assignor::Sticky => sticky_assign(members, topic_partitions, previous),
         }
     }
 }
@@ -168,6 +180,126 @@ fn roundrobin_assign(
     assignment
 }
 
+/// Keep every member on the partitions it already holds, and move only what
+/// balance actually requires.
+///
+/// `previous` is what each member holds now. The result differs from it by
+/// the minimum needed to reach a balanced, valid assignment:
+///
+/// 1. A member keeps a partition only if it is still subscribed to that
+///    topic and the partition still exists — a partition whose topic the
+///    member dropped, or that was deleted, cannot be kept.
+/// 2. A member holding more than its fair share gives up the excess.
+/// 3. Everything unclaimed is dealt to whoever is under quota.
+///
+/// The reason to prefer this over range/roundrobin is not elegance: every
+/// partition that moves costs the new owner a seek and the old owner a
+/// discarded fetch buffer, and any consumer with per-partition local state
+/// has to rebuild it. Recomputing from scratch reshuffles nearly everything
+/// on a change that should have touched one member's share.
+fn sticky_assign(
+    members: &[(String, Vec<String>)],
+    topic_partitions: &BTreeMap<String, Vec<i32>>,
+    previous: &BTreeMap<String, Vec<TopicPartition>>,
+) -> BTreeMap<String, Vec<TopicPartition>> {
+    let mut assignment = empty_assignment(members);
+    if members.is_empty() {
+        return assignment;
+    }
+
+    let subscribes = |member_id: &str, topic: &str| -> bool {
+        members
+            .iter()
+            .find(|(id, _)| id == member_id)
+            .is_some_and(|(_, topics)| topics.iter().any(|t| t == topic))
+    };
+
+    // Every partition that needs an owner, and who currently has a valid
+    // claim on it.
+    let mut unassigned: Vec<TopicPartition> = Vec::new();
+    let mut claimed: BTreeMap<TopicPartition, String> = BTreeMap::new();
+    for (topic, partitions) in topic_partitions {
+        for partition in partitions {
+            let tp = (topic.clone(), *partition);
+            let holder = previous
+                .iter()
+                .find(|(member_id, held)| held.contains(&tp) && subscribes(member_id, topic));
+            match holder {
+                Some((member_id, _)) => {
+                    claimed.insert(tp, member_id.clone());
+                }
+                None => unassigned.push(tp),
+            }
+        }
+    }
+
+    // Fair share: the members subscribed to at least one live topic split
+    // the partitions, and the remainder means some may hold one extra.
+    let eligible: Vec<&String> = members
+        .iter()
+        .filter(|(_, topics)| topics.iter().any(|t| topic_partitions.contains_key(t)))
+        .map(|(member_id, _)| member_id)
+        .collect();
+    if eligible.is_empty() {
+        return assignment;
+    }
+    let total: usize = topic_partitions.values().map(Vec::len).sum();
+    let base = total / eligible.len();
+    let extra = total % eligible.len();
+    // Sorted so the "who gets the extra one" decision is deterministic
+    // across members computing it independently.
+    let mut quota: BTreeMap<&String, usize> = BTreeMap::new();
+    for (index, member_id) in eligible.iter().enumerate() {
+        quota.insert(*member_id, base + usize::from(index < extra));
+    }
+
+    // Honour existing claims up to each member's quota; the overflow joins
+    // the pool. Sorted for the same determinism reason.
+    let mut kept: BTreeMap<String, Vec<TopicPartition>> = BTreeMap::new();
+    for (tp, member_id) in claimed {
+        let held = kept.entry(member_id.clone()).or_default();
+        if held.len() < quota.get(&member_id).copied().unwrap_or(0) {
+            held.push(tp);
+        } else {
+            unassigned.push(tp);
+        }
+    }
+
+    for (member_id, held) in kept {
+        if let Some(slot) = assignment.get_mut(&member_id) {
+            *slot = held;
+        }
+    }
+
+    // Deal the rest to whoever is still under quota and subscribed.
+    unassigned.sort();
+    for tp in unassigned {
+        let taker = eligible.iter().find(|member_id| {
+            subscribes(member_id, &tp.0)
+                && assignment.get(**member_id).map_or(0, Vec::len)
+                    < quota.get(**member_id).copied().unwrap_or(0)
+        });
+        // If quotas are exhausted (possible when subscriptions are uneven),
+        // fall back to any subscribed member rather than dropping the
+        // partition — an unassigned partition is a stalled partition.
+        let taker = taker.or_else(|| {
+            eligible
+                .iter()
+                .find(|member_id| subscribes(member_id, &tp.0))
+        });
+        if let Some(member_id) = taker {
+            assignment
+                .get_mut(*member_id)
+                .expect("member present")
+                .push(tp);
+        }
+    }
+
+    for held in assignment.values_mut() {
+        held.sort();
+    }
+    assignment
+}
 /// One consumed record with its topic-partition and offset.
 #[derive(Debug)]
 pub struct ConsumedRecord {
@@ -920,9 +1052,25 @@ impl GroupConsumer {
             .iter()
             .map(|member| (member.member_id.clone(), member.subscription_topics.clone()))
             .collect();
+        // What each member holds going in, as the coordinator reported it.
+        // A sticky assignor measures movement against this; the others
+        // ignore it.
+        let previous: BTreeMap<String, Vec<TopicPartition>> = members
+            .iter()
+            .map(|member| {
+                (
+                    member.member_id.clone(),
+                    member
+                        .assignment
+                        .iter()
+                        .map(|held| (held.topic.clone(), held.partition))
+                        .collect(),
+                )
+            })
+            .collect();
         Ok(self
             .assignor
-            .assign(&member_list, &topic_partitions)
+            .assign(&member_list, &topic_partitions, &previous)
             .into_iter()
             .map(|(member_id, partitions)| MemberAssignment {
                 member_id,
@@ -1140,7 +1288,7 @@ mod tests {
     fn range_distributes_contiguous_ranges_per_topic() {
         let members = members(&[("a", &["t"]), ("b", &["t"])]);
         let topics = topics(&[("t", 5)]);
-        let assignment = Assignor::Range.assign(&members, &topics);
+        let assignment = Assignor::Range.assign(&members, &topics, &BTreeMap::new());
         assert_eq!(
             assignment["a"],
             vec![
@@ -1159,7 +1307,7 @@ mod tests {
     fn range_handles_uneven_and_multi_topic_subscriptions() {
         let members = members(&[("a", &["t1", "t2"]), ("b", &["t1"])]);
         let topics = topics(&[("t1", 3), ("t2", 2)]);
-        let assignment = Assignor::Range.assign(&members, &topics);
+        let assignment = Assignor::Range.assign(&members, &topics, &BTreeMap::new());
         assert_eq!(
             assignment["a"],
             vec![
@@ -1176,7 +1324,7 @@ mod tests {
     fn roundrobin_deals_partitions_across_members() {
         let members = members(&[("a", &["t"]), ("b", &["t"])]);
         let topics = topics(&[("t", 5)]);
-        let assignment = Assignor::RoundRobin.assign(&members, &topics);
+        let assignment = Assignor::RoundRobin.assign(&members, &topics, &BTreeMap::new());
         assert_eq!(
             assignment["a"],
             vec![
@@ -1195,7 +1343,7 @@ mod tests {
     fn roundrobin_skips_members_not_subscribed_to_a_topic() {
         let members = members(&[("a", &["t1"]), ("b", &["t1", "t2"])]);
         let topics = topics(&[("t1", 2), ("t2", 2)]);
-        let assignment = Assignor::RoundRobin.assign(&members, &topics);
+        let assignment = Assignor::RoundRobin.assign(&members, &topics, &BTreeMap::new());
         assert_eq!(assignment["a"], vec![("t1".to_owned(), 0)]);
         assert_eq!(
             assignment["b"],
@@ -1212,7 +1360,7 @@ mod tests {
         for assignor in [Assignor::Range, Assignor::RoundRobin] {
             let members = members(&[("only", &["t"])]);
             let topics = topics(&[("t", 4)]);
-            let assignment = assignor.assign(&members, &topics);
+            let assignment = assignor.assign(&members, &topics, &BTreeMap::new());
             assert_eq!(
                 assignment["only"],
                 (0..4).map(|p| ("t".to_owned(), p)).collect::<Vec<_>>()
@@ -1225,11 +1373,11 @@ mod tests {
         for assignor in [Assignor::Range, Assignor::RoundRobin] {
             let three = members(&[("a", &["t"]), ("b", &["t"]), ("c", &["t"])]);
             let topics = topics(&[("t", 3)]);
-            let before = assignor.assign(&three, &topics);
+            let before = assignor.assign(&three, &topics, &BTreeMap::new());
             assert_eq!(before["b"], vec![("t".to_owned(), 1)]);
 
             let two = members(&[("a", &["t"]), ("c", &["t"])]);
-            let after = assignor.assign(&two, &topics);
+            let after = assignor.assign(&two, &topics, &BTreeMap::new());
             let mut assigned: Vec<i32> = after
                 .values()
                 .flat_map(|tps| tps.iter().map(|(_, p)| *p))
@@ -1244,7 +1392,7 @@ mod tests {
         let members = members(&[("a", &["t"]), ("b", &["other"])]);
         let topics = topics(&[("t", 1)]);
         for assignor in [Assignor::Range, Assignor::RoundRobin] {
-            let assignment = assignor.assign(&members, &topics);
+            let assignment = assignor.assign(&members, &topics, &BTreeMap::new());
             assert_eq!(assignment["a"], vec![("t".to_owned(), 0)]);
             assert!(assignment["b"].is_empty());
         }
@@ -1257,4 +1405,248 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod sticky_tests {
+    use super::*;
+
+    fn members(list: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        list.iter()
+            .map(|(id, topics)| {
+                (
+                    (*id).to_string(),
+                    topics.iter().map(|t| (*t).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn topics(list: &[(&str, i32)]) -> BTreeMap<String, Vec<i32>> {
+        list.iter()
+            .map(|(topic, count)| ((*topic).to_string(), (0..*count).collect()))
+            .collect()
+    }
+
+    fn previous(list: &[(&str, &[(&str, i32)])]) -> BTreeMap<String, Vec<TopicPartition>> {
+        list.iter()
+            .map(|(id, held)| {
+                (
+                    (*id).to_string(),
+                    held.iter()
+                        .map(|(topic, partition)| ((*topic).to_string(), *partition))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// How many partitions changed hands. This is the number the sticky
+    /// assignor exists to keep small, so it is what these tests assert on.
+    fn moved(
+        before: &BTreeMap<String, Vec<TopicPartition>>,
+        after: &BTreeMap<String, Vec<TopicPartition>>,
+    ) -> usize {
+        after
+            .iter()
+            .flat_map(|(member_id, held)| held.iter().map(move |tp| (member_id, tp)))
+            .filter(|(member_id, tp)| before.get(*member_id).is_none_or(|held| !held.contains(tp)))
+            .count()
+    }
+
+    fn all_assigned(
+        assignment: &BTreeMap<String, Vec<TopicPartition>>,
+        topic_partitions: &BTreeMap<String, Vec<i32>>,
+    ) {
+        let mut got: Vec<TopicPartition> = assignment
+            .values()
+            .flat_map(|v| v.iter().cloned())
+            .collect();
+        got.sort();
+        let mut want: Vec<TopicPartition> = topic_partitions
+            .iter()
+            .flat_map(|(topic, partitions)| partitions.iter().map(move |p| (topic.clone(), *p)))
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "every partition must have exactly one owner");
+    }
+
+    /// Nothing changed, so nothing should move. A sticky assignor that
+    /// reshuffles a stable group is worse than useless.
+    #[test]
+    fn a_stable_group_moves_nothing() {
+        let members = members(&[("a", &["t"]), ("b", &["t"])]);
+        let topics = topics(&[("t", 4)]);
+        let before = previous(&[("a", &[("t", 0), ("t", 1)]), ("b", &[("t", 2), ("t", 3)])]);
+        let after = sticky_assign(&members, &topics, &before);
+        assert_eq!(moved(&before, &after), 0);
+        assert_eq!(after, before);
+    }
+
+    /// A member leaves: only its partitions move. The survivors keep
+    /// everything they held — that is the whole difference from range,
+    /// which recomputes and reshuffles.
+    #[test]
+    fn only_the_departed_partitions_move() {
+        let topics = topics(&[("t", 6)]);
+        let before = previous(&[
+            ("a", &[("t", 0), ("t", 1)]),
+            ("b", &[("t", 2), ("t", 3)]),
+            ("c", &[("t", 4), ("t", 5)]),
+        ]);
+        let survivors = members(&[("a", &["t"]), ("c", &["t"])]);
+        let after = sticky_assign(&survivors, &topics, &before);
+
+        all_assigned(&after, &topics);
+        assert_eq!(
+            moved(&before, &after),
+            2,
+            "only the two orphaned partitions should change hands, got {after:?}"
+        );
+        for tp in &before["a"] {
+            assert!(after["a"].contains(tp), "a kept {tp:?}");
+        }
+        for tp in &before["c"] {
+            assert!(after["c"].contains(tp), "c kept {tp:?}");
+        }
+    }
+
+    /// A member joins: it takes a fair share, and only that many move.
+    #[test]
+    fn a_joining_member_takes_only_its_fair_share() {
+        let topics = topics(&[("t", 6)]);
+        let before = previous(&[
+            ("a", &[("t", 0), ("t", 1), ("t", 2)]),
+            ("b", &[("t", 3), ("t", 4), ("t", 5)]),
+        ]);
+        let grown = members(&[("a", &["t"]), ("b", &["t"]), ("c", &["t"])]);
+        let after = sticky_assign(&grown, &topics, &before);
+
+        all_assigned(&after, &topics);
+        assert_eq!(after["a"].len(), 2);
+        assert_eq!(after["b"].len(), 2);
+        assert_eq!(after["c"].len(), 2);
+        assert_eq!(
+            moved(&before, &after),
+            2,
+            "exactly the two partitions the newcomer needs should move"
+        );
+    }
+
+    /// Sticky must still be *correct*, not merely stable: a partition whose
+    /// topic a member no longer subscribes to cannot be kept.
+    #[test]
+    fn a_partition_whose_topic_was_unsubscribed_is_reassigned() {
+        let topics = topics(&[("t1", 2), ("t2", 2)]);
+        let before = previous(&[
+            ("a", &[("t1", 0), ("t1", 1)]),
+            ("b", &[("t2", 0), ("t2", 1)]),
+        ]);
+        // `a` drops t1 and picks up t2; it cannot keep t1's partitions.
+        let changed = members(&[("a", &["t2"]), ("b", &["t2"])]);
+        let after = sticky_assign(&changed, &topics, &before);
+        assert!(
+            !after["a"].iter().any(|(topic, _)| topic == "t1"),
+            "a must not keep a topic it no longer subscribes to"
+        );
+    }
+
+    /// A partition that no longer exists must not be carried forward, and a
+    /// newly created one must be handed out.
+    #[test]
+    fn deleted_and_created_partitions_are_handled() {
+        let before = previous(&[("a", &[("t", 0), ("t", 1)]), ("b", &[("t", 2), ("t", 3)])]);
+        let members = members(&[("a", &["t"]), ("b", &["t"])]);
+
+        // As far as this assignment is concerned the topic has 2 partitions;
+        // the vanished ones simply do not appear in the result.
+        let shrunk = topics(&[("t", 2)]);
+        let after = sticky_assign(&members, &shrunk, &before);
+        all_assigned(&after, &shrunk);
+
+        // Topic grew to 6; the new ones get owners.
+        let grown = topics(&[("t", 6)]);
+        let after = sticky_assign(&members, &grown, &before);
+        all_assigned(&after, &grown);
+        assert_eq!(after["a"].len(), 3);
+        assert_eq!(after["b"].len(), 3);
+    }
+
+    /// With no history every partition is new, so sticky must still produce
+    /// a complete, balanced assignment rather than an empty one.
+    #[test]
+    fn a_first_assignment_with_no_history_is_balanced() {
+        let members = members(&[("a", &["t"]), ("b", &["t"]), ("c", &["t"])]);
+        let topics = topics(&[("t", 7)]);
+        let after = sticky_assign(&members, &topics, &BTreeMap::new());
+        all_assigned(&after, &topics);
+        let sizes: Vec<usize> = after.values().map(Vec::len).collect();
+        assert!(
+            sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1,
+            "sizes must differ by at most one, got {sizes:?}"
+        );
+    }
+
+    /// Independent members computing the assignment must agree, or they
+    /// would fight over partitions on every rebalance.
+    #[test]
+    fn assignment_is_deterministic() {
+        let members = members(&[("a", &["t"]), ("b", &["t"]), ("c", &["t"])]);
+        let topics = topics(&[("t", 8)]);
+        let before = previous(&[("a", &[("t", 0)]), ("b", &[("t", 1)])]);
+        let first = sticky_assign(&members, &topics, &before);
+        for _ in 0..5 {
+            assert_eq!(sticky_assign(&members, &topics, &before), first);
+        }
+    }
+
+    /// The comparison that justifies the strategy.
+    ///
+    /// A member *joining* is the discriminating case. When one leaves, its
+    /// partitions have to move under any strategy, so both can hit the
+    /// same floor. When one joins, only the newcomer's share needs to move
+    /// — but range recomputes every boundary, so partitions shuffle between
+    /// members that were never involved.
+    #[test]
+    fn sticky_moves_less_than_range_when_a_member_joins() {
+        let topics = topics(&[("t", 12)]);
+        let two = members(&[("a", &["t"]), ("b", &["t"])]);
+        let initial = sticky_assign(&two, &topics, &BTreeMap::new());
+
+        let three = members(&[("a", &["t"]), ("b", &["t"]), ("c", &["t"])]);
+        let sticky_after = sticky_assign(&three, &topics, &initial);
+        let range_after = range_assign(&three, &topics);
+
+        let sticky_moves = moved(&initial, &sticky_after);
+        let range_moves = moved(&initial, &range_after);
+        assert_eq!(
+            sticky_moves, 4,
+            "only the newcomer's four partitions need to move"
+        );
+        assert!(
+            sticky_moves < range_moves,
+            "sticky moved {sticky_moves}, range moved {range_moves}"
+        );
+        all_assigned(&sticky_after, &topics);
+    }
+
+    /// When a member leaves, its partitions must move under any strategy,
+    /// so the meaningful claim is that sticky moves *exactly* that many and
+    /// not one more.
+    #[test]
+    fn a_departure_moves_exactly_the_orphaned_partitions() {
+        let topics = topics(&[("t", 9)]);
+        let three = members(&[("a", &["t"]), ("b", &["t"]), ("c", &["t"])]);
+        let initial = sticky_assign(&three, &topics, &BTreeMap::new());
+        let orphaned = initial["b"].len();
+
+        let two = members(&[("a", &["t"]), ("c", &["t"])]);
+        let after = sticky_assign(&two, &topics, &initial);
+        assert_eq!(
+            moved(&initial, &after),
+            orphaned,
+            "sticky must move the departed member's partitions and nothing else"
+        );
+        all_assigned(&after, &topics);
+    }
 }
