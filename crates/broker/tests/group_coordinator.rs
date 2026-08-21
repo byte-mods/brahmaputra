@@ -69,6 +69,23 @@ async fn start_standalone(data_dir: &Path, default_partitions: i32) -> RunningBr
     run_broker(broker).await
 }
 
+/// A standalone broker with a tweaked config, for tests that need to move
+/// a timing knob rather than wait out a production default.
+async fn start_standalone_with(
+    data_dir: &Path,
+    default_partitions: i32,
+    tweak: impl FnOnce(&mut BrokerConfig),
+) -> RunningBroker {
+    let mut config = BrokerConfig {
+        port: 0,
+        data_dir: data_dir.to_owned(),
+        default_partitions,
+        ..BrokerConfig::default()
+    };
+    tweak(&mut config);
+    let broker = Broker::bind(config).await.unwrap();
+    run_broker(broker).await
+}
 async fn start_cluster_broker(
     broker_id: i32,
     data_dir: &Path,
@@ -1091,6 +1108,166 @@ async fn dynamic_members_still_rebalance_on_rejoin() {
     assert!(
         rejoin.generation > generation,
         "a new dynamic member must start a new generation"
+    );
+
+    stop_broker(broker).await;
+}
+
+/// `offsets.retention.ms`. A group that no longer exists must eventually
+/// stop costing disk: its committed offsets are tombstoned, which lets
+/// compaction reclaim them. Nothing wrote a tombstone before this, so the
+/// offsets topic grew forever with groups that were long gone.
+#[tokio::test]
+async fn an_empty_groups_offsets_expire() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone_with(&temp.path().join("broker"), 4, |config| {
+        // Short enough to observe; the group must still be empty first.
+        config.offsets_retention = Some(Duration::from_millis(300));
+    })
+    .await;
+    let conn = connect(broker.addr, "expiry").await;
+
+    let member = join(&conn, "eg", "", 1_000, 500).await;
+    assert_eq!(member.error_code, ec::NONE);
+    let committed_code = commit(
+        &conn,
+        "eg",
+        member.generation,
+        &member.member_id,
+        vec![OffsetCommitEntry {
+            topic: "events".into(),
+            partition: 0,
+            offset: 42,
+        }],
+    )
+    .await;
+    assert_eq!(committed_code, ec::NONE);
+    assert_eq!(
+        fetch_offsets(&conn, "eg", vec![assigned("events", 0)])
+            .await
+            .offsets[0]
+            .offset,
+        42,
+        "the offset is committed to begin with"
+    );
+
+    // The member leaves, so the group is empty and the clock starts.
+    assert_eq!(
+        leave(&conn, "eg", &member.member_id).await.error_code,
+        ec::NONE
+    );
+
+    // The sweeper runs every 100ms; give retention plus several sweeps.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut expired = false;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let response = fetch_offsets(&conn, "eg", vec![assigned("events", 0)]).await;
+        if response.offsets.is_empty() || response.offsets[0].offset < 0 {
+            expired = true;
+            break;
+        }
+    }
+    assert!(
+        expired,
+        "an empty group's offsets must expire after offsets.retention.ms"
+    );
+
+    stop_broker(broker).await;
+}
+
+/// The clock runs from emptiness, not from the commit. A group that is
+/// still consuming keeps offsets far older than the retention — expiring
+/// under a live consumer would silently rewind it.
+#[tokio::test]
+async fn a_live_groups_offsets_never_expire() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone_with(&temp.path().join("broker"), 4, |config| {
+        config.offsets_retention = Some(Duration::from_millis(200));
+    })
+    .await;
+    let conn = connect(broker.addr, "live").await;
+
+    let member = join(&conn, "lg-live", "", 600_000, 500).await;
+    // Sync, or the group sits in AwaitingSync and the wedge-recovery sweep
+    // restarts the rebalance out from under these heartbeats.
+    sync(
+        &conn,
+        "lg-live",
+        member.generation,
+        &member.member_id,
+        vec![MemberAssignment {
+            member_id: member.member_id.clone(),
+            partitions: vec![assigned("events", 0)],
+        }],
+    )
+    .await;
+    commit(
+        &conn,
+        "lg-live",
+        member.generation,
+        &member.member_id,
+        vec![OffsetCommitEntry {
+            topic: "events".into(),
+            partition: 0,
+            offset: 7,
+        }],
+    )
+    .await;
+
+    // Far longer than the retention, with the member still present and
+    // heartbeating.
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            heartbeat(&conn, "lg-live", member.generation, &member.member_id).await,
+            ec::NONE
+        );
+    }
+
+    let response = fetch_offsets(&conn, "lg-live", vec![assigned("events", 0)]).await;
+    assert_eq!(
+        response.offsets[0].offset, 7,
+        "a group with members must keep its offsets however old they are"
+    );
+
+    stop_broker(broker).await;
+}
+
+/// Expiry is off when retention is `None`: an operator who wants offsets
+/// kept forever must be able to say so.
+#[tokio::test]
+async fn expiry_can_be_disabled() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone_with(&temp.path().join("broker"), 4, |config| {
+        config.offsets_retention = None;
+    })
+    .await;
+    let conn = connect(broker.addr, "never").await;
+
+    let member = join(&conn, "ng", "", 1_000, 500).await;
+    commit(
+        &conn,
+        "ng",
+        member.generation,
+        &member.member_id,
+        vec![OffsetCommitEntry {
+            topic: "events".into(),
+            partition: 0,
+            offset: 11,
+        }],
+    )
+    .await;
+    assert_eq!(
+        leave(&conn, "ng", &member.member_id).await.error_code,
+        ec::NONE
+    );
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let response = fetch_offsets(&conn, "ng", vec![assigned("events", 0)]).await;
+    assert_eq!(
+        response.offsets[0].offset, 11,
+        "with retention disabled, offsets survive an empty group indefinitely"
     );
 
     stop_broker(broker).await;

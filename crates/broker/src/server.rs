@@ -77,6 +77,13 @@ pub struct BrokerConfig {
     pub max_frame_bytes: usize,
     /// How often partition actors apply enabled time/size retention policies.
     pub retention_check_interval: Duration,
+    /// How long a group with no members keeps its committed offsets
+    /// (`offsets.retention.ms`). `None` keeps them forever.
+    ///
+    /// The clock starts when the group empties, not when each offset was
+    /// committed: a live group is still using its offsets however old they
+    /// are, and expiring under it would silently rewind the consumer.
+    pub offsets_retention: Option<Duration>,
     /// Shared controller-materialized metadata image. `None` preserves the
     /// standalone M1 topic map and implicit topic creation behavior.
     pub metadata_cache: Option<MetadataCache>,
@@ -111,6 +118,8 @@ impl Default for BrokerConfig {
             channel_capacity: 1024,
             max_frame_bytes: 32 * 1024 * 1024,
             retention_check_interval: Duration::from_secs(1),
+            // Kafka's default: 7 days.
+            offsets_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)),
             metadata_cache: None,
             replication_enabled: false,
             transport: Transport::default(),

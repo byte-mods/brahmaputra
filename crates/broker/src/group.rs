@@ -109,6 +109,13 @@ struct Group {
     rebalance_deadline_ms: i64,
     rebalance_timeout_ms: i64,
     next_member_seq: u64,
+    /// When the group last became memberless, for `offsets.retention.ms`.
+    /// `None` while it has members.
+    ///
+    /// The clock runs from emptiness rather than from each commit because
+    /// a live group is still using its offsets however old they are —
+    /// expiring under it would silently rewind the consumer.
+    empty_since_ms: Option<i64>,
     /// Bumped on every state change; JoinGroup/SyncGroup waiters subscribe.
     watch: watch::Sender<()>,
 }
@@ -124,6 +131,7 @@ impl Group {
             rebalance_deadline_ms: 0,
             rebalance_timeout_ms: DEFAULT_REBALANCE_TIMEOUT_MS,
             next_member_seq: 0,
+            empty_since_ms: None,
             watch: watch::channel(()).0,
         }
     }
@@ -1104,8 +1112,98 @@ impl GroupCoordinator {
                         warn!(%error, group = %group_id, "failed to persist group after expiry");
                     }
                 }
+
+                // `offsets.retention.ms`. Tracked here rather than at each
+                // transition into Empty because the sweeper already visits
+                // every group, so one self-correcting place cannot drift
+                // out of step with the several ways a group can empty.
+                let expire = {
+                    let Some(mut group) = shard.groups.get_mut(&group_id) else {
+                        continue;
+                    };
+                    if group.members.is_empty() {
+                        let since = *group.empty_since_ms.get_or_insert(now);
+                        broker.config().offsets_retention.is_some_and(|retention| {
+                            now.saturating_sub(since) >= retention.as_millis() as i64
+                        })
+                    } else {
+                        // Still in use: the clock has not started.
+                        group.empty_since_ms = None;
+                        false
+                    }
+                };
+                if expire {
+                    if let Err(error) = self.expire_group_offsets(broker, &shard, &group_id).await {
+                        warn!(%error, group = %group_id, "failed to expire group offsets");
+                    }
+                }
             }
         }
+    }
+
+    /// Append a whole-group tombstone, dropping its committed offsets.
+    ///
+    /// Written to the log rather than only to memory so the deletion
+    /// survives a coordinator failover — and because compaction then
+    /// reclaims the superseded commits, which is what stops a cluster's
+    /// offsets topic growing forever with groups that no longer exist.
+    async fn expire_group_offsets(
+        &self,
+        broker: &Broker,
+        shard: &Arc<CoordinatorShard>,
+        group_id: &str,
+    ) -> Result<(), BrokerError> {
+        let held: Vec<(String, String, i32)> = shard
+            .offsets
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|(group, _, _)| group == group_id)
+            .collect();
+        if held.is_empty() {
+            // Nothing to expire; drop the empty group so the sweep does not
+            // reconsider it every tick forever.
+            shard.groups.remove(group_id);
+            return Ok(());
+        }
+        debug!(
+            group = %group_id,
+            offsets = held.len(),
+            "expiring the offsets of a group that has been empty past offsets.retention.ms"
+        );
+
+        let tombstone = TombstoneRecord {
+            group_id: group_id.to_owned(),
+            // Empty topic means the whole group, matching what replay
+            // already understands.
+            topic: String::new(),
+            partition: -1,
+        };
+        let mut value = vec![KIND_TOMBSTONE];
+        value.extend_from_slice(
+            &tombstone
+                .encode()
+                .map_err(|error| BrokerError::Meta(format!("encoding group tombstone: {error}")))?,
+        );
+        let mut watermark = shard.handle.watermark_watch();
+        watermark.borrow_and_update();
+        let base = self
+            .append_and_commit(broker, shard, vec![(group_id.to_owned(), value)])
+            .await?;
+        // Only forget the offsets once the deletion is committed. Dropping
+        // them from memory first would make a coordinator that then failed
+        // over resurrect every one of them.
+        if !wait_for_high_watermark(&mut watermark, base + 1, COMMIT_WATERMARK_TIMEOUT).await {
+            return Err(BrokerError::NotEnoughReplicas {
+                required: 1,
+                available: 0,
+            });
+        }
+
+        for key in held {
+            shard.offsets.remove(&key);
+        }
+        shard.groups.remove(group_id);
+        Ok(())
     }
 }
 

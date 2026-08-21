@@ -168,6 +168,12 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_OFFSETS_TOPIC_PARTITIONS)]
     offsets_topic_partitions: i32,
 
+    /// How long a group with no members keeps its committed offsets
+    /// (`offsets.retention.ms`); 0 keeps them forever. The clock starts
+    /// when the group empties, so a live consumer is never affected.
+    #[arg(long = "offsets-retention-ms", default_value_t = 7 * 24 * 60 * 60 * 1000)]
+    offsets_retention_ms: u64,
+
     /// Data-plane transport: `tcp` (one multiplexed byte stream, plain),
     /// `tcp-tls` (the same, encrypted with TLS 1.3), or `quic` (TLS 1.3,
     /// one bidirectional stream per request, no head-of-line blocking
@@ -271,6 +277,8 @@ async fn run_standalone(args: Args) -> Result<()> {
             ..LogConfig::default()
         },
         retention_check_interval: Duration::from_millis(args.retention_check_interval_ms.max(1)),
+        offsets_retention: (args.offsets_retention_ms > 0)
+            .then(|| Duration::from_millis(args.offsets_retention_ms)),
         transport: args.transport,
         quota,
         require_auth: args.require_auth,
@@ -373,6 +381,8 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
             retention_check_interval: Duration::from_millis(
                 args.retention_check_interval_ms.max(1),
             ),
+            offsets_retention: (args.offsets_retention_ms > 0)
+                .then(|| Duration::from_millis(args.offsets_retention_ms)),
             transport: args.transport,
             quota,
             require_auth: args.require_auth,
