@@ -201,6 +201,11 @@ enum Command {
         /// benchmarks, where per-record stdout dominates the measurement.
         #[arg(long)]
         quiet: bool,
+        /// Also print each record's create timestamp. Off by default: the
+        /// default output line is parsed positionally by scripts and
+        /// pipelines, so widening it would break them silently.
+        #[arg(long = "show-timestamp")]
+        show_timestamp: bool,
     },
     /// Print broker/topic/partition metadata.
     Metadata {
@@ -522,6 +527,7 @@ async fn run(cli: Cli) -> Result<()> {
             assignor,
             auto_offset_reset,
             quiet,
+            show_timestamp,
         } => {
             let broker = broker.expect("data-plane commands resolve a broker");
             match group {
@@ -552,6 +558,7 @@ async fn run(cli: Cli) -> Result<()> {
                             max,
                             follow,
                             quiet,
+                            show_timestamp,
                         },
                     )
                     .await
@@ -1000,6 +1007,7 @@ struct ConsumeOptions<'a> {
     max: Option<u64>,
     follow: bool,
     quiet: bool,
+    show_timestamp: bool,
 }
 
 async fn consume(broker: SocketAddr, topic: String, options: ConsumeOptions<'_>) -> Result<()> {
@@ -1010,6 +1018,7 @@ async fn consume(broker: SocketAddr, topic: String, options: ConsumeOptions<'_>)
         max,
         follow,
         quiet,
+        show_timestamp,
     } = options;
     let consumer = Consumer::connect_with(transport(), broker, "brahmaputra-cli").await?;
     let started = Instant::now();
@@ -1043,7 +1052,16 @@ async fn consume(broker: SocketAddr, topic: String, options: ConsumeOptions<'_>)
             for (p, next) in &mut cursors {
                 let records = consumer.fetch(&topic, *p, *next, max_wait_ms).await?;
                 made_progress |= !records.is_empty();
-                if emit_records(*p, next, &mut printed, max, records, quiet, &mut bytes) {
+                if emit_records(
+                    *p,
+                    next,
+                    &mut printed,
+                    max,
+                    records,
+                    quiet,
+                    show_timestamp,
+                    &mut bytes,
+                ) {
                     report_consume_rate(quiet, printed, bytes, started);
                     return Ok(());
                 }
@@ -1080,6 +1098,7 @@ async fn consume(broker: SocketAddr, topic: String, options: ConsumeOptions<'_>)
                 max,
                 records,
                 quiet,
+                show_timestamp,
                 &mut bytes,
             ) {
                 report_consume_rate(quiet, printed, bytes, started);
@@ -1249,6 +1268,7 @@ fn emit_records(
     max: Option<u64>,
     records: Vec<FetchedRecord>,
     quiet: bool,
+    show_timestamp: bool,
     bytes: &mut u64,
 ) -> bool {
     for record in records {
@@ -1277,10 +1297,19 @@ fn emit_records(
                     .collect();
                 format!(" headers=[{}]", rendered.join(","))
             };
+            // Timestamps are opt-in, and headers only appear when a record
+            // actually has one. The default line is a contract: the
+            // verification scripts parse it positionally, and so does
+            // anything a user has piped it into. Widening it by default
+            // breaks every one of those silently.
+            let timestamp = if show_timestamp {
+                format!(" timestamp={}", record.timestamp)
+            } else {
+                String::new()
+            };
             println!(
-                "partition={partition} offset={} timestamp={} key={key} value={}{headers}",
+                "partition={partition} offset={}{timestamp} key={key} value={}{headers}",
                 record.offset,
-                record.timestamp,
                 String::from_utf8_lossy(&record.value)
             );
         }
@@ -2206,6 +2235,7 @@ mod tests {
                     max: Some(1),
                     follow: true,
                     quiet: false,
+                    show_timestamp: false,
                 },
             ),
         )
