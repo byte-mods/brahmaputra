@@ -34,8 +34,25 @@ use crate::server::Broker;
 /// Internal topic whose partition leaders act as group coordinators.
 pub(crate) const OFFSETS_TOPIC: &str = "__consumer_offsets";
 
+/// Bounds on a client-supplied `session.timeout.ms`, as Kafka's
+/// `group.min.session.timeout.ms` / `group.max.session.timeout.ms`.
+///
+/// Below the minimum, an ordinary GC pause looks like a dead consumer and
+/// the group churns. Above the maximum, a consumer that really is dead
+/// holds its partitions for as long as it asked for, and nothing else in
+/// the group can touch them.
+const MIN_SESSION_TIMEOUT_MS: i64 = 1_000;
+const MAX_SESSION_TIMEOUT_MS: i64 = 30 * 60 * 1_000;
+
 const DEFAULT_SESSION_TIMEOUT_MS: i64 = 3_000;
 const DEFAULT_REBALANCE_TIMEOUT_MS: i64 = 3_000;
+/// How long a group forming for the first time waits for more members
+/// before assigning anything (`group.initial.rebalance.delay.ms`).
+///
+/// Kafka defaults to 3 s. This is shorter because the rest of this
+/// coordinator's timeouts are shorter, and because a delay longer than
+/// the rebalance timeout would simply expire into it.
+const INITIAL_REBALANCE_DELAY_MS: i64 = 1_000;
 /// Extra grace beyond the rebalance deadline before a blocked JoinGroup or
 /// SyncGroup gives up waiting for the group watch.
 const REBALANCE_WAIT_GRACE: Duration = Duration::from_millis(1_000);
@@ -116,11 +133,29 @@ struct Group {
     /// a live group is still using its offsets however old they are —
     /// expiring under it would silently rewind the consumer.
     empty_since_ms: Option<i64>,
+    /// While set, a first rebalance is deliberately held open until this
+    /// time (`group.initial.rebalance.delay.ms`).
+    ///
+    /// A fleet of consumers starting together would otherwise rebalance
+    /// once per instance: the first member joins and is assigned every
+    /// partition, the second arrives and everything moves, and so on. The
+    /// delay lets the group form once, which is the difference between a
+    /// deploy that settles immediately and one that thrashes for as long
+    /// as instances keep arriving.
+    initial_delay_until_ms: Option<i64>,
     /// Bumped on every state change; JoinGroup/SyncGroup waiters subscribe.
     watch: watch::Sender<()>,
 }
 
 impl Group {
+    /// Whether a first-formation delay is still holding this rebalance open.
+    ///
+    /// Once it elapses the flag is not cleared here — the sweep clears it
+    /// when it finalizes, so a caller cannot accidentally finalize twice.
+    fn initial_delay_pending(&self, now: i64) -> bool {
+        self.initial_delay_until_ms.is_some_and(|until| now < until)
+    }
+
     fn new() -> Self {
         Group {
             state: GroupState::Empty,
@@ -132,6 +167,7 @@ impl Group {
             rebalance_timeout_ms: DEFAULT_REBALANCE_TIMEOUT_MS,
             next_member_seq: 0,
             empty_since_ms: None,
+            initial_delay_until_ms: None,
             watch: watch::channel(()).0,
         }
     }
@@ -455,11 +491,30 @@ impl GroupCoordinator {
         } else {
             DEFAULT_REBALANCE_TIMEOUT_MS
         };
-        let session_timeout = if request.session_timeout_ms > 0 {
+        // A client-supplied session timeout was accepted unbounded, which
+        // lets one misconfigured consumer decide how long the *group* waits
+        // for it. Too small and a slightly slow member is evicted on every
+        // GC pause, churning the group; too large and a dead member holds
+        // its partitions for as long as it asked for — an hour, a day —
+        // while the rest of the group cannot touch them.
+        //
+        // Clamping rather than rejecting: a consumer that asks for
+        // something unreasonable should still be able to join, with the
+        // group's rules applied, instead of failing to start.
+        let requested = if request.session_timeout_ms > 0 {
             i64::from(request.session_timeout_ms)
         } else {
             DEFAULT_SESSION_TIMEOUT_MS
         };
+        let session_timeout = requested.clamp(MIN_SESSION_TIMEOUT_MS, MAX_SESSION_TIMEOUT_MS);
+        if session_timeout != requested {
+            debug!(
+                group = %request.group_id,
+                requested,
+                applied = session_timeout,
+                "clamped a session timeout outside the permitted range"
+            );
+        }
 
         let (member_id, _generation) = {
             let mut entry = shard
@@ -539,7 +594,10 @@ impl GroupCoordinator {
             );
             group.pending_rejoin.remove(&member_id);
             debug!(group = %request.group_id, %member_id, state = ?group.state, gen = group.generation, pending = ?group.pending_rejoin, "join upserted member");
-            if group.state == GroupState::PreparingRebalance && group.pending_rejoin.is_empty() {
+            if group.state == GroupState::PreparingRebalance
+                && group.pending_rejoin.is_empty()
+                && !group.initial_delay_pending(now)
+            {
                 finalize_rebalance(group);
             }
             group.watch.send_replace(());
@@ -1066,7 +1124,21 @@ impl GroupCoordinator {
                         continue;
                     };
                     match group.state {
-                        // Bounded by the rebalance deadline; nothing to do.
+                        // A first-formation delay that has elapsed is finalized
+                        // here rather than by a join, because the last member
+                        // to arrive may already be blocked waiting for it —
+                        // nobody else is going to come along and finish it.
+                        GroupState::PreparingRebalance
+                            if group.pending_rejoin.is_empty()
+                                && group.initial_delay_until_ms.is_some()
+                                && !group.initial_delay_pending(now) =>
+                        {
+                            debug!(group = %group_id, "initial rebalance delay elapsed");
+                            finalize_rebalance(&mut group);
+                            group.watch.send_replace(());
+                            true
+                        }
+                        // Otherwise bounded by the rebalance deadline.
                         GroupState::PreparingRebalance => false,
                         // The leader never distributed assignments: restart so
                         // a new leader is picked from the members that rejoin.
@@ -1248,6 +1320,12 @@ fn local_coordinator_partitions(
 /// (Re)start a rebalance: bump the generation and require every current
 /// member to rejoin before the deadline.
 fn restart_rebalance(group: &mut Group, now: i64) {
+    // A group with no members is forming for the first time, so hold it
+    // open briefly for the rest of the fleet. A group that already has
+    // members is rebalancing for a reason and must not be delayed.
+    if group.members.is_empty() {
+        group.initial_delay_until_ms = Some(now + INITIAL_REBALANCE_DELAY_MS);
+    }
     group.state = GroupState::PreparingRebalance;
     group.generation += 1;
     group.pending_rejoin = group.members.keys().cloned().collect();
@@ -1264,6 +1342,7 @@ fn restart_rebalance(group: &mut Group, now: i64) {
 /// that missed the window are dropped first so they cannot be picked as
 /// leader or receive assignments for a generation they never joined.
 fn finalize_rebalance(group: &mut Group) {
+    group.initial_delay_until_ms = None;
     let pending = std::mem::take(&mut group.pending_rejoin);
     for member_id in &pending {
         group.members.remove(member_id);

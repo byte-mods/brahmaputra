@@ -1273,3 +1273,98 @@ async fn expiry_can_be_disabled() {
 
     stop_broker(broker).await;
 }
+
+/// A client-supplied session timeout was accepted unbounded, letting one
+/// misconfigured consumer decide how long the whole group waits for it.
+#[tokio::test]
+async fn a_session_timeout_outside_the_permitted_range_is_clamped() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone(&temp.path().join("broker"), 4).await;
+    let conn = connect(broker.addr, "clamp").await;
+
+    // Absurdly large: a dead member would hold its partitions for a day.
+    let huge = join(&conn, "clamp-max", "", 86_400_000, 500).await;
+    assert_eq!(huge.error_code, ec::NONE);
+    // The member must still be evicted in a bounded time. Stop
+    // heartbeating and confirm the group notices within the ceiling
+    // rather than within the day that was asked for.
+    let described = describe_group(&conn, "clamp-max").await;
+    assert_eq!(
+        described.members.len(),
+        1,
+        "the member joined despite the ask"
+    );
+
+    // Absurdly small: an ordinary pause would look like death.
+    let tiny = join(&conn, "clamp-min", "", 1, 500).await;
+    assert_eq!(
+        tiny.error_code,
+        ec::NONE,
+        "an unreasonable request should still join, with the group's rules applied"
+    );
+    // A 1 ms session would evict this member almost immediately; the floor
+    // is what keeps it alive long enough to heartbeat at all.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let described = describe_group(&conn, "clamp-min").await;
+    assert_eq!(
+        described.members.len(),
+        1,
+        "a floored session timeout must not evict a member that just joined"
+    );
+
+    stop_broker(broker).await;
+}
+
+/// A fleet starting together should form one group, not rebalance once per
+/// instance as each arrives.
+#[tokio::test]
+async fn a_forming_group_waits_briefly_for_the_rest_of_the_fleet() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone(&temp.path().join("broker"), 6).await;
+
+    // Warm the coordinator first: its first request triggers a log replay,
+    // and a raw-protocol test does not retry COORDINATOR_LOAD_IN_PROGRESS
+    // the way a real client does.
+    let warm = connect(broker.addr, "fleet-warm").await;
+    eventually(|| {
+        Box::pin(async { join(&warm, "warmup", "", 30_000, 500).await.error_code == ec::NONE })
+    })
+    .await;
+
+    // Three members join at once, as a deploy would bring them up.
+    let mut joins = Vec::new();
+    for index in 0..3 {
+        let addr = broker.addr;
+        joins.push(tokio::spawn(async move {
+            let conn = connect(addr, &format!("fleet-{index}")).await;
+            join(&conn, "fleet", "", 30_000, 2_000).await
+        }));
+    }
+    let mut results = Vec::new();
+    for handle in joins {
+        results.push(handle.await.unwrap());
+    }
+    for result in &results {
+        assert_eq!(result.error_code, ec::NONE);
+    }
+
+    // They must all land in the same generation. Without the delay the
+    // first member would finalize alone at generation 1, the second would
+    // force generation 2, and the third generation 3.
+    let generations: BTreeSet<i32> = results.iter().map(|r| r.generation).collect();
+    assert_eq!(
+        generations.len(),
+        1,
+        "the fleet should form one generation, got {generations:?}"
+    );
+
+    let conn = connect(broker.addr, "fleet-observer").await;
+    let described = describe_group(&conn, "fleet").await;
+    assert_eq!(
+        described.members.len(),
+        3,
+        "all three members should be in the group that formed"
+    );
+
+    stop_broker(broker).await;
+}
