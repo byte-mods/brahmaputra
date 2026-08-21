@@ -154,6 +154,9 @@ pub struct Broker {
     config: BrokerConfig,
     state: BrokerState,
     handles: DashMap<(String, i32), PartitionHandle>,
+    /// The log configuration each open partition was last told to use, so
+    /// the maintenance tick can tell a real change from a no-op.
+    applied_topic_configs: DashMap<(String, i32), LogConfig>,
     partition_mutations: DashMap<(String, i32), Arc<AsyncMutex<()>>>,
     lifecycle: Mutex<BrokerLifecycle>,
     replication: ReplicationTracker,
@@ -205,6 +208,7 @@ impl Broker {
             config,
             state,
             handles: DashMap::new(),
+            applied_topic_configs: DashMap::new(),
             partition_mutations: DashMap::new(),
             lifecycle: Mutex::new(BrokerLifecycle::default()),
             replication: ReplicationTracker::default(),
@@ -416,6 +420,53 @@ impl Broker {
     /// A partition still being reassigned is skipped: `replicas` is the
     /// union during a move, so a broker that appears absent is a broker
     /// the controller has not finished with.
+    /// Push topic configuration changes into partitions that are already
+    /// open.
+    ///
+    /// Resolving a topic's config only when a partition is opened made a
+    /// live change silently inert: an operator who shortens `retention.ms`
+    /// sees the new value echoed back by the dashboard, watches nothing
+    /// happen, and cannot tell whether the setting is wrong or merely not
+    /// in effect until the next restart. Recomputing here and sending the
+    /// result to the actor closes that gap.
+    ///
+    /// Cheap enough to run on the maintenance tick: it compares the
+    /// resolved config against what the partition already holds and sends
+    /// nothing when they match, which is the overwhelmingly common case.
+    pub(crate) async fn apply_topic_config_changes(&self, image: &ClusterMetadata) {
+        let open: Vec<((String, i32), PartitionHandle)> = self
+            .handles
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
+        for ((topic_name, partition), handle) in open {
+            let configs = image.topics.get(&topic_name).map(|topic| &topic.configs);
+            let resolved =
+                crate::state::log_config_for_topic(&self.config.log_config, &topic_name, configs);
+            let previous = self
+                .applied_topic_configs
+                .insert((topic_name.clone(), partition), resolved.clone());
+            if previous.as_ref() == Some(&resolved) {
+                continue;
+            }
+            if let Err(error) = handle.reconfigure(resolved).await {
+                tracing::warn!(
+                    %error,
+                    topic = %topic_name,
+                    partition,
+                    "could not push a topic configuration change to a live partition"
+                );
+            } else if previous.is_some() {
+                tracing::info!(
+                    topic = %topic_name,
+                    partition,
+                    "applied a topic configuration change to a running partition"
+                );
+            }
+        }
+    }
+
     pub(crate) fn drain_unowned_partitions(&self, image: &ClusterMetadata) {
         let local_id = self.config.broker_id;
         let registered = image
@@ -1389,5 +1440,115 @@ impl Broker {
             .parse::<usize>()
             .ok()
             .filter(|limit| *limit > 0)
+    }
+}
+
+#[cfg(test)]
+impl Broker {
+    /// Open (or reuse) a partition, for tests that need a live actor.
+    pub(crate) fn partition_handle_for_test(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<PartitionHandle, BrokerError> {
+        self.open_partition(topic, partition)
+    }
+
+    /// What configuration a partition was last told to use.
+    pub(crate) fn applied_topic_config_for_test(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Option<LogConfig> {
+        self.applied_topic_configs
+            .get(&(topic.to_owned(), partition))
+            .map(|entry| entry.value().clone())
+    }
+}
+
+#[cfg(test)]
+mod live_topic_config_tests {
+    use super::*;
+    use brahmaputra_metadata::MetadataCommand;
+    use std::collections::BTreeMap;
+
+    /// A topic config change has to reach a *running* partition.
+    ///
+    /// Resolving the config only when a partition is opened made a live
+    /// change silently inert: an operator shortens `retention.ms`, sees the
+    /// new value echoed back, watches nothing happen, and cannot tell
+    /// whether the setting is wrong or merely not in effect until the next
+    /// restart.
+    #[tokio::test]
+    async fn a_topic_config_change_reaches_a_running_partition() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut image = ClusterMetadata::default();
+        image
+            .apply(MetadataCommand::RegisterBroker {
+                broker_id: 0,
+                host: "127.0.0.1".into(),
+                data_port: 9092,
+                control_port: 19092,
+                roles: vec![NodeRole::Broker],
+                rack: None,
+                now_ms: 1,
+            })
+            .expect("register");
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "cfg".into(),
+                partitions: 1,
+                replication_factor: 1,
+                configs: BTreeMap::new(),
+            })
+            .expect("create");
+        let cache = MetadataCache::new(image.clone());
+
+        let broker = Broker::bind(BrokerConfig {
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            default_partitions: 1,
+            metadata_cache: Some(cache.clone()),
+            ..BrokerConfig::default()
+        })
+        .await
+        .expect("bind");
+
+        // Open the partition, which resolves its config once, at open time.
+        let handle = broker.open_partition("cfg", 0).expect("open partition");
+        handle.offsets().await.expect("partition actor is running");
+
+        // Change the topic's retention, exactly as an operator would.
+        image
+            .apply(MetadataCommand::SetTopicConfig {
+                name: "cfg".into(),
+                configs: BTreeMap::from([("retention.ms".to_string(), "60000".to_string())]),
+            })
+            .expect("set config");
+        cache.replace(image.clone());
+
+        broker.apply_topic_config_changes(&cache.snapshot()).await;
+
+        let applied = broker
+            .applied_topic_configs
+            .get(&("cfg".to_string(), 0))
+            .map(|entry| entry.value().clone())
+            .expect("the partition should have been told a config");
+        assert_eq!(
+            applied.retention_ms,
+            Some(60_000),
+            "the running partition never received the changed retention"
+        );
+
+        // A second sweep with nothing changed must be a no-op rather than
+        // re-sending the same config on every tick.
+        broker.apply_topic_config_changes(&cache.snapshot()).await;
+        let again = broker
+            .applied_topic_configs
+            .get(&("cfg".to_string(), 0))
+            .map(|entry| entry.value().clone())
+            .expect("still tracked");
+        assert_eq!(applied, again);
     }
 }

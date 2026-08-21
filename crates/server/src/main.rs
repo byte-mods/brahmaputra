@@ -99,6 +99,13 @@ struct Args {
     #[arg(long)]
     quota_fetch_bytes_per_sec: Option<u64>,
 
+    /// Ceiling on bytes this broker serves to *followers* catching up.
+    /// Without one, a rejoining broker fetches as fast as the leader can
+    /// read and competes with client traffic for the same disk and NIC, so
+    /// a single restart shows up as latency on every producer and consumer.
+    #[arg(long)]
+    quota_replication_bytes_per_sec: Option<u64>,
+
     /// Ceiling on how long one response may be delayed by a quota.
     #[arg(long, default_value_t = 30_000)]
     quota_max_throttle_ms: u64,
@@ -256,6 +263,7 @@ fn quota_config(args: &Args) -> QuotaConfig {
     QuotaConfig {
         produce_bytes_per_sec: args.quota_produce_bytes_per_sec,
         fetch_bytes_per_sec: args.quota_fetch_bytes_per_sec,
+        replication_bytes_per_sec: args.quota_replication_bytes_per_sec,
         max_throttle: Some(Duration::from_millis(args.quota_max_throttle_ms)),
     }
 }

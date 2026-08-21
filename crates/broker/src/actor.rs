@@ -317,6 +317,15 @@ pub enum Cmd {
         offset: i64,
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
+    /// Swap this partition's log configuration without reopening it.
+    ///
+    /// Sent when a topic's configuration changes in the metadata, so that a
+    /// live partition picks up a new `retention.ms` (or any other per-topic
+    /// setting) rather than waiting for a broker restart.
+    Reconfigure {
+        config: brahmaputra_storage::LogConfig,
+        reply: oneshot::Sender<()>,
+    },
     /// Current (start, end, high watermark) offsets.
     Offsets {
         reply: oneshot::Sender<(i64, i64, i64)>,
@@ -531,6 +540,19 @@ impl PartitionHandle {
         rx.await.map_err(|_| actor_gone())?
     }
 
+    /// Swap this partition's log configuration in place, so a topic config
+    /// change reaches a running partition instead of waiting for a restart.
+    pub async fn reconfigure(
+        &self,
+        config: brahmaputra_storage::LogConfig,
+    ) -> Result<(), StorageError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Reconfigure { config, reply })
+            .await
+            .map_err(|_| actor_gone())?;
+        rx.await.map_err(|_| actor_gone())
+    }
     /// (log_start_offset, log_end_offset, high_watermark).
     pub async fn offsets(&self) -> Result<(i64, i64, i64), StorageError> {
         let (reply, rx) = oneshot::channel();
@@ -985,6 +1007,12 @@ async fn run(
                 };
                 trace!(?result, offset, "replica log reset");
                 let _ = reply.send(result);
+            }
+            Cmd::Reconfigure { config, reply } => {
+                if let Some(current) = log.as_mut() {
+                    current.set_config(config);
+                }
+                let _ = reply.send(());
             }
             Cmd::Offsets { reply } => {
                 let current = log.as_ref().expect("partition log");

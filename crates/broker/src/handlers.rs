@@ -668,7 +668,28 @@ async fn replica_fetch(broker: &Broker, body: Bytes) -> Bytes {
         .read_uncommitted(request.fetch_offset, request.max_bytes as usize)
         .await
     {
-        Ok(outcome) => respond(ec::NONE, Some(&outcome)),
+        Ok(outcome) => {
+            // Charge the bytes against the replication budget before
+            // answering. A rejoining broker otherwise fetches as fast as
+            // this leader can read, competing with client traffic for the
+            // same disk and NIC, so one restart surfaces as latency for
+            // every producer and consumer on this broker.
+            //
+            // Delaying the response rather than truncating it keeps
+            // catch-up correct: the follower still receives every byte it
+            // asked for, just no faster than the ceiling allows.
+            let served: u64 = outcome.batches.iter().map(|batch| batch.len() as u64).sum();
+            if served > 0 {
+                broker
+                    .throttle(
+                        Some(&format!("replica-{}", request.follower_id)),
+                        crate::quota::QuotaKind::Replication,
+                        served,
+                    )
+                    .await;
+            }
+            respond(ec::NONE, Some(&outcome))
+        }
         Err(error @ StorageError::OffsetOutOfRange { .. }) => {
             match validation.handle.offsets().await {
                 Ok((log_start_offset, log_end_offset, high_watermark)) => {

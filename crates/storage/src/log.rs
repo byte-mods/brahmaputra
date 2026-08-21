@@ -316,7 +316,7 @@ fn decode_hwm_record(
 }
 
 /// Configuration for a [`Log`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogConfig {
     /// Roll the active segment once it reaches this many bytes.
     /// Must fit in a `u32` (index positions are 32-bit, as in Kafka).
@@ -2465,5 +2465,28 @@ mod segment_ms_tests {
         let mut log = Log::open(dir.path(), config(Some(3_600_000))).unwrap();
         log.append(batch("a")).unwrap();
         assert!(!log.roll_due());
+    }
+}
+
+impl Log {
+    /// Replace this log's configuration in place.
+    ///
+    /// A topic config change has to reach a *running* partition, not merely
+    /// the metadata. Applying it only when a partition is next opened means
+    /// an operator who shortens `retention.ms` sees the new value echoed
+    /// back, watches nothing happen, and has no way to tell whether the
+    /// setting is wrong or simply not in effect yet.
+    ///
+    /// `segment_bytes` and `index_interval_bytes` take effect from the next
+    /// roll rather than retroactively: segments already written keep the
+    /// shape they were written with, which is the only option that does not
+    /// involve rewriting the log.
+    pub fn set_config(&mut self, config: LogConfig) {
+        self.config = config;
+    }
+
+    /// This log's current configuration.
+    pub fn config(&self) -> &LogConfig {
+        &self.config
     }
 }

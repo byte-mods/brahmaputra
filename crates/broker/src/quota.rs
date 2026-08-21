@@ -24,6 +24,15 @@ use std::time::{Duration, Instant};
 pub enum QuotaKind {
     Produce,
     Fetch,
+    /// Inter-broker replication: a follower catching up.
+    ///
+    /// Separate from Fetch because it is charged against the cluster
+    /// rather than a client, and because the two want opposite defaults —
+    /// client traffic should be limited only when an operator says so,
+    /// while replication is exactly the traffic that needs a ceiling if a
+    /// single broker restart is not to become a cluster-wide latency
+    /// event.
+    Replication,
 }
 
 /// Per-client byte-rate limits. `None` for a direction means unlimited.
@@ -31,6 +40,13 @@ pub enum QuotaKind {
 pub struct QuotaConfig {
     pub produce_bytes_per_sec: Option<u64>,
     pub fetch_bytes_per_sec: Option<u64>,
+    /// Ceiling on bytes served to *followers* catching up.
+    ///
+    /// Without one, a rejoining broker fetches as fast as the leader can
+    /// read, competing with client traffic for the same disk and NIC. One
+    /// restart then shows up as latency on every producer and consumer
+    /// talking to that leader.
+    pub replication_bytes_per_sec: Option<u64>,
     /// Cap on how long a single response may be delayed, so a very large
     /// request against a very small quota cannot hang a client forever.
     pub max_throttle: Option<Duration>,
@@ -38,13 +54,16 @@ pub struct QuotaConfig {
 
 impl QuotaConfig {
     pub fn is_enabled(&self) -> bool {
-        self.produce_bytes_per_sec.is_some() || self.fetch_bytes_per_sec.is_some()
+        self.produce_bytes_per_sec.is_some()
+            || self.fetch_bytes_per_sec.is_some()
+            || self.replication_bytes_per_sec.is_some()
     }
 
     fn rate(&self, kind: QuotaKind) -> Option<u64> {
         match kind {
             QuotaKind::Produce => self.produce_bytes_per_sec,
             QuotaKind::Fetch => self.fetch_bytes_per_sec,
+            QuotaKind::Replication => self.replication_bytes_per_sec,
         }
     }
 }
@@ -130,6 +149,7 @@ mod tests {
     fn manager(rate: u64) -> QuotaManager {
         QuotaManager::new(QuotaConfig {
             produce_bytes_per_sec: Some(rate),
+            replication_bytes_per_sec: Some(rate),
             fetch_bytes_per_sec: Some(rate),
             max_throttle: Some(Duration::from_secs(5)),
         })
@@ -203,5 +223,82 @@ mod tests {
         let manager = manager(1);
         let throttle = manager.throttle_for(Some("c"), QuotaKind::Produce, 1_000_000);
         assert_eq!(throttle, Duration::from_secs(5), "capped by max_throttle");
+    }
+}
+
+#[cfg(test)]
+mod replication_quota_tests {
+    use super::*;
+
+    /// The three budgets are independent. A follower catching up must not
+    /// be able to exhaust the budget a producer needs, and vice versa —
+    /// that separation is the entire reason replication has its own
+    /// ceiling rather than sharing the fetch one.
+    #[test]
+    fn replication_has_a_budget_of_its_own() {
+        let manager = QuotaManager::new(QuotaConfig {
+            produce_bytes_per_sec: Some(1_000),
+            fetch_bytes_per_sec: Some(1_000),
+            replication_bytes_per_sec: Some(1_000),
+            max_throttle: Some(Duration::from_secs(30)),
+        });
+
+        // Spend the replication budget several times over.
+        for _ in 0..5 {
+            manager.throttle_for(Some("replica-2"), QuotaKind::Replication, 1_000);
+        }
+        assert!(
+            !manager
+                .throttle_for(Some("replica-2"), QuotaKind::Replication, 1_000)
+                .is_zero(),
+            "replication should be throttled once its budget is spent"
+        );
+
+        // A client's produce and fetch budgets are untouched by that.
+        assert!(
+            manager
+                .throttle_for(Some("app"), QuotaKind::Produce, 500)
+                .is_zero(),
+            "a catching-up follower must not throttle a producer"
+        );
+        assert!(
+            manager
+                .throttle_for(Some("app"), QuotaKind::Fetch, 500)
+                .is_zero(),
+            "a catching-up follower must not throttle a consumer"
+        );
+    }
+
+    /// Replication is unlimited unless an operator sets a ceiling, matching
+    /// how the other two directions behave.
+    #[test]
+    fn replication_is_unlimited_by_default() {
+        let manager = QuotaManager::new(QuotaConfig {
+            produce_bytes_per_sec: Some(10),
+            fetch_bytes_per_sec: Some(10),
+            replication_bytes_per_sec: None,
+            max_throttle: Some(Duration::from_secs(30)),
+        });
+        for _ in 0..100 {
+            assert!(
+                manager
+                    .throttle_for(Some("replica-9"), QuotaKind::Replication, 1_000_000)
+                    .is_zero(),
+                "no replication ceiling means no replication throttling"
+            );
+        }
+    }
+
+    /// Enabling only a replication ceiling must still switch quotas on, or
+    /// the broker would skip the whole quota path and ignore it.
+    #[test]
+    fn a_replication_ceiling_alone_enables_quotas() {
+        let config = QuotaConfig {
+            produce_bytes_per_sec: None,
+            fetch_bytes_per_sec: None,
+            replication_bytes_per_sec: Some(1_000),
+            max_throttle: None,
+        };
+        assert!(config.is_enabled());
     }
 }

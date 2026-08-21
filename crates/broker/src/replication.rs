@@ -302,7 +302,9 @@ impl ReplicaManager {
                     // completed reassignment still has its data here; free it,
                     // or a drained broker never gives its disk back.
                     if let Some(cache) = self.broker.metadata_cache() {
-                        self.broker.drain_unowned_partitions(&cache.snapshot());
+                        let image = cache.snapshot();
+                        self.broker.apply_topic_config_changes(&image).await;
+                        self.broker.drain_unowned_partitions(&image);
                     }
                 }
             }
