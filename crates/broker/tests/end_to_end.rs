@@ -432,7 +432,10 @@ async fn headers_and_timestamps_survive_a_real_round_trip() {
             Bytes::from_static(b"with-headers"),
             vec![
                 brahmaputra_protocol::RecordHeader::new("trace-id", b"abc-123".to_vec()),
-                brahmaputra_protocol::RecordHeader::new("content-type", b"application/json".to_vec()),
+                brahmaputra_protocol::RecordHeader::new(
+                    "content-type",
+                    b"application/json".to_vec(),
+                ),
             ],
         )
         .await

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -256,6 +256,7 @@ impl GroupCoordinator {
         rebalance_timeout_ms: i32,
         member_id: &str,
         subscription_topics: &[String],
+        group_instance_id: &str,
     ) -> Result<JoinGroupResponse, ClientError> {
         let request = JoinGroupRequest {
             group_id: self.group_id.clone(),
@@ -263,6 +264,7 @@ impl GroupCoordinator {
             rebalance_timeout_ms,
             member_id: member_id.to_owned(),
             subscription_topics: subscription_topics.to_vec(),
+            group_instance_id: group_instance_id.to_owned(),
         };
         let body = request.encode().map_err(msg_err)?;
         self.request(
@@ -436,6 +438,19 @@ pub struct GroupConsumer {
     auto_commit: Option<Duration>,
     /// What to do when a partition has no valid position; see [`AutoOffsetReset`].
     auto_offset_reset: AutoOffsetReset,
+    /// Longest gap between `poll` calls before this member is presumed
+    /// stuck (`max.poll.interval.ms`).
+    /// Stable identity across restarts (`group.instance.id`), empty for a
+    /// dynamic member.
+    group_instance_id: String,
+    max_poll_interval: Duration,
+    /// When `poll` was last called, shared with the heartbeat task.
+    ///
+    /// Liveness has two independent questions — "is the process alive"
+    /// (heartbeats) and "is the application still consuming" (this) — and
+    /// conflating them is what lets a consumer wedged in a slow handler
+    /// keep its partitions indefinitely while faithfully heartbeating.
+    last_poll_ms: Arc<AtomicI64>,
     max_poll_records: usize,
     subscribed: Vec<String>,
     membership: Arc<Mutex<Membership>>,
@@ -484,6 +499,12 @@ impl GroupConsumer {
             assignor: Assignor::Range,
             auto_commit: Some(Duration::from_secs(5)),
             auto_offset_reset: AutoOffsetReset::default(),
+            // Kafka's default. Long enough that a slow batch handler is
+            // not mistaken for a stuck one, short enough that a genuinely
+            // wedged consumer releases its partitions the same day.
+            group_instance_id: String::new(),
+            max_poll_interval: Duration::from_millis(300_000),
+            last_poll_ms: Arc::new(AtomicI64::new(now_ms())),
             max_poll_records: DEFAULT_MAX_POLL_RECORDS,
             subscribed: Vec::new(),
             membership: Arc::new(Mutex::new(Membership::default())),
@@ -501,6 +522,36 @@ impl GroupConsumer {
 
     /// What to do when a partition has no valid position — never committed,
     /// or committed then aged off the log (`auto.offset.reset`).
+
+    /// Longest gap between `poll` calls before this member gives up its
+    /// partitions (`max.poll.interval.ms`).
+    ///
+    /// Separate from `session.timeout.ms` on purpose: heartbeats prove the
+    /// process is alive, this proves the application is still consuming.
+    /// A consumer stuck in a slow handler answers the first question
+    /// perfectly while making no progress at all, and only this releases
+    /// its partitions to a member that can.
+
+    /// Give this consumer a stable identity across restarts
+    /// (`group.instance.id`, KIP-345).
+    ///
+    /// A static member that restarts reclaims its own member slot and its
+    /// partitions rather than arriving as a stranger. That turns a rolling
+    /// restart from two rebalances per instance — one when it leaves, one
+    /// when it returns — into none, which is the difference between a
+    /// deploy that pauses consumption and one that does not.
+    ///
+    /// The id must be unique within the group and stable for the life of
+    /// the instance; a duplicate would have two processes claiming one
+    /// member slot.
+    pub fn with_group_instance_id(mut self, group_instance_id: impl Into<String>) -> Self {
+        self.group_instance_id = group_instance_id.into();
+        self
+    }
+    pub fn with_max_poll_interval_ms(mut self, max_poll_interval_ms: u64) -> Self {
+        self.max_poll_interval = Duration::from_millis(max_poll_interval_ms.max(1));
+        self
+    }
     pub fn with_auto_offset_reset(mut self, policy: AutoOffsetReset) -> Self {
         self.auto_offset_reset = policy;
         self
@@ -600,6 +651,11 @@ impl GroupConsumer {
                 "subscribe to at least one topic before polling".into(),
             ));
         }
+        // Stamped on entry, not on return: the interval bounds how long the
+        // *application* may go without asking for records, and a poll that
+        // blocks for its full `max_wait` is the consumer working normally,
+        // not stalling.
+        self.last_poll_ms.store(now_ms(), Ordering::Relaxed);
         if !self.is_joined() || self.rejoin.load(Ordering::Relaxed) {
             tracing::debug!(member = %self.membership.lock().expect("membership").member_id, "poll triggers (re)join");
             self.join().await?;
@@ -785,6 +841,7 @@ impl GroupConsumer {
                     self.rebalance_timeout_ms,
                     &member_id,
                     &self.subscribed,
+                    &self.group_instance_id,
                 )
                 .await
             {
@@ -948,12 +1005,22 @@ impl GroupConsumer {
         let coordinator = self.coordinator.clone();
         let membership = Arc::clone(&self.membership);
         let rejoin = Arc::clone(&self.rejoin);
-        let interval = Duration::from_millis(
-            u64::try_from(self.session_timeout_ms / 3)
-                .unwrap_or(1)
-                .max(1),
-        );
+        let last_poll_ms = Arc::clone(&self.last_poll_ms);
+        let max_poll_interval = self.max_poll_interval;
+        // This loop enforces two independent deadlines, so it has to wake
+        // often enough for the shorter of them. Deriving the tick from the
+        // session timeout alone means a consumer with a long session and a
+        // short poll interval — a perfectly ordinary combination — would
+        // not be checked for a stalled poll until long after it stalled.
+        let heartbeat_every = u64::try_from(self.session_timeout_ms / 3)
+            .unwrap_or(1)
+            .max(1);
+        let poll_check_every = (self.max_poll_interval.as_millis() as u64 / 3).max(1);
+        let interval = Duration::from_millis(heartbeat_every.min(poll_check_every));
         self.heartbeat_task = Some(tokio::spawn(async move {
+            // Once the poll interval is breached the member leaves, and it
+            // must not keep leaving on every subsequent tick.
+            let mut left_for_slow_poll = false;
             loop {
                 tokio::time::sleep(interval).await;
                 let (generation, member_id, joined) = {
@@ -967,6 +1034,32 @@ impl GroupConsumer {
                 if !joined {
                     continue;
                 }
+
+                // `max.poll.interval.ms`: the application has stopped
+                // consuming even though the process is alive. Continuing to
+                // heartbeat would assert a liveness this member no longer
+                // has, holding its partitions away from a consumer that
+                // could actually make progress. Leaving explicitly hands
+                // them over now instead of after a session timeout.
+                let idle_ms = now_ms().saturating_sub(last_poll_ms.load(Ordering::Relaxed));
+                if idle_ms >= max_poll_interval.as_millis() as i64 {
+                    if !left_for_slow_poll {
+                        tracing::warn!(
+                            %member_id,
+                            idle_ms,
+                            "no poll within max.poll.interval.ms; leaving the group"
+                        );
+                        let _ = coordinator.leave(&member_id).await;
+                        left_for_slow_poll = true;
+                        // The next poll must rejoin rather than resume as a
+                        // member the coordinator has already removed.
+                        membership.lock().expect("membership").joined = false;
+                        rejoin.store(true, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                left_for_slow_poll = false;
+
                 match coordinator.heartbeat(generation, &member_id).await {
                     Ok(_) => {}
                     Err(ClientError::Server {
@@ -1156,4 +1249,12 @@ mod tests {
             assert!(assignment["b"].is_empty());
         }
     }
+}
+
+/// Wall clock in unix milliseconds, for poll-liveness accounting.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
 }

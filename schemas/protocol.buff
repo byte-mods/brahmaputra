@@ -123,6 +123,10 @@ class JoinGroupRequest {
     int rebalance_timeout_ms;
     string member_id;        // empty = new member, coordinator assigns one
     string[] subscription_topics;
+    // Stable identity across restarts (KIP-345). Empty = dynamic member.
+    // A static member reclaims its previous member_id, so a rolling
+    // restart does not rebalance the group twice per instance.
+    string group_instance_id;
 }
 
 class JoinGroupResponse {
@@ -357,6 +361,10 @@ class GroupMemberRecord {
     string member_id;
     string[] subscription_topics;
     AssignedPartition[] assignment;
+    // Preserved across coordinator failover, or a static member would be
+    // rebuilt as a dynamic one and lose the very identity that spares the
+    // group a rebalance when it restarts.
+    string group_instance_id;
 }
 
 class GroupMetadataRecord {

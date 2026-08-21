@@ -115,6 +115,7 @@ pub struct JoinGroupRequest {
 	pub rebalance_timeout_ms: i32,
 	pub member_id: String,
 	pub subscription_topics: Vec<String>,
+	pub group_instance_id: String,
 	
 }
 
@@ -372,6 +373,7 @@ pub struct GroupMemberRecord {
 	pub member_id: String,
 	pub subscription_topics: Vec<String>,
 	pub assignment: Vec<AssignedPartition>,
+	pub group_instance_id: String,
 	
 }
 

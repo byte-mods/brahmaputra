@@ -93,6 +93,10 @@ struct Member {
     last_heartbeat_ms: i64,
     session_timeout_ms: i64,
     assignment: Vec<AssignedPartition>,
+    /// Stable identity across restarts (KIP-345), empty for a dynamic
+    /// member. A restarting instance that presents the same one reclaims
+    /// this member slot instead of being treated as a new arrival.
+    group_instance_id: String,
 }
 
 struct Group {
@@ -282,6 +286,7 @@ impl CoordinatorShard {
                         last_heartbeat_ms: now,
                         session_timeout_ms: DEFAULT_SESSION_TIMEOUT_MS,
                         assignment: member.assignment,
+                        group_instance_id: member.group_instance_id,
                     },
                 )
             })
@@ -412,6 +417,7 @@ impl GroupCoordinator {
                             member_id: member_id.clone(),
                             subscription_topics: member.subscription_topics.clone(),
                             assignment: member.assignment.clone(),
+                            group_instance_id: member.group_instance_id.clone(),
                         })
                         .collect();
                     members.sort_by(|a, b| a.member_id.cmp(&b.member_id));
@@ -454,8 +460,25 @@ impl GroupCoordinator {
                 .or_insert_with(Group::new);
             let group = entry.value_mut();
             group.rebalance_timeout_ms = rebalance_timeout;
-            let known_member =
-                !request.member_id.is_empty() && group.members.contains_key(&request.member_id);
+            // Static membership (KIP-345): an instance that presents a
+            // `group_instance_id` the group already knows is the *same*
+            // member coming back, whatever member id it now claims. This is
+            // what makes a rolling restart cheap — the returning instance
+            // reclaims its slot and its partitions, so the group does not
+            // rebalance once when it goes and again when it returns.
+            let reclaimed_member_id = (!request.group_instance_id.is_empty())
+                .then(|| {
+                    group
+                        .members
+                        .iter()
+                        .find(|(_, member)| member.group_instance_id == request.group_instance_id)
+                        .map(|(member_id, _)| member_id.clone())
+                })
+                .flatten();
+
+            let known_member = reclaimed_member_id.is_some()
+                || (!request.member_id.is_empty()
+                    && group.members.contains_key(&request.member_id));
             // A rejoin from a known member while a rebalance is already
             // collecting (PreparingRebalance) or distributing assignments
             // (AwaitingSync) is part of the current cycle — restarting here
@@ -465,26 +488,45 @@ impl GroupCoordinator {
             let restart = match group.state {
                 GroupState::PreparingRebalance => false,
                 GroupState::AwaitingSync => !known_member,
-                _ => true,
+                // A returning static member changes nothing about the
+                // group's shape: same identity, same subscription, same
+                // partitions. Rebalancing here would throw away the very
+                // saving static membership exists to provide.
+                _ => reclaimed_member_id.is_none(),
             };
             if restart {
                 debug!(group = %request.group_id, member = %request.member_id, state = ?group.state, gen = group.generation + 1, "join restarts rebalance");
                 restart_rebalance(group, now);
             }
-            let member_id = if request.member_id.is_empty() {
-                let assigned = format!("member-{}", group.next_member_seq);
-                group.next_member_seq += 1;
-                assigned
-            } else {
-                request.member_id.clone()
+            let member_id = match reclaimed_member_id {
+                Some(existing) => existing,
+                None if request.member_id.is_empty() => {
+                    let assigned = format!("member-{}", group.next_member_seq);
+                    group.next_member_seq += 1;
+                    assigned
+                }
+                None => request.member_id.clone(),
             };
+            // A reclaiming static member keeps the partitions it already
+            // held; wiping the assignment would strand them until the next
+            // rebalance, which is exactly the pause being avoided.
+            let previous_assignment = group
+                .members
+                .get(&member_id)
+                .map(|member| member.assignment.clone())
+                .unwrap_or_default();
             group.members.insert(
                 member_id.clone(),
                 Member {
                     subscription_topics: request.subscription_topics.clone(),
                     last_heartbeat_ms: now,
                     session_timeout_ms: session_timeout,
-                    assignment: Vec::new(),
+                    assignment: if restart {
+                        Vec::new()
+                    } else {
+                        previous_assignment
+                    },
+                    group_instance_id: request.group_instance_id.clone(),
                 },
             );
             group.pending_rejoin.remove(&member_id);

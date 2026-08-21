@@ -276,7 +276,10 @@ async fn every_transport_reports_the_same_api_versions() {
             .expect("connect");
         let versions = consumer.api_versions().await.expect("api versions");
         assert!(
-            versions.supports(brahmaputra_protocol::ApiKey::Produce, 1),
+            versions.supports(
+                brahmaputra_protocol::ApiKey::Produce,
+                brahmaputra_protocol::API_VERSION,
+            ),
             "{transport} broker must accept this client's Produce version"
         );
         seen.push(versions.api_versions);

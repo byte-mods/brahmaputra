@@ -23,8 +23,11 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::ProtocolError;
 
-/// The only api version implemented so far (all M1 APIs).
-pub const API_VERSION: i16 = 1;
+/// The wire version this build speaks. Bumped to 2 when JoinGroup gained
+/// `group_instance_id`: the broker requires an exact match, so a client
+/// built against version 1 now gets a clean UNSUPPORTED_VERSION rather
+/// than silently misparsing a request whose shape changed.
+pub const API_VERSION: i16 = 2;
 
 /// Bytes in a payload header: api_key + api_version + correlation_id.
 /// (`client_id` is variable-length and follows.)

@@ -541,3 +541,75 @@ async fn auto_offset_reset_none_reports_rather_than_guessing() {
 
     stop_broker(broker).await;
 }
+
+/// `max.poll.interval.ms` separates two liveness questions that a single
+/// heartbeat conflates: is the process alive, and is the application still
+/// consuming. A consumer wedged in a slow handler answers the first
+/// perfectly while making no progress, and without this it keeps its
+/// partitions indefinitely.
+#[tokio::test]
+async fn a_consumer_that_stops_polling_releases_its_partitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_broker(dir.path()).await;
+    produce_records(broker.addr, 0, 20).await;
+
+    // A long session timeout, so heartbeats alone would keep this member
+    // alive indefinitely — only the poll interval can evict it.
+    let mut stalled = GroupConsumer::connect(broker.addr, "stalled", "poll-interval")
+        .await
+        .expect("connect")
+        .with_session_timeout(600_000)
+        .with_rebalance_timeout(2_500)
+        .with_auto_commit(None)
+        .with_max_poll_interval_ms(500);
+    stalled.subscribe(&[TOPIC]);
+
+    // One poll to join and take the assignment.
+    let _ = stalled
+        .poll(Duration::from_millis(500))
+        .await
+        .expect("poll");
+    let admin = GroupAdmin::connect(broker.addr, "poll-admin")
+        .await
+        .expect("connect admin");
+    let described = admin
+        .describe_group("poll-interval")
+        .await
+        .expect("describe");
+    assert_eq!(described.members.len(), 1, "the consumer joined");
+
+    // Now stop polling — simulating a handler that has wedged — while the
+    // heartbeat task keeps running. It must give up its membership.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut released = false;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let described = admin
+            .describe_group("poll-interval")
+            .await
+            .expect("describe");
+        if described.members.is_empty() {
+            released = true;
+            break;
+        }
+    }
+    assert!(
+        released,
+        "a consumer that stopped polling must release its partitions \
+         despite a 600s session timeout"
+    );
+
+    // The point of releasing them is that someone else can have them. A
+    // healthy consumer now takes the partitions and drains the topic,
+    // which the stalled one was holding and not doing.
+    drop(stalled);
+    let mut healthy = group_consumer(broker.addr, "poll-interval", "healthy").await;
+    let records = poll_until(&mut healthy, 20, Duration::from_secs(20)).await;
+    assert_eq!(
+        records.len(),
+        20,
+        "a working consumer inherits the stalled member's partitions"
+    );
+
+    stop_broker(broker).await;
+}

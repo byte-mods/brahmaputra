@@ -151,12 +151,32 @@ async fn join(
     session_timeout_ms: i32,
     rebalance_timeout_ms: i32,
 ) -> JoinGroupResponse {
+    join_static(
+        conn,
+        group,
+        member_id,
+        session_timeout_ms,
+        rebalance_timeout_ms,
+        "",
+    )
+    .await
+}
+
+async fn join_static(
+    conn: &Connection,
+    group: &str,
+    member_id: &str,
+    session_timeout_ms: i32,
+    rebalance_timeout_ms: i32,
+    group_instance_id: &str,
+) -> JoinGroupResponse {
     let request = JoinGroupRequest {
         group_id: group.into(),
         session_timeout_ms,
         rebalance_timeout_ms,
         member_id: member_id.into(),
         subscription_topics: vec!["events".into()],
+        group_instance_id: group_instance_id.into(),
     };
     let body = request.encode().unwrap();
     let response = conn.request(ApiKey::JoinGroup, &body).await.unwrap();
@@ -576,6 +596,7 @@ async fn cluster_coordinator_serves_groups_and_fences_non_leaders() {
         rebalance_timeout_ms: 500,
         member_id: String::new(),
         subscription_topics: vec!["events".into()],
+        group_instance_id: String::new(),
     };
     let body = rejected.encode().unwrap();
     let response = other_conn.request(ApiKey::JoinGroup, &body).await.unwrap();
@@ -949,6 +970,128 @@ async fn the_last_member_leaving_empties_the_group() {
     let described = describe_group(&conn, "lg3").await;
     assert_eq!(described.state, "Empty", "an emptied group reports Empty");
     assert!(described.members.is_empty());
+
+    stop_broker(broker).await;
+}
+
+/// Static membership (KIP-345). A restarting instance that presents the
+/// same `group.instance.id` reclaims its member slot *and* its partitions
+/// without starting a new generation — which is the entire point, since a
+/// rebalance per restart is what makes rolling deploys pause consumption.
+#[tokio::test]
+async fn a_static_member_rejoins_without_a_rebalance() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone(&temp.path().join("broker"), 4).await;
+    let conn = connect(broker.addr, "static").await;
+
+    let first = join_static(&conn, "sg", "", 600_000, 500, "instance-a").await;
+    assert_eq!(first.error_code, ec::NONE);
+    let generation = first.generation;
+
+    // Give it an assignment, so we can prove the assignment survives too.
+    sync(
+        &conn,
+        "sg",
+        generation,
+        &first.member_id,
+        vec![MemberAssignment {
+            member_id: first.member_id.clone(),
+            partitions: vec![assigned("events", 0), assigned("events", 1)],
+        }],
+    )
+    .await;
+
+    // The instance restarts: new connection, no member id, same instance id.
+    let restarted = connect(broker.addr, "static-restarted").await;
+    let rejoin = join_static(&restarted, "sg", "", 600_000, 500, "instance-a").await;
+    assert_eq!(rejoin.error_code, ec::NONE);
+    assert_eq!(
+        rejoin.member_id, first.member_id,
+        "a static member reclaims its own member id"
+    );
+    assert_eq!(
+        rejoin.generation, generation,
+        "reclaiming must not start a new generation"
+    );
+
+    let described = describe_group(&restarted, "sg").await;
+    assert_eq!(
+        described.members.len(),
+        1,
+        "no duplicate member was created"
+    );
+    let member = &described.members[0];
+    assert_eq!(
+        member.assignment.len(),
+        2,
+        "the reclaimed member keeps the partitions it held"
+    );
+
+    // Its old generation is still valid, because nothing was fenced.
+    assert_eq!(
+        heartbeat(&conn, "sg", generation, &first.member_id).await,
+        ec::NONE
+    );
+
+    stop_broker(broker).await;
+}
+
+/// Two different instance ids are two different members — the reclaim path
+/// must key on the id, not merely on "is static".
+#[tokio::test]
+async fn distinct_instance_ids_remain_distinct_members() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone(&temp.path().join("broker"), 4).await;
+    let conn = connect(broker.addr, "static-two").await;
+
+    let first = join_static(&conn, "sg2", "", 600_000, 500, "instance-a").await;
+    assert_eq!(first.error_code, ec::NONE);
+
+    let second_conn = connect(broker.addr, "static-two-b").await;
+    let second_join = tokio::spawn(async move {
+        join_static(&second_conn, "sg2", "", 600_000, 500, "instance-b").await
+    });
+    eventually(|| {
+        heartbeat(&conn, "sg2", 1, &first.member_id)
+            .then(|code| async move { code == ec::ILLEGAL_GENERATION })
+    })
+    .await;
+    let rejoin = join_static(&conn, "sg2", &first.member_id, 600_000, 500, "instance-a").await;
+    assert_eq!(rejoin.error_code, ec::NONE);
+    let second = second_join.await.unwrap();
+    assert_ne!(
+        second.member_id, first.member_id,
+        "a different instance id must be a different member"
+    );
+
+    let described = describe_group(&conn, "sg2").await;
+    assert_eq!(described.members.len(), 2);
+
+    stop_broker(broker).await;
+}
+
+/// A dynamic member (empty instance id) keeps the old behaviour: rejoining
+/// with no member id is a new arrival and does rebalance. Static membership
+/// must not silently change what dynamic members do.
+#[tokio::test]
+async fn dynamic_members_still_rebalance_on_rejoin() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone(&temp.path().join("broker"), 4).await;
+    let conn = connect(broker.addr, "dynamic").await;
+
+    let first = join(&conn, "dg", "", 600_000, 500).await;
+    let generation = first.generation;
+
+    let other = connect(broker.addr, "dynamic-b").await;
+    let rejoin = join(&other, "dg", "", 600_000, 500).await;
+    assert_ne!(
+        rejoin.member_id, first.member_id,
+        "a dynamic rejoin with no member id is a new member"
+    );
+    assert!(
+        rejoin.generation > generation,
+        "a new dynamic member must start a new generation"
+    );
 
     stop_broker(broker).await;
 }

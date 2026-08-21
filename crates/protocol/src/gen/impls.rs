@@ -1136,6 +1136,10 @@ impl JoinGroupRequest {
 		}
 		
 		
+		
+		buf.put_str(&self.group_instance_id);
+		
+		
         Ok(())
     }
 
@@ -1177,6 +1181,10 @@ impl JoinGroupRequest {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.subscription_topics.push(val);
 		}
+		
+		
+		
+		obj.group_instance_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
 		Ok(obj)
@@ -3240,6 +3248,10 @@ impl GroupMemberRecord {
 		}
 		
 		
+		
+		buf.put_str(&self.group_instance_id);
+		
+		
         Ok(())
     }
 
@@ -3277,6 +3289,10 @@ impl GroupMemberRecord {
 			let val = AssignedPartition::decode_from(buf)?;
 			obj.assignment.push(val);
 		}
+		
+		
+		
+		obj.group_instance_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
 		Ok(obj)
