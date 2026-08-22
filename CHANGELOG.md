@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `brahmaputra-cli produce --latency` reports acknowledgement-latency
+  percentiles (`avg`/`p50`/`p95`/`p99`/`p99.9`/`max`) by nearest rank, so a
+  reported percentile is a wait some record actually experienced. Behind a
+  flag: the throughput line above it is parsed positionally by the verify
+  scripts.
+- `brahmaputra-cli produce --rate` offers records at a fixed rate rather
+  than as fast as the broker accepts them, the analogue of
+  `kafka-producer-perf-test --throughput`. Latency measured at saturation
+  is queue depth divided by throughput — Kafka's own saturated run reports
+  a 1,185 ms p50 for that reason — so a bounded offered rate is the only
+  way to measure what an `acks=all` caller actually waits for.
+- `RATE` and `BRAHMA_IMAGE` in `scripts/bench-replicated-vs-kafka.sh`, the
+  latter so a before/after can be taken against an image built from an
+  older commit without touching the working tree.
+
+### Measured
+
+The 0.2.0 long-poll fix cut RF=3 `acks=all` **median commit latency from
+67.4 ms to 5.4 ms (12.5×) and p95 from 96.8 ms to 11.6 ms (8.4×)** at
+20,000 records/sec offered. The pre-fix median is the 50 ms poll interval
+plus overhead. RF=1 latency is unchanged — 4.34 ms to 4.33 ms p50 — which
+is the control that attributes the gain to the replication path. The fix
+costs CPU at low offered rates (160 % to 394 % for the cluster), because
+followers are woken per append rather than coalescing 50 ms of them.
+
+A hundreds-of-milliseconds RF=3 p99 remains, in Kafka and in the pre-fix
+build as well as this one, clean at RF=1 in both systems, and unstable
+across runs. No p99 claim is made for either system; see
+`docs/replicated-benchmark-2026-08-22.md` §4a.
+
 ## 0.2.0 — 2026-08-22
 
 The first release measured against Kafka in the configuration a durable

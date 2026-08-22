@@ -61,6 +61,11 @@ BATCH_SIZE="${BATCH_SIZE:-65536}"
 LINGER_MS="${LINGER_MS:-5}"
 COMPRESSION="${COMPRESSION:-none}"
 IN_FLIGHT="${IN_FLIGHT:-4096}"
+# Offered records per second per client. Unset means "as fast as the broker
+# accepts", which measures saturation throughput; set it below saturation to
+# measure acknowledgement latency instead, since at saturation latency is
+# just queue depth over throughput.
+RATE="${RATE:-}"
 CPUS="${CPUS:-4}"
 MEMORY="${MEMORY:-4g}"
 NODES=3
@@ -82,6 +87,10 @@ MAX_BYTES="${MAX_BYTES:-16777216}"
 CLUSTER_ID="${CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 ONLY="${ONLY:-both}"
+# Which Brahmaputra image to run. Overriding it with an image built from an
+# older commit is how a before/after comparison is taken without touching
+# the working tree: build that image once, then run with SKIP_BUILD=1.
+BRAHMA_IMAGE="${BRAHMA_IMAGE:-brahmaputra-bench:latest}"
 
 # See bench-matched.sh for why the broker heap and the client heap are set
 # separately: KAFKA_HEAP_OPTS is read by every Kafka CLI tool, so one large
@@ -123,7 +132,7 @@ docker_run network inspect "$NETWORK" --format '{{range .IPAM.Config}}{{.Subnet}
   | grep -q "$SUBNET" || die "network $NETWORK exists with a different subnet; remove it first"
 
 : > "$CSV"
-printf 'system,config,phase,clients,records,seconds,msgs_per_sec,client_msgs_per_sec,cpu_avg,cpu_peak,mem_avg,mem_peak\n' >> "$CSV"
+printf 'system,config,phase,clients,records,seconds,msgs_per_sec,client_msgs_per_sec,cpu_avg,cpu_peak,mem_avg,mem_peak,lat_p50_ms,lat_p99_ms,lat_p999_ms,lat_max_ms\n' >> "$CSV"
 : > "$NOTES"
 
 # ------------------------------------------------------------- sampling
@@ -177,6 +186,42 @@ now_ms() { date +%s%3N; }
 rate() { awk -v r="$1" -v ms="$2" 'BEGIN { if (ms > 0) printf "%.0f", r * 1000 / ms; else print 0 }'; }
 wait_all() { local pid status=0; for pid in "${pids[@]}"; do wait "$pid" || status=1; done; return $status; }
 
+# Acknowledgement-latency percentiles, in milliseconds.
+#
+# Both sides measure the same span — record admitted to record acked — but
+# report it differently, so each is parsed from its own summary line rather
+# than recomputed. Kafka prints whole milliseconds; Brahmaputra prints two
+# decimals. With several clients per level the percentiles are averaged
+# across them: a percentile of percentiles is not a percentile of the
+# population, but it is the honest summary available without the raw
+# samples, and it is applied identically to both systems.
+latency_summary() {
+    local kind="$1"; shift
+    local file p50=0 p99=0 p999=0 max=0 n=0 value
+    for file in "$@"; do
+        [[ -f "$file" ]] || continue
+        case "$kind" in
+            kafka)
+                value="$(sed -n 's/.*records sent.*, \([0-9.]*\) ms avg latency, \([0-9.]*\) ms max latency, \([0-9]*\) ms 50th, [0-9]* ms 95th, \([0-9]*\) ms 99th, \([0-9]*\) ms 99.9th.*/\3 \4 \5 \2/p' "$file" | tail -1)" ;;
+            brahmaputra)
+                value="$(sed -n 's/.*p50=\([0-9.]*\) p95=[0-9.]* p99=\([0-9.]*\) p99.9=\([0-9.]*\) max=\([0-9.]*\).*/\1 \2 \3 \4/p' "$file" | tail -1)" ;;
+        esac
+        [[ -n "$value" ]] || continue
+        read -r a b c d <<<"$value"
+        p50="$(awk -v x="$p50" -v y="$a" 'BEGIN { print x + y }')"
+        p99="$(awk -v x="$p99" -v y="$b" 'BEGIN { print x + y }')"
+        p999="$(awk -v x="$p999" -v y="$c" 'BEGIN { print x + y }')"
+        max="$(awk -v x="$max" -v y="$d" 'BEGIN { print (y > x) ? y : x }')"
+        n=$(( n + 1 ))
+    done
+    if (( n == 0 )); then
+        printf '0,0,0,0'
+        return
+    fi
+    awk -v a="$p50" -v b="$p99" -v c="$p999" -v d="$max" -v n="$n" \
+        'BEGIN { printf "%.2f,%.2f,%.2f,%.2f", a/n, b/n, c/n, d }'
+}
+
 sum_client_rates() {
   local kind="$1"; shift
   local file total=0 value
@@ -194,14 +239,17 @@ sum_client_rates() {
 
 record_level() {
   local system="$1" config="$2" phase="$3" clients="$4" records="$5" ms="$6" stats="$7" client_rate="$8"
+  local latency="${9:-0,0,0,0}"
   local seconds throughput
   seconds="$(awk -v ms="$ms" 'BEGIN { printf "%.2f", ms / 1000 }')"
   throughput="$(rate "$records" "$ms")"
   read -r cpu cpu_max mem mem_max <<<"$(summarize_samples "$stats")"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "$system" "$config" "$phase" "$clients" "$records" "$seconds" "$throughput" \
-    "${client_rate:-0}" "$cpu" "$cpu_max" "$mem" "$mem_max" >> "$CSV"
+    "${client_rate:-0}" "$cpu" "$cpu_max" "$mem" "$mem_max" "$latency" >> "$CSV"
   info "$system/$config $phase x$clients: $throughput msgs/sec wall (${client_rate:-0} client), CPU ${cpu}%, ${mem} MiB"
+  [[ "$phase" == "produce" ]] && info "  ack latency ms: p50/p99/p99.9/max = ${latency//,/ / }"
+  return 0
 }
 
 # ---------------------------------------------------------------- build
@@ -337,7 +385,7 @@ run_kafka_level() {
       -e KAFKA_JVM_PERFORMANCE_OPTS="$KAFKA_CLIENT_GC" \
       "$node" /opt/kafka/bin/kafka-producer-perf-test.sh \
       --topic "$TOPIC-$config-$clients-$index" --num-records "$PER_CLIENT" \
-      --record-size "$RECORD_SIZE" --throughput -1 \
+      --record-size "$RECORD_SIZE" --throughput "${RATE:--1}" \
       --producer-props bootstrap.servers="$KAFKA_BOOTSTRAP" "acks=$acks" \
         "batch.size=$BATCH_SIZE" "linger.ms=$LINGER_MS" \
         "compression.type=$COMPRESSION" "max.request.size=$MAX_BYTES" \
@@ -350,7 +398,8 @@ run_kafka_level() {
   stop_sampling
   record_level kafka "$config" produce "$clients" $(( PER_CLIENT * clients )) "$elapsed" \
     "$RESULTS/kafka-$config-produce-$clients.stats" \
-    "$(sum_client_rates kafka-produce "$RESULTS"/kafka-"$config"-produce-"$clients"-*.txt)"
+    "$(sum_client_rates kafka-produce "$RESULTS"/kafka-"$config"-produce-"$clients"-*.txt)" \
+    "$(latency_summary kafka "$RESULTS"/kafka-"$config"-produce-"$clients"-*.txt)"
 
   start_sampling "$RESULTS/kafka-$config-consume-$clients.stats" "${KAFKA_NODES[@]}"
   start="$(now_ms)"
@@ -394,7 +443,7 @@ start_brahmaputra() {
     docker_run run -d --name "bench-b$i" --network "$NETWORK" \
       --ip "${BRAHMA_IPS[$(( i - 1 ))]}" \
       --cpus "$CPUS" --memory "$MEMORY" "${publish[@]}" \
-      brahmaputra-bench:latest \
+      "$BRAHMA_IMAGE" \
       --host "${BRAHMA_IPS[$(( i - 1 ))]}" --port 9092 --data-dir /data \
       --node-id "$i" --cluster-id brahma-rep \
       --control-port 19311 --http-port 0 \
@@ -469,7 +518,8 @@ run_brahmaputra_level() {
       --topic "$TOPIC-$config-$clients-$index" --count "$PER_CLIENT" \
       --value-size "$RECORD_SIZE" --no-key --acks "$acks" \
       --batch-size "$BATCH_SIZE" --linger-ms "$LINGER_MS" \
-      --in-flight "$IN_FLIGHT" --compression "$COMPRESSION" \
+      --in-flight "$IN_FLIGHT" --compression "$COMPRESSION" --latency \
+      ${RATE:+--rate "$RATE"} \
       > "$RESULTS/brahmaputra-$config-produce-$clients-$index.txt" 2>&1 &
     pids+=($!)
   done
@@ -478,7 +528,8 @@ run_brahmaputra_level() {
   stop_sampling
   record_level brahmaputra "$config" produce "$clients" $(( PER_CLIENT * clients )) "$elapsed" \
     "$RESULTS/brahmaputra-$config-produce-$clients.stats" \
-    "$(sum_client_rates brahmaputra "$RESULTS"/brahmaputra-"$config"-produce-"$clients"-*.txt)"
+    "$(sum_client_rates brahmaputra "$RESULTS"/brahmaputra-"$config"-produce-"$clients"-*.txt)" \
+    "$(latency_summary brahmaputra "$RESULTS"/brahmaputra-"$config"-produce-"$clients"-*.txt)"
 
   brahma_verify "$TOPIC-$config-$clients-0" "$rf" "$PER_CLIENT"
 
@@ -578,10 +629,21 @@ emit_replication_cost() {
   emit_replication_cost produce
   emit_replication_cost consume
 
+  # Latency is the number a durable deployment actually feels: with
+  # acks=all a caller waits for the record to reach the ISR, and no amount
+  # of throughput hides a long tail.
+  printf '### Acknowledgement latency, produce (milliseconds)\n\n'
+  printf '| System | Config | Clients | p50 | p99 | p99.9 | max |\n'
+  printf '|---|---|---|---|---|---|---|\n'
+  awk -F, 'NR>1 && $3=="produce" { printf "| %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$4,$13,$14,$15,$16 }' "$CSV"
+  printf '\nKafka reports whole milliseconds, Brahmaputra two decimals; each\n'
+  printf 'is parsed from its own client summary rather than recomputed. Both\n'
+  printf 'measure the same span: record admitted to record acknowledged.\n\n'
+
   printf '### Every level\n\n'
-  printf '| System | Config | Phase | Clients | Records | Seconds | msgs/sec | Client msgs/sec | CPU avg %% | CPU peak %% | Mem avg MiB | Mem peak MiB |\n'
-  printf '|---|---|---|---|---|---|---|---|---|---|---|---|\n'
-  tail -n +2 "$CSV" | awk -F, '{ printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12 }'
+  printf '| System | Config | Phase | Clients | Records | Seconds | msgs/sec | Client msgs/sec | CPU avg %% | CPU peak %% | Mem avg MiB | Mem peak MiB | p50 ms | p99 ms | p99.9 ms | max ms |\n'
+  printf '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n'
+  tail -n +2 "$CSV" | awk -F, '{ printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16 }'
 
   printf '\n### Replication actually happened\n\n```\n'
   cat "$NOTES"

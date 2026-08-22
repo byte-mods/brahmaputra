@@ -165,6 +165,99 @@ perfectly reproducible *because* it is sleeping. Now that it actually uses
 the machine, it varies like any other saturating workload — more than
 Kafka does on the same measurement. The determinism was a symptom.
 
+## 4a. Acknowledgement latency
+
+Throughput was the wrong headline for a durable deployment: under
+`acks=all` a caller waits for the record to reach the ISR, and no amount of
+throughput hides a long tail. This is what the long-poll fix should have
+improved most, because it removed a 50 ms sleep from the commit path.
+
+### Latency at saturation is not latency
+
+The first attempt measured at full offered load and produced numbers that
+looked dramatic and meant nothing:
+
+| Saturated (offered load unbounded) | p50 | p99 |
+|---|---|---|
+| Kafka, RF=3 | 1,185 ms | 1,698 ms |
+| Brahmaputra, RF=3 | — | 582 ms |
+
+At saturation the queue never drains, so latency is queue depth divided by
+throughput — arithmetic, not a property of the commit path. Both figures
+are artefacts of an in-flight window, and either would have been easy to
+publish and hard to defend.
+
+Everything below therefore offers load at a **fixed rate** below
+saturation, via `--rate` on the Brahmaputra CLI and `--throughput` on
+`kafka-producer-perf-test`. Both measure the same span: record admitted to
+record acknowledged, which includes batching and `linger.ms`.
+
+One thing that does not transfer: **saturation throughput is not a guide to
+a safe paced rate.** 12,500 records/sec per client was chosen as "22 % of
+Kafka's measured 231k", and Kafka still peaked at 1,165 % of a 1,200 % CPU
+ceiling — because at a paced rate `linger.ms` closes batches at roughly 62
+records instead of 256, so per-record cost is several times higher than in
+the saturated run.
+
+### What the fix did, RF=3 `acks=all`, 20,000 records/sec offered
+
+4 clients × 5,000/sec, 600,000 records, three brokers per system.
+
+| | Brahmaputra before | Brahmaputra after |
+|---|---|---|
+| p50 | 67.39 ms | **5.39 ms** |
+| p95 | 96.8 ms | **11.6 ms** |
+| avg | 79.0 ms | **16.2 ms** |
+| Cluster CPU avg | 160 % | 394 % |
+
+**Median commit latency fell 12.5×, p95 8.4×.** The pre-fix p50 of ~67 ms
+is the 50 ms poll interval plus overhead — direct confirmation of a root
+cause that had until now only been inferred from throughput.
+
+The control that makes it attributable, same runs, RF=1 `acks=1`, where the
+fix touches nothing:
+
+| RF=1 `acks=1` | before | after |
+|---|---|---|
+| p50 | 4.34 ms | 4.33 ms |
+| p99 | 8.95 ms | 9.07 ms |
+
+Unreplicated latency is unchanged to within noise while the replicated path
+moved by an order of magnitude, which is exactly the signature a
+replication-path change should leave.
+
+**The fix costs CPU.** At the same offered rate the cluster went from 160 %
+to 394 %, because followers are now woken per append rather than
+coalescing 50 ms of appends into one fetch. That is the trade: latency and
+saturation throughput bought with CPU at low rates.
+
+### The tail is not attributable, and is not new
+
+| RF=3, 20,000/sec offered | Kafka | Before | After |
+|---|---|---|---|
+| p99 | 588 ms | 647 ms | 497 ms |
+| p99.9 | 730 ms | 881 ms | 762 ms |
+| max | 1,350 ms | 980 ms | 818 ms |
+
+A hundreds-of-milliseconds p99 appears in **all three**, including Kafka,
+and in the pre-fix build that had no leader-side wait at all — which
+disposes of the obvious suspicion that it was the 500 ms
+`REPLICA_FETCH_MAX_WAIT_MS` introduced by the fix. Both systems' RF=1
+controls are clean (Kafka p99 61.75 ms, Brahmaputra 9.07 ms), so it is
+specific to the replicated path rather than to the host's disk alone.
+
+It is also not stable across runs: at 12,500/sec per client Brahmaputra's
+RF=3 p99 was **35.67 ms** with a 173 ms max — no tail at all — while the
+same build at the lower rate showed 497 ms. A tail that improves under
+heavier load is not a queueing effect, and the two rates were measured
+half an hour apart on a host that was also building container images.
+
+**No p99 claim is made here for either system.** What survives is the
+median and p95 comparison, where the mechanism is understood and the
+magnitude matches the interval that was removed. Isolating the tail needs a
+quiet host and per-record timestamps correlated with broker-side events;
+it is the obvious next piece of work.
+
 ## 5. What replication costs each system
 
 Each ratio is computed within one system, using the same client and
@@ -353,8 +446,12 @@ superseded 25,618 msgs/sec figure.
 1. **The heartbeat self-exit (§6a).** The most consequential item on this
    list, and the one the fix made most reachable. It needs a design
    decision, not a patch.
-2. **`acks=all` latency percentiles.** The fix removed a 50 ms sleep from
-   the commit path, so p99 should have moved further than throughput did —
-   and nothing here measures it.
+2. **The RF=3 tail (§4a).** A hundreds-of-milliseconds p99 that appears in
+   Kafka, in the pre-fix build and in the current one, is clean at RF=1 in
+   both systems, and is not stable across runs. Needs a quiet host and
+   per-record timestamps correlated with broker-side events.
 3. **Longer runs.** Kafka was still gaining from JIT warmup at 2M records
    per client when measurement stopped.
+
+Median and p95 acknowledgement latency are now measured (§4a): the fix cut
+RF=3 p50 by 12.5× and p95 by 8.4×, with RF=1 unchanged as the control.

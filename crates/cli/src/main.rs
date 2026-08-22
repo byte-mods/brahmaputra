@@ -115,6 +115,20 @@ enum Command {
         /// (`max.in.flight.requests.per.connection`).
         #[arg(long = "max-in-flight", default_value_t = 5)]
         max_in_flight: usize,
+        /// With --count, also report acknowledgement-latency percentiles.
+        /// Off by default: it adds a line of output, and the throughput
+        /// line above it is parsed positionally by scripts.
+        #[arg(long)]
+        latency: bool,
+        /// Offer records at this many per second instead of as fast as the
+        /// broker accepts them (`kafka-producer-perf-test --throughput`).
+        ///
+        /// Latency measured at saturation is queue depth divided by
+        /// throughput — arithmetic, not a property of the commit path. To
+        /// measure what a caller actually waits for, offer load below
+        /// saturation so the queue stays near empty.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        rate: Option<u64>,
         /// How long the broker may wait for the requested acknowledgements.
         #[arg(
             long = "timeout-ms",
@@ -327,6 +341,8 @@ struct ProduceOptions {
     no_key: bool,
     in_flight: usize,
     max_in_flight: usize,
+    latency: bool,
+    rate: Option<u64>,
     acks: i32,
     timeout_ms: i32,
     batch_size: usize,
@@ -450,6 +466,34 @@ where
     Ok(completed)
 }
 
+/// Summarise acknowledgement waits as milliseconds, by nearest rank.
+///
+/// Nearest rank rather than interpolation so a reported percentile is a
+/// wait some record actually experienced, and so the value cannot drift
+/// with the sample size.
+fn format_latency(waits: &mut [u32]) -> String {
+    if waits.is_empty() {
+        return "latency ms: no samples".to_owned();
+    }
+    waits.sort_unstable();
+    let at = |quantile: f64| -> f64 {
+        let rank = (quantile * waits.len() as f64).ceil() as usize;
+        f64::from(waits[rank.clamp(1, waits.len()) - 1]) / 1000.0
+    };
+    let mean =
+        waits.iter().map(|micros| f64::from(*micros)).sum::<f64>() / waits.len() as f64 / 1000.0;
+    format!(
+        "latency ms: avg={:.2} p50={:.2} p95={:.2} p99={:.2} p99.9={:.2} max={:.2} (n={})",
+        mean,
+        at(0.50),
+        at(0.95),
+        at(0.99),
+        at(0.999),
+        f64::from(*waits.last().expect("non-empty")) / 1000.0,
+        waits.len()
+    )
+}
+
 async fn resolve_broker(addr: &str) -> Result<SocketAddr> {
     if let Ok(parsed) = addr.parse::<SocketAddr>() {
         return Ok(parsed);
@@ -492,6 +536,8 @@ async fn run(cli: Cli) -> Result<()> {
             no_key,
             in_flight,
             max_in_flight,
+            latency,
+            rate,
             acks,
             batch_size,
             linger_ms,
@@ -515,6 +561,8 @@ async fn run(cli: Cli) -> Result<()> {
                 no_key,
                 in_flight,
                 max_in_flight,
+                latency,
+                rate,
                 acks,
                 timeout_ms,
                 batch_size,
@@ -857,6 +905,8 @@ async fn produce(options: ProduceOptions) -> Result<()> {
         no_key,
         in_flight,
         max_in_flight,
+        latency,
+        rate,
         acks,
         timeout_ms,
         batch_size,
@@ -962,10 +1012,34 @@ async fn produce(options: ProduceOptions) -> Result<()> {
                     // Distinct per-record key keeps batches honest in count
                     // mode; --no-key sends null keys instead.
                     let key = (!no_key).then(|| Bytes::from(format!("load-{i}").into_bytes()));
-                    producer.send(topic, partition, key, value).await
+                    // Hold each record until its slot in the offered rate.
+                    // Pacing from a fixed origin rather than sleeping
+                    // between sends keeps the offered rate honest: a send
+                    // that runs long steals from the next interval instead
+                    // of pushing the whole schedule back.
+                    if let Some(rate) = rate {
+                        let slot =
+                            started + Duration::from_secs_f64(i as f64 / rate as f64);
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(slot)).await;
+                    }
+                    // Timed from the moment this record is admitted — the
+                    // in-flight window has already let it through — to its
+                    // acknowledgement. That is the same span
+                    // `kafka-producer-perf-test` reports: it covers batching
+                    // and `linger.ms`, which is exactly what `acks=all`
+                    // callers wait on.
+                    let at = Instant::now();
+                    let offset = producer.send(topic, partition, key, value).await?;
+                    Ok::<_, brahmaputra_client::ClientError>((offset, at.elapsed()))
                 }
             });
-            let sent = drive_ordered(sends, in_flight.max(1), |_| {}).await?;
+            let mut waits: Vec<u32> = Vec::with_capacity(if latency { count as usize } else { 0 });
+            let sent = drive_ordered(sends, in_flight.max(1), |(_, waited)| {
+                if latency {
+                    waits.push(waited.as_micros().min(u128::from(u32::MAX)) as u32);
+                }
+            })
+            .await?;
             debug_assert_eq!(sent as u64, count);
             producer.flush().await?;
             let elapsed = started.elapsed().as_secs_f64();
@@ -973,6 +1047,9 @@ async fn produce(options: ProduceOptions) -> Result<()> {
                 "produced {count} records ({size} B each) in {elapsed:.2}s -> {:.0} msgs/sec",
                 count as f64 / elapsed
             );
+            if latency {
+                println!("{}", format_latency(&mut waits));
+            }
         }
         (None, None, None) => {
             anyhow::bail!("one of --value, --file, or --count/--value-size is required")
@@ -1430,6 +1507,28 @@ mod tests {
     use std::str;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn latency_percentiles_use_nearest_rank() {
+        // 1 ms .. 100 ms, one sample each, so every percentile has an
+        // unambiguous answer that interpolation would get wrong.
+        let mut waits: Vec<u32> = (1..=100).map(|ms| ms * 1000).collect();
+        let line = super::format_latency(&mut waits);
+        assert!(line.contains("p50=50.00"), "{line}");
+        assert!(line.contains("p95=95.00"), "{line}");
+        assert!(line.contains("p99=99.00"), "{line}");
+        assert!(line.contains("p99.9=100.00"), "{line}");
+        assert!(line.contains("max=100.00"), "{line}");
+        assert!(line.contains("avg=50.50"), "{line}");
+        assert!(line.contains("(n=100)"), "{line}");
+    }
+
+    #[test]
+    fn latency_percentiles_handle_one_and_none() {
+        assert!(super::format_latency(&mut []).contains("no samples"));
+        let line = super::format_latency(&mut [2_500]);
+        assert!(line.contains("p50=2.50") && line.contains("p99.9=2.50"), "{line}");
+    }
 
     use brahmaputra_broker::{Broker, BrokerConfig};
     use tempfile::tempdir;
