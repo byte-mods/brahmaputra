@@ -636,7 +636,7 @@ async fn a_cooperative_group_keeps_consuming_while_a_member_joins() {
     first.subscribe(&[TOPIC]);
 
     // Establish an assignment and consume some of the backlog.
-    let mut seen = poll_until(&mut first, 30, Duration::from_secs(15));
+    let seen = poll_until(&mut first, 30, Duration::from_secs(15));
     let mut collected = seen.await;
     assert!(!collected.is_empty(), "the first member consumed nothing");
     let held_before: BTreeSet<(String, i32)> = collected

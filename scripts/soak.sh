@@ -194,7 +194,6 @@ while (( SECONDS < DEADLINE )); do
   fi
 
   if (( SECONDS >= NEXT_KILL )); then
-    NEXT_KILL=$((SECONDS + KILL_EVERY_SECONDS))
     victim=$(( (RANDOM % NODE_COUNT) + 1 ))
     if kill -0 "${PID[$victim]}" 2>/dev/null; then
       kill -9 "${PID[$victim]}" 2>/dev/null || true
@@ -203,7 +202,27 @@ while (( SECONDS < DEADLINE )); do
       sleep 2
       start_node "$victim"
       wait_for_port "${DATA_PORT[$victim]}" || echo "   !! broker $victim did not come back"
-      sleep 2
+
+      # Wait for the partition to be fully replicated again before the
+      # next kill is even scheduled. Killing faster than a cluster can
+      # heal is not a durability test -- it drives the cluster below
+      # quorum, at which point `acks=all` is *correctly* refused and the
+      # run measures nothing but the operator's impatience.
+      healed_deadline=$((SECONDS + 60))
+      while (( SECONDS < healed_deadline )); do
+        isr_size="$(curl -s "http://127.0.0.1:${CONTROL_PORT[$(live_node)]}/api/v1/controller/metadata" 2>/dev/null \
+          | perl -MJSON::PP -0777 -ne '
+              my $d = eval { decode_json($_) } or exit 0;
+              my $t = $d->{topics}{"soak"} or exit 0;
+              my $p = $t->{partitions}{"0"} or exit 0;
+              print scalar @{$p->{isr}};' 2>/dev/null)"
+        [[ "${isr_size:-0}" -ge "$NODE_COUNT" ]] && break
+        sleep 2
+      done
+      # Only now start the clock for the next kill.
+      NEXT_KILL=$((SECONDS + KILL_EVERY_SECONDS))
+    else
+      NEXT_KILL=$((SECONDS + KILL_EVERY_SECONDS))
     fi
   fi
 done

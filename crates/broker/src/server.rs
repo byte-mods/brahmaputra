@@ -1444,29 +1444,6 @@ impl Broker {
 }
 
 #[cfg(test)]
-impl Broker {
-    /// Open (or reuse) a partition, for tests that need a live actor.
-    pub(crate) fn partition_handle_for_test(
-        &self,
-        topic: &str,
-        partition: i32,
-    ) -> Result<PartitionHandle, BrokerError> {
-        self.open_partition(topic, partition)
-    }
-
-    /// What configuration a partition was last told to use.
-    pub(crate) fn applied_topic_config_for_test(
-        &self,
-        topic: &str,
-        partition: i32,
-    ) -> Option<LogConfig> {
-        self.applied_topic_configs
-            .get(&(topic.to_owned(), partition))
-            .map(|entry| entry.value().clone())
-    }
-}
-
-#[cfg(test)]
 mod live_topic_config_tests {
     use super::*;
     use brahmaputra_metadata::MetadataCommand;

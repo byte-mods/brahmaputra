@@ -716,18 +716,6 @@ impl GroupConsumer {
         Ok(group)
     }
 
-    /// What to do when a partition has no valid position — never committed,
-    /// or committed then aged off the log (`auto.offset.reset`).
-
-    /// Longest gap between `poll` calls before this member gives up its
-    /// partitions (`max.poll.interval.ms`).
-    ///
-    /// Separate from `session.timeout.ms` on purpose: heartbeats prove the
-    /// process is alive, this proves the application is still consuming.
-    /// A consumer stuck in a slow handler answers the first question
-    /// perfectly while making no progress at all, and only this releases
-    /// its partitions to a member that can.
-
     /// Give this consumer a stable identity across restarts
     /// (`group.instance.id`, KIP-345).
     ///
@@ -744,10 +732,20 @@ impl GroupConsumer {
         self.group_instance_id = group_instance_id.into();
         self
     }
+    /// Longest gap between `poll` calls before this member gives up its
+    /// partitions (`max.poll.interval.ms`).
+    ///
+    /// Separate from `session.timeout.ms` on purpose: heartbeats prove the
+    /// process is alive, this proves the application is still consuming.
+    /// A consumer stuck in a slow handler answers the first question
+    /// perfectly while making no progress at all, and only this releases
+    /// its partitions to a member that can.
     pub fn with_max_poll_interval_ms(mut self, max_poll_interval_ms: u64) -> Self {
         self.max_poll_interval = Duration::from_millis(max_poll_interval_ms.max(1));
         self
     }
+    /// What to do when a partition has no valid position — never committed,
+    /// or committed then aged off the log (`auto.offset.reset`).
     pub fn with_auto_offset_reset(mut self, policy: AutoOffsetReset) -> Self {
         self.auto_offset_reset = policy;
         self
