@@ -10,7 +10,7 @@ binary, with no JVM, no ZooKeeper and no heap to tune.
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![Tests](https://img.shields.io/badge/tests-230%20passing-brightgreen.svg)](#verification)
-[![Throughput](https://img.shields.io/badge/vs%20Kafka-3.0%C3%97%20produce%20%C2%B7%205.7%C3%97%20consume-brightgreen.svg)](#performance)
+[![Throughput](https://img.shields.io/badge/vs%20Kafka-3.0%C3%97%20produce%20RF%3D1%20%C2%B7%203.4%C3%97%20RF%3D3-brightgreen.svg)](#performance)
 [![Transports](https://img.shields.io/badge/transport-TCP%20%C2%B7%20TLS%201.3%20%C2%B7%20QUIC-informational.svg)](#transports)
 [![Auth](https://img.shields.io/badge/auth-SASL--style%20%C2%B7%20ACLs-blueviolet.svg)](#authentication-and-access-control)
 
@@ -25,7 +25,7 @@ open http://localhost:8080                              # dashboard
 
 |  | |
 |---|---|
-| 🚀 **Faster than Kafka on both sides** | At equal CPU: **3.0× produce**, **5.7× consume** at 256 B records, on **8–28× less memory**. [Measured, with method →](#performance) |
+| 🚀 **Faster than Kafka where it counts** | Single node at equal CPU: **3.0× produce**. Three nodes at RF=3 `acks=all` — the durable setting — **3.4× produce**, on **4.5× less memory**. [Measured, with method →](#performance) |
 | 🧩 **One static binary** | Broker, controller, dashboard and metrics compiled in. No JVM, no ZooKeeper, no Prometheus required. |
 | 🔁 **Kafka semantics, not just Kafka shape** | Leader/ISR replication, leader-epoch truncation (KIP-101), high-watermark visibility, `acks=0/1/all`, idempotent producer, consumer groups with generation fencing. |
 | 🔌 **Three transports, one flag** | Plain TCP, TLS 1.3, or QUIC — same wire format, same correctness suite. |
@@ -681,6 +681,21 @@ same host, and passes 30/30 in isolation. Its election deadline is already
 than papered over with a larger timeout. Run the live suites serially.
 
 ## Performance
+
+> **Read the conditions on these numbers.** Everything in this section is
+> **single-node, RF=1, `acks=1`** — no replication. For the durable
+> configuration (three brokers, RF=3, `acks=all`), see
+> [docs/replicated-benchmark-2026-08-22.md](docs/replicated-benchmark-2026-08-22.md),
+> which measures **3.40× produce** against Kafka on 4.5× less memory.
+>
+> Two caveats on the consume figures below, both established by that
+> report. The **5.7× consume number compares an uncoordinated reader
+> against a consumer group**: `kafka-consumer-perf-test` always joins a
+> group and pays for the rebalance, while the Brahmaputra CLI here read
+> partitions directly. Measured group-to-group the two are within about
+> 17 %. And Kafka gains up to 40 % on longer runs from JIT warmup, so
+> short-run comparisons understate it. The produce figures survive both
+> corrections; the consume figure does not.
 
 Head-to-head with Apache Kafka 3.9.0, same host, same container limits
 (4 CPUs, 4 GiB), same record size, partition count and durability setting,

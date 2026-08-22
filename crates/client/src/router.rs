@@ -12,6 +12,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{MetadataRequest, MetadataResponse};
@@ -45,6 +46,9 @@ impl BrokerEndpoint {
         Ok(Self { host, port })
     }
 
+    /// Uncached name resolution. Every caller on a hot path should go
+    /// through [`BrokerRouter::resolve`] instead — see the cache there for
+    /// why.
     async fn resolve(&self) -> Result<SocketAddr, ClientError> {
         if let Ok(ip) = self.host.parse::<IpAddr>() {
             return Ok(SocketAddr::new(ip, self.port));
@@ -119,7 +123,27 @@ struct Inner {
     connections: Mutex<HashMap<SocketAddr, PooledConnection>>,
     routes: Mutex<RoutingTable>,
     refresh: AsyncMutex<()>,
+    /// Resolved broker addresses, keyed by the endpoint metadata advertised.
+    resolved: Mutex<HashMap<BrokerEndpoint, (SocketAddr, Instant)>>,
 }
+
+/// How long a resolved broker address is reused before being looked up
+/// again.
+///
+/// Without this cache the routing path calls `getaddrinfo` on every send:
+/// a measured 6,418 lookups to produce 2,000 records, because the leader
+/// address is resolved afresh for each flush. Each lookup is individually
+/// fast, but tokio dispatches it to the blocking pool, and at that volume
+/// the cost dominates everything else — producing to a cluster whose
+/// brokers advertise hostnames took 5.5 s where the same cluster
+/// advertising IP literals took 0.97 s. `BrokerEndpoint::resolve`
+/// short-circuits on an IP literal, which is why only name-advertised
+/// clusters (Kubernetes, Compose, any DNS service discovery) paid it.
+///
+/// The TTL keeps a moved broker reachable without a restart; a broker that
+/// moves *and* breaks its connection is re-resolved immediately, because
+/// `invalidate` drops the cached address along with the connection.
+const RESOLVE_TTL: Duration = Duration::from_secs(30);
 
 /// Cheaply cloned Metadata cache plus lazy broker connection pool.
 #[derive(Clone)]
@@ -153,8 +177,34 @@ impl BrokerRouter {
                 connections: Mutex::new(HashMap::from([(seed, pooled)])),
                 routes: Mutex::new(RoutingTable::default()),
                 refresh: AsyncMutex::new(()),
+                resolved: Mutex::new(HashMap::new()),
             }),
         })
+    }
+
+    /// Resolve a broker endpoint, reusing a recent answer.
+    ///
+    /// An IP literal never reaches the cache — `BrokerEndpoint::resolve`
+    /// answers it without a syscall.
+    async fn resolve(&self, endpoint: &BrokerEndpoint) -> Result<SocketAddr, ClientError> {
+        if let Some(address) = self
+            .inner
+            .resolved
+            .lock()
+            .expect("resolved")
+            .get(endpoint)
+            .filter(|(_, seen)| seen.elapsed() < RESOLVE_TTL)
+            .map(|(address, _)| *address)
+        {
+            return Ok(address);
+        }
+        let address = endpoint.resolve().await?;
+        self.inner
+            .resolved
+            .lock()
+            .expect("resolved")
+            .insert(endpoint.clone(), (address, Instant::now()));
+        Ok(address)
     }
 
     /// Fetch Metadata from a live seed/cached broker and publish its routes.
@@ -257,7 +307,7 @@ impl BrokerRouter {
 
         let mut responses = Vec::with_capacity(endpoints.len());
         for (broker_id, endpoint) in endpoints {
-            let address = match endpoint.resolve().await {
+            let address = match self.resolve(&endpoint).await {
                 Ok(address) => address,
                 Err(error) => {
                     responses.push((broker_id, Err(error)));
@@ -316,7 +366,7 @@ impl BrokerRouter {
                     .ok_or_else(|| unknown_partition(topic, partition))?
             }
         };
-        let address = endpoint.resolve().await?;
+        let address = self.resolve(&endpoint).await?;
         self.connection(address).await
     }
 
@@ -380,7 +430,7 @@ impl BrokerRouter {
         let mut seen = HashSet::from([self.inner.seed]);
         let mut candidates = vec![self.inner.seed];
         for endpoint in endpoints {
-            if let Ok(address) = endpoint.resolve().await {
+            if let Ok(address) = self.resolve(&endpoint).await {
                 if seen.insert(address) {
                     candidates.push(address);
                 }
@@ -428,6 +478,15 @@ impl BrokerRouter {
         {
             connections.remove(&failed.address);
         }
+        // Drop any cached name that resolved to this address too. A broker
+        // that came back at a different IP is the ordinary reason a pooled
+        // connection dies, and reusing the cached address would reconnect
+        // to nothing until the TTL expired.
+        self.inner
+            .resolved
+            .lock()
+            .expect("resolved")
+            .retain(|_, (address, _)| *address != failed.address);
     }
 }
 
@@ -484,7 +543,7 @@ impl BrokerRouter {
                 unroutable.push((topic.clone(), *partition));
                 continue;
             };
-            match endpoint.resolve().await {
+            match self.resolve(&endpoint).await {
                 Ok(address) => grouped
                     .entry(address)
                     .or_default()

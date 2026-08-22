@@ -197,31 +197,39 @@ encrypt them. Kafka draws the same line for SSL but not for OS.
 
 ## 8. Performance, including the replicated path
 
-Published numbers are single-node, RF=1, `acks=1` — 3.0× Kafka on produce
-and 5.7× on consume at 256 B, on 8–28× less memory
-([docs/benchmarks.md](benchmarks.md)).
+Published single-node numbers are RF=1, `acks=1` — 3.0× Kafka on produce
+at 256 B, on 8–28× less memory ([docs/benchmarks.md](benchmarks.md)). The
+5.7× consume figure in that document **does not survive matched
+methodology**: it compares an uncoordinated reader against a Kafka
+consumer group, and group-to-group the two systems land within about 17 %.
 
-**The replicated path is now measured too**
-(`scripts/bench-replicated.sh`), and it is the number that matters for a
-durable deployment. 100k × 256 B across 6 partitions, three brokers on one
-host:
+**Kafka is now measured in the same replicated configuration**
+(`scripts/bench-replicated-vs-kafka.sh`), which is the comparison that
+decides anything for a durable deployment. Three brokers per system on one
+host, 8M × 256 B across 6 partitions, 4 clients, means of three runs
+([replicated-benchmark-2026-08-22.md](replicated-benchmark-2026-08-22.md)):
 
-| Configuration | msgs/sec |
-|---|---|
-| RF=1, `acks=1` (what the headline measures) | 109,298 |
-| RF=3, `acks=all`, `min.insync.replicas=2` | **25,618** |
+| Produce configuration | Kafka | Brahmaputra |
+|---|---|---|
+| RF=1, `acks=1` | 735,668 | **1,157,006** |
+| RF=3, `acks=all`, `min.insync.replicas=2` | 231,454 | **787,385** |
+| Replication cost | 3.18× | **1.47×** |
+| Cluster memory at RF=3 | 4,464 MiB | **999 MiB** |
 
-**Replication keeps roughly a quarter of single-node throughput — a 4.2×
-cost.** The run verifies it actually replicated: all three nodes hold all
-six partition logs and the log end offsets sum to exactly the records
-produced.
+**Brahmaputra is 3.40× faster than Kafka at RF=3 and replicates at less
+than half Kafka's cost.** Every RF=3 level asserts it actually replicated:
+Kafka at ISR=3 on all six partitions, Brahmaputra with logs on all three
+nodes and log end offsets summing exactly to the records produced.
 
-Two caveats. Three brokers on one machine share a disk and a NIC, so these
-absolute numbers are below any real deployment. And **Kafka has not been
-measured in the same configuration**, so "3.0× Kafka" cannot be carried
-over to RF=3 — Kafka pays a replication cost too, and nobody here has
-measured how much. Comparing a replicated Brahmaputra against a
-non-replicated Kafka would be dishonest, so no such comparison is made.
+This is a reversal of the previous audit, which recorded 25,618 msgs/sec
+and a 4.2× replication cost. Both were real: the follower fetch path slept
+50 ms between empty fetches, and under `acks=all` every producer waited out
+that sleep before its record could commit. Replacing it with a leader-side
+long poll took the native RF=3 figure from 28,568 to 299,013 msgs/sec.
+
+One caveat stands: three brokers on one machine share a disk and a NIC, so
+the absolute numbers are below any real deployment — for both systems
+equally, which is what preserves the ratios.
 
 ## 9. Gaps ranked by impact
 

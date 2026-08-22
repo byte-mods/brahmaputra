@@ -39,6 +39,14 @@ use brahmaputra_metrics::{names, MetricKey};
 const TIMESTAMP_LATEST: i64 = -1;
 const TIMESTAMP_EARLIEST: i64 = -2;
 
+/// How long a leader holds a caught-up follower's fetch before answering it
+/// empty. Long enough that an idle partition costs two round trips a second
+/// rather than twenty; short enough that a follower still re-reads metadata
+/// and notices a leadership change promptly. `ReplicaFetchRequest` carries
+/// no client-chosen wait, so this is the leader's own policy and needs no
+/// wire-format change.
+const REPLICA_FETCH_MAX_WAIT_MS: u64 = 500;
+
 /// Who a connection is acting as.
 ///
 /// A connection starts anonymous. `Authenticate` binds a principal to it,
@@ -663,11 +671,55 @@ async fn replica_fetch(broker: &Broker, body: Bytes) -> Bytes {
             return respond(code_of(&BrokerError::Storage(error)), None);
         }
     }
-    match validation
+    // Long-poll a caught-up follower rather than answering it empty.
+    //
+    // Without this the follower's only way to notice a new append is to ask
+    // again, and its loop sleeps between empty answers — so under
+    // `acks=all` every producer waits out that sleep before its record can
+    // commit, and the whole cluster runs at the polling interval instead of
+    // at the speed of the log. Holding the request here costs one task on a
+    // connection that belongs to this one partition's fetcher, and the
+    // client fetch path already blocks the same way.
+    //
+    // The wait is on the *append* watch, not the watermark: under
+    // `acks=all` the watermark cannot advance until this follower fetches,
+    // so waiting on the watermark would be waiting on ourselves.
+    let mut appends = validation.handle.append_watch();
+    let mut read = validation
         .handle
         .read_uncommitted(request.fetch_offset, request.max_bytes as usize)
-        .await
-    {
+        .await;
+    if matches!(&read, Ok(outcome) if outcome.batches.is_empty()) {
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(REPLICA_FETCH_MAX_WAIT_MS);
+        while let Ok(Ok(())) = tokio::time::timeout_at(deadline, appends.changed()).await {
+            read = validation
+                .handle
+                .read_uncommitted(request.fetch_offset, request.max_bytes as usize)
+                .await;
+            match &read {
+                Ok(outcome) if outcome.batches.is_empty() => continue,
+                _ => break,
+            }
+        }
+        // Leadership can move while the request is parked here. Re-check
+        // before answering: a broker demoted during the wait would
+        // otherwise serve batches under an epoch it no longer owns, and the
+        // follower would accept them as committed history. Validation
+        // demands an exact leader-epoch match, so if it still passes the
+        // epoch captured above is still the right one to report.
+        if let Err(error) = validate_replica_request(
+            broker,
+            &request.topic,
+            request.partition,
+            request.follower_id,
+            request.follower_broker_epoch,
+            request.leader_epoch,
+        ) {
+            return respond(code_of(&error), None);
+        }
+    }
+    match read {
         Ok(outcome) => {
             // Charge the bytes against the replication budget before
             // answering. A rejoining broker otherwise fetches as fast as
