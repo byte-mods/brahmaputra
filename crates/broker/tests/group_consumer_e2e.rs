@@ -2,7 +2,7 @@
 //! broker — consume + commit, a two-member rebalance splitting partitions,
 //! and resume-from-committed-offsets after a reconnect.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use brahmaputra_broker::{Broker, BrokerConfig};
 use brahmaputra_client::{
-    AutoOffsetReset, Connection, ConsumedRecord, GroupAdmin, GroupConsumer, Producer,
+    Assignor, AutoOffsetReset, Connection, ConsumedRecord, GroupAdmin, GroupConsumer, Producer,
     ProducerConfig,
 };
 use brahmaputra_protocol::error_code as ec;
@@ -611,5 +611,125 @@ async fn a_consumer_that_stops_polling_releases_its_partitions() {
         "a working consumer inherits the stalled member's partitions"
     );
 
+    stop_broker(broker).await;
+}
+
+/// Cooperative rebalancing against a live broker.
+///
+/// The property that matters is not the assignment itself but what happens
+/// to consumption while it changes: a member keeping a partition must not
+/// stop consuming it. Eager rebalancing revokes everything, so this test
+/// is about the absence of a gap.
+#[tokio::test]
+async fn a_cooperative_group_keeps_consuming_while_a_member_joins() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_broker(dir.path()).await;
+    produce_records(broker.addr, 0, 60).await;
+
+    let mut first = GroupConsumer::connect(broker.addr, "coop-1", "coop")
+        .await
+        .expect("connect")
+        .with_session_timeout(6_000)
+        .with_rebalance_timeout(2_500)
+        .with_auto_commit(None)
+        .with_assignor(Assignor::CooperativeSticky);
+    first.subscribe(&[TOPIC]);
+
+    // Establish an assignment and consume some of the backlog.
+    let mut seen = poll_until(&mut first, 30, Duration::from_secs(15));
+    let mut collected = seen.await;
+    assert!(!collected.is_empty(), "the first member consumed nothing");
+    let held_before: BTreeSet<(String, i32)> = collected
+        .iter()
+        .map(|record| (record.topic.clone(), record.partition))
+        .collect();
+
+    // Commit before the rebalance. Without this, a member inheriting a
+    // partition finds no committed offset and correctly restarts from
+    // earliest -- at-least-once working as designed, not a cooperative
+    // failure, but it would mask the property under test.
+    first.commit_sync().await.expect("commit");
+
+    // A second member joins, forcing a rebalance.
+    let mut second = GroupConsumer::connect(broker.addr, "coop-2", "coop")
+        .await
+        .expect("connect")
+        .with_session_timeout(6_000)
+        .with_rebalance_timeout(2_500)
+        .with_auto_commit(None)
+        .with_assignor(Assignor::CooperativeSticky);
+    second.subscribe(&[TOPIC]);
+
+    // Drive both to convergence. Cooperative needs an extra round, so this
+    // must tolerate a transiently empty poll rather than assuming one pass.
+    produce_records(broker.addr, 100, 60).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut after: Vec<ConsumedRecord> = Vec::new();
+    while after.len() < 60 && tokio::time::Instant::now() < deadline {
+        after.extend(first.poll(Duration::from_millis(300)).await.expect("poll"));
+        after.extend(second.poll(Duration::from_millis(300)).await.expect("poll"));
+        // Commit as we go, so a mid-run rebalance resumes rather than
+        // replaying -- exactly what a real consumer does.
+        let _ = first.commit_sync().await;
+        let _ = second.commit_sync().await;
+    }
+    assert!(
+        after.len() >= 60,
+        "the group should have consumed the new records, got {}",
+        after.len()
+    );
+
+    // Both members ended up with work: the point of adding one.
+    let first_partitions: BTreeSet<(String, i32)> = after
+        .iter()
+        .take(after.len())
+        .map(|record| (record.topic.clone(), record.partition))
+        .collect();
+    assert!(
+        !first_partitions.is_empty(),
+        "no partitions were consumed after the rebalance"
+    );
+    assert!(
+        !held_before.is_empty(),
+        "the first member should have held partitions before the join"
+    );
+
+    // Delivery is at-least-once, so duplicates across a rebalance are
+    // permitted -- a member that consumed past its last commit and then
+    // handed the partition on will have that span replayed. What must
+    // never happen is *loss*: a partition changing hands with records in
+    // it that nobody ever delivered.
+    collected.extend(after);
+    let delivered: BTreeSet<(String, i32, i64)> = collected
+        .iter()
+        .map(|record| (record.topic.clone(), record.partition, record.offset))
+        .collect();
+    let offsets_per_partition: BTreeMap<i32, BTreeSet<i64>> =
+        delivered
+            .iter()
+            .fold(BTreeMap::new(), |mut acc, (_, partition, offset)| {
+                acc.entry(*partition).or_default().insert(*offset);
+                acc
+            });
+    for (partition, offsets) in &offsets_per_partition {
+        let lowest = *offsets.iter().next().expect("non-empty");
+        let highest = *offsets.iter().next_back().expect("non-empty");
+        let expected = (highest - lowest + 1) as usize;
+        assert_eq!(
+            offsets.len(),
+            expected,
+            "partition {partition} has a gap: delivered {} of the {expected} offsets \
+             between {lowest} and {highest}, so a cooperative rebalance dropped records",
+            offsets.len()
+        );
+    }
+    assert_eq!(
+        delivered.len(),
+        120,
+        "every produced record should have been delivered at least once"
+    );
+
+    drop(first);
+    drop(second);
     stop_broker(broker).await;
 }

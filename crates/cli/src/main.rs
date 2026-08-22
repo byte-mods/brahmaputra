@@ -183,7 +183,7 @@ enum Command {
         /// Partition assignor for group consumption.
         #[arg(
             long,
-            value_parser = ["range", "roundrobin", "sticky"],
+            value_parser = ["range", "roundrobin", "sticky", "cooperative-sticky"],
             default_value = "range",
             requires = "group"
         )]
@@ -1212,6 +1212,7 @@ async fn consume_group(
         "range" => Assignor::Range,
         "roundrobin" => Assignor::RoundRobin,
         "sticky" => Assignor::Sticky,
+        "cooperative-sticky" => Assignor::CooperativeSticky,
         other => anyhow::bail!("unknown assignor {other:?}"),
     };
     let auto_offset_reset = match auto_offset_reset {
@@ -1798,7 +1799,7 @@ mod tests {
 
         // Every assignor the group consumer implements must be reachable
         // from the CLI, or the flag silently lags the library.
-        for assignor in ["range", "roundrobin", "sticky"] {
+        for assignor in ["range", "roundrobin", "sticky", "cooperative-sticky"] {
             assert!(
                 Cli::try_parse_from([
                     "brahmaputra-cli",
@@ -1823,7 +1824,7 @@ mod tests {
             "--group",
             "shoppers",
             "--assignor",
-            "cooperative-sticky",
+            "no-such-assignor",
         ])
         .is_err());
     }

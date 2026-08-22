@@ -77,6 +77,14 @@ pub enum Assignor {
     /// per-partition state, because every partition that moves throws that
     /// state away.
     Sticky,
+    /// Sticky, and incremental: a partition that has to move is withheld
+    /// for one round so its current owner can revoke just that partition
+    /// while continuing to consume the rest.
+    ///
+    /// Costs one extra rebalance round and removes the stop-the-world
+    /// pause, which is the trade that matters once a group is large
+    /// enough that a full revoke-and-rejoin is felt downstream.
+    CooperativeSticky,
 }
 
 impl Assignor {
@@ -99,6 +107,13 @@ impl Assignor {
             Assignor::Range => range_assign(members, topic_partitions),
             Assignor::RoundRobin => roundrobin_assign(members, topic_partitions),
             Assignor::Sticky => sticky_assign(members, topic_partitions, previous),
+            // Cooperative computes the same sticky target, then withholds
+            // whatever is still held elsewhere so it can be revoked before
+            // it is handed over.
+            Assignor::CooperativeSticky => {
+                let target = sticky_assign(members, topic_partitions, previous);
+                withhold_moving_partitions(&target, previous)
+            }
         }
     }
 }
@@ -299,6 +314,55 @@ fn sticky_assign(
         held.sort();
     }
     assignment
+}
+
+/// Withhold, from a computed assignment, every partition that another
+/// member still holds — the cooperative half of incremental rebalancing
+/// (KIP-429).
+///
+/// Eager rebalancing stops the world: every member revokes everything and
+/// waits for a new assignment, so a group of a hundred consumers pauses
+/// entirely because one joined. Cooperative rebalancing instead moves a
+/// partition in two steps. In the first, a member that is losing a
+/// partition simply is not given it, so it revokes only that one and keeps
+/// consuming everything else. In the second — triggered because the
+/// assignment changed — the partition is genuinely free and goes to its
+/// new owner.
+///
+/// The cost is one extra rebalance round. The benefit is that a member
+/// keeping a partition never stops consuming it, which is what makes a
+/// rolling deploy something other than an outage.
+fn withhold_moving_partitions(
+    target: &BTreeMap<String, Vec<TopicPartition>>,
+    previous: &BTreeMap<String, Vec<TopicPartition>>,
+) -> BTreeMap<String, Vec<TopicPartition>> {
+    // Who holds what right now, so "still owned by someone else" is a
+    // lookup rather than a scan per partition.
+    let mut current_owner: BTreeMap<&TopicPartition, &String> = BTreeMap::new();
+    for (member_id, held) in previous {
+        for slot in held {
+            current_owner.insert(slot, member_id);
+        }
+    }
+
+    target
+        .iter()
+        .map(|(member_id, wanted)| {
+            let granted = wanted
+                .iter()
+                .filter(|slot| match current_owner.get(slot) {
+                    // Held by someone else: withhold it this round so that
+                    // member can revoke it cleanly first.
+                    Some(owner) => *owner == member_id,
+                    // Held by nobody — a new partition, or one already
+                    // revoked in an earlier round. Safe to assign now.
+                    None => true,
+                })
+                .cloned()
+                .collect();
+            (member_id.clone(), granted)
+        })
+        .collect()
 }
 /// One consumed record with its topic-partition and offset.
 #[derive(Debug)]
@@ -1139,9 +1203,28 @@ impl GroupConsumer {
             self.buffered.clear();
             self.fetch_positions = positions.clone();
         }
+        // Cooperative rebalancing moves a partition in two rounds: this
+        // one withheld it so the losing member could revoke it cleanly, and
+        // a second is needed to hand it to its new owner. Nothing else will
+        // trigger that round — the coordinator sees a completed rebalance —
+        // so the member that just gave something up asks for it.
+        //
+        // Only on an actual loss. Rejoining because the assignment merely
+        // *changed* would loop forever, since gaining a partition is also a
+        // change.
+        let revoked = self.assignor == Assignor::CooperativeSticky
+            && self
+                .assignment
+                .iter()
+                .any(|held| !assignment.contains(held));
+
         if self.assignment != assignment {
             self.assignment = assignment;
             self.assignment_version.fetch_add(1, Ordering::Relaxed);
+        }
+        if revoked {
+            tracing::debug!("revoked partitions cooperatively; rejoining to place them");
+            self.rejoin.store(true, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -1648,5 +1731,153 @@ mod sticky_tests {
             "sticky must move the departed member's partitions and nothing else"
         );
         all_assigned(&after, &topics);
+    }
+}
+
+#[cfg(test)]
+mod cooperative_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn members(list: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        list.iter()
+            .map(|(id, topics)| {
+                (
+                    (*id).to_string(),
+                    topics.iter().map(|t| (*t).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn topics(list: &[(&str, i32)]) -> BTreeMap<String, Vec<i32>> {
+        list.iter()
+            .map(|(topic, count)| ((*topic).to_string(), (0..*count).collect()))
+            .collect()
+    }
+
+    fn previous(list: &[(&str, &[(&str, i32)])]) -> BTreeMap<String, Vec<TopicPartition>> {
+        list.iter()
+            .map(|(id, held)| {
+                (
+                    (*id).to_string(),
+                    held.iter()
+                        .map(|(topic, partition)| ((*topic).to_string(), *partition))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The property cooperative rebalancing exists for: a member never has
+    /// a partition taken away from under it in the same round it is given
+    /// to someone else. Anything moving is withheld first.
+    #[test]
+    fn a_partition_is_never_assigned_while_another_member_still_holds_it() {
+        let topics = topics(&[("t", 6)]);
+        let before = previous(&[
+            ("a", &[("t", 0), ("t", 1), ("t", 2)]),
+            ("b", &[("t", 3), ("t", 4), ("t", 5)]),
+        ]);
+        // `c` arrives and should eventually take two partitions.
+        let grown = members(&[("a", &["t"]), ("b", &["t"]), ("c", &["t"])]);
+
+        let target = sticky_assign(&grown, &topics, &before);
+        let round_one = withhold_moving_partitions(&target, &before);
+
+        // Nothing `c` receives may still belong to a or b.
+        for slot in &round_one["c"] {
+            for (member_id, held) in &before {
+                assert!(
+                    !held.contains(slot),
+                    "{slot:?} was handed to c while {member_id} still holds it"
+                );
+            }
+        }
+        // And a and b keep everything they are not losing.
+        for member_id in ["a", "b"] {
+            for slot in &round_one[member_id] {
+                assert!(
+                    before[member_id].contains(slot),
+                    "{member_id} was given {slot:?} it did not already hold"
+                );
+            }
+        }
+    }
+
+    /// The second round is what actually places the withheld partitions.
+    /// Without it a joining member would sit with nothing forever.
+    #[test]
+    fn the_second_round_places_what_the_first_withheld() {
+        let topics = topics(&[("t", 6)]);
+        let before = previous(&[
+            ("a", &[("t", 0), ("t", 1), ("t", 2)]),
+            ("b", &[("t", 3), ("t", 4), ("t", 5)]),
+        ]);
+        let grown = members(&[("a", &["t"]), ("b", &["t"]), ("c", &["t"])]);
+
+        let target = sticky_assign(&grown, &topics, &before);
+        let round_one = withhold_moving_partitions(&target, &before);
+        // After round one, the revoked partitions belong to nobody.
+        let round_two_target = sticky_assign(&grown, &topics, &round_one);
+        let round_two = withhold_moving_partitions(&round_two_target, &round_one);
+
+        let placed: BTreeSet<TopicPartition> = round_two
+            .values()
+            .flat_map(|held| held.iter().cloned())
+            .collect();
+        let expected: BTreeSet<TopicPartition> = (0..6).map(|p| ("t".to_string(), p)).collect();
+        assert_eq!(
+            placed, expected,
+            "every partition must have an owner after the second round"
+        );
+        assert!(
+            !round_two["c"].is_empty(),
+            "the joining member must end up with partitions"
+        );
+    }
+
+    /// A stable group must not be disturbed: with nothing to move, the
+    /// cooperative pass is the identity.
+    #[test]
+    fn a_stable_group_is_untouched_by_the_cooperative_pass() {
+        let topics = topics(&[("t", 4)]);
+        let before = previous(&[("a", &[("t", 0), ("t", 1)]), ("b", &[("t", 2), ("t", 3)])]);
+        let same = members(&[("a", &["t"]), ("b", &["t"])]);
+
+        let target = sticky_assign(&same, &topics, &before);
+        let withheld = withhold_moving_partitions(&target, &before);
+        assert_eq!(withheld, target, "a settled group should not be reshuffled");
+        assert_eq!(withheld, before);
+    }
+
+    /// A departing member frees its partitions outright — nobody holds
+    /// them, so there is nothing to revoke and they can be placed at once.
+    /// Cooperative must not add a needless round to a departure.
+    #[test]
+    fn a_departure_needs_no_extra_round() {
+        let topics = topics(&[("t", 6)]);
+        let before = previous(&[
+            ("a", &[("t", 0), ("t", 1)]),
+            ("b", &[("t", 2), ("t", 3)]),
+            ("c", &[("t", 4), ("t", 5)]),
+        ]);
+        // `c` is gone; its partitions belong to nobody in `members`.
+        let survivors = members(&[("a", &["t"]), ("b", &["t"])]);
+        let mut without_c = before.clone();
+        without_c.remove("c");
+
+        let target = sticky_assign(&survivors, &topics, &without_c);
+        let granted = withhold_moving_partitions(&target, &without_c);
+
+        let placed: BTreeSet<TopicPartition> = granted
+            .values()
+            .flat_map(|held| held.iter().cloned())
+            .collect();
+        let expected: BTreeSet<TopicPartition> = (0..6).map(|p| ("t".to_string(), p)).collect();
+        assert_eq!(
+            placed, expected,
+            "an orphaned partition has no current owner, so it can move immediately"
+        );
     }
 }
