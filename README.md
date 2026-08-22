@@ -947,18 +947,24 @@ semantics, multi-datacentre replication, tiered storage.
 Known gaps, ranked, in [docs/kafka-parity.md](docs/kafka-parity.md) §8.
 The ones that matter most:
 
-1. **Topic-level configs other than `min.insync.replicas` are stored but
-   not applied.** The dashboard can set `retention.ms` on a topic and the
-   value is persisted, but the log still follows the broker-wide flag.
-2. **`sendfile` is plaintext-TCP only.** TLS and QUIC must read the bytes
-   to encrypt them, so those paths still make one copy out of the page
-   cache. Kafka has the same limitation whenever SSL is enabled.
-3. **No Kafka wire-protocol compatibility.** Existing Kafka clients,
+1. **No Kafka wire-protocol compatibility.** Existing Kafka clients,
    Connect, Streams and the surrounding ecosystem do not work against it;
    this speaks its own protocol.
-4. **Not benchmarked at RF=3 with `acks=all`.** Every published throughput
-   number is single-node, RF=1, so the replicated produce path — the one
-   production actually runs — is unmeasured. No soak test either.
+2. **No transactions or exactly-once semantics.** A read-process-write
+   pipeline cannot be built on it. Delivery is at-least-once, which plenty
+   of production Kafka also runs on, but it is a real ceiling on which
+   workloads qualify.
+3. **`sendfile` is Linux and plaintext-TCP only.** TLS and QUIC must see
+   the bytes to encrypt them, so those paths keep one copy out of the page
+   cache — Kafka has the same limitation whenever SSL is enabled. On
+   non-Linux platforms the fallback reads the range and writes it: correct
+   everywhere, just not free. That fallback is what every test on the
+   Windows development host exercises.
+4. **No JBOD.** One data directory per broker, so a single disk failure
+   takes the whole broker rather than the partitions on that disk.
+5. **No soak history.** The failure suites kill brokers under load and
+   assert what survived, but they run for minutes. Nothing here has been
+   run for a week.
 
 On production readiness: with `--require-auth` and TLS this is no longer
 open to anyone who can reach the port, and the offsets topic no longer

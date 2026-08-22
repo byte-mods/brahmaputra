@@ -18,6 +18,12 @@ producer, a Raft (KRaft-style) control plane, consumer groups with
 generation fencing and offsets in `__consumer_offsets`, log compaction,
 retention, quotas, TLS, authentication and ACLs.
 
+The control plane can now also *reshape* a cluster: partitions move
+between brokers, placement is rack-aware, and topic-configuration changes
+reach running partitions. That is what decides whether a cluster can be
+operated for years rather than merely started once, and it was the
+largest non-protocol gap.
+
 The one gap that dominates every other consideration is **§2: this speaks
 its own wire protocol, not Kafka's**. No Kafka client, Connect, Streams,
 Schema Registry, MirrorMaker or ecosystem tool works against it. That is
@@ -93,15 +99,15 @@ version-1 client gets `UNSUPPORTED_VERSION` rather than misparsing.
 | `offsets.topic.num.partitions` | 50 | `--offsets-topic-partitions` | ✅ |
 | `offsets.retention.minutes` | 7 days | **`--offsets-retention-ms`** | ✅ *new* |
 | `offsets.topic.replication.factor` | 3 | derived from cluster size | 🟡 not configurable |
-| `group.initial.rebalance.delay.ms` | 3 s | — | ❌ |
-| `group.min/max.session.timeout.ms` | 6 s / 30 min | — | ❌ client timeout accepted unbounded |
+| `group.initial.rebalance.delay.ms` | 3 s | fixed 1 s | ✅ not tunable |
+| `group.min/max.session.timeout.ms` | 6 s / 30 min | clamped to 1 s / 30 min | ✅ not tunable |
 | `num.network.threads` / `num.io.threads` | 3 / 8 | tokio runtime + per-partition actor | ✅ different model, same effect |
 | `socket.request.max.bytes` | 100 MiB | `max_frame_bytes` (32 MiB) | 🟡 no flag |
 | `log.index.interval.bytes` | 4096 | `LogConfig` | 🟡 no flag |
-| `broker.rack` | — | `--rack`, recorded | 🟡 not used for placement |
+| `broker.rack` | — | `--rack`, used for replica placement | ✅ |
 | `auto.create.topics.enable` | true | standalone on, cluster off | ✅ |
 | `quota.producer.default` / `.consumer.` | — | `--quota-*-bytes-per-sec` | ✅ throttles by delaying the ack |
-| `replication.quota.*` | — | — | ❌ replication traffic unthrottled |
+| `replication.quota.*` | — | `--quota-replication-bytes-per-sec` | ✅ |
 | `ssl.*` | — | `--transport tcp-tls` / `quic` | 🟡 self-signed, no client certs |
 | `sasl.*` | — | `--require-auth` + ACLs | 🟡 password auth, no SASL mechanisms |
 
@@ -144,10 +150,10 @@ there is no `AlterConfigs` — configs are fixed at topic creation.
 | Kafka config | Kafka default | Brahmaputra | Status |
 |---|---|---|---|
 | `group.id` | — | ✅ | ✅ |
-| `partition.assignment.strategy` | range,cooperative-sticky | range / roundrobin / **sticky** | 🟡 sticky is eager, not cooperative |
+| `partition.assignment.strategy` | range,cooperative-sticky | range / roundrobin / sticky / **cooperative-sticky** | ✅ |
 | `enable.auto.commit` / `auto.commit.interval.ms` | true / 5 s | ✅ | ✅ |
 | `max.poll.records` | 500 | 500 | ✅ |
-| `session.timeout.ms` | 45 s | 10 s | ✅ configurable |
+| `session.timeout.ms` | 45 s | 10 s, clamped 1 s–30 min | ✅ configurable |
 | `heartbeat.interval.ms` | 3 s | derived | 🟡 not independently configurable |
 | **`max.poll.interval.ms`** | 5 min | **300 s** | ✅ *new* |
 | **`group.instance.id`** | — | **supported** | ✅ *new*, static membership |
@@ -170,14 +176,18 @@ there is no `AlterConfigs` — configs are fixed at topic creation.
 | Leader/follower replication, ISR, HW | ✅ | ✅ |
 | Leader-epoch truncation (KIP-101) | ✅ verified live | ✅ |
 | Controller-driven election from ISR, epoch fencing | ✅ Raft | ✅ |
+| **Partition reassignment** | ✅ union-then-narrow; drained brokers free their disk | ✅ |
+| **Rack-aware replica placement** | ✅ interleaved, leadership rotated | ✅ |
+| **Live topic-config changes** | ✅ pushed to running partitions | ✅ |
 | Consumer groups, coordinator failover by log replay | ✅ verified live | ✅ |
-| Rebalance protocol | 🟡 eager only | 🟡 |
+| Rebalance protocol | ✅ eager and cooperative (KIP-429) | ✅ |
 | **Offset expiry** | ✅ *new* | ✅ |
 | Log compaction | ✅ | ✅ |
-| Quotas / throttling | ✅ | ✅ |
+| Quotas / throttling | ✅ client produce/fetch **and replication** | ✅ |
 | TLS / auth / ACLs | ✅ | ✅ |
 | Transactions / EOS | ❌ | v1 non-goal |
 | Tiered storage | ❌ | v1 non-goal |
+| Multi-log-dir / JBOD | ❌ | one disk per broker |
 | Metrics endpoint / dashboard | ✅ | ✅ |
 
 **On `sendfile`:** the zero-copy fetch path is `#[cfg(target_os = "linux")]`
@@ -220,36 +230,66 @@ non-replicated Kafka would be dishonest, so no such comparison is made.
 1. **No Kafka wire-protocol compatibility.** No Kafka client, Connect,
    Streams, ksqlDB, Schema Registry, MirrorMaker, Debezium, Flink/Spark
    connector or `kafka-*.sh` tool works. Everything that talks to this
-   must be rewritten against one of the four native drivers, two of which
-   have never been run.
+   must be rewritten against one of the native drivers. Nothing else on
+   this list compensates for it.
 
 **Semantics**
 
 2. **No transactions or exactly-once semantics.** Read-process-write
    pipelines that need atomicity cannot be built on this.
-3. **Eager rebalancing only.** Sticky assignment minimises *movement*, but
-   every rebalance is still stop-the-world; there is no cooperative
-   protocol.
-4. No `group.initial.rebalance.delay.ms`, and client-supplied session
-   timeouts are accepted unbounded.
-5. No `AlterConfigs`: topic configs are fixed at creation.
+3. No `buffer.memory` / `max.block.ms`: a client that outruns its broker
+   buffers without bound rather than blocking.
+4. No `delivery.timeout.ms`: retries are bounded per attempt, not
+   end to end.
 
 **Operational**
 
-6. **No production track record and no soak test.** The longest run in
-   this repository is a chaos script measured in minutes.
-7. **Replication traffic is unquota-limited**, so a catching-up follower
-   can crowd out client traffic.
-8. No multi-log-dir/JBOD, no rack-aware replica placement.
-9. `sendfile` is Linux-plus-plaintext only.
-10. TLS is self-signed with no client certificates; authentication is
-    password-only with no SASL mechanism negotiation.
-11. No follower fetching (`client.rack`), so cross-AZ reads all cross AZs.
+5. **No production track record.** `scripts/soak.sh` now exists and
+   sustains `acks=all` load through repeated broker kills while watching
+   memory, segment counts and offset monotonicity — but the longest run to
+   date is measured in minutes. A soak that would actually move this is
+   measured in weeks.
+6. **No multi-log-dir / JBOD.** One data directory per broker, so a single
+   disk failure takes the whole broker rather than the partitions on it.
+7. `sendfile` is Linux-plus-plaintext only; elsewhere the fallback reads
+   the range and writes it — correct, just not free.
+8. TLS is self-signed with no client certificates; authentication is
+   password-only with no SASL mechanism negotiation.
 
+**Efficiency at scale**
+
+9. No follower fetching (`client.rack`), so every consumer read crosses
+   AZs.
+10. No tiered storage: retention is bounded by local disk.
+11. No incremental fetch sessions (KIP-227), so per-fetch metadata cost
+    grows with partition count.
+12. `heartbeat.interval.ms` is derived from the session timeout rather
+    than set independently.
+
+## 9a. Closed since the last audit
+
+Recorded because this document has drifted before, and a gap list that
+only ever grows is not being read against the code.
+
+- **Partition reassignment.** `ReassignPartition` / `CompleteReassignment`
+  move a partition between brokers, keeping the union of old and new
+  replicas until the targets are in the ISR so durability never dips. A
+  drained broker deletes the partition's local data, so rebalancing
+  reclaims disk instead of merely relabelling it.
+- **Rack-aware placement.** `--rack` is read: replicas interleave across
+  racks and leadership rotates between them, so RF=3 spans three failure
+  domains instead of possibly landing in one.
+- **Live topic configuration.** Changes reach running partitions on the
+  maintenance tick rather than waiting for a restart.
+- **Replication quotas.** `--quota-replication-bytes-per-sec` bounds what
+  a catching-up follower can take, so one broker restart is no longer a
+  cluster-wide latency event.
+- **Cooperative rebalancing** (KIP-429), alongside eager.
+- **Bounded session timeouts** and `group.initial.rebalance.delay.ms`.
 ## 10. Verification
 
 ```bash
-cargo test --workspace                    # 283
+cargo test --workspace                    # 304
 bash scripts/verify-m1.sh                 # 31  storage, protocol, SIGKILL recovery
 bash scripts/verify-m4.sh                 # 30  consumer groups across 5 nodes
 bash scripts/verify-m5.sh                 # 15  fsync, quotas, version negotiation
@@ -259,6 +299,8 @@ bash scripts/verify-retention.sh          # 21  time and size retention
 bash scripts/verify-failures.sh           # 15  producer/broker/consumer kills
 bash scripts/verify-transport-parity.sh   #     tcp vs tls vs quic, identical
 bash scripts/verify-chaos.sh              # 7   random kills under load
+bash scripts/verify-reassignment.sh       # 10  rack placement, partition moves, disk freed
+SOAK_MINUTES=20 bash scripts/soak.sh      # 5   sustained load through repeated kills
 bash scripts/bench-replicated.sh          #     RF=3 acks=all vs RF=1 acks=1
 ```
 
