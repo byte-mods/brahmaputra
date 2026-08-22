@@ -357,6 +357,12 @@ pub struct PartitionHandle {
     tx: mpsc::Sender<Cmd>,
     /// Latest high watermark (== log end in M1); used for fetch long-polls.
     watermark: watch::Receiver<i64>,
+    /// Latest log end offset, published on every append. A consumer's
+    /// long poll waits on the watermark, because a consumer may not read
+    /// past it; a *follower* must wait on this instead, because under
+    /// `acks=all` the watermark cannot advance until that follower has
+    /// fetched — waiting on the watermark would deadlock against itself.
+    appends: watch::Receiver<i64>,
 }
 
 impl PartitionHandle {
@@ -568,6 +574,12 @@ impl PartitionHandle {
     pub fn watermark_watch(&self) -> watch::Receiver<i64> {
         self.watermark.clone()
     }
+
+    /// Watch the log end offset, which moves on every append regardless of
+    /// commit state. This is what a follower fetch long-polls on.
+    pub fn append_watch(&self) -> watch::Receiver<i64> {
+        self.appends.clone()
+    }
 }
 
 fn actor_gone() -> StorageError {
@@ -641,6 +653,7 @@ fn spawn_mode(
 ) -> (PartitionHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(capacity);
     let (wm_tx, wm_rx) = watch::channel(log.high_watermark());
+    let (append_tx, append_rx) = watch::channel(log.log_end_offset());
     let retention_tick = retention_check_interval.map(|duration| {
         let duration = duration.max(Duration::from_millis(1));
         let mut interval = tokio::time::interval_at(Instant::now() + duration, duration);
@@ -651,6 +664,7 @@ fn spawn_mode(
         log,
         rx,
         wm_tx,
+        append_tx,
         retention_tick,
         auto_commit,
         reset_context,
@@ -659,6 +673,7 @@ fn spawn_mode(
         PartitionHandle {
             tx,
             watermark: wm_rx,
+            appends: append_rx,
         },
         task,
     )
@@ -668,6 +683,7 @@ async fn run(
     log: Log,
     mut rx: mpsc::Receiver<Cmd>,
     watermark: watch::Sender<i64>,
+    appends: watch::Sender<i64>,
     mut retention_tick: Option<Interval>,
     auto_commit: bool,
     reset_context: Option<ResetContext>,
@@ -1021,6 +1037,18 @@ async fn run(
                     current.log_end_offset(),
                     current.high_watermark(),
                 ));
+            }
+        }
+        // Publish the log end offset whenever it moves, from one place
+        // rather than from each append arm: a follower long-polling this
+        // leader is woken by it, and a notification that a future append
+        // command forgot to send would look exactly like a stalled
+        // replica. Truncation moves the end backwards and is published
+        // too — a waiter that re-reads after one is still correct.
+        if let Some(current) = log.as_ref() {
+            let end = current.log_end_offset();
+            if end != *appends.borrow() {
+                let _ = appends.send(end);
             }
         }
         if log.is_none() {

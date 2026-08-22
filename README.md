@@ -9,8 +9,8 @@ binary, with no JVM, no ZooKeeper and no heap to tune.
 [![CI](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml/badge.svg)](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-230%20passing-brightgreen.svg)](#verification)
-[![Throughput](https://img.shields.io/badge/vs%20Kafka-3.0%C3%97%20produce%20%C2%B7%205.7%C3%97%20consume-brightgreen.svg)](#performance)
+[![Tests](https://img.shields.io/badge/tests-306%20passing-brightgreen.svg)](#verification)
+[![Throughput](https://img.shields.io/badge/vs%20Kafka-3.4%C3%97%20produce%20at%20RF%3D3-brightgreen.svg)](#performance)
 [![Transports](https://img.shields.io/badge/transport-TCP%20%C2%B7%20TLS%201.3%20%C2%B7%20QUIC-informational.svg)](#transports)
 [![Auth](https://img.shields.io/badge/auth-SASL--style%20%C2%B7%20ACLs-blueviolet.svg)](#authentication-and-access-control)
 
@@ -25,7 +25,7 @@ open http://localhost:8080                              # dashboard
 
 |  | |
 |---|---|
-| 🚀 **Faster than Kafka on both sides** | At equal CPU: **3.0× produce**, **5.7× consume** at 256 B records, on **8–28× less memory**. [Measured, with method →](#performance) |
+| 🚀 **Faster than Kafka where it counts** | Three brokers at RF=3, `acks=all` — the durable setting — **3.4× produce** and **2.1× consume**, on **4.5× less memory**. Replication costs it 1.47× against Kafka's 3.18×. [Measured, with method →](#performance) |
 | 🧩 **One static binary** | Broker, controller, dashboard and metrics compiled in. No JVM, no ZooKeeper, no Prometheus required. |
 | 🔁 **Kafka semantics, not just Kafka shape** | Leader/ISR replication, leader-epoch truncation (KIP-101), high-watermark visibility, `acks=0/1/all`, idempotent producer, consumer groups with generation fencing. |
 | 🔌 **Three transports, one flag** | Plain TCP, TLS 1.3, or QUIC — same wire format, same correctness suite. |
@@ -88,9 +88,9 @@ Brahmaputra keeps the model and removes those costs:
 - **One static binary.** No JVM, no ZooKeeper, no separate controller
   process, no external metrics stack. The dashboard is compiled in.
 - **Memory that does not grow with load.** The broker passes refcounted
-  byte slices and leans on the page cache. Under a 2 GiB workload it holds
-  ~200–300 MiB resident where Kafka's JVM holds 1.4–2.8 GiB
-  ([benchmarks](docs/benchmarks.md)).
+  byte slices and leans on the page cache. A three-broker cluster under
+  RF=3 `acks=all` load holds under 1 GiB across the whole cluster where
+  Kafka holds 4.5 GiB ([benchmarks](#performance)).
 - **Choice of transport.** Plain TCP, TLS 1.3 over TCP, or QUIC — same
   wire format, one flag.
 
@@ -682,135 +682,110 @@ than papered over with a larger timeout. Run the live suites serially.
 
 ## Performance
 
-Head-to-head with Apache Kafka 3.9.0, same host, same container limits
-(4 CPUs, 4 GiB), same record size, partition count and durability setting,
-each system driven by its own client from inside its own container.
+Head-to-head with Apache Kafka 4.3.1 in the configuration a durable
+deployment actually runs: **three brokers each, RF=3, `acks=all`,
+`min.insync.replicas=2`**. Same host, same container limits (4 CPUs and
+4 GiB per broker, so 1200 % is the CPU ceiling for a three-node cluster),
+same record size and partition count, each system driven by its own
+clients from inside its own containers.
+
+Means of three consecutive runs, 8 000 000 × 256 B records across
+4 concurrent clients and 6 partitions.
 
 ```
-256 B records · 4 CPUs each · both saturated at ~400 % CPU
+RF=3 · acks=all · min.insync.replicas=2 · 256 B records
 
-produce   Kafka  ████████                                 257 848 msgs/sec
-          TCP    ████████████████████████                 772 947  (3.0×)
-          QUIC   █████████████                            418 498  (1.6×)
+produce   Kafka         ████████                          231 454 msgs/sec
+          Brahmaputra   ████████████████████████████      787 385  (3.40×)
 
-consume   Kafka  ████                                     572 656 msgs/sec
-          TCP    ████████████████████████████             3 238 866 (5.7×)
-          QUIC   ████████                                 924 642  (1.6×)
+consume   Kafka         ██████████████                  1 413 122 msgs/sec
+          Brahmaputra   ██████████████████████████████  2 977 061  (2.11×)
 
-memory    Kafka  ████████████████████████████             2 080–2 722 MiB
-          TCP    █                                        98–256 MiB
+memory    Kafka         ████████████████████████████        4 464 MiB
+          Brahmaputra   ██████                                999 MiB  (4.5× less)
 ```
 
-Throughput alone is a weak comparison, because a single client can leave a
-fast broker idle — that reads as "similar throughput" when it really means
-"the client ran out of work to give". So each system is driven at 1, 2, 4
-and 8 concurrent clients, and the headline compares them **at the same CPU
-draw**: with `--cpus 4`, 400 % is the ceiling, and all three saturate it.
+| Metric | Kafka | Brahmaputra |
+|---|---|---|
+| **Produce msgs/sec** (RF=3, `acks=all`) | 231 454 | **787 385** (3.40×) |
+| Produce msgs/sec, client-measured | 257 503 | **838 655** (3.26×) |
+| Produce cluster CPU % (ceiling 1200) | 940 | **828** |
+| Produce cluster memory MiB | 4 464 | **999** |
+| **Consume msgs/sec** (RF=3) | 1 413 122 | **2 977 061** (2.11×) |
+| Consume msgs/sec, client-measured | 3 159 988 | **3 712 925** (1.17×) |
 
-**256 B records, ~400 % CPU on both sides:**
+Consume is close, and honestly so: wall clock favours Brahmaputra because
+it charges Kafka roughly two seconds of JVM startup, while each client's
+own reported rate puts them within 17 %.
 
-| Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC |
-|---|---|---|---|
-| **Produce msgs/sec** | 257 848 | **772 947** (3.0×) | 418 498 (1.6×) |
-| Produce CPU % | 399.3 | 403.2 | 402.7 |
-| Produce memory MiB | 2080 | **256** | 197 |
-| **Consume msgs/sec** | 572 656 | **3 238 866** (5.7×) | 924 642 (1.6×) |
-| Consume CPU % | 350.5 | 331.1 | 320.9 |
-| Consume memory MiB | 2722 | **98** | 95 |
+### What replication costs
 
-Best result any concurrency level reached, which is the number to quote for
-capacity planning:
+The number that decides whether a design replicates cheaply. Each ratio is
+computed *within* one system, using the same client and the same metric.
 
-| | Kafka | Brahmaputra TCP | Brahmaputra QUIC |
-|---|---|---|---|
-| Peak produce msgs/sec | 257 848 | **916 380** (3.6×) | 419 287 (1.6×) |
-| Peak consume msgs/sec | 572 656 | **3 652 968** (6.4×) | 1 230 769 (2.1×) |
+| System | RF=1 `acks=1` | RF=3 `acks=all` | Kept | Cost |
+|---|---|---|---|---|
+| Kafka | 735 668 | 231 454 | 31 % | 3.18× |
+| **Brahmaputra** | 1 157 006 | **787 385** | **68 %** | **1.47×** |
 
-**1 MiB records**, same run, same limits:
-
-| Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC |
-|---|---|---|---|
-| Produce MB/sec | 170.9 | **418** (2.5×) | 112 |
-| Consume MB/sec | 221.5 | **942** (4.3×) | 106 |
-| Consume CPU % | 149.8 | **116.0** | 270.3 |
-| Consume memory MiB | 2952 | **1065** | 792 |
-
-Consume at this size used to be the one place Kafka clearly won
-(377 against 575). It took two rounds of read-path work to turn that
-around: removing the three copies between the page cache and the socket,
-then removing the copy *out of* the page cache with `sendfile`. Consume
-went from 603 to 942 MB/sec while its CPU **fell** from 155 % to 116 % —
-more bytes on less CPU is what a removed copy looks like.
-Details in [docs/benchmarks.md](docs/benchmarks.md).
-
-Memory is the most stable difference and it is structural rather than
-tuning: the JVM holds its heap and copies records through it, while the
-Rust broker passes refcounted `Bytes` slices and leans on the page cache,
-so its resident set stays in the tens or low hundreds of MiB regardless of
-load — **8–28× less** across these runs.
+Brahmaputra keeps more than twice the share of its unreplicated throughput
+that Kafka keeps. Across three runs the two cost ranges — 3.04–3.31× and
+1.39–1.59× — do not overlap.
 
 ### What made it fast
 
-Every one of these was found by measuring, not by guessing, and each is
-described where it lives in [docs/benchmarks.md](docs/benchmarks.md).
+Two defects found by building this benchmark, both fixed in 0.2.0.
 
 | Problem | Fix | Effect |
 |---|---|---|
-| The high-watermark checkpoint fsynced on **every append**, per partition — the most expensive operation available spent on a recovery hint, while the record data itself is left to the OS as Kafka leaves it | Write it on a 5 s timer, as Kafka's `replica.high.watermark.checkpoint.interval.ms` does; `__consumer_offsets` still checkpoints eagerly | 116k → **356k** msgs/sec produce (3.1×) |
-| One topic-partition per Produce/Fetch request, so per-request cost was paid per partition — and it dominates at small records | `ProduceMulti`/`FetchMulti` carry every partition a client holds on a broker in one request | 6.4× consume |
-| The broker processed one request at a time per connection, so the client's in-flight window bought nothing and a long poll blocked everything behind it | Dispatch requests concurrently behind a bounded in-flight limit | +17 % produce |
-| A batched flush held every partition's send lock across the round trip, allowing one request in flight per broker | Split partitions into `max.in.flight` fixed shards, so ordering holds per partition while shards overlap | +20 % produce |
-| Every `send()` that found a full batch queued its own flush behind the partition lock, so raising concurrency *lowered* throughput | Skip the size-triggered flush when one is already running; the running flusher drains the buffer | 5 162 → **61 187** msgs/sec (11.9×) |
-| The broker never set `TCP_NODELAY` on accepted sockets, so responses waited on Nagle plus the peer's delayed ACK | `set_nodelay(true)` on accept | 6 415 → **14 790** msgs/sec |
-| The broker decoded and re-encoded every batch on append | Validate the header only and stamp `base_offset`/`leader_epoch` in place — both sit before the CRC, so it stays valid | +34 % |
-| Every fetched byte was copied **four times** before the kernel saw it: `pread`, concatenate the batches, copy into a frame, copy into the codec's buffer | Write the response as the chain of buffers it already is, with one `writev` | consume **377 → 603 MB/sec** at 1 MiB |
-| The one copy left was out of the page cache itself — the one Kafka never makes | Describe a fetch as file ranges and let `sendfile` move them; only 27 bytes per batch are read, to apply the offset, watermark and budget rules | consume **603 → 942 MB/sec**, CPU **155 % → 116 %** |
-| A read made two syscalls and a fresh zero-filled allocation per batch | One `pread` covers a run of batches; each is a slice of that shared buffer | fewer syscalls, no per-batch memset |
+| A follower learned about new appends only by asking again, and slept 50 ms between empty answers. Under `acks=all` the high watermark cannot advance until followers have fetched, so **every producer waited out that sleep before its record could commit** — the cluster ran at the polling interval, not at the speed of the log | Leaders hold a caught-up follower's fetch until an append arrives or 500 ms passes, waiting on a log-end-offset watch rather than the high watermark (which cannot advance until this follower fetches — waiting on it would be waiting on itself) | RF=3 produce **106 077 → 787 385** msgs/sec; replication cost 13.35× → **1.47×** |
+| The client resolved the broker hostname on **every send** and never cached it — a measured 6 418 `lookup_host` calls to produce 2 000 records. Only name-advertised clusters paid it, which is every Kubernetes or Compose deployment | Cache resolved addresses on the router with a 30 s TTL, dropped when the connection to that address is invalidated so a broker returning at a new IP is re-resolved at once | 400 000 records to a name-advertised cluster: **6.22 s → 1.45 s** |
 
-And one that was not a performance bug at all: a batched fetch could build
-a response **larger than the frame the client accepts**, because each
-partition's read overshoots its allowance by up to a whole batch and
-nothing capped the total. With megabyte batches across six partitions the
-frame was rejected and the connection dropped — an intermittent
-"connection closed" that made the 1 MiB benchmark hang outright. The
-budget is now enforced across the whole response.
+Memory is the most stable difference and it is structural rather than
+tuning: the JVM holds its heap and copies records through it, while the
+Rust broker passes refcounted `Bytes` slices and leans on the page cache.
+
+The earlier read- and write-path work that got the single-node numbers
+here — removing four copies from the fetch path, `sendfile`, multi-partition
+requests, concurrent request dispatch — is documented with its own
+measurements in [docs/benchmarks.md](docs/benchmarks.md).
 
 ### Benchmark method
-
-The exact machine, both systems' full configuration, and how the numbers
-are taken are documented in
-[docs/benchmarks.md §1](docs/benchmarks.md). In summary:
 
 | | |
 |---|---|
 | Host | AMD Ryzen AI MAX+ 395, 32 logical CPUs, 64 GB RAM |
-| OS | Windows 11 26200, Docker Desktop 29.6.2, WSL2 kernel 6.18.33.2 |
+| OS | Windows 11 26200, Docker Desktop 29.6.2, WSL2 |
 | Per container | `--cpus 4 --memory 4g`, overlayfs on the WSL2 virtual disk |
-| Workload | 1 000 000 × 256 B records per client, 6 partitions, RF=1, acks=1 |
+| Cluster | 3 brokers per system; Kafka `apache/kafka:4.3.1` in KRaft mode |
+| Workload | 2 000 000 × 256 B records per client, 4 clients, 6 partitions |
 | Producer | `batch.size` 64 KiB, `linger.ms` 5, no compression |
-| Kafka | `apache/kafka:3.9.0` KRaft, 2 GiB G1 heap, 8 I/O + 4 network threads, 1 MiB socket buffers |
 
-Kafka is tuned rather than left at defaults — a 2 GiB heap inside a 4 GiB
-container so the page cache it relies on has room, G1 with a 20 ms pause
-target, and a separate small heap for the perf-test clients (they read the
-same `KAFKA_HEAP_OPTS`, so one large setting silently gives every client a
-large heap too, which is what makes an 8-client run fall over).
+Load generators run inside the broker containers, spread round-robin
+across all three, so sampled CPU and memory cover broker *plus* client for
+both systems. Both clusters advertise static IPs, and **both consumers
+join a consumer group** — `kafka-consumer-perf-test` always does, and
+comparing it against an uncoordinated reader overstates the other side by
+about 3×.
+
+Every RF=3 level asserts it actually replicated: Kafka must report ISR=3 on
+all six partitions, and Brahmaputra must hold partition logs on all three
+nodes with log end offsets summing exactly to the records produced.
 
 Reproduce:
 
 ```bash
-bash scripts/bench-matched.sh          # resource-matched, all three systems
-bash scripts/bench-three-way.sh        # 1 MiB records, all three
-bash scripts/bench-vs-kafka.sh         # small records, Kafka vs Brahmaputra
+PER_CLIENT=2000000 LEVELS=4 bash scripts/bench-replicated-vs-kafka.sh
+bash scripts/bench-replicated.sh    # native, no Docker: RF=3 against RF=1
 ```
 
-**Caveats.** Docker Desktop on Windows virtualises disk and network, so
-absolute numbers are below bare metal for every system measured; the
-comparison between them is the useful part. Run-to-run variance is high —
-Kafka's own produce peak moved between 147k and 258k msgs/sec across runs
-on this host — so all three systems are always measured in a single run,
-and only within-run comparisons are quoted. One run per configuration, no
-confidence intervals.
+**Caveats.** Three brokers per system share one host's disk and NIC, so
+absolute numbers sit below real hardware — for both systems equally, which
+is what preserves the ratios. Kafka gains up to 40 % on longer runs from
+JIT warmup and was still climbing when measurement stopped, so its side of
+every ratio is a floor. Throughput only; no latency percentiles. Full
+report, including two findings this benchmark surfaced that are not fixed,
+in [docs/replicated-benchmark-2026-08-22.md](docs/replicated-benchmark-2026-08-22.md).
 
 ## Architecture
 
