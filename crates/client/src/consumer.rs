@@ -8,12 +8,12 @@ use brahmaputra_protocol::gen::{
     ApiVersionsRequest, ApiVersionsResponse, FetchMultiPartition, FetchMultiRequest, FetchRequest,
     FetchResponse, ListOffsetsRequest,
 };
-use brahmaputra_protocol::{ApiKey, ProtocolError, RecordBatch, RecordHeader};
+use brahmaputra_protocol::{ApiKey, IsolationLevel, ProtocolError, RecordBatch, RecordHeader};
 use bytes::Bytes;
 
 use crate::error::ClientError;
 use crate::router::{message_error, BrokerRouter};
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportConfig};
 
 /// `timestamp` sentinel for [`Consumer::list_offsets`]: earliest offset.
 pub const EARLIEST: i64 = -2;
@@ -26,6 +26,9 @@ pub struct Consumer {
     max_bytes: i32,
     min_bytes: i32,
     max_wait_ms: i32,
+    /// What a fetch is allowed to see. `ReadCommitted` bounds it at the
+    /// last stable offset and skips aborted records.
+    isolation_level: IsolationLevel,
 }
 
 impl Consumer {
@@ -33,9 +36,19 @@ impl Consumer {
         Consumer::connect_with(Transport::default(), addr, client_id).await
     }
 
+    /// Read only what has been committed.
+    ///
+    /// On a topic nobody writes transactionally to this changes nothing —
+    /// the last stable offset and the high watermark are the same place —
+    /// which is why it is opt-in rather than the default.
+    pub fn with_isolation_level(mut self, isolation_level: IsolationLevel) -> Self {
+        self.isolation_level = isolation_level;
+        self
+    }
+
     /// Connect over an explicit transport (must match the broker's).
     pub async fn connect_with(
-        transport: Transport,
+        transport: impl Into<TransportConfig>,
         addr: SocketAddr,
         client_id: &str,
     ) -> Result<Consumer, ClientError> {
@@ -46,6 +59,7 @@ impl Consumer {
             max_bytes: 8 * 1024 * 1024,
             min_bytes: 1,
             max_wait_ms: 500,
+            isolation_level: IsolationLevel::default(),
         })
     }
 
@@ -78,6 +92,7 @@ impl Consumer {
             max_bytes,
             min_bytes: 1,
             max_wait_ms: 500,
+            isolation_level: IsolationLevel::default(),
         }
     }
 
@@ -113,6 +128,7 @@ impl Consumer {
             max_bytes: self.max_bytes,
             max_wait_ms: max_wait_ms.min(self.max_wait_ms),
             min_bytes: self.min_bytes,
+            isolation_level: self.isolation_level.to_wire(),
         };
         let body = Bytes::from(req.encode().map_err(msg_err)?);
         let (mut resp, mut raw_batches) = self.fetch_once(topic, partition, &body).await?;
@@ -126,6 +142,13 @@ impl Consumer {
         for raw in raw_batches {
             let mut buf = raw;
             let batch = RecordBatch::decode(&mut buf)?;
+            // A control batch is a transaction marker, not data. It occupies
+            // an offset — which is why a transactional topic's offsets are
+            // not contiguous — but no application ever sees it, at either
+            // isolation level.
+            if batch.control {
+                continue;
+            }
             for (record_offset, record) in batch.iter() {
                 if record_offset >= offset {
                     records.push(FetchedRecord {
@@ -345,6 +368,7 @@ impl Consumer {
             let request = FetchMultiRequest {
                 max_wait_ms: max_wait_ms.min(self.max_wait_ms),
                 min_bytes: self.min_bytes,
+                isolation_level: self.isolation_level.to_wire(),
                 partitions: descriptors,
             };
             let body = request.encode().map_err(message_error)?;
@@ -377,6 +401,11 @@ impl Consumer {
                 for raw in raw_batches {
                     let mut buffer = raw;
                     let batch = RecordBatch::decode(&mut buffer)?;
+                    // Transaction markers occupy offsets but are not data;
+                    // no application sees one, at either isolation level.
+                    if batch.control {
+                        continue;
+                    }
                     let base = batch.base_offset;
                     let max_timestamp = batch.max_timestamp;
                     for (index, record) in batch.records.into_iter().enumerate() {

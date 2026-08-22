@@ -23,12 +23,14 @@ use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
     FetchMultiRequest, FetchMultiResult, ProduceMultiResponse, ProduceMultiResult,
 };
-use brahmaputra_protocol::{validate_batch_header, ApiKey};
+use brahmaputra_protocol::{validate_batch_header, ApiKey, IsolationLevel};
 use bytes::Bytes;
 use tracing::warn;
 
 use crate::error::BrokerError;
-use crate::handlers::{code_of, encode_error_for, now_ms, wait_for_high_watermark, ResponseBody};
+use crate::handlers::{
+    code_of, encode_error_for, now_ms, wait_for_high_watermark, ClientIdentity, ResponseBody,
+};
 use crate::quota::QuotaKind;
 use crate::server::Broker;
 use brahmaputra_client::Transport;
@@ -37,7 +39,7 @@ use brahmaputra_storage::LogRegion;
 pub(crate) async fn produce_multi(
     broker: &Broker,
     body: Bytes,
-    client_id: Option<&str>,
+    client: ClientIdentity<'_>,
 ) -> Option<Bytes> {
     let (request, per_partition) = match codec::decode_produce_multi(body) {
         Ok(decoded) => decoded,
@@ -95,7 +97,7 @@ pub(crate) async fn produce_multi(
     metrics.count(names::PRODUCE_RECORDS, total_records);
     metrics.count(names::PRODUCE_BYTES, total_bytes);
     let throttle = broker
-        .throttle(client_id, QuotaKind::Produce, total_bytes)
+        .throttle(client.principal, client.client_id, QuotaKind::Produce, total_bytes)
         .await;
     if !throttle.is_zero() {
         metrics.count(names::THROTTLED_REQUESTS, 1);
@@ -365,11 +367,11 @@ async fn fetch_multi_zero_copy(
 }
 
 /// Count a served fetch and apply the client's quota.
-async fn record_fetch(broker: &Broker, client_id: Option<&str>, served: u64) {
+async fn record_fetch(broker: &Broker, client: ClientIdentity<'_>, served: u64) {
     let metrics = broker.metrics();
     metrics.count(names::FETCH_REQUESTS, 1);
     metrics.count(names::FETCH_BYTES, served);
-    let throttle = broker.throttle(client_id, QuotaKind::Fetch, served).await;
+    let throttle = broker.throttle(client.principal, client.client_id, QuotaKind::Fetch, served).await;
     if !throttle.is_zero() {
         metrics.count(names::THROTTLED_REQUESTS, 1);
         metrics.count(names::THROTTLE_MS, throttle.as_millis() as u64);
@@ -379,7 +381,7 @@ async fn record_fetch(broker: &Broker, client_id: Option<&str>, served: u64) {
 pub(crate) async fn fetch_multi(
     broker: &Broker,
     body: Bytes,
-    client_id: Option<&str>,
+    client: ClientIdentity<'_>,
 ) -> ResponseBody {
     let request = match FetchMultiRequest::decode(&body) {
         Ok(request) => request,
@@ -389,12 +391,18 @@ pub(crate) async fn fetch_multi(
         }
     };
 
+    let isolation = IsolationLevel::from_wire(request.isolation_level);
     // The fast path: hand the socket file ranges and let the kernel move
     // the bytes. Anything unusual — an idle partition, an error — falls
     // through to the buffered path below, which handles both.
-    if zero_copy_fetch_available(broker) {
+    //
+    // A committed read cannot take it: deciding which batches to withhold
+    // means looking at their headers, and the whole point of handing the
+    // kernel a file range is that nobody looks at the bytes. Filtering is
+    // still per batch, so this costs a copy, not a decompression.
+    if isolation == IsolationLevel::ReadUncommitted && zero_copy_fetch_available(broker) {
         if let Some((header, regions, served)) = fetch_multi_zero_copy(broker, &request).await {
-            record_fetch(broker, client_id, served).await;
+            record_fetch(broker, client, served).await;
             return ResponseBody::with_regions(header, regions);
         }
     }
@@ -420,7 +428,7 @@ pub(crate) async fn fetch_multi(
         served = long_poll(broker, &request, &mut results).await;
     }
 
-    record_fetch(broker, client_id, served).await;
+    record_fetch(broker, client, served).await;
 
     codec::encode_fetch_multi_response_chunks(&results)
         .unwrap_or_default()
@@ -433,6 +441,7 @@ async fn read_all_partitions(
     request: &FetchMultiRequest,
     results: &mut Vec<(FetchMultiResult, Vec<Bytes>)>,
 ) -> u64 {
+    let isolation = IsolationLevel::from_wire(request.isolation_level);
     // Divide the budget up front so the partitions can be read
     // concurrently: one round trip that takes as long as the slowest
     // partition, not as long as all of them added together.
@@ -460,7 +469,7 @@ async fn read_all_partitions(
             }
         };
         let allowance = (descriptor.max_bytes.max(0) as usize).min(per_partition);
-        match handle.read(descriptor.fetch_offset, allowance).await {
+        match handle.read_at(descriptor.fetch_offset, allowance, isolation).await {
             Ok(outcome) => {
                 result.high_watermark = outcome.high_watermark;
                 result.last_stable_offset = outcome.high_watermark;
@@ -514,6 +523,7 @@ async fn long_poll(
     request: &FetchMultiRequest,
     results: &mut [(FetchMultiResult, Vec<Bytes>)],
 ) -> u64 {
+    let isolation = IsolationLevel::from_wire(request.isolation_level);
     let deadline = tokio::time::Instant::now() + Duration::from_millis(request.max_wait_ms as u64);
     let poll_interval = Duration::from_millis(5);
     while tokio::time::Instant::now() < deadline {
@@ -527,9 +537,10 @@ async fn long_poll(
                 continue;
             };
             let Ok(outcome) = handle
-                .read(
+                .read_at(
                     descriptor.fetch_offset,
                     descriptor.max_bytes.max(0) as usize,
+                    isolation,
                 )
                 .await
             else {

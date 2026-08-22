@@ -54,6 +54,19 @@ pub enum BrokerError {
     #[error("not enough in-sync replicas: required {required}, available {available}")]
     NotEnoughReplicas { required: usize, available: usize },
 
+    /// The disk holding this partition has failed.
+    ///
+    /// Distinct from "unknown partition": the partition exists and this
+    /// broker is assigned it, but the directory its data is in stopped
+    /// working. A client that treated the two alike would conclude the
+    /// topic had been deleted.
+    #[error("{topic}-{partition} is on log dir {dir}, which is offline")]
+    LogDirOffline {
+        topic: String,
+        partition: i32,
+        dir: String,
+    },
+
     /// Topic name is empty or contains characters outside `[a-zA-Z0-9._-]`.
     #[error("invalid topic name: {0:?}")]
     InvalidTopic(String),

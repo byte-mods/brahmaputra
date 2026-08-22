@@ -264,6 +264,30 @@ pub enum Cmd {
         batch: RecordBatch,
         reply: oneshot::Sender<Result<ProducerAppendOutcome, ProducerAppendError>>,
     },
+    /// Where to start scanning for the first record at or after a
+    /// timestamp. `None` means no record in the log qualifies.
+    ScanStartForTimestamp {
+        timestamp: i64,
+        reply: oneshot::Sender<Option<i64>>,
+    },
+    /// On-disk size and offset bounds, for `DescribeLogDirs`.
+    Usage {
+        reply: oneshot::Sender<PartitionUsage>,
+    },
+    /// Discard every record below an offset; reply with the resulting log
+    /// start offset.
+    DeleteRecordsBefore {
+        offset: i64,
+        reply: oneshot::Sender<Result<i64, StorageError>>,
+    },
+    /// Read as [`Cmd::Read`] does, but showing only committed data:
+    /// bounded by the last stable offset, with control batches and aborted
+    /// records removed.
+    ReadCommitted {
+        offset: i64,
+        max_bytes: usize,
+        reply: oneshot::Sender<Result<ReadOutcome, StorageError>>,
+    },
     /// Read raw batch bytes from `offset`, capped by the high watermark.
     Read {
         offset: i64,
@@ -341,6 +365,16 @@ pub struct RegionOutcome {
     pub high_watermark: i64,
     pub log_start_offset: i64,
     pub log_end_offset: i64,
+}
+
+/// What one partition occupies on this broker, for `DescribeLogDirs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionUsage {
+    pub size_bytes: u64,
+    pub log_start_offset: i64,
+    pub log_end_offset: i64,
+    pub high_watermark: i64,
+    pub segments: usize,
 }
 
 pub struct ReadOutcome {
@@ -425,6 +459,40 @@ impl PartitionHandle {
             .await
             .map_err(|_| actor_gone())?;
         rx.await.map_err(|_| actor_gone())?
+    }
+
+    /// Read only committed data. `high_watermark` in the outcome carries
+    /// the last stable offset, which is the ceiling that actually applied.
+    pub async fn read_committed(
+        &self,
+        offset: i64,
+        max_bytes: usize,
+    ) -> Result<ReadOutcome, StorageError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::ReadCommitted {
+                offset,
+                max_bytes,
+                reply,
+            })
+            .await
+            .map_err(|_| actor_gone())?;
+        rx.await.map_err(|_| actor_gone())?
+    }
+
+    /// Read at `isolation`, so a caller that has a level in hand does not
+    /// have to branch on it.
+    pub async fn read_at(
+        &self,
+        offset: i64,
+        max_bytes: usize,
+        isolation: brahmaputra_protocol::IsolationLevel,
+    ) -> Result<ReadOutcome, StorageError> {
+        if isolation.is_committed() {
+            self.read_committed(offset, max_bytes).await
+        } else {
+            self.read(offset, max_bytes).await
+        }
     }
 
     pub async fn read(&self, offset: i64, max_bytes: usize) -> Result<ReadOutcome, StorageError> {
@@ -564,6 +632,40 @@ impl PartitionHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Cmd::Offsets { reply })
+            .await
+            .map_err(|_| actor_gone())?;
+        rx.await.map_err(|_| actor_gone())
+    }
+
+    /// What this partition occupies on disk and where its offsets sit.
+    pub async fn usage(&self) -> Result<PartitionUsage, StorageError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Usage { reply })
+            .await
+            .map_err(|_| actor_gone())?;
+        rx.await.map_err(|_| actor_gone())
+    }
+
+    /// Discard every record below `offset`, returning the new log start.
+    pub async fn delete_records_before(&self, offset: i64) -> Result<i64, StorageError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::DeleteRecordsBefore { offset, reply })
+            .await
+            .map_err(|_| actor_gone())?;
+        rx.await.map_err(|_| actor_gone())?
+    }
+
+    /// Where a timestamp lookup should start reading. `None` means the log
+    /// holds no record at or after `timestamp`.
+    pub async fn scan_start_for_timestamp(
+        &self,
+        timestamp: i64,
+    ) -> Result<Option<i64>, StorageError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::ScanStartForTimestamp { timestamp, reply })
             .await
             .map_err(|_| actor_gone())?;
         rx.await.map_err(|_| actor_gone())
@@ -868,6 +970,27 @@ async fn run(
                     });
                 let _ = reply.send(result);
             }
+            Cmd::ReadCommitted {
+                offset,
+                max_bytes,
+                reply,
+            } => {
+                let current = log.as_ref().expect("partition log");
+                // Bounded by the last stable offset rather than the high
+                // watermark, and already stripped of control batches and
+                // aborted records — so the take_while below has nothing
+                // left to trim.
+                let stable = current.last_stable_offset();
+                let result = current.read_committed(offset, max_bytes).map(|batches| {
+                    ReadOutcome {
+                        batches,
+                        high_watermark: stable,
+                        log_start_offset: current.log_start_offset(),
+                        log_end_offset: current.log_end_offset(),
+                    }
+                });
+                let _ = reply.send(result);
+            }
             Cmd::Read {
                 offset,
                 max_bytes,
@@ -1037,6 +1160,24 @@ async fn run(
                     current.log_end_offset(),
                     current.high_watermark(),
                 ));
+            }
+            Cmd::ScanStartForTimestamp { timestamp, reply } => {
+                let current = log.as_ref().expect("partition log");
+                let _ = reply.send(current.scan_start_for_timestamp(timestamp));
+            }
+            Cmd::Usage { reply } => {
+                let current = log.as_ref().expect("partition log");
+                let _ = reply.send(PartitionUsage {
+                    size_bytes: current.size_bytes(),
+                    log_start_offset: current.log_start_offset(),
+                    log_end_offset: current.log_end_offset(),
+                    high_watermark: current.high_watermark(),
+                    segments: current.segment_count(),
+                });
+            }
+            Cmd::DeleteRecordsBefore { offset, reply } => {
+                let current = log.as_mut().expect("partition log");
+                let _ = reply.send(current.delete_records_before(offset));
             }
         }
         // Publish the log end offset whenever it moves, from one place

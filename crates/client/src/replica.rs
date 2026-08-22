@@ -15,6 +15,7 @@ use brahmaputra_protocol::replica::{
 use brahmaputra_protocol::ApiKey;
 use bytes::Bytes;
 
+use crate::transport::TransportConfig;
 use crate::{ClientError, Connection, Transport};
 
 /// Decoded ReplicaFetch response plus validated, byte-identical batches.
@@ -42,7 +43,7 @@ impl ReplicaClient {
     /// Follower fetches ride the same transport the cluster is configured
     /// for, so switching to QUIC moves replication traffic too.
     pub async fn connect_with(
-        transport: Transport,
+        transport: impl Into<TransportConfig>,
         addr: SocketAddr,
         client_id: impl Into<String>,
         max_in_flight: usize,

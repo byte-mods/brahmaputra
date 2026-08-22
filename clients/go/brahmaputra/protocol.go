@@ -32,7 +32,19 @@ const SchemaVersion = "1.0.0"
 
 // APIVersion is the wire version this client speaks. The broker requires
 // an exact match and answers UnsupportedVersion otherwise.
-const APIVersion int16 = 2
+//
+// Version 3 added transactions: Fetch and FetchMulti carry an
+// isolation_level, and MetadataResponse carries a request-level error
+// code so an authorization denial is no longer reported as an unknown
+// topic.
+const APIVersion int16 = 3
+
+// Isolation levels for a fetch. ReadUncommitted is the default and is what
+// every non-transactional topic gives either way.
+const (
+	ReadUncommitted int32 = 0
+	ReadCommitted   int32 = 1
+)
 
 const (
 	batchHeaderLen       = 12

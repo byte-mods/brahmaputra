@@ -99,6 +99,7 @@ fn metadata(state: &ClusterState, body: Bytes) -> Bytes {
     let leader = state.leader.load(Ordering::SeqCst);
     Bytes::from(
         MetadataResponse {
+            error_code: 0,
             brokers: state
                 .brokers
                 .iter()

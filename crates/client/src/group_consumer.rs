@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use crate::consumer::{Consumer, EARLIEST, LATEST};
 use crate::error::ClientError;
 use crate::router::BrokerRouter;
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportConfig};
 
 /// Internal topic whose partition leaders act as group coordinators.
 const OFFSETS_TOPIC: &str = "__consumer_offsets";
@@ -676,7 +676,7 @@ impl GroupConsumer {
 
     /// Connect over an explicit transport (must match the broker's).
     pub async fn connect_with(
-        transport: Transport,
+        transport: impl Into<TransportConfig>,
         addr: SocketAddr,
         client_id: &str,
         group_id: &str,

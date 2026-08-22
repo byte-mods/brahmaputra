@@ -4,14 +4,24 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use brahmaputra_client::{
-    Assignor, AutoOffsetReset, Connection, Consumer, FetchedRecord, GroupAdmin, GroupConsumer,
-    Producer, ProducerConfig, Transport, EARLIEST, LATEST,
+    Admin, Assignor, AutoOffsetReset, Connection, Consumer, FetchedRecord, GroupAdmin,
+    GroupConsumer, IsolationLevel, Producer, ProducerConfig, TlsSettings, TransactionalProducer,
+    Transport, TransportConfig, DEFAULT_TRANSACTION_TIMEOUT_MS, EARLIEST,
+    LATEST,
 };
-use brahmaputra_controller::{ControllerCommandResult, MetadataCommand, MetadataEvent};
+
+
+
+
+use brahmaputra_controller::{
+    ClusterMetadata, ControllerCommandResult, MetadataCommand, MetadataEvent, QuotaEntity,
+    QuotaLimits,
+};
 use brahmaputra_protocol::codec;
 use brahmaputra_protocol::gen::{ProduceRequest, ProduceResponse};
 use brahmaputra_protocol::producer::{InitProducerIdRequest, InitProducerIdResponse};
@@ -27,13 +37,14 @@ const FOLLOW_IDLE_DELAY: Duration = Duration::from_millis(100);
 /// Internal topic whose partition leaders coordinate consumer groups.
 const OFFSETS_TOPIC: &str = "__consumer_offsets";
 
-/// Data-plane transport for this invocation. A CLI process talks to one
-/// cluster over one transport, so it is set once from --transport rather
-/// than threaded through every command function.
-static TRANSPORT: std::sync::OnceLock<Transport> = std::sync::OnceLock::new();
+/// Data-plane transport and TLS material for this invocation. A CLI process
+/// talks to one cluster over one transport with one identity, so it is set
+/// once from the global flags rather than threaded through every command
+/// function.
+static TRANSPORT: std::sync::OnceLock<TransportConfig> = std::sync::OnceLock::new();
 
-fn transport() -> Transport {
-    TRANSPORT.get().copied().unwrap_or_default()
+fn transport() -> TransportConfig {
+    TRANSPORT.get().cloned().unwrap_or_default()
 }
 
 #[derive(Parser)]
@@ -50,6 +61,27 @@ struct Cli {
     /// Data-plane transport; must match the broker's --transport.
     #[arg(long, global = true, default_value = "tcp")]
     transport: Transport,
+
+    /// PEM CA bundle the broker's certificate must chain to. Without it any
+    /// certificate is accepted, which encrypts the connection but proves
+    /// nothing about who is on the other end of it.
+    #[arg(long = "tls-ca", global = true)]
+    tls_ca: Option<PathBuf>,
+
+    /// PEM certificate chain to present to a broker started with
+    /// `--tls-client-ca`. Its common name becomes this connection's
+    /// principal, so no password crosses the wire at all.
+    #[arg(long = "tls-cert", global = true, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key matching `--tls-cert`.
+    #[arg(long = "tls-key", global = true, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
+    /// Name to check the broker's certificate against. Brokers that
+    /// generate their own use `brahmaputra`, which is the default.
+    #[arg(long = "tls-server-name", global = true)]
+    tls_server_name: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -183,6 +215,16 @@ enum Command {
         /// Keep polling for new records (long-poll).
         #[arg(long)]
         follow: bool,
+        /// What this consumer is allowed to see: `read_uncommitted`
+        /// (the default, and what every non-transactional topic gives
+        /// either way) or `read_committed`, which stops at the last stable
+        /// offset and skips the records of aborted transactions.
+        #[arg(
+            long = "isolation-level",
+            value_parser = ["read_uncommitted", "read_committed"],
+            default_value = "read_uncommitted"
+        )]
+        isolation_level: String,
         /// Join this consumer group instead of consuming standalone.
         #[arg(long, conflicts_with_all = ["partition", "from", "offset"])]
         group: Option<String>,
@@ -235,11 +277,92 @@ enum Command {
         topic: String,
         #[arg(long)]
         partition: Option<i32>,
+        /// Also resolve the first offset at or after this unix-millisecond
+        /// timestamp — where a consumer would start to replay from a point
+        /// in time.
+        #[arg(long)]
+        timestamp: Option<i64>,
     },
     /// Create or delete topics through the controller.
     Topic {
         #[command(subcommand)]
         command: TopicCommand,
+    },
+    /// Set byte-rate limits for a user, a client id, or both.
+    Quota {
+        #[command(subcommand)]
+        command: QuotaCommand,
+    },
+    /// Write records inside a transaction, then commit or abort them.
+    ///
+    /// Every `--send TOPIC:PARTITION=VALUE` is written immediately; whether
+    /// it *counts* is decided at the end. A `read_committed` consumer sees
+    /// all of them or none; the default `read_uncommitted` sees them either
+    /// way, which is the point of the flag.
+    Transaction {
+        /// The `transactional.id` to claim. Claiming it fences any previous
+        /// holder and resolves whatever that holder abandoned.
+        #[arg(long = "id")]
+        transactional_id: String,
+        /// A record to write, as `topic:partition=value`. Repeatable.
+        #[arg(long = "send", value_parser = parse_transactional_record)]
+        sends: Vec<TransactionalRecord>,
+        /// Abort instead of committing.
+        #[arg(long)]
+        abort: bool,
+        /// Write the records and exit without ending the transaction, as a
+        /// crashed producer would.
+        ///
+        /// The records stay in doubt and a `read_committed` consumer stops
+        /// before them until something resolves it — which is what the next
+        /// claim of this `--id` does. That recovery is the reason the
+        /// coordinator owns the decision rather than the client.
+        #[arg(long, conflicts_with = "abort")]
+        abandon: bool,
+        /// Commit these consumed offsets with the transaction, as
+        /// `topic:partition=offset`. Repeatable; requires --group.
+        #[arg(long = "offset", value_parser = parse_transactional_record, requires = "group")]
+        offsets: Vec<TransactionalRecord>,
+        /// Consumer group the `--offset` values belong to.
+        #[arg(long)]
+        group: Option<String>,
+    },
+    /// Describe the cluster: brokers, racks, and the current controller.
+    DescribeCluster,
+    /// Print the configuration in force on a topic or on a broker.
+    DescribeConfigs {
+        /// `topic` or `broker`.
+        #[arg(long = "type", value_parser = ["topic", "broker"], default_value = "topic")]
+        resource_type: String,
+        /// Topic name. Ignored (and unnecessary) for `--type broker`.
+        #[arg(long, default_value = "")]
+        name: String,
+        /// Show only these configs; repeatable. Default shows every one,
+        /// including the ones left at their default.
+        #[arg(long = "config")]
+        config_names: Vec<String>,
+    },
+    /// Print per-partition disk usage, asked of every broker.
+    DescribeLogDirs {
+        /// Restrict to these topics; repeatable. Default covers all.
+        #[arg(long = "topic")]
+        topics: Vec<String>,
+    },
+    /// Delete every record below an offset, reclaiming its segments.
+    ///
+    /// The only way to reclaim space on a topic retention will not touch,
+    /// and the only answer to "delete this data now" short of deleting the
+    /// topic. The offset is clamped to what is committed.
+    DeleteRecords {
+        #[arg(long)]
+        topic: String,
+        /// Partition to trim; default trims every partition of the topic.
+        #[arg(long)]
+        partition: Option<i32>,
+        /// Delete records below this offset; -1 deletes everything
+        /// committed.
+        #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
+        offset: i64,
     },
     /// Inspect consumer groups: membership, committed offsets, lag.
     Groups {
@@ -329,6 +452,41 @@ enum TopicCommand {
     },
 }
 
+/// `quota` subcommands: byte-rate limits bound to a user, a client id, or
+/// both.
+#[derive(Subcommand)]
+enum QuotaCommand {
+    /// Set (or replace) the limits for one entity.
+    ///
+    /// Omitting both `--user` and `--client-id` writes the cluster-wide
+    /// default, which every request falls back to when no more specific
+    /// rule matches. Omitting a direction leaves it to the next-less
+    /// specific rule; setting both directions to 0 removes the entity.
+    Set {
+        /// Authenticated principal this applies to; omit for any user.
+        #[arg(long)]
+        user: Option<String>,
+        /// `client.id` this applies to; omit for any client.
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+        /// Produce ceiling in bytes per second.
+        #[arg(long = "produce-bytes-per-sec")]
+        produce_bytes_per_sec: Option<u64>,
+        /// Fetch ceiling in bytes per second.
+        #[arg(long = "fetch-bytes-per-sec")]
+        fetch_bytes_per_sec: Option<u64>,
+    },
+    /// Remove the limits bound to one entity.
+    Delete {
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+    },
+    /// List every configured quota entity.
+    List,
+}
+
 struct ProduceOptions {
     broker: SocketAddr,
     topic: String,
@@ -368,6 +526,37 @@ fn parse_acks(value: &str) -> std::result::Result<i32, String> {
         "all" | "-1" => Ok(-1),
         _ => Err("acks must be one of: 0, 1, all, -1".to_owned()),
     }
+}
+
+/// One `topic:partition=value` argument to `transaction`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransactionalRecord {
+    topic: String,
+    partition: i32,
+    value: String,
+}
+
+fn parse_transactional_record(value: &str) -> std::result::Result<TransactionalRecord, String> {
+    let (target, payload) = value
+        .split_once('=')
+        .ok_or_else(|| "expected topic:partition=value".to_owned())?;
+    let (topic, partition) = target
+        .split_once(':')
+        .ok_or_else(|| "expected topic:partition=value".to_owned())?;
+    if topic.is_empty() {
+        return Err("the topic must not be empty".to_owned());
+    }
+    let partition = partition
+        .parse::<i32>()
+        .map_err(|_| format!("{partition:?} is not a partition number"))?;
+    if partition < 0 {
+        return Err("the partition must not be negative".to_owned());
+    }
+    Ok(TransactionalRecord {
+        topic: topic.to_owned(),
+        partition,
+        value: payload.to_owned(),
+    })
 }
 
 fn parse_topic_config(value: &str) -> std::result::Result<TopicConfig, String> {
@@ -517,8 +706,16 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let _ = TRANSPORT.set(cli.transport);
-    let broker = if matches!(&cli.command, Command::Topic { .. }) {
+    let _ = TRANSPORT.set(TransportConfig::new(
+        cli.transport,
+        TlsSettings {
+            ca_path: cli.tls_ca.clone(),
+            cert_path: cli.tls_cert.clone(),
+            key_path: cli.tls_key.clone(),
+            server_name: cli.tls_server_name.clone(),
+        },
+    ));
+    let broker = if matches!(&cli.command, Command::Topic { .. } | Command::Quota { .. }) {
         None
     } else {
         Some(resolve_broker(&cli.broker).await?)
@@ -583,6 +780,7 @@ async fn run(cli: Cli) -> Result<()> {
             offset,
             max,
             follow,
+            isolation_level,
             group,
             commit_interval_ms,
             assignor,
@@ -618,6 +816,7 @@ async fn run(cli: Cli) -> Result<()> {
                             offset,
                             max,
                             follow,
+                            isolation_level: &isolation_level,
                             quiet,
                             show_timestamp,
                         },
@@ -632,15 +831,76 @@ async fn run(cli: Cli) -> Result<()> {
         Command::ApiVersions => {
             api_versions(broker.expect("data-plane commands resolve a broker")).await
         }
-        Command::Offsets { topic, partition } => {
+        Command::Offsets {
+            topic,
+            partition,
+            timestamp,
+        } => {
             offsets(
                 broker.expect("data-plane commands resolve a broker"),
                 topic,
                 partition,
+                timestamp,
             )
             .await
         }
         Command::Topic { command } => topic_admin(&cli.controller, command).await,
+        Command::Quota { command } => quota_admin(&cli.controller, command).await,
+        Command::Transaction {
+            transactional_id,
+            sends,
+            abort,
+            abandon,
+            offsets,
+            group,
+        } => {
+            run_transaction(
+                broker.expect("data-plane commands resolve a broker"),
+                &transactional_id,
+                &sends,
+                abort,
+                abandon,
+                &offsets,
+                group.as_deref(),
+            )
+            .await
+        }
+        Command::DescribeCluster => {
+            describe_cluster(broker.expect("data-plane commands resolve a broker")).await
+        }
+        Command::DescribeConfigs {
+            resource_type,
+            name,
+            config_names,
+        } => {
+            describe_configs(
+                broker.expect("data-plane commands resolve a broker"),
+                &resource_type,
+                &name,
+                &config_names,
+            )
+            .await
+        }
+        Command::DescribeLogDirs { topics } => {
+            describe_log_dirs(
+                broker.expect("data-plane commands resolve a broker"),
+                &topics,
+            )
+            .await
+        }
+        Command::DeleteRecords {
+            topic,
+            partition,
+            offset,
+        } => {
+            delete_records(
+                broker.expect("data-plane commands resolve a broker"),
+                &topic,
+                partition,
+                offset,
+            )
+            .await
+        }
         Command::Groups { command } => {
             group_admin(
                 broker.expect("data-plane commands resolve a broker"),
@@ -760,6 +1020,8 @@ async fn producer_admin(broker: SocketAddr, command: ProducerCommand) -> Result<
         } => InitProducerIdRequest {
             producer_id,
             producer_epoch,
+            transactional_id: None,
+            transaction_timeout_ms: 0,
         },
         ProducerCommand::Init { .. } => {
             unreachable!("clap requires producer id and epoch together")
@@ -856,6 +1118,308 @@ async fn topic_admin(controller: &str, command: TopicCommand) -> Result<()> {
     }
 
     println!("{success}");
+    Ok(())
+}
+
+async fn run_transaction(
+    broker: SocketAddr,
+    transactional_id: &str,
+    sends: &[TransactionalRecord],
+    abort: bool,
+    abandon: bool,
+    offsets: &[TransactionalRecord],
+    group: Option<&str>,
+) -> Result<()> {
+    let mut producer = TransactionalProducer::init_with(
+        transport(),
+        broker,
+        transactional_id,
+        DEFAULT_TRANSACTION_TIMEOUT_MS,
+    )
+    .await?;
+    let (producer_id, producer_epoch) = producer.producer_identity();
+    println!("producer id={producer_id} epoch={producer_epoch}");
+
+    producer.begin()?;
+    for record in sends {
+        let offset = producer
+            .send(
+                &record.topic,
+                record.partition,
+                Record::new(record.value.clone().into_bytes()),
+            )
+            .await?;
+        println!(
+            "wrote {}-{} offset={offset} (in doubt until the transaction ends)",
+            record.topic, record.partition
+        );
+    }
+
+    if let Some(group) = group {
+        let committed: Vec<(String, i32, i64)> = offsets
+            .iter()
+            .map(|entry| {
+                let offset = entry
+                    .value
+                    .parse::<i64>()
+                    .map_err(|_| anyhow::anyhow!("{:?} is not an offset", entry.value))?;
+                Ok((entry.topic.clone(), entry.partition, offset))
+            })
+            .collect::<Result<_>>()?;
+        if !committed.is_empty() {
+            producer.send_offsets(group, &committed).await?;
+            println!("staged {} offset(s) for group {group}", committed.len());
+        }
+    }
+
+    if abandon {
+        println!(
+            "abandoned: the transaction is still open, so a read_committed \n             consumer stops before these records until it is resolved"
+        );
+        return Ok(());
+    }
+    if abort {
+        producer.abort().await?;
+        println!("aborted: a read_committed consumer will skip every record above");
+    } else {
+        producer.commit().await?;
+        println!("committed: every record above is now visible to a read_committed consumer");
+    }
+    Ok(())
+}
+
+async fn describe_cluster(broker: SocketAddr) -> Result<()> {
+    let admin = Admin::connect_with(transport(), broker, "brahmaputra-cli").await?;
+    let cluster = admin.describe_cluster().await?;
+    println!("cluster id: {}", cluster.cluster_id);
+    println!(
+        "controller: {}",
+        if cluster.controller_id < 0 {
+            "none".to_owned()
+        } else {
+            cluster.controller_id.to_string()
+        }
+    );
+    println!("{:<8} {:<24} {:<10}", "BROKER", "ADDRESS", "RACK");
+    for member in &cluster.brokers {
+        println!(
+            "{:<8} {:<24} {:<10}",
+            member.broker_id,
+            format!("{}:{}", member.host, member.port),
+            if member.rack.is_empty() {
+                "-"
+            } else {
+                &member.rack
+            },
+        );
+    }
+    println!("{} broker(s)", cluster.brokers.len());
+    Ok(())
+}
+
+async fn describe_configs(
+    broker: SocketAddr,
+    resource_type: &str,
+    name: &str,
+    config_names: &[String],
+) -> Result<()> {
+    if resource_type == "topic" && name.is_empty() {
+        anyhow::bail!("--name is required for --type topic");
+    }
+    let admin = Admin::connect_with(transport(), broker, "brahmaputra-cli").await?;
+    let configs = admin
+        .describe_configs(resource_type, name, config_names)
+        .await?;
+    if name.is_empty() {
+        println!("{resource_type}");
+    } else {
+        println!("{resource_type} {name}");
+    }
+    println!("{:<32} {:<24} {:<10}", "CONFIG", "VALUE", "SOURCE");
+    for config in &configs {
+        println!(
+            "{:<32} {:<24} {:<10}",
+            config.name,
+            config.value,
+            if config.is_default { "default" } else { "set" },
+        );
+    }
+    println!("{} config(s)", configs.len());
+    Ok(())
+}
+
+async fn describe_log_dirs(broker: SocketAddr, topics: &[String]) -> Result<()> {
+    let admin = Admin::connect_with(transport(), broker, "brahmaputra-cli").await?;
+    let (dirs, unreachable) = admin.describe_log_dirs(topics).await?;
+    let mut total: i64 = 0;
+    for dir in &dirs {
+        println!(
+            "broker {} dir {} ({})",
+            dir.broker_id,
+            dir.log_dir,
+            if dir.error_code != 0 {
+                // The line an operator is actually looking for. A failed
+                // disk with its capacity blanked out would read as an
+                // empty one.
+                format!(
+                    "OFFLINE — this disk has failed{}",
+                    if dir.offline_reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", dir.offline_reason)
+                    }
+                )
+            } else {
+                format!(
+                    "total={} usable={}",
+                    describe_bytes(dir.total_bytes),
+                    describe_bytes(dir.usable_bytes)
+                )
+            },
+        );
+        println!("  {:<28} {:>14} {:>10} {:>8}", "PARTITION", "SIZE", "LAG", "ROLE");
+        for partition in &dir.partitions {
+            total += partition.size_bytes;
+            println!(
+                "  {:<28} {:>14} {:>10} {:>8}",
+                format!("{}-{}", partition.topic, partition.partition),
+                partition.size_bytes,
+                partition.offset_lag,
+                if partition.is_leader {
+                    "leader"
+                } else {
+                    "follower"
+                },
+            );
+        }
+    }
+    for (broker_id, error) in &unreachable {
+        println!("broker {broker_id}: unreachable ({error})");
+    }
+    println!("total {total} bytes across {} dir(s)", dirs.len());
+    Ok(())
+}
+
+fn describe_bytes(bytes: i64) -> String {
+    if bytes < 0 {
+        "unknown".to_owned()
+    } else {
+        bytes.to_string()
+    }
+}
+
+async fn delete_records(
+    broker: SocketAddr,
+    topic: &str,
+    partition: Option<i32>,
+    offset: i64,
+) -> Result<()> {
+    let admin = Admin::connect_with(transport(), broker, "brahmaputra-cli").await?;
+    let partitions = match partition {
+        Some(one) => vec![one],
+        None => admin.partitions(topic).await?,
+    };
+    let targets: Vec<(String, i32, i64)> = partitions
+        .into_iter()
+        .map(|partition| (topic.to_owned(), partition, offset))
+        .collect();
+    for result in admin.delete_records(&targets).await? {
+        println!(
+            "{}-{}: records below {} deleted, log start now {}",
+            result.topic, result.partition, result.low_watermark, result.low_watermark
+        );
+    }
+    Ok(())
+}
+
+/// `quota` subcommands: read and write the byte-rate overrides the brokers
+/// enforce.
+///
+/// Limits go through the controller rather than a broker flag so the whole
+/// cluster agrees on one number — otherwise a client's real ceiling would
+/// depend on which leader it happened to reach.
+async fn quota_admin(controller: &str, command: QuotaCommand) -> Result<()> {
+    let (request, success) = match command {
+        QuotaCommand::Set {
+            user,
+            client_id,
+            produce_bytes_per_sec,
+            fetch_bytes_per_sec,
+        } => {
+            if produce_bytes_per_sec.is_none() && fetch_bytes_per_sec.is_none() {
+                anyhow::bail!(
+                    "set at least one of --produce-bytes-per-sec or --fetch-bytes-per-sec"
+                );
+            }
+            let entity = QuotaEntity::new(user, client_id);
+            let limits = QuotaLimits {
+                // 0 is how an operator says "stop overriding this
+                // direction"; storing it would instead mean "no bytes at
+                // all", which is a stall, not a removal.
+                produce_bytes_per_sec: produce_bytes_per_sec.filter(|rate| *rate > 0),
+                fetch_bytes_per_sec: fetch_bytes_per_sec.filter(|rate| *rate > 0),
+            };
+            let success = if limits.is_empty() {
+                format!("quota removed entity={}", entity.key())
+            } else {
+                format!(
+                    "quota set entity={} produce={} fetch={}",
+                    entity.key(),
+                    describe_rate(limits.produce_bytes_per_sec),
+                    describe_rate(limits.fetch_bytes_per_sec),
+                )
+            };
+            (MetadataCommand::PutQuota { entity, limits }, success)
+        }
+        QuotaCommand::Delete { user, client_id } => {
+            let key = QuotaEntity::new(user, client_id).key();
+            let success = format!("quota removed entity={key}");
+            (MetadataCommand::DeleteQuota { key }, success)
+        }
+        QuotaCommand::List => return list_quotas(controller).await,
+    };
+
+    let event = submit_controller_command(controller, &request).await?;
+    if !matches!(event, MetadataEvent::QuotaChanged { .. }) {
+        anyhow::bail!("controller returned unexpected event for quota command: {event:?}");
+    }
+    println!("{success}");
+    Ok(())
+}
+
+fn describe_rate(rate: Option<u64>) -> String {
+    rate.map_or_else(|| "default".to_owned(), |bytes| format!("{bytes}B/s"))
+}
+
+async fn list_quotas(controller: &str) -> Result<()> {
+    let url = format!(
+        "{}/api/v1/controller/metadata",
+        controller.trim_end_matches('/')
+    );
+    let image = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("cannot reach controller at {url}"))?
+        .error_for_status()
+        .context("controller rejected the metadata request")?
+        .json::<ClusterMetadata>()
+        .await
+        .context("controller returned an invalid metadata image")?;
+
+    if image.quotas.is_empty() {
+        println!("no quota overrides configured; every client uses the broker defaults");
+        return Ok(());
+    }
+    println!("{:<40} {:>16} {:>16}", "ENTITY", "PRODUCE", "FETCH");
+    for (entity, limits) in image.quotas.values() {
+        println!(
+            "{:<40} {:>16} {:>16}",
+            entity.key(),
+            describe_rate(limits.produce_bytes_per_sec),
+            describe_rate(limits.fetch_bytes_per_sec),
+        );
+    }
     Ok(())
 }
 
@@ -1131,6 +1695,7 @@ struct ConsumeOptions<'a> {
     offset: Option<i64>,
     max: Option<u64>,
     follow: bool,
+    isolation_level: &'a str,
     quiet: bool,
     show_timestamp: bool,
 }
@@ -1142,10 +1707,15 @@ async fn consume(broker: SocketAddr, topic: String, options: ConsumeOptions<'_>)
         offset,
         max,
         follow,
+        isolation_level,
         quiet,
         show_timestamp,
     } = options;
-    let consumer = Consumer::connect_with(transport(), broker, "brahmaputra-cli").await?;
+    let consumer = Consumer::connect_with(transport(), broker, "brahmaputra-cli")
+        .await?
+        .with_isolation_level(
+            IsolationLevel::parse(isolation_level).unwrap_or_default(),
+        );
     let started = Instant::now();
     let mut bytes = 0u64;
     let partitions = topic_partitions(&consumer, &topic, partition).await?;
@@ -1492,12 +2062,22 @@ async fn metadata(broker: SocketAddr, topic: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn offsets(broker: SocketAddr, topic: String, partition: Option<i32>) -> Result<()> {
+async fn offsets(
+    broker: SocketAddr,
+    topic: String,
+    partition: Option<i32>,
+    timestamp: Option<i64>,
+) -> Result<()> {
     let consumer = Consumer::connect_with(transport(), broker, "brahmaputra-cli").await?;
     for p in topic_partitions(&consumer, &topic, partition).await? {
         let earliest = consumer.list_offsets(&topic, p, EARLIEST).await?;
         let latest = consumer.list_offsets(&topic, p, LATEST).await?;
-        println!("{topic}-{p}: earliest={earliest} latest={latest}");
+        let mut line = format!("{topic}-{p}: earliest={earliest} latest={latest}");
+        if let Some(target) = timestamp {
+            let at = consumer.list_offsets(&topic, p, target).await?;
+            line.push_str(&format!(" at({target})={at}"));
+        }
+        println!("{line}");
     }
     Ok(())
 }
@@ -2228,7 +2808,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let broker = Broker::bind(BrokerConfig {
             port: 0,
-            data_dir: dir.path().to_path_buf(),
+            data_dirs: vec![dir.path().to_path_buf()],
             ..BrokerConfig::default()
         })
         .await
@@ -2278,7 +2858,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let broker = Broker::bind(BrokerConfig {
             port: 0,
-            data_dir: dir.path().to_path_buf(),
+            data_dirs: vec![dir.path().to_path_buf()],
             ..BrokerConfig::default()
         })
         .await
@@ -2339,7 +2919,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let broker = Broker::bind(BrokerConfig {
             port: 0,
-            data_dir: dir.path().to_path_buf(),
+            data_dirs: vec![dir.path().to_path_buf()],
             default_partitions: 2,
             ..BrokerConfig::default()
         })
@@ -2382,6 +2962,7 @@ mod tests {
                     offset: None,
                     max: Some(1),
                     follow: true,
+                    isolation_level: "read_uncommitted",
                     quiet: false,
                     show_timestamp: false,
                 },

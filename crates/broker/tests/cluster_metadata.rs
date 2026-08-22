@@ -41,7 +41,7 @@ async fn start_broker(
             broker_id,
             broker_epoch,
             port: 0,
-            data_dir: data_dir.to_owned(),
+            data_dirs: vec![data_dir.to_owned()],
             metadata_cache: Some(metadata_cache),
             ..BrokerConfig::default()
         })
@@ -295,6 +295,7 @@ async fn client_io_rejects_a_follower_but_replica_io_can_open_its_log() {
         max_bytes: 1_024,
         max_wait_ms: 0,
         min_bytes: 1,
+        isolation_level: 0,
     };
     let response = raw_request(follower.addr, ApiKey::Fetch, &fetch.encode().unwrap()).await;
     let (response, batches) = codec::decode_fetch_response(response).unwrap();
@@ -323,7 +324,7 @@ async fn client_io_rejects_a_follower_but_replica_io_can_open_its_log() {
         broker_id: 3,
         broker_epoch: Some(1),
         port: 0,
-        data_dir: temp.path().join("unassigned"),
+        data_dirs: vec![temp.path().join("unassigned")],
         metadata_cache: Some(MetadataCache::new(image)),
         ..BrokerConfig::default()
     })
@@ -347,7 +348,7 @@ async fn default_config_keeps_m1_implicit_topic_creation() {
     let temp = tempfile::tempdir().unwrap();
     let broker = Broker::bind(BrokerConfig {
         port: 0,
-        data_dir: temp.path().to_owned(),
+        data_dirs: vec![temp.path().to_owned()],
         default_partitions: 3,
         ..BrokerConfig::default()
     })
@@ -384,7 +385,7 @@ async fn standalone_recovery_promotes_a_stale_hwm_but_cluster_recovery_does_not(
 
     let standalone = Broker::bind(BrokerConfig {
         port: 0,
-        data_dir: standalone_dir,
+        data_dirs: vec![standalone_dir],
         ..BrokerConfig::default()
     })
     .await
@@ -414,7 +415,7 @@ async fn standalone_recovery_promotes_a_stale_hwm_but_cluster_recovery_does_not(
         broker_id: 1,
         broker_epoch: Some(1),
         port: 0,
-        data_dir: cluster_dir,
+        data_dirs: vec![cluster_dir],
         metadata_cache: Some(MetadataCache::new(cluster_image())),
         replication_enabled: true,
         ..BrokerConfig::default()

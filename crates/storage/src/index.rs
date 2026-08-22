@@ -163,9 +163,76 @@ impl SparseIndex<OffsetEntry> {
     }
 }
 
+impl SparseIndex<TimeEntry> {
+    /// Relative offset to begin scanning from when looking for the first
+    /// batch whose timestamp is `>= target`, or `None` when the segment
+    /// should be scanned from its base.
+    ///
+    /// Deliberately a linear pass rather than a binary search. The index
+    /// records each batch's own `max_timestamp`, and record timestamps are
+    /// producer-assigned create times, so the column is only *usually*
+    /// ascending — one clock-skewed producer is enough to make a binary
+    /// search land past the answer and report an offset that is simply
+    /// wrong. Carrying a running maximum instead is correct for any
+    /// contents at all, and it is a pass over a 12-byte-per-entry vector
+    /// holding one entry per `index_interval_bytes` of log: for a 1 GiB
+    /// segment that is a few hundred thousand comparisons against the
+    /// gigabyte of file reads it replaces.
+    pub fn scan_start(&self, target: i64) -> Option<u32> {
+        let mut highest_so_far = i64::MIN;
+        for (position, entry) in self.entries.iter().enumerate() {
+            highest_so_far = highest_so_far.max(entry.timestamp);
+            if highest_so_far >= target {
+                // Everything before the previous entry is strictly older
+                // than the target, so the answer cannot precede it. The
+                // batches between that entry and this one are not indexed,
+                // which is why this is a scan *start* and not the answer.
+                return position
+                    .checked_sub(1)
+                    .map(|previous| self.entries[previous].relative_offset);
+            }
+        }
+        // No indexed batch reaches the target. Anything that does must lie
+        // in the unindexed tail after the last entry.
+        self.entries.last().map(|entry| entry.relative_offset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_index_scan_start_survives_out_of_order_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("00000000000000000000.timeindex");
+        let mut index: SparseIndex<TimeEntry> = SparseIndex::open(&path).unwrap();
+        // Entry 2 is stamped by a producer whose clock runs slow, so the
+        // column is not ascending.
+        for (timestamp, relative_offset) in [(100, 0), (200, 10), (150, 20), (400, 30)] {
+            index
+                .append(TimeEntry {
+                    timestamp,
+                    relative_offset,
+                })
+                .unwrap();
+        }
+
+        // Before anything indexed: scan from the segment base.
+        assert_eq!(index.scan_start(50), None);
+        // The running maximum reaches 200 at entry 1, so the answer is at
+        // or after entry 0 — not after entry 2, which a binary search over
+        // the unsorted column would have concluded.
+        assert_eq!(index.scan_start(200), Some(0));
+        assert_eq!(index.scan_start(160), Some(0));
+        assert_eq!(index.scan_start(400), Some(20));
+        // Beyond every indexed batch: scan only the unindexed tail.
+        assert_eq!(index.scan_start(9_000), Some(30));
+
+        let empty: SparseIndex<TimeEntry> =
+            SparseIndex::open(&dir.path().join("empty.timeindex")).unwrap();
+        assert_eq!(empty.scan_start(1), None);
+    }
 
     #[test]
     fn offset_index_lookup_binary_search() {

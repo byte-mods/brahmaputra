@@ -9,7 +9,12 @@ use brahmaputra_protocol::codec;
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
     ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, AuthenticateRequest,
-    AuthenticateResponse, BrokerInfo, DescribeGroupRequest, DescribeGroupResponse,
+    AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, AddPartitionsToTxnRequest,
+    AddPartitionsToTxnResponse, AuthenticateResponse, BrokerInfo, DeleteRecordsRequest,
+    DescribeConfigsRequest, EndTxnRequest, EndTxnResponse, TxnMarkerResult,
+    TxnOffsetCommitRequest, TxnOffsetCommitResponse, WriteTxnMarkersRequest,
+    WriteTxnMarkersResponse,
+    DescribeGroupRequest, DescribeGroupResponse,
     FetchMultiRequest, FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse,
     JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest,
     ListGroupsResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
@@ -21,7 +26,9 @@ use brahmaputra_protocol::replica::{
     encode_replica_fetch_response, OffsetsForLeaderEpochRequest, OffsetsForLeaderEpochResponse,
     ReplicaFetchRequest, ReplicaFetchResponse,
 };
-use brahmaputra_protocol::{validate_batch_header, ApiKey, FrameHeader, RecordBatch, API_VERSION};
+use brahmaputra_protocol::{
+    validate_batch_header, ApiKey, FrameHeader, IsolationLevel, RecordBatch, API_VERSION,
+};
 use brahmaputra_storage::StorageError;
 use bytes::Bytes;
 use tracing::warn;
@@ -63,6 +70,14 @@ impl ConnectionSession {
         Self::default()
     }
 
+    /// A connection that arrived already identified — today, by a client
+    /// certificate the broker's CA signed during the TLS handshake.
+    pub fn authenticated(principal: String) -> Self {
+        ConnectionSession {
+            principal: std::sync::RwLock::new(Some(principal)),
+        }
+    }
+
     pub fn principal(&self) -> Option<String> {
         self.principal
             .read()
@@ -75,6 +90,28 @@ impl ConnectionSession {
             .principal
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(principal);
+    }
+}
+
+/// Who a request is charged to.
+///
+/// Quotas need both halves: the authenticated principal is the tenant, and
+/// `client.id` distinguishes that tenant's individual applications. Kept
+/// together in one value so every request-charging path takes the same
+/// identity rather than each one deciding which half it can be bothered to
+/// pass along.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ClientIdentity<'a> {
+    pub principal: Option<&'a str>,
+    pub client_id: Option<&'a str>,
+}
+
+impl<'a> ClientIdentity<'a> {
+    pub fn new(principal: Option<&'a str>, client_id: Option<&'a str>) -> Self {
+        ClientIdentity {
+            principal,
+            client_id,
+        }
     }
 }
 
@@ -206,6 +243,67 @@ fn required_access(api_key: ApiKey, body: &Bytes) -> Vec<(ResourceType, String, 
             "cluster".to_string(),
             AclOperation::Write,
         )],
+        // Transactions are the producer's own session; the id it names is
+        // its identity, not a resource anyone else can be granted. What it
+        // may *write* is checked when it writes, so a transaction API needs
+        // only the right to produce at all.
+        ApiKey::AddPartitionsToTxn | ApiKey::AddOffsetsToTxn | ApiKey::EndTxn => {
+            vec![(
+                ResourceType::Cluster,
+                "cluster".to_string(),
+                AclOperation::Write,
+            )]
+        }
+        ApiKey::TxnOffsetCommit => TxnOffsetCommitRequest::decode(body)
+            .map(|request| vec![(ResourceType::Group, request.group_id, AclOperation::Read)])
+            .unwrap_or_default(),
+        // Cluster-internal, like the replication APIs: a marker rewrites
+        // what a committed reader can see on any partition, so leaving it
+        // open would let anyone who can reach the port resolve — or
+        // fabricate — another producer's transaction.
+        ApiKey::WriteTxnMarkers => vec![(
+            ResourceType::Cluster,
+            "cluster".to_string(),
+            AclOperation::Write,
+        )],
+        // Cluster introspection. `DescribeLogDirs` names every topic on the
+        // broker and how big it is, which is a topic listing by another
+        // route, so it is gated at the cluster level rather than per topic.
+        ApiKey::DescribeCluster | ApiKey::DescribeLogDirs => vec![(
+            ResourceType::Cluster,
+            "cluster".to_string(),
+            AclOperation::Describe,
+        )],
+        ApiKey::DescribeConfigs => DescribeConfigsRequest::decode(body)
+            .map(|request| {
+                // A broker's configuration is cluster-wide information; a
+                // topic's belongs to whoever may describe that topic.
+                if request.resource_type.eq_ignore_ascii_case("topic") {
+                    vec![(
+                        ResourceType::Topic,
+                        request.resource_name,
+                        AclOperation::Describe,
+                    )]
+                } else {
+                    vec![(
+                        ResourceType::Cluster,
+                        "cluster".to_string(),
+                        AclOperation::Describe,
+                    )]
+                }
+            })
+            .unwrap_or_default(),
+        // Destructive, so it needs write permission on every topic it
+        // touches — Describe would let a reader delete what it can see.
+        ApiKey::DeleteRecords => DeleteRecordsRequest::decode(body)
+            .map(|request| {
+                request
+                    .partitions
+                    .into_iter()
+                    .map(|partition| (ResourceType::Topic, partition.topic, AclOperation::Write))
+                    .collect()
+            })
+            .unwrap_or_default(),
         // Answered before authentication: a client has to be able to
         // discover versions and to authenticate at all.
         ApiKey::ApiVersions | ApiKey::Authenticate => Vec::new(),
@@ -354,23 +452,25 @@ pub async fn dispatch(
         }
     }
     let client_id = header.client_id.as_deref();
+    let principal = session.principal();
+    let client = ClientIdentity::new(principal.as_deref(), client_id);
     broker.metrics().increment(
         MetricKey::with(names::REQUESTS, &[("api", api_name(header.api_key))]),
         1,
     );
     match header.api_key {
-        ApiKey::Produce => produce(broker, body, client_id)
+        ApiKey::Produce => produce(broker, body, client)
             .await
             .map(ResponseBody::from),
         // The fetch paths return their pieces rather than one buffer, so
         // the record batches reach the socket without being copied again.
-        ApiKey::Fetch => Some(fetch(broker, body, client_id).await.into()),
-        ApiKey::FetchMulti => Some(crate::multi::fetch_multi(broker, body, client_id).await),
+        ApiKey::Fetch => Some(fetch(broker, body, client).await.into()),
+        ApiKey::FetchMulti => Some(crate::multi::fetch_multi(broker, body, client).await),
         ApiKey::ReplicaFetch => Some(replica_fetch(broker, body).await.into()),
         ApiKey::ListOffsets => Some(list_offsets(broker, body).await.into()),
         ApiKey::Metadata => Some(metadata(broker, body).into()),
         ApiKey::OffsetsForLeaderEpoch => Some(offsets_for_leader_epoch(broker, body).await.into()),
-        ApiKey::InitProducerId => Some(init_producer_id(broker, body).into()),
+        ApiKey::InitProducerId => Some(init_producer_id(broker, body).await.into()),
         ApiKey::JoinGroup => Some(join_group(broker, body).await.into()),
         ApiKey::SyncGroup => Some(sync_group(broker, body).await.into()),
         ApiKey::Heartbeat => Some(heartbeat(broker, body).await.into()),
@@ -381,9 +481,18 @@ pub async fn dispatch(
         ApiKey::DescribeGroup => Some(describe_group(broker, body).await.into()),
         ApiKey::ApiVersions => Some(api_versions(broker, body).await.into()),
         ApiKey::Authenticate => Some(authenticate(broker, body, session).await.into()),
-        ApiKey::ProduceMulti => crate::multi::produce_multi(broker, body, client_id)
+        ApiKey::ProduceMulti => crate::multi::produce_multi(broker, body, client)
             .await
             .map(ResponseBody::from),
+        ApiKey::AddPartitionsToTxn => Some(add_partitions_to_txn(broker, body).await.into()),
+        ApiKey::AddOffsetsToTxn => Some(add_offsets_to_txn(broker, body).await.into()),
+        ApiKey::EndTxn => Some(end_txn(broker, body).await.into()),
+        ApiKey::TxnOffsetCommit => Some(txn_offset_commit(broker, body).await.into()),
+        ApiKey::WriteTxnMarkers => Some(write_txn_markers(broker, body).await.into()),
+        ApiKey::DescribeCluster => Some(crate::admin::describe_cluster(broker, body).into()),
+        ApiKey::DescribeConfigs => Some(crate::admin::describe_configs(broker, body).into()),
+        ApiKey::DescribeLogDirs => Some(crate::admin::describe_log_dirs(broker, body).await.into()),
+        ApiKey::DeleteRecords => Some(crate::admin::delete_records(broker, body).await.into()),
     }
 }
 
@@ -493,13 +602,47 @@ pub(crate) fn encode_error_for(api_key: ApiKey, error_code: i32) -> Bytes {
         // empty rather than carrying a partition that was never attempted.
         ApiKey::ProduceMulti => brahmaputra_protocol::gen::ProduceMultiResponse::default().encode(),
         ApiKey::FetchMulti => brahmaputra_protocol::gen::FetchMultiResponse::default().encode(),
+        ApiKey::DeleteRecords => {
+            brahmaputra_protocol::gen::DeleteRecordsResponse::default().encode()
+        }
+        ApiKey::DescribeCluster => brahmaputra_protocol::gen::DescribeClusterResponse {
+            error_code,
+            controller_id: -1,
+            ..Default::default()
+        }
+        .encode(),
+        ApiKey::DescribeConfigs => brahmaputra_protocol::gen::DescribeConfigsResponse {
+            error_code,
+            ..Default::default()
+        }
+        .encode(),
+        ApiKey::DescribeLogDirs => brahmaputra_protocol::gen::DescribeLogDirsResponse {
+            error_code,
+            ..Default::default()
+        }
+        .encode(),
+        ApiKey::AddPartitionsToTxn => brahmaputra_protocol::gen::AddPartitionsToTxnResponse {
+            error_code,
+        }
+        .encode(),
+        ApiKey::AddOffsetsToTxn => {
+            brahmaputra_protocol::gen::AddOffsetsToTxnResponse { error_code }.encode()
+        }
+        ApiKey::EndTxn => brahmaputra_protocol::gen::EndTxnResponse { error_code }.encode(),
+        ApiKey::TxnOffsetCommit => {
+            brahmaputra_protocol::gen::TxnOffsetCommitResponse { error_code }.encode()
+        }
+        // Per-partition results; a request-level failure names none of them.
+        ApiKey::WriteTxnMarkers => {
+            brahmaputra_protocol::gen::WriteTxnMarkersResponse::default().encode()
+        }
     };
     Bytes::from(bytes.unwrap_or_default())
 }
 
 // ---------- InitProducerId (api_key 6) ----------
 
-fn init_producer_id(broker: &Broker, body: Bytes) -> Bytes {
+async fn init_producer_id(broker: &Broker, body: Bytes) -> Bytes {
     if let Err(error) = broker.validate_local_broker_lease() {
         return encode_error_for(ApiKey::InitProducerId, code_of(&error));
     }
@@ -515,6 +658,33 @@ fn init_producer_id(broker: &Broker, body: Bytes) -> Bytes {
             .encode();
         }
     };
+
+    // A transactional id makes this a coordinator operation rather than a
+    // bare identity allocation: the coordinator fences whatever instance
+    // held the id before and resolves anything that instance abandoned.
+    if let Some(transactional_id) = request.transactional_id.as_deref() {
+        return match crate::transaction::init_transactional_producer(
+            broker,
+            transactional_id,
+            request.transaction_timeout_ms,
+        )
+        .await
+        {
+            Ok((producer_id, producer_epoch)) => InitProducerIdResponse {
+                error_code: ec::NONE,
+                producer_id,
+                producer_epoch,
+            }
+            .encode(),
+            Err(error) => InitProducerIdResponse {
+                error_code: code_of(&error),
+                producer_id: -1,
+                producer_epoch: -1,
+            }
+            .encode(),
+        };
+    }
+
     let result = if request == InitProducerIdRequest::allocate() {
         broker.producer_ids().allocate()
     } else if request.producer_id >= 0 && request.producer_epoch >= 0 {
@@ -592,6 +762,7 @@ pub(crate) fn code_of(err: &BrokerError) -> i32 {
         BrokerError::IllegalGeneration { .. } => ec::ILLEGAL_GENERATION,
         BrokerError::RebalanceInProgress { .. } => ec::REBALANCE_IN_PROGRESS,
         BrokerError::CoordinatorLoadInProgress { .. } => ec::COORDINATOR_LOAD_IN_PROGRESS,
+        BrokerError::LogDirOffline { .. } => ec::LOG_DIR_OFFLINE,
         _ => ec::INTERNAL,
     }
 }
@@ -734,6 +905,7 @@ async fn replica_fetch(broker: &Broker, body: Bytes) -> Bytes {
             if served > 0 {
                 broker
                     .throttle(
+                        None,
                         Some(&format!("replica-{}", request.follower_id)),
                         crate::quota::QuotaKind::Replication,
                         served,
@@ -943,7 +1115,7 @@ fn current_leader_epoch(broker: &Broker, topic: &str, partition: i32) -> i32 {
 
 // ---------- Produce (api_key 0) ----------
 
-async fn produce(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Option<Bytes> {
+async fn produce(broker: &Broker, body: Bytes, client: ClientIdentity<'_>) -> Option<Bytes> {
     let (req, raw_batches) = match codec::decode_produce_request(body) {
         Ok(v) => v,
         Err(e) => {
@@ -1211,7 +1383,12 @@ async fn produce(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Optio
     metrics.count(names::PRODUCE_RECORDS, records_appended);
     metrics.count(names::PRODUCE_BYTES, appended_bytes);
     let throttle = broker
-        .throttle(client_id, QuotaKind::Produce, appended_bytes)
+        .throttle(
+            client.principal,
+            client.client_id,
+            QuotaKind::Produce,
+            appended_bytes,
+        )
         .await;
     if !throttle.is_zero() {
         metrics.count(names::THROTTLED_REQUESTS, 1);
@@ -1259,7 +1436,7 @@ pub(crate) async fn wait_for_high_watermark(
 
 // ---------- Fetch (api_key 1) ----------
 
-async fn fetch(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Vec<Bytes> {
+async fn fetch(broker: &Broker, body: Bytes, client: ClientIdentity<'_>) -> Vec<Bytes> {
     let req = match FetchRequest::decode(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -1267,13 +1444,17 @@ async fn fetch(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Vec<Byt
             return vec![encode_error_for(ApiKey::Fetch, ec::INVALID_REQUEST)];
         }
     };
+    let isolation = IsolationLevel::from_wire(req.isolation_level);
+    // A committed read is already bounded at the last stable offset, and
+    // the actor reports that offset in place of the high watermark — so the
+    // two fields agree about the ceiling that actually applied.
     let respond = |error_code, hw: i64, batches: &[Bytes]| {
         let resp = FetchResponse {
             topic: req.topic.clone(),
             partition: req.partition,
             error_code,
             high_watermark: hw,
-            last_stable_offset: hw, // M1: LSO == HW (no transactions)
+            last_stable_offset: hw,
             batches_length: 0,      // filled in by encode_fetch_response
         };
         codec::encode_fetch_response_chunks(&resp, batches).unwrap_or_default()
@@ -1291,7 +1472,7 @@ async fn fetch(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Vec<Byt
     // poll re-reads immediately instead of sleeping until its deadline.
     let mut watch = handle.watermark_watch();
     watch.borrow_and_update();
-    let outcome = match handle.read(req.fetch_offset, max_bytes).await {
+    let outcome = match handle.read_at(req.fetch_offset, max_bytes, isolation).await {
         Ok(o) => o,
         Err(e) => return respond(code_of(&BrokerError::Storage(e)), -1, &[]),
     };
@@ -1305,6 +1486,7 @@ async fn fetch(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Vec<Byt
         max_bytes,
         min_bytes,
         req.max_wait_ms,
+        isolation,
         outcome,
     )
     .await
@@ -1320,7 +1502,14 @@ async fn fetch(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Vec<Byt
     let metrics = broker.metrics();
     metrics.count(names::FETCH_REQUESTS, 1);
     metrics.count(names::FETCH_BYTES, served);
-    let throttle = broker.throttle(client_id, QuotaKind::Fetch, served).await;
+    let throttle = broker
+        .throttle(
+            client.principal,
+            client.client_id,
+            QuotaKind::Fetch,
+            served,
+        )
+        .await;
     if !throttle.is_zero() {
         metrics.count(names::THROTTLED_REQUESTS, 1);
         metrics.count(names::THROTTLE_MS, throttle.as_millis() as u64);
@@ -1328,6 +1517,11 @@ async fn fetch(broker: &Broker, body: Bytes, client_id: Option<&str>) -> Vec<Byt
     respond(ec::NONE, outcome.high_watermark, &outcome.batches)
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Eight parameters because a long poll is genuinely a function of all of
+/// them: what to read, where to wait, how much is enough, how long to wait,
+/// what the reader may see, and what was already read. Bundling them into a
+/// struct would move the list rather than shorten it.
 async fn long_poll_until_min_bytes(
     handle: &PartitionHandle,
     watch: &mut tokio::sync::watch::Receiver<i64>,
@@ -1335,13 +1529,14 @@ async fn long_poll_until_min_bytes(
     max_bytes: usize,
     min_bytes: usize,
     max_wait_ms: i32,
+    isolation: IsolationLevel,
     mut outcome: ReadOutcome,
 ) -> Result<ReadOutcome, StorageError> {
     let mut ready: usize = outcome.batches.iter().map(|b| b.len()).sum();
     if ready < min_bytes && max_wait_ms > 0 {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(max_wait_ms as u64);
         while let Ok(Ok(())) = tokio::time::timeout_at(deadline, watch.changed()).await {
-            outcome = handle.read(fetch_offset, max_bytes).await?;
+            outcome = handle.read_at(fetch_offset, max_bytes, isolation).await?;
             ready = outcome.batches.iter().map(|b| b.len()).sum();
             if ready >= min_bytes {
                 break;
@@ -1389,9 +1584,18 @@ async fn list_offsets(broker: &Broker, body: Bytes) -> Bytes {
         // measured against. Replication uses ReplicaFetch, not this API.
         TIMESTAMP_LATEST => respond(ec::NONE, high_watermark, -1),
         target => {
-            // M1: linear scan over batch headers (the timeindex is a
-            // storage-internal detail for now).
-            let mut pos = start;
+            // The time index says which segment can hold the answer and
+            // roughly where inside it, so the scan below starts near the
+            // target instead of at the log start. It bounds *where to
+            // look*; the scan still decides the answer, so the offset
+            // returned is the same one a full walk would have found.
+            let scan_start = match handle.scan_start_for_timestamp(target).await {
+                Ok(Some(offset)) => offset.max(start),
+                // No record in the log reaches the target timestamp.
+                Ok(None) => return respond(ec::NONE, end, -1),
+                Err(e) => return respond(code_of(&BrokerError::Storage(e)), -1, -1),
+            };
+            let mut pos = scan_start;
             while pos < end {
                 match handle.read(pos, 1024 * 1024).await {
                     Ok(outcome) => {
@@ -1422,6 +1626,123 @@ async fn list_offsets(broker: &Broker, body: Bytes) -> Bytes {
             respond(ec::NONE, end, -1)
         }
     }
+}
+
+// ---------- Transactions (api_keys 23-27) ----------
+
+/// Decode a request, or answer with `INVALID_REQUEST`.
+macro_rules! decode_or_reject {
+    ($type:ty, $body:expr, $key:expr) => {
+        match <$type>::decode(&$body) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(%error, api = api_name($key), "undecodable transaction request");
+                return encode_error_for($key, ec::INVALID_REQUEST);
+            }
+        }
+    };
+}
+
+async fn add_partitions_to_txn(broker: &Broker, body: Bytes) -> Bytes {
+    let request = decode_or_reject!(
+        AddPartitionsToTxnRequest,
+        body,
+        ApiKey::AddPartitionsToTxn
+    );
+    let partitions = request
+        .partitions
+        .into_iter()
+        .map(|partition| (partition.topic, partition.partition))
+        .collect();
+    let error_code = crate::transaction::add_partitions(
+        broker,
+        &request.transactional_id,
+        request.producer_id,
+        request.producer_epoch as i16,
+        partitions,
+    )
+    .await
+    .err()
+    .unwrap_or(ec::NONE);
+    codec_bytes(AddPartitionsToTxnResponse { error_code }.encode())
+}
+
+async fn add_offsets_to_txn(broker: &Broker, body: Bytes) -> Bytes {
+    let request = decode_or_reject!(AddOffsetsToTxnRequest, body, ApiKey::AddOffsetsToTxn);
+    let error_code = crate::transaction::add_offsets(
+        broker,
+        &request.transactional_id,
+        request.producer_id,
+        request.producer_epoch as i16,
+        &request.group_id,
+    )
+    .await
+    .err()
+    .unwrap_or(ec::NONE);
+    codec_bytes(AddOffsetsToTxnResponse { error_code }.encode())
+}
+
+async fn end_txn(broker: &Broker, body: Bytes) -> Bytes {
+    let request = decode_or_reject!(EndTxnRequest, body, ApiKey::EndTxn);
+    let error_code = crate::transaction::end_transaction(
+        broker,
+        &request.transactional_id,
+        request.producer_id,
+        request.producer_epoch as i16,
+        request.committed,
+    )
+    .await
+    .err()
+    .unwrap_or(ec::NONE);
+    codec_bytes(EndTxnResponse { error_code }.encode())
+}
+
+/// Commit consumed offsets as part of a transaction.
+///
+/// The offsets go to the *group* coordinator, because that is where offsets
+/// live — but they are written as transactional records, so they become
+/// visible to a `read_committed` reader of `__consumer_offsets` only when
+/// the transaction's marker reaches that partition. That is what makes a
+/// read-process-write pipeline atomic: the offsets advance if and only if
+/// the output records do.
+async fn txn_offset_commit(broker: &Broker, body: Bytes) -> Bytes {
+    let request = decode_or_reject!(TxnOffsetCommitRequest, body, ApiKey::TxnOffsetCommit);
+    let error_code = crate::group::commit_transactional_offsets(
+        broker,
+        &request.group_id,
+        request.producer_id,
+        request.producer_epoch as i16,
+        request.offsets,
+    )
+    .await
+    .err()
+    .unwrap_or(ec::NONE);
+    codec_bytes(TxnOffsetCommitResponse { error_code }.encode())
+}
+
+/// Cluster-internal: append markers to partitions this broker leads.
+async fn write_txn_markers(broker: &Broker, body: Bytes) -> Bytes {
+    let request = decode_or_reject!(WriteTxnMarkersRequest, body, ApiKey::WriteTxnMarkers);
+    let mut results = Vec::new();
+    for marker in request.markers {
+        for partition in marker.partitions {
+            let outcome = crate::transaction::append_marker(
+                broker,
+                &partition.topic,
+                partition.partition,
+                marker.producer_id,
+                marker.producer_epoch as i16,
+                marker.committed,
+            )
+            .await;
+            results.push(TxnMarkerResult {
+                topic: partition.topic,
+                partition: partition.partition,
+                error_code: outcome.err().map_or(ec::NONE, |error| code_of(&error)),
+            });
+        }
+    }
+    codec_bytes(WriteTxnMarkersResponse { results }.encode())
 }
 
 // ---------- Metadata (api_key 3) ----------
@@ -1480,6 +1801,7 @@ fn metadata(broker: &Broker, body: Bytes) -> Bytes {
             .collect();
         return codec_bytes(
             MetadataResponse {
+                error_code: ec::NONE,
                 brokers,
                 controller_id: image.controller_id.unwrap_or(-1),
                 topics,
@@ -1530,6 +1852,7 @@ fn metadata(broker: &Broker, body: Bytes) -> Bytes {
     }
 
     let resp = MetadataResponse {
+        error_code: ec::NONE,
         brokers: vec![BrokerInfo {
             broker_id,
             host: addr.ip().to_string(),
@@ -1541,7 +1864,7 @@ fn metadata(broker: &Broker, body: Bytes) -> Bytes {
     codec_bytes(resp.encode())
 }
 
-fn codec_bytes(result: std::io::Result<Vec<u8>>) -> Bytes {
+pub(crate) fn codec_bytes(result: std::io::Result<Vec<u8>>) -> Bytes {
     Bytes::from(result.unwrap_or_default())
 }
 
@@ -1575,7 +1898,7 @@ async fn api_versions(broker: &Broker, body: Bytes) -> Bytes {
         })
         .collect();
     let throttle = broker
-        .throttle(None, crate::quota::QuotaKind::Fetch, 0)
+        .throttle(None, None, crate::quota::QuotaKind::Fetch, 0)
         .await;
     codec_bytes(
         ApiVersionsResponse {
@@ -1606,6 +1929,21 @@ const SUPPORTED_APIS: &[ApiKey] = &[
     ApiKey::ListGroups,
     ApiKey::DescribeGroup,
     ApiKey::ApiVersions,
+    // The multi-partition forms and Authenticate were dispatched but never
+    // advertised, so a client that trusted ApiVersions to describe the
+    // broker could not discover the very APIs it is supposed to prefer.
+    ApiKey::ProduceMulti,
+    ApiKey::FetchMulti,
+    ApiKey::Authenticate,
+    ApiKey::DescribeCluster,
+    ApiKey::DescribeConfigs,
+    ApiKey::DescribeLogDirs,
+    ApiKey::DeleteRecords,
+    ApiKey::AddPartitionsToTxn,
+    ApiKey::AddOffsetsToTxn,
+    ApiKey::EndTxn,
+    ApiKey::TxnOffsetCommit,
+    ApiKey::WriteTxnMarkers,
 ];
 
 // ---------- Consumer groups (api_keys 7-11, Blueprint 05) ----------
@@ -1829,6 +2167,15 @@ fn api_name(api_key: ApiKey) -> &'static str {
         ApiKey::ProduceMulti => "produce_multi",
         ApiKey::FetchMulti => "fetch_multi",
         ApiKey::Authenticate => "authenticate",
+        ApiKey::DescribeCluster => "describe_cluster",
+        ApiKey::DescribeConfigs => "describe_configs",
+        ApiKey::DescribeLogDirs => "describe_log_dirs",
+        ApiKey::DeleteRecords => "delete_records",
+        ApiKey::AddPartitionsToTxn => "add_partitions_to_txn",
+        ApiKey::AddOffsetsToTxn => "add_offsets_to_txn",
+        ApiKey::EndTxn => "end_txn",
+        ApiKey::TxnOffsetCommit => "txn_offset_commit",
+        ApiKey::WriteTxnMarkers => "write_txn_markers",
     }
 }
 
@@ -1862,7 +2209,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_millis(100),
-            long_poll_until_min_bytes(&handle, &mut watch, 0, usize::MAX, 1, 2_000, stale_outcome),
+            long_poll_until_min_bytes(&handle, &mut watch, 0, usize::MAX, 1, 2_000, IsolationLevel::ReadUncommitted, stale_outcome),
         )
         .await
         .expect("an unread watermark update should wake without waiting for the deadline")

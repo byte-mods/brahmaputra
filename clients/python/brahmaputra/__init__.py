@@ -16,6 +16,8 @@
 
 from .protocol import (
     API_VERSION,
+    READ_COMMITTED,
+    READ_UNCOMMITTED,
     ApiKey,
     BrahmaputraError,
     Compression,
@@ -54,6 +56,8 @@ __version__ = "0.1.0"
 
 __all__ = [
     "API_VERSION",
+    "READ_COMMITTED",
+    "READ_UNCOMMITTED",
     "ApiKey",
     "Assignor",
     "AutoOffsetReset",

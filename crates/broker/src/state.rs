@@ -43,6 +43,7 @@ pub fn valid_topic_name(name: &str) -> bool {
 }
 
 /// Directory holding the log of one partition: `<data_dir>/<topic>-<partition>`.
+#[allow(dead_code)]
 pub fn partition_dir(data_dir: &Path, topic: &str, partition: i32) -> PathBuf {
     data_dir.join(format!("{topic}-{partition}"))
 }
@@ -231,15 +232,17 @@ pub(crate) fn log_config_for_topic(
 ) -> LogConfig {
     let mut config = defaults.clone();
 
-    if topic == crate::group::OFFSETS_TOPIC {
-        // Every commit rewrites the same key, so this topic must be
-        // compacted or it grows without bound and coordinator failover
-        // slows without limit.
+    if topic == crate::group::OFFSETS_TOPIC
+        || topic == crate::transaction::TRANSACTION_STATE_TOPIC
+    {
+        // Both rewrite the same key over and over — one per group offset,
+        // one per transactional id — so they must be compacted or they grow
+        // without bound and coordinator failover slows without limit.
         config.compact = true;
-        // A committed consumer offset that disappears on restart is a
-        // correctness break, not a lost optimisation, and commits arrive
-        // far too slowly for an eager checkpoint to cost anything. User
-        // topics keep the periodic one.
+        // A committed consumer offset, or a transaction's decision, that
+        // disappears on restart is a correctness break rather than a lost
+        // optimisation, and both arrive far too slowly for an eager
+        // checkpoint to cost anything. User topics keep the periodic one.
         config.hwm_checkpoint_interval_ms = 0;
         return config;
     }

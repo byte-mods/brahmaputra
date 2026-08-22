@@ -51,6 +51,10 @@ class FetchRequest {
     int max_bytes;
     int max_wait_ms;       // long poll
     int min_bytes;         // return early when at least this many bytes ready
+    // 0 = read_uncommitted, 1 = read_committed. A committed read stops at
+    // the last stable offset instead of the high watermark, and never sees
+    // an aborted transaction's records or a control marker.
+    int isolation_level;
 }
 
 class FetchResponse {
@@ -105,6 +109,10 @@ class MetadataRequest {
 }
 
 class MetadataResponse {
+    // Request-level failure, distinct from a topic that does not exist.
+    // Without it an authorization denial is reported to the client as an
+    // unknown topic, which sends an operator looking for the wrong thing.
+    int error_code;
     BrokerInfo[] brokers;
     int controller_id;
     TopicInfo[] topics;
@@ -307,6 +315,7 @@ class FetchMultiPartition {
 class FetchMultiRequest {
     int max_wait_ms;          // long poll, applied across the whole request
     int min_bytes;            // return early once this many bytes are ready
+    int isolation_level;      // 0 = read_uncommitted, 1 = read_committed
     FetchMultiPartition[] partitions;
 }
 
@@ -421,4 +430,283 @@ class LeaveGroupRequest {
 
 class LeaveGroupResponse {
     int error_code;
+}
+
+// ---------- DescribeCluster (api_key 19) ----------
+// What a cluster actually is, from the broker's own view: who is in it,
+// which node is the controller, and where each broker sits.
+//
+// Metadata answers this only in passing, as a by-product of asking about
+// topics — so an operator with no topic in mind had no way to ask "what am
+// I connected to?" without reading the controller's HTTP API, which a
+// data-plane client has no reason to be able to reach.
+
+class DescribeClusterBroker {
+    int broker_id;
+    string host;
+    int port;
+    string rack;            // empty when the broker was started without --rack
+}
+
+class DescribeClusterRequest {
+    bool include_cluster_authorized_operations;
+}
+
+class DescribeClusterResponse {
+    int error_code;
+    string cluster_id;
+    int controller_id;      // -1 = no controller elected right now
+    DescribeClusterBroker[] brokers;
+}
+
+// ---------- DescribeConfigs (api_key 20) ----------
+// Read back the configuration in force for a topic or a broker.
+//
+// Configs could be set but never read: an operator could change
+// `retention.ms` and then had no way to confirm what the cluster believed
+// it to be. `is_default` is the part that matters — it distinguishes a
+// topic that was explicitly set to the same value as the default from one
+// that was never set at all, which is exactly the difference that decides
+// whether changing the broker default will move it.
+
+class ConfigEntry {
+    string name;
+    string value;
+    bool is_default;        // true = inherited, not set on this resource
+}
+
+class DescribeConfigsRequest {
+    string resource_type;   // "topic" | "broker"
+    string resource_name;   // topic name, or broker id as a string
+    string[] config_names;  // empty = every config
+}
+
+class DescribeConfigsResponse {
+    int error_code;
+    string resource_type;
+    string resource_name;
+    ConfigEntry[] configs;
+}
+
+// ---------- DescribeLogDirs (api_key 21) ----------
+// How much disk each partition is using on this broker.
+//
+// Without it, "which topic filled the disk?" is answered by walking the
+// data directory by hand on every broker in turn.
+//
+// `offset_lag` is this replica's own uncommitted tail: log end offset
+// minus high watermark. A leader whose followers are keeping up reports
+// zero; a number that stays high means records are being written that the
+// ISR is not acknowledging, which is the shape of a stalled follower seen
+// from the other side. It is deliberately not "how far behind the leader
+// is this broker", because a follower does not durably know the leader's
+// log end offset and a field that guesses is worse than one that does not.
+
+class LogDirPartition {
+    string topic;
+    int partition;
+    long size_bytes;
+    long offset_lag;
+    bool is_leader;
+}
+
+class LogDirInfo {
+    int error_code;
+    string log_dir;
+    // Why this directory is offline, empty when it is healthy. A disk that
+    // failed is worth reporting with its reason: "offline" sends an
+    // operator to the machine, "offline: Input/output error" tells them
+    // what they will find when they get there.
+    string offline_reason;
+    long total_bytes;       // -1 when the filesystem could not be queried
+    long usable_bytes;      // -1 when the filesystem could not be queried
+    LogDirPartition[] partitions;
+}
+
+class DescribeLogDirsRequest {
+    string[] topics;        // empty = every topic on this broker
+}
+
+class DescribeLogDirsResponse {
+    int error_code;
+    LogDirInfo[] log_dirs;
+}
+
+// ---------- DeleteRecords (api_key 22) ----------
+// Discard every record below an offset, and reclaim the segments that hold
+// only such records.
+//
+// This is the only way to reclaim space on a topic retention will not
+// touch — a compacted one, or one whose retention is deliberately long —
+// and the only answer to "delete this data now" that stops short of
+// deleting the topic.
+//
+// The offset is clamped to the committed range. Past the high watermark it
+// would discard records the ISR has not all acknowledged, which is data
+// loss wearing an admin command's clothes.
+
+class DeleteRecordsPartition {
+    string topic;
+    int partition;
+    long offset;            // delete below this; -1 = up to the high watermark
+}
+
+class DeleteRecordsRequest {
+    int timeout_ms;
+    DeleteRecordsPartition[] partitions;
+}
+
+class DeleteRecordsResult {
+    string topic;
+    int partition;
+    int error_code;
+    long low_watermark;     // the log start offset after the delete
+}
+
+class DeleteRecordsResponse {
+    DeleteRecordsResult[] results;
+}
+
+// ---------- Transactions (api_keys 23-26) ----------
+//
+// A transactional producer writes to many partitions and then decides, once,
+// whether all of it counts. What makes that atomic is not holding the records
+// back — they are appended as they are produced — but *marking* them: each
+// partition receives a control batch saying the transaction committed or
+// aborted, and a `read_committed` consumer refuses to look past the first
+// record of any transaction that has not been marked yet.
+//
+// The coordinator for a `transactional.id` is the leader of
+// `hash(transactional_id) % partitions` of `__transaction_state`, exactly as a
+// consumer group's coordinator is chosen from `__consumer_offsets`. A client
+// therefore finds it by routing to that partition, with no separate discovery
+// API to keep consistent.
+//
+// `producer_epoch` is an `int` on the wire because BitPacker has no 16-bit
+// type; it is narrowed to the i16 the record batch header carries. A request
+// whose epoch is behind the coordinator's is fenced — that is what stops a
+// producer that was partitioned away from finishing a transaction its
+// replacement has already started.
+
+class TxnPartition {
+    string topic;
+    int partition;
+}
+
+// ---------- AddPartitionsToTxn (api_key 23) ----------
+// Announce a partition before writing to it, so the coordinator knows where
+// to send a marker. A partition the coordinator never heard of would keep its
+// records in doubt forever.
+
+class AddPartitionsToTxnRequest {
+    string transactional_id;
+    long producer_id;
+    int producer_epoch;
+    TxnPartition[] partitions;
+}
+
+class AddPartitionsToTxnResponse {
+    int error_code;
+}
+
+// ---------- AddOffsetsToTxn (api_key 24) ----------
+// Bring a consumer group's offset commits into the transaction, which is what
+// makes read-process-write atomic: the offsets advance if and only if the
+// output records do.
+
+class AddOffsetsToTxnRequest {
+    string transactional_id;
+    long producer_id;
+    int producer_epoch;
+    string group_id;
+}
+
+class AddOffsetsToTxnResponse {
+    int error_code;
+}
+
+// ---------- EndTxn (api_key 25) ----------
+// Commit or abort. The coordinator writes a marker to every partition the
+// transaction touched and only then records the outcome as complete, so a
+// coordinator that dies mid-commit is recovered by replaying its log and
+// finishing the markers rather than by guessing.
+
+class EndTxnRequest {
+    string transactional_id;
+    long producer_id;
+    int producer_epoch;
+    bool committed;         // false aborts
+}
+
+class EndTxnResponse {
+    int error_code;
+}
+
+// ---------- TxnOffsetCommit (api_key 26) ----------
+// Commit consumed offsets as part of a transaction. Sent to the *group*
+// coordinator, not the transaction coordinator, because that is where the
+// offsets live; the records are transactional, so they become visible only
+// when the transaction's marker reaches `__consumer_offsets`.
+
+class TxnOffsetCommitRequest {
+    string transactional_id;
+    long producer_id;
+    int producer_epoch;
+    string group_id;
+    OffsetCommitEntry[] offsets;
+}
+
+class TxnOffsetCommitResponse {
+    int error_code;
+}
+
+// ---------- Internal __transaction_state record payload ----------
+// Not a wire API: the coordinator's durable state for one transactional id,
+// stored as the value of a record keyed by that id so the topic compacts to
+// the latest state per producer.
+
+class TransactionStateRecord {
+    string transactional_id;
+    long producer_id;
+    int producer_epoch;
+    // Empty | Ongoing | PrepareCommit | PrepareAbort | CompleteCommit |
+    // CompleteAbort. A string rather than an integer because this is read
+    // by operators as often as by code, and a number in a log dump tells
+    // nobody anything.
+    string state;
+    int timeout_ms;
+    long last_update_ms;
+    TxnPartition[] partitions;
+}
+
+// ---------- WriteTxnMarkers (api_key 27) ----------
+// Cluster-internal: the transaction coordinator asking a broker to append a
+// commit or abort marker to partitions it leads.
+//
+// A separate API rather than a Produce request because it is a different
+// authority. Markers are written by the coordinator on behalf of a producer
+// that may already be gone — that is the whole point, since a producer which
+// crashes mid-transaction must not leave its records in doubt forever — and
+// they must bypass the idempotent-sequence checks that govern client writes.
+// Authorized at the cluster level alongside the replication APIs.
+
+class TxnMarker {
+    long producer_id;
+    int producer_epoch;
+    bool committed;
+    TxnPartition[] partitions;
+}
+
+class WriteTxnMarkersRequest {
+    TxnMarker[] markers;
+}
+
+class TxnMarkerResult {
+    string topic;
+    int partition;
+    int error_code;
+}
+
+class WriteTxnMarkersResponse {
+    TxnMarkerResult[] results;
 }

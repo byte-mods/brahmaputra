@@ -24,7 +24,15 @@ const zlib = require('zlib');
 /** The BitPacker schema version every body carries as its first field. */
 const SCHEMA_VERSION = '1.0.0';
 /** Wire version this client speaks. The broker requires an exact match. */
-const API_VERSION = 2;
+// Version 3 added transactions: Fetch carries an isolation_level, and
+// MetadataResponse carries a request-level error code so an authorization
+// denial is no longer reported as an unknown topic.
+const API_VERSION = 3;
+
+// Isolation levels for a fetch. READ_UNCOMMITTED is the default and is what
+// every non-transactional topic gives either way.
+const READ_UNCOMMITTED = 0;
+const READ_COMMITTED = 1;
 
 const BATCH_HEADER_LEN = 12;
 const MIN_BATCH_LENGTH = 4 + 1 + 4 + 2 + 4 + 8;
@@ -696,6 +704,8 @@ function partitionForKey(key, partitions) {
 
 module.exports = {
   API_VERSION,
+  READ_COMMITTED,
+  READ_UNCOMMITTED,
   ApiKey,
   BATCH_HEADER_LEN,
   BrahmaputraError,

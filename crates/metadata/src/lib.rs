@@ -124,6 +124,74 @@ pub struct UserRecord {
     pub force_password_change: bool,
 }
 
+/// Who a byte-rate limit applies to.
+///
+/// A single broker-wide rate is the wrong shape for a shared cluster: the
+/// tenant filling the disk and the tenant reading one topic an hour get the
+/// same ceiling, so it has to be set for the worst case and is then too
+/// loose for everyone. Kafka names the entity a quota binds to; this is the
+/// same set, with `None` meaning "any".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub struct QuotaEntity {
+    /// Authenticated principal, or `None` for a rule that ignores identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// `client.id` the request announced, or `None` to ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+impl QuotaEntity {
+    pub fn new(user: Option<String>, client_id: Option<String>) -> Self {
+        QuotaEntity { user, client_id }
+    }
+
+    /// A stable identity, so re-setting the same entity replaces its limits
+    /// instead of accumulating duplicates in the metadata log.
+    pub fn key(&self) -> String {
+        format!(
+            "user={}|client={}",
+            self.user.as_deref().unwrap_or("*"),
+            self.client_id.as_deref().unwrap_or("*")
+        )
+    }
+
+    /// How specific this rule is: 2 names both, 1 names one, 0 is the
+    /// cluster-wide default. Higher wins.
+    fn specificity(&self) -> u8 {
+        u8::from(self.user.is_some()) + u8::from(self.client_id.is_some())
+    }
+
+    fn matches(&self, user: Option<&str>, client_id: Option<&str>) -> bool {
+        let user_ok = match &self.user {
+            Some(name) => user == Some(name.as_str()),
+            None => true,
+        };
+        let client_ok = match &self.client_id {
+            Some(name) => client_id == Some(name.as_str()),
+            None => true,
+        };
+        user_ok && client_ok
+    }
+}
+
+/// Byte-rate ceilings for one entity. `None` leaves that direction to
+/// whatever the next-less-specific rule — ultimately the broker default —
+/// says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct QuotaLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produce_bytes_per_sec: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_bytes_per_sec: Option<u64>,
+}
+
+impl QuotaLimits {
+    pub fn is_empty(&self) -> bool {
+        self.produce_bytes_per_sec.is_none() && self.fetch_bytes_per_sec.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerMetadata {
     pub broker_id: BrokerId,
@@ -163,6 +231,50 @@ impl PartitionMetadata {
     pub fn is_reassigning(&self) -> bool {
         self.target_replicas.is_some()
     }
+
+    /// The replica that *should* lead this partition.
+    ///
+    /// Placement spreads leadership across brokers and racks by rotating
+    /// which replica it puts first, so `replicas[0]` is the choice that
+    /// keeps the cluster balanced. Every other broker in the list is a
+    /// fallback for when that one is unavailable.
+    pub fn preferred_leader(&self) -> Option<BrokerId> {
+        self.replicas.first().copied()
+    }
+
+    /// Whether leadership has drifted off the preferred replica while that
+    /// replica is still a fully caught-up member of the ISR.
+    ///
+    /// This is the state a broker restart leaves behind: the partition
+    /// failed over, the original broker came back and rejoined the ISR, and
+    /// nothing moved leadership back. It is safe to correct precisely
+    /// because the preferred replica is in the ISR — it holds every
+    /// committed record, so the handover loses nothing.
+    pub fn is_leader_imbalanced(&self) -> bool {
+        match self.preferred_leader() {
+            Some(preferred) => {
+                preferred != self.leader && self.isr.contains(&preferred) && !self.is_reassigning()
+            }
+            None => false,
+        }
+    }
+}
+
+/// Pick a leader from the ISR, preferring the replica placement chose.
+///
+/// Taking `isr.first()` instead — the ISR is sorted, so that is the
+/// lowest-numbered surviving broker — piles leadership onto low broker ids
+/// every time a cluster loses and regains a node. Walking `replicas` in
+/// order keeps failover landing where placement intended, and falls back to
+/// any ISR member when the preferred replicas are all gone.
+fn elect_from_isr(partition: &PartitionMetadata) -> BrokerId {
+    partition
+        .replicas
+        .iter()
+        .copied()
+        .find(|replica| partition.isr.contains(replica))
+        .or_else(|| partition.isr.first().copied())
+        .unwrap_or(-1)
 }
 
 /// Choose `count` brokers for one partition, spreading across racks first.
@@ -248,6 +360,10 @@ pub struct ClusterMetadata {
     /// replaces it rather than duplicating it.
     #[serde(default)]
     pub acls: BTreeMap<String, AclRule>,
+    /// Byte-rate overrides, keyed by [`QuotaEntity::key`]. Empty means every
+    /// client is held to the broker-wide default.
+    #[serde(default)]
+    pub quotas: BTreeMap<String, (QuotaEntity, QuotaLimits)>,
     pub jwt_secret: Option<String>,
 }
 
@@ -329,6 +445,7 @@ impl ClusterMetadata {
             topics: BTreeMap::new(),
             users: BTreeMap::new(),
             acls: BTreeMap::new(),
+            quotas: BTreeMap::new(),
             jwt_secret: None,
         }
     }
@@ -705,6 +822,22 @@ impl ClusterMetadata {
                 self.acls.remove(&key);
                 MetadataEvent::AclChanged { key }
             }
+            MetadataCommand::PutQuota { entity, limits } => {
+                let key = entity.key();
+                if limits.is_empty() {
+                    // Setting every direction back to "unspecified" is how an
+                    // operator removes an override, so treat it as a delete
+                    // rather than storing a rule that says nothing.
+                    self.quotas.remove(&key);
+                } else {
+                    self.quotas.insert(key.clone(), (entity, limits));
+                }
+                MetadataEvent::QuotaChanged { key }
+            }
+            MetadataCommand::DeleteQuota { key } => {
+                self.quotas.remove(&key);
+                MetadataEvent::QuotaChanged { key }
+            }
             MetadataCommand::PutUser { user } => {
                 validate_username(&user.username)?;
                 let username = user.username.clone();
@@ -769,7 +902,7 @@ impl ClusterMetadata {
                     .isr
                     .retain(|id| *id != broker_id && alive.contains(id));
                 if partition.leader == broker_id || !partition.isr.contains(&partition.leader) {
-                    partition.leader = partition.isr.first().copied().unwrap_or(-1);
+                    partition.leader = elect_from_isr(partition);
                     partition.leader_epoch += 1;
                 }
             }
@@ -867,6 +1000,19 @@ pub enum MetadataCommand {
     DeleteAcl {
         key: String,
     },
+    /// Bind byte-rate limits to a user, a client id, or both.
+    ///
+    /// Limits live in cluster metadata rather than in broker flags so they
+    /// can be changed on a running cluster and so every broker enforces the
+    /// same number — a per-broker flag would mean a client's real ceiling
+    /// depended on which leader it happened to be talking to.
+    PutQuota {
+        entity: QuotaEntity,
+        limits: QuotaLimits,
+    },
+    DeleteQuota {
+        key: String,
+    },
     DeleteUser {
         username: String,
     },
@@ -913,6 +1059,9 @@ pub enum MetadataEvent {
         username: String,
     },
     AclChanged {
+        key: String,
+    },
+    QuotaChanged {
         key: String,
     },
     UserDeleted {
@@ -1181,6 +1330,55 @@ mod tests {
     }
 
     #[test]
+    fn failover_follows_replica_order_not_broker_number() {
+        let mut state = ClusterMetadata::default();
+        let mut epochs = BTreeMap::new();
+        for broker_id in 1..=3 {
+            epochs.insert(broker_id, register(&mut state, broker_id, 0));
+        }
+        create_topic(&mut state, "orders");
+        // Placement put broker 3 ahead of broker 1 for this partition, so
+        // that is where leadership should land — taking the lowest ISR
+        // member instead would pile every failover onto broker 1.
+        let partition = state
+            .topics
+            .get_mut("orders")
+            .unwrap()
+            .partitions
+            .get_mut(&0)
+            .unwrap();
+        partition.replicas = vec![2, 3, 1];
+        partition.leader = 2;
+        partition.isr = vec![1, 2, 3];
+
+        state
+            .apply(MetadataCommand::FenceBroker {
+                broker_id: 2,
+                broker_epoch: epochs[&2],
+            })
+            .unwrap();
+        let partition = &state.topics["orders"].partitions[&0];
+        assert_eq!(partition.leader, 3);
+        assert_eq!(partition.isr, vec![1, 3]);
+        assert_eq!(partition.preferred_leader(), Some(2));
+        // Still out of the ISR, so there is nothing to rebalance back to
+        // yet: an imbalance only becomes correctable once broker 2 returns
+        // and catches up.
+        assert!(!partition.is_leader_imbalanced());
+        register(&mut state, 2, 100);
+        state
+            .apply(MetadataCommand::ChangePartition {
+                topic: "orders".into(),
+                partition: 0,
+                leader: 3,
+                isr: vec![1, 2, 3],
+                expected_leader_epoch: 1,
+            })
+            .unwrap();
+        assert!(state.topics["orders"].partitions[&0].is_leader_imbalanced());
+    }
+
+    #[test]
     fn stale_leader_epoch_is_rejected() {
         let mut state = ClusterMetadata::default();
         for broker_id in 1..=3 {
@@ -1355,6 +1553,143 @@ impl ClusterMetadata {
             return false;
         }
         matching().any(|rule| rule.permission == AclPermission::Allow)
+    }
+
+    /// The byte-rate limits that apply to one request, or `None` where no
+    /// override matches and the broker default should stand.
+    ///
+    /// The most specific matching rule wins outright, as in Kafka: a
+    /// `(user, client-id)` rule beats a rule naming only one of them, which
+    /// beats the catch-all. Directions resolve independently, so a rule can
+    /// cap a tenant's writes and leave its reads to the default. Ties are
+    /// impossible — two rules of equal specificity that both match would
+    /// have to name the same user and client, and that is one key.
+    pub fn quota_for(&self, user: Option<&str>, client_id: Option<&str>) -> Option<QuotaLimits> {
+        let mut produce = None;
+        let mut fetch = None;
+        let mut produce_rank = None;
+        let mut fetch_rank = None;
+        for (entity, limits) in self.quotas.values() {
+            if !entity.matches(user, client_id) {
+                continue;
+            }
+            let rank = entity.specificity();
+            if limits.produce_bytes_per_sec.is_some()
+                && produce_rank.is_none_or(|best| rank > best)
+            {
+                produce = limits.produce_bytes_per_sec;
+                produce_rank = Some(rank);
+            }
+            if limits.fetch_bytes_per_sec.is_some() && fetch_rank.is_none_or(|best| rank > best) {
+                fetch = limits.fetch_bytes_per_sec;
+                fetch_rank = Some(rank);
+            }
+        }
+        (produce.is_some() || fetch.is_some()).then_some(QuotaLimits {
+            produce_bytes_per_sec: produce,
+            fetch_bytes_per_sec: fetch,
+        })
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    fn put(state: &mut ClusterMetadata, user: Option<&str>, client: Option<&str>, produce: Option<u64>, fetch: Option<u64>) {
+        state
+            .apply(MetadataCommand::PutQuota {
+                entity: QuotaEntity::new(user.map(str::to_owned), client.map(str::to_owned)),
+                limits: QuotaLimits {
+                    produce_bytes_per_sec: produce,
+                    fetch_bytes_per_sec: fetch,
+                },
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn no_override_leaves_the_broker_default_in_charge() {
+        let state = ClusterMetadata::default();
+        assert_eq!(state.quota_for(Some("alice"), Some("app")), None);
+    }
+
+    #[test]
+    fn the_most_specific_matching_rule_wins_per_direction() {
+        let mut state = ClusterMetadata::default();
+        put(&mut state, None, None, Some(1_000), Some(1_000));
+        put(&mut state, Some("alice"), None, Some(5_000), None);
+        put(&mut state, Some("alice"), Some("batch"), Some(50_000), None);
+
+        // Catch-all only.
+        let bob = state.quota_for(Some("bob"), Some("app")).unwrap();
+        assert_eq!(bob.produce_bytes_per_sec, Some(1_000));
+        assert_eq!(bob.fetch_bytes_per_sec, Some(1_000));
+
+        // Alice's own rule raises her writes; her reads fall back to the
+        // catch-all, because directions resolve independently.
+        let alice = state.quota_for(Some("alice"), Some("app")).unwrap();
+        assert_eq!(alice.produce_bytes_per_sec, Some(5_000));
+        assert_eq!(alice.fetch_bytes_per_sec, Some(1_000));
+
+        // Her batch job is named exactly, so it beats the rule naming only
+        // her.
+        let batch = state.quota_for(Some("alice"), Some("batch")).unwrap();
+        assert_eq!(batch.produce_bytes_per_sec, Some(50_000));
+        assert_eq!(batch.fetch_bytes_per_sec, Some(1_000));
+    }
+
+    #[test]
+    fn a_client_id_rule_applies_across_users() {
+        let mut state = ClusterMetadata::default();
+        put(&mut state, None, Some("scanner"), None, Some(100));
+        assert_eq!(
+            state
+                .quota_for(Some("alice"), Some("scanner"))
+                .unwrap()
+                .fetch_bytes_per_sec,
+            Some(100)
+        );
+        assert_eq!(
+            state
+                .quota_for(None, Some("scanner"))
+                .unwrap()
+                .fetch_bytes_per_sec,
+            Some(100)
+        );
+        assert_eq!(state.quota_for(Some("alice"), Some("other")), None);
+    }
+
+    #[test]
+    fn resetting_every_direction_removes_the_override() {
+        let mut state = ClusterMetadata::default();
+        put(&mut state, Some("alice"), None, Some(5_000), None);
+        assert!(state.quota_for(Some("alice"), None).is_some());
+
+        put(&mut state, Some("alice"), None, None, None);
+        assert!(state.quotas.is_empty());
+        assert_eq!(state.quota_for(Some("alice"), None), None);
+    }
+
+    #[test]
+    fn re_setting_an_entity_replaces_rather_than_accumulates() {
+        let mut state = ClusterMetadata::default();
+        put(&mut state, Some("alice"), Some("app"), Some(1), None);
+        put(&mut state, Some("alice"), Some("app"), Some(2), None);
+        assert_eq!(state.quotas.len(), 1);
+        assert_eq!(
+            state
+                .quota_for(Some("alice"), Some("app"))
+                .unwrap()
+                .produce_bytes_per_sec,
+            Some(2)
+        );
+
+        let key = QuotaEntity::new(Some("alice".into()), Some("app".into())).key();
+        state
+            .apply(MetadataCommand::DeleteQuota { key })
+            .unwrap();
+        assert!(state.quotas.is_empty());
     }
 }
 

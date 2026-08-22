@@ -31,7 +31,7 @@ struct RunningBroker {
 async fn start_broker(data_dir: &std::path::Path) -> RunningBroker {
     let config = BrokerConfig {
         port: 0, // ephemeral
-        data_dir: data_dir.to_path_buf(),
+        data_dirs: vec![data_dir.to_path_buf()],
         default_partitions: PARTITIONS,
         ..BrokerConfig::default()
     };

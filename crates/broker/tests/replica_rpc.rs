@@ -68,6 +68,7 @@ fn cluster_image() -> ClusterMetadata {
         )]),
         users: BTreeMap::new(),
         acls: Default::default(),
+        quotas: Default::default(),
         jwt_secret: None,
     }
 }
@@ -78,7 +79,7 @@ async fn start_broker(data_dir: &std::path::Path) -> RunningBroker {
             broker_id: LEADER_ID,
             broker_epoch: Some(11),
             port: 0,
-            data_dir: data_dir.to_owned(),
+            data_dirs: vec![data_dir.to_owned()],
             metadata_cache: Some(brahmaputra_metadata::MetadataCache::new(cluster_image())),
             ..BrokerConfig::default()
         })

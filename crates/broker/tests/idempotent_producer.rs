@@ -97,7 +97,7 @@ async fn live_tcp_init_dedup_restart_fencing_and_ordering() {
     let temp = tempfile::tempdir().unwrap();
     let config = || BrokerConfig {
         port: 0,
-        data_dir: temp.path().to_owned(),
+        data_dirs: vec![temp.path().to_owned()],
         ..BrokerConfig::default()
     };
 
@@ -134,6 +134,8 @@ async fn live_tcp_init_dedup_restart_fencing_and_ordering() {
         InitProducerIdRequest {
             producer_id: allocated.producer_id,
             producer_epoch: 0,
+            transactional_id: None,
+            transaction_timeout_ms: 0,
         },
     )
     .await;
@@ -190,6 +192,8 @@ async fn live_tcp_init_dedup_restart_fencing_and_ordering() {
         InitProducerIdRequest {
             producer_id: allocated.producer_id,
             producer_epoch: 0,
+            transactional_id: None,
+            transaction_timeout_ms: 0,
         },
     )
     .await;
@@ -200,6 +204,8 @@ async fn live_tcp_init_dedup_restart_fencing_and_ordering() {
         InitProducerIdRequest {
             producer_id: allocated.producer_id,
             producer_epoch: 1,
+            transactional_id: None,
+            transaction_timeout_ms: 0,
         },
     )
     .await;
@@ -250,6 +256,7 @@ fn proxy_cluster_image(proxy_port: u16) -> ClusterMetadata {
         )]),
         users: BTreeMap::new(),
         acls: Default::default(),
+        quotas: Default::default(),
         jwt_secret: None,
     }
 }
@@ -330,7 +337,7 @@ async fn idempotent_client_retries_lost_response_without_duplicate_append() {
             broker_id: 1,
             broker_epoch: Some(1),
             port: 0,
-            data_dir: temp.path().to_owned(),
+            data_dirs: vec![temp.path().to_owned()],
             metadata_cache: Some(cache),
             ..BrokerConfig::default()
         })

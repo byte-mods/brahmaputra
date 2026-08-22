@@ -82,6 +82,7 @@ impl QuicConnection {
         addr: SocketAddr,
         client_id: Option<String>,
         max_in_flight: usize,
+        tls_settings: &crate::tls::TlsSettings,
     ) -> Result<QuicConnection, ClientError> {
         let bind: SocketAddr = if addr.is_ipv4() {
             "0.0.0.0:0".parse().expect("valid bind address")
@@ -90,11 +91,7 @@ impl QuicConnection {
         };
         let mut endpoint = Endpoint::client(bind).map_err(ClientError::Io)?;
 
-        let mut tls = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-            .with_no_client_auth();
-        tls.alpn_protocols = vec![ALPN.to_vec()];
+        let tls = crate::tls::client_config(tls_settings)?;
         let tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|error| ClientError::Configuration(format!("quic tls config: {error}")))?;
         let mut config = ClientConfig::new(Arc::new(tls));

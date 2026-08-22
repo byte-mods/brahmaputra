@@ -20,9 +20,11 @@ pub mod replica;
 mod varint;
 
 pub use batch::{
-    validate_batch_header, BatchHeader, Compression, ProducerMetadata, Record, RecordBatch,
-    RecordHeader, BATCH_HEADER_LEN, MAGIC_V1, MAGIC_V2, MAX_DECOMPRESSED_BYTES, MIN_BATCH_LENGTH,
-    PRODUCER_EXTENSION_LEN,
+    control_batch, read_control_marker, validate_batch_header, BatchHeader, Compression,
+    ControlMarker, IsolationLevel, ProducerMetadata, Record, RecordBatch, RecordHeader,
+    BATCH_HEADER_LEN,
+    CONTROL_BIT, MAGIC_V1, MAGIC_V2, MAX_DECOMPRESSED_BYTES, MIN_BATCH_LENGTH,
+    PRODUCER_EXTENSION_LEN, TRANSACTIONAL_BIT,
 };
 pub use error::ProtocolError;
 pub use frame::{

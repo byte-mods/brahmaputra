@@ -73,6 +73,7 @@ fn cluster_image(
         )]),
         users: BTreeMap::new(),
         acls: Default::default(),
+        quotas: Default::default(),
         jwt_secret: None,
     }
 }
@@ -98,7 +99,7 @@ impl ClusterHarness {
                     broker_id,
                     broker_epoch: Some(broker_epoch(broker_id)),
                     port: 0,
-                    data_dir: temp.path().join(format!("broker-{broker_id}")),
+                    data_dirs: vec![temp.path().join(format!("broker-{broker_id}"))],
                     metadata_cache: Some(cache.clone()),
                     replication_enabled: true,
                     ..BrokerConfig::default()

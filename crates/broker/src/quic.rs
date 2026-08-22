@@ -57,16 +57,18 @@ pub struct QuicListener {
 }
 
 impl QuicListener {
-    /// Bind a QUIC endpoint on `addr` with a freshly generated self-signed
-    /// certificate.
-    pub fn bind(addr: SocketAddr, max_frame_bytes: usize) -> Result<QuicListener, BrokerError> {
-        let (cert_der, key_der) = self_signed_identity()?;
-
-        let mut tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der.into())
-            .map_err(|error| BrokerError::Meta(format!("cannot build quic tls config: {error}")))?;
-        tls.alpn_protocols = vec![ALPN.to_vec()];
+    /// Bind a QUIC endpoint on `addr` with the configured TLS identity.
+    ///
+    /// QUIC and TLS-over-TCP share one identity by construction: they are
+    /// the same certificate, the same client CA, and the same principal
+    /// derived from it. A client that authenticates by certificate must not
+    /// get a different answer for having picked a different transport.
+    pub fn bind(
+        addr: SocketAddr,
+        max_frame_bytes: usize,
+        identity: &crate::tls::TlsIdentity,
+    ) -> Result<QuicListener, BrokerError> {
+        let tls = crate::tls::server_config(identity)?;
         let tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
             .map_err(|error| BrokerError::Meta(format!("quic tls config: {error}")))?;
 
@@ -138,7 +140,21 @@ async fn serve_connection(
 ) {
     // QUIC multiplexes every request of a connection onto its own stream,
     // so the identity belongs to the connection, not the stream.
-    let session = Arc::new(handlers::ConnectionSession::new());
+    //
+    // A client certificate, where the listener demanded one, has already
+    // been verified against the configured CA during the handshake, so the
+    // connection starts as that principal rather than anonymous.
+    let peer_principal = connection
+        .peer_identity()
+        .and_then(|identity| identity.downcast::<Vec<rustls_pki_types::CertificateDer>>().ok())
+        .and_then(|chain| chain.first().and_then(crate::tls::common_name));
+    let session = Arc::new(match peer_principal {
+        Some(principal) => {
+            debug!(%principal, "quic connection authenticated by client certificate");
+            handlers::ConnectionSession::authenticated(principal)
+        }
+        None => handlers::ConnectionSession::new(),
+    });
     let peer = connection.remote_address();
     debug!(%peer, "quic connection accepted");
     let mut streams = JoinSet::new();

@@ -21,7 +21,8 @@ use bytes::Bytes;
 use tokio::net::lookup_host;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::{ClientError, Connection, Transport};
+use crate::transport::TransportConfig;
+use crate::{ClientError, Connection};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BrokerEndpoint {
@@ -118,7 +119,7 @@ struct Inner {
     seed: SocketAddr,
     client_id: Option<String>,
     max_in_flight: usize,
-    transport: Transport,
+    transport: TransportConfig,
     next_generation: AtomicU64,
     connections: Mutex<HashMap<SocketAddr, PooledConnection>>,
     routes: Mutex<RoutingTable>,
@@ -155,13 +156,19 @@ impl BrokerRouter {
     /// Connect over an explicit transport; every later connection this
     /// router opens to any broker uses the same one.
     pub(crate) async fn connect_with(
-        transport: Transport,
+        transport: impl Into<TransportConfig>,
         seed: SocketAddr,
         client_id: Option<String>,
         max_in_flight: usize,
     ) -> Result<Self, ClientError> {
+        // Resolved once and kept: every later connection this router opens
+        // to any broker must use the same transport *and* the same
+        // certificates, or a reconnect would silently drop the client's
+        // identity.
+        let transport = transport.into();
         let connection =
-            Connection::connect_with(transport, seed, client_id.clone(), max_in_flight).await?;
+            Connection::connect_with(transport.clone(), seed, client_id.clone(), max_in_flight)
+                .await?;
         let pooled = PooledConnection {
             address: seed,
             generation: 0,
@@ -452,7 +459,7 @@ impl BrokerRouter {
         }
 
         let connection = Connection::connect_with(
-            self.inner.transport,
+            self.inner.transport.clone(),
             address,
             self.inner.client_id.clone(),
             self.inner.max_in_flight,

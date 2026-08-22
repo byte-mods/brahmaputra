@@ -60,7 +60,7 @@ async fn stop_broker(running: RunningBroker) {
 async fn start_standalone(data_dir: &Path, default_partitions: i32) -> RunningBroker {
     let broker = Broker::bind(BrokerConfig {
         port: 0,
-        data_dir: data_dir.to_owned(),
+        data_dirs: vec![data_dir.to_owned()],
         default_partitions,
         ..BrokerConfig::default()
     })
@@ -78,7 +78,7 @@ async fn start_standalone_with(
 ) -> RunningBroker {
     let mut config = BrokerConfig {
         port: 0,
-        data_dir: data_dir.to_owned(),
+        data_dirs: vec![data_dir.to_owned()],
         default_partitions,
         ..BrokerConfig::default()
     };
@@ -100,7 +100,7 @@ async fn start_cluster_broker(
         broker_id,
         broker_epoch,
         port: 0,
-        data_dir: data_dir.to_owned(),
+        data_dirs: vec![data_dir.to_owned()],
         metadata_cache: Some(cache),
         replication_enabled: true,
         ..BrokerConfig::default()
@@ -152,6 +152,7 @@ fn cluster_image() -> ClusterMetadata {
         )]),
         users: BTreeMap::new(),
         acls: Default::default(),
+        quotas: Default::default(),
         jwt_secret: None,
     }
 }

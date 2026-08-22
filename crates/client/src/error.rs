@@ -106,6 +106,26 @@ impl ClientError {
                 code,
                 message: "coordinator load in progress".into(),
             }),
+            ec::INVALID_TXN_STATE => Err(ClientError::Server {
+                code,
+                message: "invalid transaction state".into(),
+            }),
+            ec::INVALID_PRODUCER_ID_MAPPING => Err(ClientError::Server {
+                code,
+                message: "unknown transactional id for this producer".into(),
+            }),
+            ec::CONCURRENT_TRANSACTIONS => Err(ClientError::Server {
+                code,
+                message: "concurrent transaction; retry".into(),
+            }),
+            // Not "unknown partition": the partition exists and is assigned
+            // to that broker, but the disk under it has failed. A client
+            // that read this as a missing topic would conclude the topic
+            // had been deleted.
+            ec::LOG_DIR_OFFLINE => Err(ClientError::Server {
+                code,
+                message: "the broker's log directory for this partition is offline".into(),
+            }),
             other => Err(ClientError::Server {
                 code: other,
                 message: "internal broker error".into(),
@@ -151,6 +171,37 @@ mod tests {
                 } => {
                     assert_eq!(actual, code);
                     assert_eq!(message, expected);
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn maps_transaction_and_storage_errors_to_stable_messages() {
+        let cases = [
+            (ec::INVALID_TXN_STATE, "invalid transaction state"),
+            (
+                ec::INVALID_PRODUCER_ID_MAPPING,
+                "unknown transactional id for this producer",
+            ),
+            (ec::CONCURRENT_TRANSACTIONS, "concurrent transaction; retry"),
+            (
+                ec::LOG_DIR_OFFLINE,
+                "the broker's log directory for this partition is offline",
+            ),
+        ];
+        for (code, expected) in cases {
+            match ClientError::from_error_code(code).unwrap_err() {
+                ClientError::Server {
+                    code: actual,
+                    message,
+                } => {
+                    assert_eq!(actual, code);
+                    assert_eq!(
+                        message, expected,
+                        "code {code} must not fall through to the generic message"
+                    );
                 }
                 other => panic!("unexpected error: {other}"),
             }

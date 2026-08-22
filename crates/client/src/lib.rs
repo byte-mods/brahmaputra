@@ -5,6 +5,7 @@
 //! in-flight requests (DESIGN.md §8 backpressure). The producer batches
 //! records per partition (`batch.size` / `linger.ms`), like Kafka's.
 
+mod admin;
 mod connection;
 mod consumer;
 mod error;
@@ -14,8 +15,14 @@ mod producer;
 mod quic;
 mod replica;
 mod router;
+mod tls;
+mod transactional;
 mod transport;
 
+pub use admin::{
+    Admin, ClusterBroker, ClusterDescription, DeletedRecords, LogDirPartitionUsage, LogDirUsage,
+    ResourceConfig,
+};
 pub use connection::TcpConnection;
 pub use consumer::{BrokerApiVersions, Consumer, FetchedRecord, EARLIEST, LATEST};
 pub use error::ClientError;
@@ -26,6 +33,9 @@ pub use group_consumer::{Assignor, AutoOffsetReset, ConsumedRecord, GroupConsume
 pub use producer::{Producer, ProducerConfig};
 pub use quic::tune_for_datacenter as tune_quic_transport;
 pub use replica::{ReplicaClient, ReplicaFetchResult};
-pub use transport::{Connection, Credentials, Transport};
+pub use tls::TlsSettings;
+pub use transactional::{TransactionalProducer, DEFAULT_TRANSACTION_TIMEOUT_MS};
+pub use transport::{Connection, Credentials, Transport, TransportConfig};
 
 pub use brahmaputra_protocol::gen::{BrokerInfo, MetadataResponse, PartitionInfo, TopicInfo};
+pub use brahmaputra_protocol::IsolationLevel;

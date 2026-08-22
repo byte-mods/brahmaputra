@@ -6,15 +6,25 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brahmaputra_protocol::{
-    validate_batch_header, Record, RecordBatch, BATCH_HEADER_LEN, MIN_BATCH_LENGTH,
+    read_control_marker, validate_batch_header, BatchHeader, ControlMarker, Record, RecordBatch,
+    BATCH_HEADER_LEN, MIN_BATCH_LENGTH,
 };
 use bytes::{Bytes, BytesMut};
 
 use crate::epoch::LeaderEpochCheckpoint;
 use crate::error::StorageError;
 use crate::segment::Segment;
+use crate::txn::{AbortedTransaction, TransactionIndex};
 
 const HWM_FILE: &str = "hwm";
+/// Where the log start offset is remembered across restarts.
+///
+/// Retention alone would not need this: it deletes whole segments, so the
+/// oldest surviving segment's base offset says where the log starts. An
+/// explicit `DeleteRecords` can land *inside* a segment, and without a
+/// record of that the records it hid would reappear on the next restart —
+/// which is precisely what an operator who deleted them did not ask for.
+const LOG_START_FILE: &str = "logstart";
 
 /// How much a single read pulls from a segment when the caller's budget
 /// is larger. Big enough to cover many small batches in one syscall,
@@ -31,6 +41,47 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The persisted log start offset, or `None` when nothing has ever moved it
+/// off the oldest segment's base.
+///
+/// A file that is missing, short, or holds a negative offset is treated as
+/// absent rather than as an error: the segments on disk are the authority
+/// on where the log starts, and this only ever refines that.
+fn read_log_start(dir: &Path) -> Result<Option<i64>, StorageError> {
+    let bytes = match fs::read(dir.join(LOG_START_FILE)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() < size_of::<i64>() {
+        return Ok(None);
+    }
+    let offset = i64::from_be_bytes(
+        bytes[..size_of::<i64>()]
+            .try_into()
+            .expect("fixed-size log start checkpoint"),
+    );
+    Ok((offset >= 0).then_some(offset))
+}
+
+/// Record where the log now starts, durably.
+///
+/// Written and fsynced inline rather than on a timer: this runs only when
+/// an operator deletes records or retention drops a segment, and a start
+/// offset that survives the operation but not the next crash would hand
+/// back records someone asked to be rid of.
+fn write_log_start(dir: &Path, offset: i64) -> Result<(), StorageError> {
+    let path = dir.join(LOG_START_FILE);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)?;
+    file.write_all(&offset.to_be_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 /// How often the high-watermark checkpoint reaches disk. Kafka's
 /// `replica.high.watermark.checkpoint.interval.ms` defaults to the same 5 s.
@@ -391,6 +442,10 @@ pub struct Log {
     /// and on every roll; a restart therefore restarts the clock, which
     /// only ever delays a roll rather than losing data.
     active_segment_created_ms: i64,
+    /// Which transactions are open here, and which of the closed ones
+    /// aborted. Empty and free for a partition nobody writes
+    /// transactionally to.
+    transactions: TransactionIndex,
 }
 
 impl Log {
@@ -450,12 +505,19 @@ impl Log {
         let next_offset = recovery.next_offset;
         segments.push(active);
 
-        let start_offset = segments[0].base_offset;
+        // A deleted segment cannot be brought back, and a stale checkpoint
+        // must never resurrect records, so the file can only ever move the
+        // start *forward* of where the segments already put it — and never
+        // past the end of the log.
+        let start_offset = read_log_start(&dir)?
+            .unwrap_or(segments[0].base_offset)
+            .clamp(segments[0].base_offset, next_offset);
         let mut high_watermark_checkpoint =
             HighWatermarkCheckpoint::open(dir.join(HWM_FILE), config.hwm_checkpoint_interval_ms)?;
         let high_watermark = high_watermark_checkpoint.recover(next_offset)?;
 
         let leader_epochs = LeaderEpochCheckpoint::open(&dir)?;
+        let transactions = TransactionIndex::open(&dir)?;
 
         Ok(Log {
             dir,
@@ -469,6 +531,7 @@ impl Log {
             unflushed_records: 0,
             last_flush_ms: now_ms(),
             active_segment_created_ms: now_ms(),
+            transactions,
         })
     }
 
@@ -538,6 +601,14 @@ impl Log {
         active.append_batch(base_offset, &bytes, batch.max_timestamp)?;
         let appended = batch.records.len() as u64;
         self.next_offset += appended as i64;
+        // Transaction state is derived from the encoded batch on every
+        // append path — this one, the producer path and the replica path —
+        // so a batch cannot be transactional on one of them and invisible
+        // to the LSO on another.
+        if batch.transactional {
+            let header = validate_batch_header(&bytes)?;
+            self.track_transaction(&header, &bytes, base_offset, self.next_offset - 1)?;
+        }
         self.maybe_flush(appended)?;
         if self.should_roll() {
             self.roll_segment()?;
@@ -579,11 +650,57 @@ impl Log {
         let active = self.segments.last_mut().expect("log always has a segment");
         active.append_batch(base_offset, &stamped, header.max_timestamp)?;
         self.next_offset = next_offset;
+        self.track_transaction(&header, &stamped, base_offset, next_offset - 1)?;
         self.maybe_flush((next_offset - base_offset) as u64)?;
         if self.should_roll() {
             self.roll_segment()?;
         }
         Ok((base_offset, next_offset))
+    }
+
+    /// Update transaction state from a batch that has just been appended.
+    ///
+    /// Driven off the batch itself rather than off a side channel so that
+    /// leader and follower reach the same state from the same bytes: a
+    /// follower replays exactly these batches, and if the two derived their
+    /// LSO differently, a failover would change what a `read_committed`
+    /// consumer can see.
+    fn track_transaction(
+        &mut self,
+        header: &BatchHeader,
+        bytes: &[u8],
+        base_offset: i64,
+        last_offset: i64,
+    ) -> Result<(), StorageError> {
+        if !header.transactional {
+            return Ok(());
+        }
+        let Some(producer_id) = header.producer_id() else {
+            // Transactional without a producer identity is malformed, but
+            // it has already been appended and its CRC checked; refusing to
+            // track it is the containable response.
+            return Ok(());
+        };
+        if !header.control {
+            return self.transactions.begin(producer_id, base_offset);
+        }
+
+        // Only a control batch is decoded, and only to read two bytes. It
+        // holds one uncompressed record by construction, so this is not the
+        // decompression the fetch path so carefully avoids — and it happens
+        // once per transaction per partition, not once per batch.
+        let mut buffer = Bytes::copy_from_slice(bytes);
+        let Ok(batch) = RecordBatch::decode(&mut buffer) else {
+            return Ok(());
+        };
+        match read_control_marker(&batch) {
+            Some(ControlMarker::Commit) => self.transactions.end(producer_id, last_offset, true),
+            Some(ControlMarker::Abort) => self.transactions.end(producer_id, last_offset, false),
+            // A marker this version cannot read: leave the transaction open
+            // rather than guessing which way it went. Holding records back
+            // is recoverable; releasing aborted ones is not.
+            None => Ok(()),
+        }
     }
 
     pub fn append_replica_batch(&mut self, batch: Bytes) -> Result<i64, StorageError> {
@@ -602,6 +719,11 @@ impl Log {
         active.append_batch(base_offset, &batch, header.max_timestamp)?;
         let appended = header.last_offset_delta as u64 + 1;
         self.next_offset = base_offset + appended as i64;
+        // A follower derives its transaction state from the same bytes the
+        // leader did, so the two agree on the LSO without any extra
+        // replication traffic — and a promoted follower answers a
+        // `read_committed` fetch identically.
+        self.track_transaction(&header, &batch, base_offset, self.next_offset - 1)?;
         self.maybe_flush(appended)?;
         if self.should_roll() {
             self.roll_segment()?;
@@ -722,6 +844,123 @@ impl Log {
         self.high_watermark
     }
 
+    /// The highest offset a `read_committed` consumer may be shown.
+    ///
+    /// Equal to the high watermark whenever nothing is in flight. With an
+    /// open transaction it stops at that transaction's first record,
+    /// because whether those records will exist has not been decided —
+    /// showing them and retracting them later is exactly what
+    /// `read_committed` exists to prevent.
+    pub fn last_stable_offset(&self) -> i64 {
+        self.transactions.last_stable_offset(self.high_watermark)
+    }
+
+    /// Aborted transactions whose records fall in `[from, to)`.
+    pub fn aborted_transactions(&self, from: i64, to: i64) -> Vec<AbortedTransaction> {
+        self.transactions.aborted_in_range(from, to)
+    }
+
+    /// Whether any transaction is open on this partition.
+    pub fn has_ongoing_transactions(&self) -> bool {
+        self.transactions.has_ongoing()
+    }
+
+    /// Read batches from `offset` as [`Log::read`] does, but showing only
+    /// what a `read_committed` consumer may see: nothing at or past the
+    /// last stable offset, no control batches, and nothing written by a
+    /// transaction that aborted.
+    ///
+    /// Filtering happens per *batch*, never per record, which is what keeps
+    /// it cheap: a batch belongs entirely to one producer and one
+    /// transaction, so dropping it needs no decompression and no re-encode.
+    /// The offsets of the batches that survive are unchanged — a consumer
+    /// sees gaps where the skipped records were, exactly as it does after
+    /// compaction.
+    pub fn read_committed(
+        &self,
+        offset: i64,
+        max_bytes: usize,
+    ) -> Result<Vec<Bytes>, StorageError> {
+        let stable = self.last_stable_offset();
+        if offset >= stable {
+            // Nothing is readable yet even though the log may hold more:
+            // the records past here are undecided.
+            if offset < self.start_offset {
+                return Err(StorageError::OffsetOutOfRange {
+                    offset,
+                    start: self.start_offset,
+                    end: self.next_offset,
+                });
+            }
+            return Ok(Vec::new());
+        }
+
+        let raw = self.read(offset, max_bytes)?;
+        if raw.is_empty() {
+            return Ok(raw);
+        }
+        let aborted = self.transactions.aborted_in_range(offset, self.next_offset);
+        let mut kept = Vec::with_capacity(raw.len());
+        for batch in raw {
+            let Ok(header) = validate_batch_header(&batch) else {
+                // The read path already validates; a batch that fails here
+                // is not one to hand a consumer.
+                break;
+            };
+            // Never past the stable point, whatever the byte budget said.
+            if header.base_offset >= stable {
+                break;
+            }
+            if header.control {
+                continue;
+            }
+            let discarded = header.transactional
+                && header.producer_id().is_some_and(|producer_id| {
+                    aborted.iter().any(|txn| {
+                        txn.producer_id == producer_id
+                            && header.base_offset >= txn.first_offset
+                            && header.base_offset <= txn.last_offset
+                    })
+                });
+            if discarded {
+                continue;
+            }
+            kept.push(batch);
+        }
+        Ok(kept)
+    }
+
+    /// Offset to begin scanning from when answering "first record at or
+    /// after timestamp `target`", or `None` when no record in the log can
+    /// qualify.
+    ///
+    /// A `ListOffsets` by timestamp used to walk the log from its start,
+    /// reading and CRC-checking every batch until one was new enough — so
+    /// the cost of asking "where was I an hour ago?" was the cost of
+    /// reading everything older than an hour. Consulting the time index
+    /// first skips whole segments by their newest record and lands within
+    /// one index interval inside the segment that can match, which is what
+    /// the `.timeindex` files were being written for all along.
+    ///
+    /// This narrows *where to look*, not what the answer is: the caller
+    /// still scans forward from here, so the offset returned is identical
+    /// to the one a full scan would have produced.
+    pub fn scan_start_for_timestamp(&self, target: i64) -> Option<i64> {
+        for segment in &self.segments {
+            // A segment whose newest record predates the target cannot hold
+            // the answer, whatever its individual batches look like.
+            if segment.max_timestamp.is_some_and(|newest| newest < target) {
+                continue;
+            }
+            let relative = segment.timeindex.scan_start(target).unwrap_or(0);
+            let start = segment.base_offset.saturating_add(i64::from(relative));
+            // Retention may have deleted records this segment's index still
+            // describes, so never point a reader below the log start.
+            return Some(start.max(self.start_offset));
+        }
+        None
+    }
+
     /// Set and persist the high watermark (survives restart via the `hwm`
     /// checkpoint file). In-memory replication machinery lands in a later
     /// milestone.
@@ -784,12 +1023,27 @@ impl Log {
         let actual = self.segments[segment_index].truncate_to_offset(offset)?;
         self.next_offset = actual;
         self.leader_epochs.truncate_to(actual)?;
+        // Transactions the discarded tail opened or closed no longer
+        // happened. Rebuilding what survives means replaying the remaining
+        // log, so this drops the lot: the follower that truncates is about
+        // to refetch from the leader, and every batch it receives is
+        // tracked again on the way in.
+        self.transactions.reset()?;
         Ok(actual)
     }
 
     /// Number of segments (including the active one).
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Bytes of log data this partition occupies, summed across segments.
+    ///
+    /// Read from the sizes the log already tracks rather than by walking
+    /// the directory, so asking every partition on a broker how big it is
+    /// costs no filesystem calls at all.
+    pub fn size_bytes(&self) -> u64 {
+        self.segments.iter().map(|segment| segment.size).sum()
     }
 
     /// Apply time- and size-based retention (DESIGN.md §4.4): delete whole
@@ -830,8 +1084,55 @@ impl Log {
             seg.delete()?;
             deleted += 1;
         }
-        self.start_offset = self.segments[0].base_offset;
+        // `max`, not assignment: an explicit DeleteRecords may have moved
+        // the start past this segment's base already, and retention must
+        // not hand those records back.
+        let start = self.segments[0].base_offset.max(self.start_offset);
+        if start != self.start_offset {
+            self.start_offset = start;
+            write_log_start(&self.dir, start)?;
+            self.transactions.prune_below(start)?;
+        }
         Ok(deleted)
+    }
+
+    /// Hide every record below `target` and reclaim the segments that hold
+    /// only such records. Returns the resulting log start offset.
+    ///
+    /// This is Kafka's `DeleteRecords`, and it is the only way to reclaim
+    /// space on a topic that retention will not touch — a compacted topic,
+    /// or one whose retention is deliberately long — and the only answer to
+    /// "delete this data now" that does not mean deleting the topic.
+    ///
+    /// The target is clamped to the committed range. Above the high
+    /// watermark it would discard records that replicas have not all
+    /// acknowledged, which is data loss dressed up as an admin operation;
+    /// below the current start it would claim to undelete, which nothing
+    /// can honour once the segments are gone.
+    ///
+    /// Records between the new start and the base of the segment holding it
+    /// stay on disk until retention or a later delete claims their whole
+    /// segment. They are unreadable from that moment: a fetch below the log
+    /// start is out of range, exactly as it is for retention-deleted data.
+    pub fn delete_records_before(&mut self, target: i64) -> Result<i64, StorageError> {
+        let target = target.clamp(self.start_offset, self.high_watermark);
+        if target == self.start_offset {
+            return Ok(self.start_offset);
+        }
+
+        // Drop whole sealed segments that end at or before the new start.
+        // The next segment's base offset is this one's exclusive end, and
+        // the active segment is never removed.
+        while self.segments.len() > 1 && self.segments[1].base_offset <= target {
+            let segment = self.segments.remove(0);
+            segment.delete()?;
+        }
+        self.start_offset = target;
+        write_log_start(&self.dir, target)?;
+        // The records of a transaction that ended below the new start are
+        // gone, so nothing will ever need to skip them again.
+        self.transactions.prune_below(target)?;
+        Ok(self.start_offset)
     }
 
     fn roll_segment(&mut self) -> Result<(), StorageError> {
@@ -890,6 +1191,284 @@ mod tests {
             out.extend(batch.iter().map(|(o, r)| (o, r.value.clone())));
         }
         out
+    }
+
+    /// Segments large enough that transactions are not split across them,
+    /// and a watermark that reaches disk on every advance so a restart in
+    /// these tests resumes where it left off rather than at zero.
+    fn txn_config() -> LogConfig {
+        LogConfig {
+            hwm_checkpoint_interval_ms: 0,
+            ..LogConfig::default()
+        }
+    }
+
+    /// Append `batch` through the producer path, returning its base offset.
+    fn append_raw(log: &mut Log, batch: &RecordBatch) -> i64 {
+        log.append_producer_batch(&batch.encode(), 0).unwrap().0
+    }
+
+    fn transactional_batch(producer_id: i64, sequence: i32, value: &str) -> RecordBatch {
+        let mut batch = RecordBatch::new(0, 0, 1_000, vec![Record::new(value.as_bytes().to_vec())]);
+        batch.producer = Some(brahmaputra_protocol::ProducerMetadata {
+            producer_id,
+            producer_epoch: 0,
+            base_sequence: sequence,
+        });
+        batch.transactional = true;
+        batch
+    }
+
+    fn values(batches: &[Bytes]) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|raw| {
+                let batch = RecordBatch::decode(&mut raw.clone()).unwrap();
+                batch
+                    .records
+                    .into_iter()
+                    .map(|record| String::from_utf8(record.value.to_vec()).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_committed_read_stops_at_the_open_transaction_and_skips_aborted_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), txn_config()).unwrap();
+
+        // A plain record everyone can see.
+        append_raw(
+            &mut log,
+            &RecordBatch::new(0, 0, 1_000, vec![Record::new(b"plain".to_vec())]),
+        );
+
+        // Producer 1 writes and aborts.
+        append_raw(&mut log, &transactional_batch(1, 0, "doomed"));
+        let abort_at = append_raw(
+            &mut log,
+            &brahmaputra_protocol::control_batch(
+                brahmaputra_protocol::ProducerMetadata {
+                    producer_id: 1,
+                    producer_epoch: 0,
+                    base_sequence: 0,
+                },
+                ControlMarker::Abort,
+                1_000,
+            ),
+        );
+
+        // Producer 2 writes and commits.
+        append_raw(&mut log, &transactional_batch(2, 0, "kept"));
+        append_raw(
+            &mut log,
+            &brahmaputra_protocol::control_batch(
+                brahmaputra_protocol::ProducerMetadata {
+                    producer_id: 2,
+                    producer_epoch: 0,
+                    base_sequence: 0,
+                },
+                ControlMarker::Commit,
+                1_000,
+            ),
+        );
+
+        // Producer 3 writes and leaves the transaction open.
+        let open_at = append_raw(&mut log, &transactional_batch(3, 0, "undecided"));
+
+        let end = log.log_end_offset();
+        log.set_high_watermark(end).unwrap();
+
+        // The open transaction, not the high watermark, is what bounds a
+        // committed read.
+        assert_eq!(log.last_stable_offset(), open_at);
+        assert!(log.has_ongoing_transactions());
+        assert!(abort_at < open_at);
+
+        let committed = values(&log.read_committed(0, 64 * 1024).unwrap());
+        assert_eq!(
+            committed,
+            vec!["plain", "kept"],
+            "aborted records, control markers and undecided records must all be withheld"
+        );
+
+        // read_uncommitted sees everything the log holds, markers included.
+        let raw = values(&log.read(0, 64 * 1024).unwrap());
+        assert!(raw.contains(&"doomed".to_owned()));
+        assert!(raw.contains(&"undecided".to_owned()));
+
+        // Committing the open transaction releases its records and returns
+        // the stable point to the high watermark.
+        append_raw(
+            &mut log,
+            &brahmaputra_protocol::control_batch(
+                brahmaputra_protocol::ProducerMetadata {
+                    producer_id: 3,
+                    producer_epoch: 0,
+                    base_sequence: 0,
+                },
+                ControlMarker::Commit,
+                1_000,
+            ),
+        );
+        let end = log.log_end_offset();
+        log.set_high_watermark(end).unwrap();
+        assert_eq!(log.last_stable_offset(), end);
+        assert_eq!(
+            values(&log.read_committed(0, 64 * 1024).unwrap()),
+            vec!["plain", "kept", "undecided"]
+        );
+
+        // And the abort is still remembered after a restart: an aborted
+        // record that reappears is the failure this whole mechanism exists
+        // to prevent.
+        drop(log);
+        let reopened = Log::open(dir.path(), txn_config()).unwrap();
+        assert_eq!(
+            values(&reopened.read_committed(0, 64 * 1024).unwrap()),
+            vec!["plain", "kept", "undecided"]
+        );
+    }
+
+    #[test]
+    fn a_replica_derives_the_same_transaction_state_from_the_same_bytes() {
+        let leader_dir = tempfile::tempdir().unwrap();
+        let follower_dir = tempfile::tempdir().unwrap();
+        let mut leader = Log::open(leader_dir.path(), LogConfig::default()).unwrap();
+        let mut follower = Log::open(follower_dir.path(), LogConfig::default()).unwrap();
+
+        append_raw(&mut leader, &transactional_batch(1, 0, "a"));
+        append_raw(&mut leader, &transactional_batch(2, 0, "b"));
+        append_raw(
+            &mut leader,
+            &brahmaputra_protocol::control_batch(
+                brahmaputra_protocol::ProducerMetadata {
+                    producer_id: 2,
+                    producer_epoch: 0,
+                    base_sequence: 0,
+                },
+                ControlMarker::Abort,
+                1_000,
+            ),
+        );
+
+        // Replicate byte for byte, exactly as the follower fetch path does.
+        for raw in leader.read(0, 1024 * 1024).unwrap() {
+            follower.append_replica_batch(raw).unwrap();
+        }
+        let end = leader.log_end_offset();
+        leader.set_high_watermark(end).unwrap();
+        follower.set_high_watermark(end).unwrap();
+
+        // If the two disagreed here, a failover would change what a
+        // read_committed consumer is allowed to see.
+        assert_eq!(follower.last_stable_offset(), leader.last_stable_offset());
+        assert_eq!(
+            values(&follower.read_committed(0, 64 * 1024).unwrap()),
+            values(&leader.read_committed(0, 64 * 1024).unwrap())
+        );
+    }
+
+    #[test]
+    fn deleting_records_hides_them_reclaims_segments_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), test_config()).unwrap();
+        for i in 0..50 {
+            log.append(batch(2, i * 2, 1_000 + i as i64)).unwrap();
+        }
+        let end = log.log_end_offset();
+        let segments_before = log.segment_count();
+        assert!(segments_before > 2, "need several segments to reclaim any");
+
+        // Only offset 40 is committed so far. Asking to delete everything
+        // must stop at the high watermark: an admin command must not
+        // discard records the cluster has not committed.
+        log.set_high_watermark(40).unwrap();
+        assert_eq!(log.delete_records_before(end).unwrap(), 40);
+        log.set_high_watermark(end).unwrap();
+
+        assert_eq!(log.log_start_offset(), 40);
+        assert!(
+            log.segment_count() < segments_before,
+            "segments below the new start should have been reclaimed"
+        );
+
+        // Below the new start is a no-op rather than an undelete.
+        assert_eq!(log.delete_records_before(0).unwrap(), 40);
+        assert_eq!(log.log_start_offset(), 40);
+
+        // Hidden records are out of range, not merely absent.
+        assert!(matches!(
+            log.read(0, 4096),
+            Err(StorageError::OffsetOutOfRange { .. })
+        ));
+        // ...and everything at or after the new start still reads.
+        let outcome = log.read(40, 64 * 1024).unwrap();
+        assert!(!outcome.is_empty());
+
+        drop(log);
+        let reopened = Log::open(dir.path(), test_config()).unwrap();
+        assert_eq!(
+            reopened.log_start_offset(),
+            40,
+            "a restart must not resurrect deleted records"
+        );
+        assert_eq!(reopened.log_end_offset(), end);
+    }
+
+    #[test]
+    fn retention_never_hands_back_records_an_operator_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), test_config()).unwrap();
+        for i in 0..50 {
+            log.append(batch(2, i * 2, 1_000 + i as i64)).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        log.delete_records_before(40).unwrap();
+        assert_eq!(log.log_start_offset(), 40);
+
+        // Retention derives the start from the oldest surviving segment,
+        // whose base is below 40; it must not move the start backwards.
+        log.apply_retention().unwrap();
+        assert_eq!(log.log_start_offset(), 40);
+    }
+
+    #[test]
+    fn timestamp_lookup_narrows_the_scan_without_moving_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), test_config()).unwrap();
+        // 50 batches of 2 records at 1000, 1001, ... spread over several
+        // segments (512-byte segments in `test_config`).
+        for i in 0..50 {
+            log.append(batch(2, i * 2, 1_000 + i as i64)).unwrap();
+        }
+        assert!(
+            log.segments.len() > 1,
+            "the point of this test is skipping whole segments"
+        );
+
+        // The answer a full scan would give: the first batch whose
+        // max_timestamp is >= target, which for batch `i` is offset `i * 2`.
+        for target in [1_000, 1_001, 1_017, 1_033, 1_049] {
+            let scan_start = log
+                .scan_start_for_timestamp(target)
+                .expect("a record reaches this timestamp");
+            let answer = (target - 1_000) * 2;
+            assert!(
+                scan_start <= answer,
+                "scan start {scan_start} skipped past the answer {answer} for {target}"
+            );
+        }
+
+        // Starting the scan later than offset 0 is the whole benefit; a
+        // lookup near the tail must not begin at the log start.
+        assert!(log.scan_start_for_timestamp(1_049).unwrap() > 0);
+
+        // Older than everything: scan from the very beginning.
+        assert_eq!(log.scan_start_for_timestamp(1).unwrap(), 0);
+        // Newer than everything: nothing to scan at all.
+        assert_eq!(log.scan_start_for_timestamp(9_999), None);
     }
 
     #[test]

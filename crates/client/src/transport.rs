@@ -25,6 +25,7 @@ use bytes::Bytes;
 use crate::connection::TcpConnection;
 use crate::error::ClientError;
 use crate::quic::QuicConnection;
+use crate::tls::TlsSettings;
 
 /// Which transport carries data-plane frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -61,6 +62,39 @@ impl fmt::Display for Transport {
     }
 }
 
+/// A transport plus the TLS material it should use.
+///
+/// Separate from [`Transport`] so every existing caller that passes a bare
+/// `Transport` keeps working — the conversion is free and produces the same
+/// defaults as before. Only a caller that has certificates to offer, or a
+/// CA to check the broker against, needs to name this type.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransportConfig {
+    pub transport: Transport,
+    pub tls: TlsSettings,
+}
+
+impl TransportConfig {
+    pub fn new(transport: Transport, tls: TlsSettings) -> Self {
+        TransportConfig { transport, tls }
+    }
+}
+
+impl From<Transport> for TransportConfig {
+    fn from(transport: Transport) -> Self {
+        TransportConfig {
+            transport,
+            tls: TlsSettings::default(),
+        }
+    }
+}
+
+impl fmt::Display for TransportConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.transport.fmt(f)
+    }
+}
+
 /// A connection to one broker over the configured transport.
 #[derive(Clone)]
 pub enum Connection {
@@ -80,20 +114,21 @@ impl Connection {
     }
 
     pub async fn connect_with(
-        transport: Transport,
+        transport: impl Into<TransportConfig>,
         addr: SocketAddr,
         client_id: Option<String>,
         max_in_flight: usize,
     ) -> Result<Connection, ClientError> {
-        match transport {
+        let config = transport.into();
+        match config.transport {
             Transport::Tcp => Ok(Connection::Tcp(
                 TcpConnection::connect(addr, client_id, max_in_flight).await?,
             )),
             Transport::TcpTls => Ok(Connection::Tcp(
-                TcpConnection::connect_tls(addr, client_id, max_in_flight).await?,
+                TcpConnection::connect_tls(addr, client_id, max_in_flight, &config.tls).await?,
             )),
             Transport::Quic => Ok(Connection::Quic(
-                QuicConnection::connect(addr, client_id, max_in_flight).await?,
+                QuicConnection::connect(addr, client_id, max_in_flight, &config.tls).await?,
             )),
         }
     }

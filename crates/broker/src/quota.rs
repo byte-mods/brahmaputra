@@ -79,11 +79,23 @@ struct Bucket {
     last_refill: Instant,
 }
 
+/// What a bucket is accounted against.
+///
+/// Both halves of the identity, not just the client id: two tenants that
+/// happen to ship the same `client.id` — the default one their library
+/// picked, most likely — must not draw down each other's budget.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BucketKey {
+    user: Option<String>,
+    client_id: String,
+    kind: QuotaKind,
+}
+
 /// Byte-rate accounting for every client the broker has seen.
 #[derive(Default)]
 pub struct QuotaManager {
     config: QuotaConfig,
-    buckets: Mutex<HashMap<(String, QuotaKind), Bucket>>,
+    buckets: Mutex<HashMap<BucketKey, Bucket>>,
 }
 
 impl QuotaManager {
@@ -98,21 +110,37 @@ impl QuotaManager {
         self.config.is_enabled()
     }
 
-    /// Charge `bytes` to `client_id` and return how long the caller should
+    /// Charge `bytes` to one client and return how long the caller should
     /// wait before responding. `Duration::ZERO` means the client is inside
     /// its budget.
+    ///
+    /// `override_rate` is the ceiling a matching quota entity imposes; with
+    /// `None` the broker-wide default applies. Accounting is per (user,
+    /// client id) either way, so tightening one tenant's limit does not
+    /// disturb anyone else's bucket.
     ///
     /// A client that identifies itself as nothing shares one bucket: that
     /// is deliberate, since otherwise anonymity would be a way around the
     /// limit.
-    pub fn throttle_for(&self, client_id: Option<&str>, kind: QuotaKind, bytes: u64) -> Duration {
-        let Some(rate) = self.config.rate(kind) else {
+    pub fn throttle_for(
+        &self,
+        user: Option<&str>,
+        client_id: Option<&str>,
+        kind: QuotaKind,
+        bytes: u64,
+        override_rate: Option<u64>,
+    ) -> Duration {
+        let Some(rate) = override_rate.or_else(|| self.config.rate(kind)) else {
             return Duration::ZERO;
         };
         if rate == 0 || bytes == 0 {
             return Duration::ZERO;
         }
-        let key = (client_id.unwrap_or("").to_owned(), kind);
+        let key = BucketKey {
+            user: user.map(str::to_owned),
+            client_id: client_id.unwrap_or("").to_owned(),
+            kind,
+        };
         let now = Instant::now();
 
         let mut buckets = self.buckets.lock().expect("quota buckets");
@@ -160,7 +188,7 @@ mod tests {
         let manager = QuotaManager::default();
         assert!(!manager.is_enabled());
         assert_eq!(
-            manager.throttle_for(Some("c"), QuotaKind::Produce, 10_000_000),
+            manager.throttle_for(None, Some("c"), QuotaKind::Produce, 10_000_000, None),
             Duration::ZERO
         );
     }
@@ -169,7 +197,7 @@ mod tests {
     fn traffic_inside_the_budget_is_not_delayed() {
         let manager = manager(1_000_000);
         assert_eq!(
-            manager.throttle_for(Some("c"), QuotaKind::Produce, 500_000),
+            manager.throttle_for(None, Some("c"), QuotaKind::Produce, 500_000, None),
             Duration::ZERO
         );
     }
@@ -180,10 +208,10 @@ mod tests {
         // Burn the initial second of credit, then overdraw by 2 000 bytes
         // against a 1 000 B/s rate: that is two seconds of repayment.
         assert_eq!(
-            manager.throttle_for(Some("c"), QuotaKind::Produce, 1_000),
+            manager.throttle_for(None, Some("c"), QuotaKind::Produce, 1_000, None),
             Duration::ZERO
         );
-        let throttle = manager.throttle_for(Some("c"), QuotaKind::Produce, 2_000);
+        let throttle = manager.throttle_for(None, Some("c"), QuotaKind::Produce, 2_000, None);
         assert!(
             throttle >= Duration::from_millis(1_900) && throttle <= Duration::from_millis(2_100),
             "expected ~2s, got {throttle:?}"
@@ -194,12 +222,12 @@ mod tests {
     fn produce_and_fetch_budgets_are_independent() {
         let manager = manager(1_000);
         assert_eq!(
-            manager.throttle_for(Some("c"), QuotaKind::Produce, 1_000),
+            manager.throttle_for(None, Some("c"), QuotaKind::Produce, 1_000, None),
             Duration::ZERO
         );
         // The produce bucket is empty, but fetch has its own full budget.
         assert_eq!(
-            manager.throttle_for(Some("c"), QuotaKind::Fetch, 1_000),
+            manager.throttle_for(None, Some("c"), QuotaKind::Fetch, 1_000, None),
             Duration::ZERO
         );
     }
@@ -208,12 +236,12 @@ mod tests {
     fn clients_are_accounted_separately() {
         let manager = manager(1_000);
         assert_eq!(
-            manager.throttle_for(Some("noisy"), QuotaKind::Produce, 5_000),
+            manager.throttle_for(None, Some("noisy"), QuotaKind::Produce, 5_000, None),
             Duration::from_secs(4)
         );
         // A different client is untouched by the noisy one's overdraft.
         assert_eq!(
-            manager.throttle_for(Some("quiet"), QuotaKind::Produce, 500),
+            manager.throttle_for(None, Some("quiet"), QuotaKind::Produce, 500, None),
             Duration::ZERO
         );
     }
@@ -221,7 +249,7 @@ mod tests {
     #[test]
     fn a_single_throttle_is_capped() {
         let manager = manager(1);
-        let throttle = manager.throttle_for(Some("c"), QuotaKind::Produce, 1_000_000);
+        let throttle = manager.throttle_for(None, Some("c"), QuotaKind::Produce, 1_000_000, None);
         assert_eq!(throttle, Duration::from_secs(5), "capped by max_throttle");
     }
 }
@@ -245,11 +273,11 @@ mod replication_quota_tests {
 
         // Spend the replication budget several times over.
         for _ in 0..5 {
-            manager.throttle_for(Some("replica-2"), QuotaKind::Replication, 1_000);
+            manager.throttle_for(None, Some("replica-2"), QuotaKind::Replication, 1_000, None);
         }
         assert!(
             !manager
-                .throttle_for(Some("replica-2"), QuotaKind::Replication, 1_000)
+                .throttle_for(None, Some("replica-2"), QuotaKind::Replication, 1_000, None)
                 .is_zero(),
             "replication should be throttled once its budget is spent"
         );
@@ -257,13 +285,13 @@ mod replication_quota_tests {
         // A client's produce and fetch budgets are untouched by that.
         assert!(
             manager
-                .throttle_for(Some("app"), QuotaKind::Produce, 500)
+                .throttle_for(None, Some("app"), QuotaKind::Produce, 500, None)
                 .is_zero(),
             "a catching-up follower must not throttle a producer"
         );
         assert!(
             manager
-                .throttle_for(Some("app"), QuotaKind::Fetch, 500)
+                .throttle_for(None, Some("app"), QuotaKind::Fetch, 500, None)
                 .is_zero(),
             "a catching-up follower must not throttle a consumer"
         );
@@ -282,7 +310,7 @@ mod replication_quota_tests {
         for _ in 0..100 {
             assert!(
                 manager
-                    .throttle_for(Some("replica-9"), QuotaKind::Replication, 1_000_000)
+                    .throttle_for(None, Some("replica-9"), QuotaKind::Replication, 1_000_000, None)
                     .is_zero(),
                 "no replication ceiling means no replication throttling"
             );

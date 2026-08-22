@@ -23,11 +23,17 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::ProtocolError;
 
-/// The wire version this build speaks. Bumped to 2 when JoinGroup gained
-/// `group_instance_id`: the broker requires an exact match, so a client
-/// built against version 1 now gets a clean UNSUPPORTED_VERSION rather
-/// than silently misparsing a request whose shape changed.
-pub const API_VERSION: i16 = 2;
+/// The wire version this build speaks. The broker requires an exact match,
+/// so a client built against an older version gets a clean
+/// UNSUPPORTED_VERSION rather than silently misparsing a request whose
+/// shape changed.
+///
+/// * **2** — JoinGroup gained `group_instance_id`.
+/// * **3** — transactions. Fetch and FetchMulti gained `isolation_level`,
+///   and MetadataResponse gained a request-level `error_code` so that an
+///   authorization denial stops being indistinguishable from a topic that
+///   does not exist.
+pub const API_VERSION: i16 = 3;
 
 /// Bytes in a payload header: api_key + api_version + correlation_id.
 /// (`client_id` is variable-length and follows.)
@@ -74,6 +80,24 @@ pub enum ApiKey {
     /// Announce a member's own departure so the coordinator can
     /// rebalance now rather than after its session timeout.
     LeaveGroup = 18,
+    /// Who is in this cluster, and which node is the controller.
+    DescribeCluster = 19,
+    /// Read back the configuration in force for a topic or a broker.
+    DescribeConfigs = 20,
+    /// How much disk each partition is using on the broker asked.
+    DescribeLogDirs = 21,
+    /// Discard every record below an offset and reclaim its segments.
+    DeleteRecords = 22,
+    /// Announce a partition a transaction will write to.
+    AddPartitionsToTxn = 23,
+    /// Bring a consumer group's offsets into a transaction.
+    AddOffsetsToTxn = 24,
+    /// Commit or abort a transaction, marking every partition it touched.
+    EndTxn = 25,
+    /// Commit consumed offsets as part of a transaction.
+    TxnOffsetCommit = 26,
+    /// Cluster-internal: write commit/abort markers to partitions.
+    WriteTxnMarkers = 27,
 }
 
 impl ApiKey {
@@ -98,6 +122,15 @@ impl ApiKey {
             16 => Ok(ApiKey::FetchMulti),
             17 => Ok(ApiKey::Authenticate),
             18 => Ok(ApiKey::LeaveGroup),
+            19 => Ok(ApiKey::DescribeCluster),
+            20 => Ok(ApiKey::DescribeConfigs),
+            21 => Ok(ApiKey::DescribeLogDirs),
+            22 => Ok(ApiKey::DeleteRecords),
+            23 => Ok(ApiKey::AddPartitionsToTxn),
+            24 => Ok(ApiKey::AddOffsetsToTxn),
+            25 => Ok(ApiKey::EndTxn),
+            26 => Ok(ApiKey::TxnOffsetCommit),
+            27 => Ok(ApiKey::WriteTxnMarkers),
             other => Err(ProtocolError::UnknownApiKey(other)),
         }
     }
@@ -166,6 +199,21 @@ pub mod error_code {
     /// The principal is known but not permitted this operation on this
     /// resource.
     pub const AUTHORIZATION_FAILED: i32 = 19;
+    /// The transaction is not in a state where this request makes sense —
+    /// writing to a partition without beginning a transaction, or ending
+    /// one that was never started.
+    pub const INVALID_TXN_STATE: i32 = 20;
+    /// This `transactional.id` is being used by a newer producer instance.
+    /// The sender has been fenced and must not complete its transaction:
+    /// its replacement has already taken over.
+    pub const INVALID_PRODUCER_ID_MAPPING: i32 = 21;
+    /// The coordinator is still replaying `__transaction_state`; retry.
+    pub const CONCURRENT_TRANSACTIONS: i32 = 22;
+    /// The log directory holding this partition has failed on the broker
+    /// that answered. The partition exists and is assigned there; its
+    /// disk does not work. A client must treat this as unavailable and
+    /// refresh metadata, never as a topic that has been deleted.
+    pub const LOG_DIR_OFFLINE: i32 = 23;
 }
 
 /// Encode `header` + `body` as a complete frame including the `length:i32`

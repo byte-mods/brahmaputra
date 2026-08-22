@@ -21,7 +21,7 @@ use crate::consumer::{Consumer, LATEST};
 use crate::error::ClientError;
 use crate::group_consumer::{msg_err, GroupCoordinator};
 use crate::router::BrokerRouter;
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportConfig};
 
 /// One group in a cluster-wide listing.
 #[derive(Debug, Clone)]
@@ -92,7 +92,7 @@ impl GroupAdmin {
 
     /// Connect over an explicit transport (must match the broker's).
     pub async fn connect_with(
-        transport: Transport,
+        transport: impl Into<TransportConfig>,
         addr: SocketAddr,
         client_id: &str,
     ) -> Result<GroupAdmin, ClientError> {

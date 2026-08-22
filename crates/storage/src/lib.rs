@@ -14,6 +14,8 @@
 //!   00000000000000481234.log
 //!   ...
 //!   hwm                                 # high-watermark checkpoint (i64 BE)
+//!   logstart                            # log start offset after DeleteRecords
+//!   txnindex                            # open and aborted transactions
 //! ```
 
 mod epoch;
@@ -21,7 +23,9 @@ mod error;
 mod index;
 mod log;
 mod segment;
+mod txn;
 
 pub use epoch::{LeaderEpochCheckpoint, LeaderEpochEntry};
 pub use error::StorageError;
 pub use log::{Log, LogConfig, LogRegion};
+pub use txn::{AbortedTransaction, TransactionIndex};

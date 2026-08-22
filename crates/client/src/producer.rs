@@ -28,7 +28,7 @@ use tracing::{debug, trace};
 
 use crate::error::ClientError;
 use crate::router::BrokerRouter;
-use crate::transport::Transport;
+use crate::transport::TransportConfig;
 
 type TopicPartition = (String, i32);
 type PartitionSendLock = Arc<AsyncMutex<()>>;
@@ -55,7 +55,7 @@ pub struct ProducerConfig {
     /// an ambiguous send. Requires acknowledgements and max_in_flight <= 5.
     pub idempotence: bool,
     /// Data-plane transport; must match the broker's.
-    pub transport: Transport,
+    pub transport: TransportConfig,
     /// Send partitions that share a broker in one request (api_key 15).
     /// On by default: it is the difference between paying the per-request
     /// cost once and paying it per partition.
@@ -102,7 +102,7 @@ impl Default for ProducerConfig {
             acks: 1,
             timeout_ms: 30_000,
             idempotence: false,
-            transport: Transport::default(),
+            transport: TransportConfig::default(),
             batch_partitions: true,
             retries: 5,
             retry_backoff_ms: 100,
@@ -273,7 +273,7 @@ impl Producer {
             ));
         }
         let router = BrokerRouter::connect_with(
-            config.transport,
+            config.transport.clone(),
             addr,
             Some(config.client_id.clone()),
             config.max_in_flight,

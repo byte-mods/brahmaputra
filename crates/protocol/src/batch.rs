@@ -8,7 +8,8 @@
 //! leader_epoch:      i32
 //! magic:             u8    (MAGIC_V1 or MAGIC_V2)
 //! crc32c:            u32   (covers everything after this field)
-//! attributes:        u16   (bits 0..=2: compression type; bit 3: headers)
+//! attributes:        u16   (bits 0..=2: compression; 3: headers;
+//!                            4: transactional; 5: control batch)
 //! last_offset_delta: i32
 //! max_timestamp:     i64
 //! producer_id:       i64   (magic v2 only)
@@ -66,6 +67,22 @@ pub const PRODUCER_EXTENSION_LEN: usize = 8 + 2 + 4;
 const COMPRESSION_MASK: u16 = 0x0007;
 /// Attributes bit 3: the records in this batch carry a header section.
 const HEADERS_BIT: u16 = 0x0008;
+/// Attributes bit 4: these records belong to a transaction and must not be
+/// shown to a `read_committed` consumer until that transaction commits.
+///
+/// A bit rather than a magic bump, for the same reason headers are: magic
+/// already means "does this batch carry producer metadata", and a
+/// transactional batch always carries it. Overloading magic would make
+/// "idempotent, not transactional" unrepresentable.
+pub const TRANSACTIONAL_BIT: u16 = 0x0010;
+/// Attributes bit 5: this batch is a transaction marker, not data.
+///
+/// Control batches are written by the transaction coordinator to say that
+/// everything a producer wrote to this partition under a given transaction
+/// is now committed or aborted. They occupy an offset — which is why a
+/// transactional topic's offsets are not contiguous with its records — and
+/// are never delivered to any consumer.
+pub const CONTROL_BIT: u16 = 0x0020;
 
 /// Compression applied to the records payload inside a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -302,6 +319,13 @@ pub struct RecordBatch {
     pub compression: Compression,
     /// `None` encodes the legacy magic-v1 layout. `Some` encodes magic v2.
     pub producer: Option<ProducerMetadata>,
+    /// These records belong to an open transaction.
+    ///
+    /// Defaulted rather than required, so every existing construction site
+    /// keeps producing exactly the bytes it did before transactions existed.
+    pub transactional: bool,
+    /// This batch is a commit or abort marker rather than data.
+    pub control: bool,
 }
 
 impl RecordBatch {
@@ -318,6 +342,8 @@ impl RecordBatch {
             records,
             compression: Compression::None,
             producer: None,
+            transactional: false,
+            control: false,
         }
     }
 
@@ -359,6 +385,8 @@ impl RecordBatch {
             records,
             compression: Compression::None,
             producer: None,
+            transactional: false,
+            control: false,
         }
     }
 
@@ -464,6 +492,12 @@ impl RecordBatch {
         if has_headers {
             attributes |= HEADERS_BIT;
         }
+        if self.transactional {
+            attributes |= TRANSACTIONAL_BIT;
+        }
+        if self.control {
+            attributes |= CONTROL_BIT;
+        }
         out.put_u16(attributes);
         out.put_i32(self.last_offset_delta());
         out.put_i64(self.max_timestamp);
@@ -553,6 +587,8 @@ impl RecordBatch {
             records,
             compression,
             producer,
+            transactional: attributes & TRANSACTIONAL_BIT != 0,
+            control: attributes & CONTROL_BIT != 0,
         })
     }
 }
@@ -672,6 +708,129 @@ pub struct BatchHeader {
     /// Stable fingerprint of attributes, producer extension and payload.
     /// It deliberately excludes broker-stamped base offset / leader epoch.
     pub content_crc32c: u32,
+    /// Records here belong to an open transaction.
+    pub transactional: bool,
+    /// A commit or abort marker rather than data.
+    pub control: bool,
+}
+
+impl BatchHeader {
+    /// Exclusive end offset of this batch: one past its last record.
+    pub fn next_offset(&self) -> i64 {
+        self.base_offset + i64::from(self.last_offset_delta) + 1
+    }
+
+    /// The producer that wrote this batch, when it declared one.
+    pub fn producer_id(&self) -> Option<i64> {
+        self.producer.map(|producer| producer.producer_id)
+    }
+}
+
+/// How much of a partition a consumer is willing to see.
+///
+/// The default is `ReadUncommitted`, as in Kafka: a topic nobody writes
+/// transactionally to behaves identically either way, and making the
+/// stricter mode the default would silently change what every existing
+/// consumer reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolationLevel {
+    /// Everything up to the high watermark, including records of
+    /// transactions that have not been decided.
+    #[default]
+    ReadUncommitted = 0,
+    /// Nothing past the last stable offset, no control markers, and nothing
+    /// written by a transaction that aborted.
+    ReadCommitted = 1,
+}
+
+impl IsolationLevel {
+    pub fn from_wire(value: i32) -> Self {
+        match value {
+            1 => IsolationLevel::ReadCommitted,
+            // Anything unrecognised reads as the permissive default rather
+            // than as an error: an isolation level a broker does not know
+            // is not a reason to refuse the fetch.
+            _ => IsolationLevel::ReadUncommitted,
+        }
+    }
+
+    pub fn to_wire(self) -> i32 {
+        self as i32
+    }
+
+    pub fn is_committed(self) -> bool {
+        matches!(self, IsolationLevel::ReadCommitted)
+    }
+
+    /// Parse the `isolation.level` spelling Kafka uses.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "read_uncommitted" => Some(IsolationLevel::ReadUncommitted),
+            "read_committed" => Some(IsolationLevel::ReadCommitted),
+            _ => None,
+        }
+    }
+}
+
+/// What a control batch says about the transaction it closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlMarker {
+    Abort = 0,
+    Commit = 1,
+}
+
+impl ControlMarker {
+    fn to_bytes(self) -> Vec<u8> {
+        // Two bytes: a version, then the marker. Versioned because a
+        // marker is written to the log forever, and the one thing worse
+        // than an unreadable marker is one that reads as the wrong kind.
+        vec![CONTROL_MARKER_VERSION, self as u8]
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            [CONTROL_MARKER_VERSION, 0] => Some(ControlMarker::Abort),
+            [CONTROL_MARKER_VERSION, 1] => Some(ControlMarker::Commit),
+            _ => None,
+        }
+    }
+}
+
+const CONTROL_MARKER_VERSION: u8 = 1;
+
+/// Build the control batch that closes a producer's transaction on one
+/// partition.
+///
+/// It carries the producer's identity in the same magic-v2 extension a data
+/// batch uses, because that is what tells a reader *whose* transaction just
+/// ended — a marker that did not name a producer could not be matched to
+/// the records it resolves.
+pub fn control_batch(
+    producer: ProducerMetadata,
+    marker: ControlMarker,
+    timestamp: i64,
+) -> RecordBatch {
+    RecordBatch {
+        base_offset: 0,
+        leader_epoch: 0,
+        max_timestamp: timestamp,
+        records: vec![Record::new(marker.to_bytes())],
+        compression: Compression::None,
+        producer: Some(producer),
+        // A marker is itself part of the transaction it closes: bounded by
+        // the same rules, and invisible to a `read_committed` consumer.
+        transactional: true,
+        control: true,
+    }
+}
+
+/// Read the marker out of a decoded control batch, or `None` if this is not
+/// a control batch or its payload is not one this version understands.
+pub fn read_control_marker(batch: &RecordBatch) -> Option<ControlMarker> {
+    if !batch.control {
+        return None;
+    }
+    ControlMarker::from_bytes(batch.records.first()?.value.as_ref())
 }
 
 /// Validate a complete batch's framing and CRC without decoding its records
@@ -740,6 +899,8 @@ pub fn validate_batch_header(bytes: &[u8]) -> Result<BatchHeader, ProtocolError>
         max_timestamp,
         producer,
         content_crc32c: stored_crc,
+        transactional: attributes & TRANSACTIONAL_BIT != 0,
+        control: attributes & CONTROL_BIT != 0,
     })
 }
 
@@ -869,6 +1030,59 @@ mod tests {
             .collect();
         assert_eq!(tags, vec![Bytes::from("first"), Bytes::from("second")]);
         assert_eq!(decoded.records[0].header("tag").unwrap().as_ref(), b"first");
+    }
+
+    #[test]
+    fn transactional_and_control_bits_survive_a_round_trip() {
+        let producer = ProducerMetadata {
+            producer_id: 77,
+            producer_epoch: 3,
+            base_sequence: 0,
+        };
+        let mut batch = RecordBatch::new(10, 1, 5_000, vec![Record::new(b"payload".to_vec())]);
+        batch.producer = Some(producer);
+        batch.transactional = true;
+
+        let encoded = batch.encode();
+        let decoded = RecordBatch::decode(&mut encoded.clone()).unwrap();
+        assert!(decoded.transactional);
+        assert!(!decoded.control);
+        // The header path is what the broker reads on every fetch, and it
+        // has to agree with the full decode or a read_committed fetch would
+        // filter on one answer while the consumer saw another.
+        let header = validate_batch_header(&encoded).unwrap();
+        assert!(header.transactional);
+        assert!(!header.control);
+        assert_eq!(header.producer_id(), Some(77));
+        assert_eq!(header.next_offset(), 11);
+
+        let marker = control_batch(producer, ControlMarker::Commit, 6_000);
+        let encoded = marker.encode();
+        let decoded = RecordBatch::decode(&mut encoded.clone()).unwrap();
+        assert!(decoded.control && decoded.transactional);
+        assert_eq!(read_control_marker(&decoded), Some(ControlMarker::Commit));
+        let header = validate_batch_header(&encoded).unwrap();
+        assert!(header.control);
+
+        let aborted = control_batch(producer, ControlMarker::Abort, 6_000);
+        let decoded = RecordBatch::decode(&mut aborted.encode()).unwrap();
+        assert_eq!(read_control_marker(&decoded), Some(ControlMarker::Abort));
+
+        // A data batch is not a marker, however it is inspected.
+        assert_eq!(read_control_marker(&batch), None);
+    }
+
+    #[test]
+    fn a_non_transactional_batch_encodes_exactly_as_it_always_did() {
+        // The bits are additive: adding transactions must not change one
+        // byte of a batch that uses none of it, or every log written before
+        // today would decode differently.
+        let batch = RecordBatch::new(4, 2, 900, vec![Record::new(b"plain".to_vec())]);
+        let encoded = batch.encode();
+        let attributes = u16::from_be_bytes([encoded[21], encoded[22]]);
+        assert_eq!(attributes & (TRANSACTIONAL_BIT | CONTROL_BIT), 0);
+        let decoded = RecordBatch::decode(&mut encoded.clone()).unwrap();
+        assert!(!decoded.transactional && !decoded.control);
     }
 
     /// The whole point of the attributes bit: a batch nobody attached a

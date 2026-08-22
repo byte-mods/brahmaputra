@@ -39,7 +39,14 @@ public final class Protocol {
     public static final String SCHEMA_VERSION = "1.0.0";
 
     /** Wire version this client speaks. The broker requires an exact match. */
-    public static final short API_VERSION = 2;
+    // Version 3 added transactions: Fetch carries an isolation_level, and
+    // MetadataResponse carries a request-level error code so an authorization
+    // denial is no longer reported as an unknown topic.
+    public static final short API_VERSION = 3;
+
+    /** Isolation levels for a fetch. READ_UNCOMMITTED is the default. */
+    public static final int READ_UNCOMMITTED = 0;
+    public static final int READ_COMMITTED = 1;
 
     static final int BATCH_HEADER_LEN = 12;
     static final int MIN_BATCH_LENGTH = 4 + 1 + 4 + 2 + 4 + 8;

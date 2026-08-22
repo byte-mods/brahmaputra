@@ -247,8 +247,13 @@ public final class Client {
     }
 
     static ClusterMetadata decodeMetadata(Reader reader) {
-        // Field order is exactly the schema's: brokers, controller_id, topics. There is no
-        // leading error code — a per-topic one lives inside each topic entry instead.
+        // Field order is exactly the schema's: error_code, brokers, controller_id, topics.
+        // The leading code is request-level — an authorization denial, say — and is
+        // distinct from the per-topic one, which is what "no such topic" uses.
+        int requestError = reader.int32();
+        if (requestError != ErrorCode.NONE) {
+            throw new ServerException(requestError, "metadata");
+        }
         List<BrokerInfo> brokers = new ArrayList<>();
         for (int count = reader.int32(); count > 0; count--) {
             brokers.add(new BrokerInfo(reader.int32(), reader.string(), reader.int32()));
@@ -756,6 +761,9 @@ public final class Client {
         public int fetchMaxBytes = 8 * 1024 * 1024;
         public int fetchMinBytes = 1;
         public int fetchMaxWaitMs = 500;
+        /** READ_UNCOMMITTED (0) or READ_COMMITTED (1). A committed read stops at the
+         * last stable offset and never sees an aborted transaction's records. */
+        public int isolationLevel = Protocol.READ_UNCOMMITTED;
         public int maxPollRecords = 500;
         public int dialTimeoutMs = 30_000;
     }
@@ -811,6 +819,7 @@ public final class Client {
                     .int32(config.fetchMaxBytes)
                     .int32(Math.min(maxWaitMs, config.fetchMaxWaitMs))
                     .int32(config.fetchMinBytes)
+                    .int32(config.isolationLevel)
                     .bytes();
 
             Object[] result = fetchOnce(router.connectionFor(topic, partition), body);

@@ -11,7 +11,7 @@ mod observability;
 use anyhow::{anyhow, bail, Context, Result};
 use brahmaputra_broker::{
     Broker, BrokerConfig, QuotaConfig, ReplicaManager, ReplicaManagerConfig,
-    ReplicationHealthSnapshot,
+    ReplicationHealthSnapshot, TlsIdentity,
 };
 use brahmaputra_client::Transport;
 use brahmaputra_controller::{ControllerConfig, ControllerNode, NodeId};
@@ -30,11 +30,17 @@ const DEFAULT_CONTROL_PORT: u16 = 19_092;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_SESSION_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_REPLICA_LAG_TIME_MAX_MS: u64 = 10_000;
+/// Kafka's `leader.imbalance.check.interval.seconds` is 300; matched here.
+/// Leadership handover costs a leader-epoch bump and a follower truncation
+/// check, so doing it eagerly would trade a balance problem for a latency
+/// one.
+const DEFAULT_LEADER_REBALANCE_INTERVAL_MS: u64 = 300_000;
 const METADATA_SYNC_INTERVAL: Duration = Duration::from_millis(50);
 const REPLICATION_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
 /// Internal consumer-group offsets topic (Blueprint 05 §1), auto-created in
 /// cluster mode once the local node is registered.
 const OFFSETS_TOPIC: &str = "__consumer_offsets";
+const TRANSACTION_STATE_TOPIC: &str = "__transaction_state";
 const DEFAULT_OFFSETS_TOPIC_PARTITIONS: i32 = 50;
 const DEFAULT_RETENTION_CHECK_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_HTTP_PORT: u16 = 8080;
@@ -56,9 +62,21 @@ struct Args {
     #[arg(long, default_value_t = 9092)]
     port: u16,
 
-    /// Data directory (one `<topic>-<partition>` log dir per partition, plus meta.toml).
-    #[arg(long, default_value = "./data")]
-    data_dir: PathBuf,
+    /// Data directory (one `<topic>-<partition>` log dir per partition, plus
+    /// meta.toml). Repeat, or comma-separate, for one directory per disk.
+    ///
+    /// Several directories is JBOD: each partition lives on exactly one of
+    /// them, a new partition is placed on whichever holds the fewest, and a
+    /// directory that fails takes only its own partitions offline instead
+    /// of the whole broker. That last part is the point — with one
+    /// directory a disk failure has no partial mode.
+    ///
+    /// Give the broker the disks directly rather than a RAID array
+    /// underneath: replication across brokers already provides the
+    /// redundancy, and RAID would spend capacity and write throughput
+    /// duplicating it.
+    #[arg(long = "data-dir", default_value = "./data", value_delimiter = ',')]
+    data_dirs: Vec<PathBuf>,
 
     /// Partition count for auto-created topics.
     #[arg(long, default_value_t = 1)]
@@ -118,6 +136,29 @@ struct Args {
     #[arg(long, default_value_t = false)]
     require_auth: bool,
 
+    /// PEM certificate chain the broker presents on `tcp-tls` and `quic`.
+    ///
+    /// Without it the broker generates a self-signed certificate at
+    /// startup: fine for development, but a client has no way to tell that
+    /// certificate apart from any other, so it proves nothing about who it
+    /// is talking to.
+    #[arg(long = "tls-cert", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key matching `--tls-cert`.
+    #[arg(long = "tls-key", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
+    /// PEM CA bundle that client certificates must chain to.
+    ///
+    /// Setting it *requires* a client certificate on every encrypted
+    /// connection, and binds that certificate's common name to the
+    /// connection as its principal — authentication with no password
+    /// crossing the wire, and ACLs enforceable against a client that never
+    /// calls Authenticate.
+    #[arg(long = "tls-client-ca")]
+    tls_client_ca: Option<PathBuf>,
+
     /// Port for the metrics API and dashboard (DESIGN.md §9.2). 0
     /// disables it.
     #[arg(long, default_value_t = DEFAULT_HTTP_PORT)]
@@ -169,6 +210,16 @@ struct Args {
     /// Remove an assigned follower from ISR after it stops fetching for this long.
     #[arg(long, default_value_t = DEFAULT_REPLICA_LAG_TIME_MAX_MS)]
     replica_lag_time_max_ms: u64,
+
+    /// How often the controller moves leadership back to each partition's
+    /// preferred replica (`leader.imbalance.check.interval.seconds`); 0
+    /// disables it.
+    ///
+    /// Without this, every broker restart leaves leadership permanently on
+    /// whichever replica took over, so a cluster that has been operated for
+    /// months ends up with its load wherever its outages happened to put it.
+    #[arg(long, default_value_t = DEFAULT_LEADER_REBALANCE_INTERVAL_MS)]
+    auto_leader_rebalance_interval_ms: u64,
 
     /// Partition count for the internal __consumer_offsets topic created at
     /// cluster startup.
@@ -231,6 +282,8 @@ struct ClusterSettings {
     heartbeat_interval: Duration,
     session_timeout: Duration,
     replica_lag_time_max: Duration,
+    /// `None` disables preferred-leader rebalancing entirely.
+    auto_leader_rebalance_interval: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -270,11 +323,12 @@ fn quota_config(args: &Args) -> QuotaConfig {
 
 async fn run_standalone(args: Args) -> Result<()> {
     let quota = quota_config(&args);
+    let tls = tls_identity(&args);
     let host = args.host.clone();
     let config = BrokerConfig {
         host: args.host.clone(),
         port: args.port,
-        data_dir: args.data_dir,
+        data_dirs: args.data_dirs,
         default_partitions: args.default_partitions,
         log_config: LogConfig {
             segment_bytes: args.segment_bytes,
@@ -290,6 +344,7 @@ async fn run_standalone(args: Args) -> Result<()> {
         transport: args.transport,
         quota,
         require_auth: args.require_auth,
+        tls,
         ..BrokerConfig::default()
     };
 
@@ -337,6 +392,7 @@ async fn run_standalone(args: Args) -> Result<()> {
 
 async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
     let quota = quota_config(&args);
+    let tls = tls_identity(&args);
     let host = args.host.clone();
     let controller_listener = TcpListener::bind((args.host.as_str(), cluster.control_port))
         .await
@@ -364,7 +420,9 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
         cluster.cluster_id.clone(),
         cluster.peers.clone(),
     )
-    .with_data_dir(args.data_dir.join("controller"))
+    // The Raft log is broker-wide, not per-partition, so it lives in the
+    // first data dir rather than being spread across them.
+    .with_data_dir(args.data_dirs[0].join("controller"))
     .with_heartbeat_checkpoint_interval(heartbeat_checkpoint_interval);
     let controller = ControllerNode::new(controller_config)
         .await
@@ -376,7 +434,7 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
             broker_id: cluster.broker_id,
             host: args.host.clone(),
             port: args.port,
-            data_dir: args.data_dir,
+            data_dirs: args.data_dirs,
             default_partitions: args.default_partitions,
             log_config: LogConfig {
                 segment_bytes: args.segment_bytes,
@@ -394,6 +452,7 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
             transport: args.transport,
             quota,
             require_auth: args.require_auth,
+            tls,
             metadata_cache: Some(metadata_cache.clone()),
             replication_enabled: true,
             ..BrokerConfig::default()
@@ -529,7 +588,7 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
     let offsets_shutdown = shutdown_rx.clone();
     let offsets_partitions = args.offsets_topic_partitions;
     components.spawn(async move {
-        ensure_offsets_topic(
+        ensure_internal_topics(
             offsets_controller,
             offsets_cache,
             offsets_epoch,
@@ -647,7 +706,23 @@ fn cluster_settings(args: &Args) -> Result<Option<ClusterSettings>> {
         heartbeat_interval: Duration::from_millis(args.heartbeat_interval_ms),
         session_timeout: Duration::from_millis(args.session_timeout_ms),
         replica_lag_time_max: Duration::from_millis(args.replica_lag_time_max_ms),
+        auto_leader_rebalance_interval: (args.auto_leader_rebalance_interval_ms > 0)
+            .then(|| Duration::from_millis(args.auto_leader_rebalance_interval_ms)),
     }))
+}
+
+/// The TLS material this broker should use, from the command line.
+///
+/// All three unset is the development default: a self-signed certificate
+/// generated at startup, and nothing asked of the client. That keeps a
+/// single-node broker startable with no files to create, which is the only
+/// reason it is the default rather than the safe choice.
+fn tls_identity(args: &Args) -> TlsIdentity {
+    TlsIdentity {
+        cert_path: args.tls_cert.clone(),
+        key_path: args.tls_key.clone(),
+        client_ca_path: args.tls_client_ca.clone(),
+    }
 }
 
 fn node_id_to_broker_id(node_id: NodeId) -> Result<i32> {
@@ -792,6 +867,11 @@ async fn controller_maintenance(
 ) -> Result<()> {
     let mut maintenance = interval(settings.heartbeat_interval);
     maintenance.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Leadership rebalancing runs on its own, much slower clock than
+    // fencing does. Tracked as "when it was last considered" rather than as
+    // a second timer so a node that only just became Raft leader does not
+    // immediately reshuffle a cluster it has barely observed.
+    let mut last_rebalance = Instant::now();
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -801,7 +881,20 @@ async fn controller_maintenance(
             }
             _ = maintenance.tick() => {
                 if *broker_epoch.borrow_and_update() != 0 {
-                    run_leader_maintenance(&controller, &settings, &mut shutdown).await?;
+                    let rebalance_due = match settings.auto_leader_rebalance_interval {
+                        Some(every) => last_rebalance.elapsed() >= every,
+                        None => false,
+                    };
+                    if rebalance_due {
+                        last_rebalance = Instant::now();
+                    }
+                    run_leader_maintenance(
+                        &controller,
+                        &settings,
+                        rebalance_due,
+                        &mut shutdown,
+                    )
+                    .await?;
                 }
             }
         }
@@ -912,6 +1005,7 @@ async fn heartbeat_broker(
 async fn run_leader_maintenance(
     controller: &ControllerNode,
     settings: &ClusterSettings,
+    rebalance_leadership: bool,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let image = controller
@@ -925,6 +1019,7 @@ async fn run_leader_maintenance(
         controller.raft_metrics().current_leader,
         unix_time_ms(),
         duration_millis_i64(settings.session_timeout),
+        rebalance_leadership,
     );
     for command in commands {
         let Some(result) = write_or_shutdown(controller, command, shutdown).await else {
@@ -1414,6 +1509,7 @@ fn leader_maintenance_commands(
     current_leader: Option<NodeId>,
     now_ms: i64,
     session_timeout_ms: i64,
+    rebalance_leadership: bool,
 ) -> Vec<MetadataCommand> {
     if current_leader != Some(node_id) {
         return Vec::new();
@@ -1435,6 +1531,53 @@ fn leader_maintenance_commands(
                 broker_epoch,
             }),
     );
+    if rebalance_leadership {
+        commands.extend(preferred_leader_commands(image));
+    }
+    commands
+}
+
+/// Move leadership back to each partition's preferred replica.
+///
+/// A partition fails over when its leader dies, and nothing brings
+/// leadership back when that broker returns — so after a rolling restart
+/// every partition is led by whichever broker happened to be next in line.
+/// Left alone, load concentrates on the brokers that stayed up, which is
+/// exactly the set already carrying the most work.
+///
+/// Only partitions whose preferred replica is *in the ISR* are moved. That
+/// replica therefore holds every committed record, so the handover cannot
+/// lose data — it costs one leader-epoch bump. Partitions mid-reassignment
+/// are skipped: their replica set is deliberately a superset of where they
+/// are heading, so `replicas[0]` is not yet meaningful.
+fn preferred_leader_commands(image: &ClusterMetadata) -> Vec<MetadataCommand> {
+    let mut commands = Vec::new();
+    for topic in image.topics.values() {
+        for assignment in topic.partitions.values() {
+            if !assignment.is_leader_imbalanced() {
+                continue;
+            }
+            let Some(preferred) = assignment.preferred_leader() else {
+                continue;
+            };
+            // The ISR is only evidence of a caught-up *replica*; the broker
+            // must also still be alive and serving as a broker, or the
+            // handover would elect a node that cannot take the traffic.
+            let usable = image.brokers.get(&preferred).is_some_and(|broker| {
+                broker.alive && broker.roles.contains(&NodeRole::Broker)
+            });
+            if !usable {
+                continue;
+            }
+            commands.push(MetadataCommand::ChangePartition {
+                topic: topic.name.clone(),
+                partition: assignment.partition,
+                leader: preferred,
+                isr: assignment.isr.clone(),
+                expected_leader_epoch: assignment.leader_epoch,
+            });
+        }
+    }
     commands
 }
 
@@ -1462,11 +1605,13 @@ async fn write_or_shutdown(
     }
 }
 
-/// Create the internal `__consumer_offsets` topic once the local node is a
-/// registered broker (broker epoch != 0). Every node attempts the create;
-/// all but one lose the race, which is fine as long as the topic exists in
-/// the applied image afterwards.
-async fn ensure_offsets_topic(
+/// Create the internal topics once the local node is a registered broker
+/// (broker epoch != 0): `__consumer_offsets` for group state, and
+/// `__transaction_state` for the transaction coordinator.
+///
+/// Every node attempts each create; all but one lose the race, which is
+/// fine as long as the topics exist in the applied image afterwards.
+async fn ensure_internal_topics(
     controller: Arc<ControllerNode>,
     cache: MetadataCache,
     mut broker_epoch: watch::Receiver<BrokerEpoch>,
@@ -1487,46 +1632,68 @@ async fn ensure_offsets_topic(
         }
     }
 
+    // The transaction state topic is deliberately smaller: it holds one
+    // record per transactional id rather than one per group-partition, and
+    // its partition count is what bounds how many coordinators a cluster
+    // spreads that work across.
+    for (name, partitions) in [
+        (OFFSETS_TOPIC, partitions),
+        (TRANSACTION_STATE_TOPIC, partitions.clamp(1, 50)),
+    ] {
+        create_internal_topic(&controller, &cache, name, partitions, &mut shutdown).await?;
+    }
+    // The topics are ensured; park until shutdown. Returning early would
+    // make supervise_components tear down the whole node (any completed
+    // component is treated as a stop signal).
+    wait_for_shutdown(shutdown).await;
+    Ok(())
+}
+
+/// Create one internal topic if the applied image does not already have it.
+///
+/// Losing the create race is not a failure: several nodes attempt it at
+/// startup, and the only thing that matters is that the topic exists
+/// afterwards.
+async fn create_internal_topic(
+    controller: &Arc<ControllerNode>,
+    cache: &MetadataCache,
+    name: &str,
+    partitions: i32,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
     let image = controller
         .local_metadata()
         .await
-        .context("failed to read metadata for offsets topic creation")?;
-    publish_if_newer(&cache, image.clone());
-    if image.topics.contains_key(OFFSETS_TOPIC) {
-        wait_for_shutdown(shutdown).await;
+        .with_context(|| format!("failed to read metadata before creating {name}"))?;
+    publish_if_newer(cache, image.clone());
+    if image.topics.contains_key(name) {
         return Ok(());
     }
     let live = image.brokers.values().filter(|broker| broker.alive).count();
     let command = MetadataCommand::CreateTopic {
-        name: OFFSETS_TOPIC.to_owned(),
+        name: name.to_owned(),
         partitions,
         replication_factor: (live as i32).clamp(1, 3),
         configs: BTreeMap::new(),
     };
-    let Some(result) = write_or_shutdown(&controller, command, &mut shutdown).await else {
+    let Some(result) = write_or_shutdown(controller, command, shutdown).await else {
         return Ok(());
     };
     match result {
         Ok(event) => {
-            tracing::info!(?event, partitions, "internal offsets topic created");
+            tracing::info!(?event, name, partitions, "internal topic created");
         }
         Err(error) => {
-            // A concurrent creator may have won; the topic existing in the
-            // applied image is the only success criterion.
             let image = controller
                 .local_metadata()
                 .await
-                .context("failed to re-read metadata after offsets topic creation")?;
-            publish_if_newer(&cache, image.clone());
-            if !image.topics.contains_key(OFFSETS_TOPIC) {
-                bail!("failed to create internal offsets topic: {error}")
+                .with_context(|| format!("failed to re-read metadata after creating {name}"))?;
+            publish_if_newer(cache, image.clone());
+            if !image.topics.contains_key(name) {
+                bail!("failed to create internal topic {name}: {error}")
             }
         }
     }
-    // The topic is ensured; park until shutdown. Returning early would make
-    // supervise_components tear down the whole node (any completed component
-    // is treated as a stop signal).
-    wait_for_shutdown(shutdown).await;
     Ok(())
 }
 
@@ -1682,7 +1849,7 @@ async fn ensure_admin_user(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brahmaputra_metadata::BrokerMetadata;
+    use brahmaputra_metadata::{BrokerMetadata, PartitionMetadata, TopicMetadata};
     use std::collections::BTreeSet;
 
     fn parse(arguments: &[&str]) -> Args {
@@ -1777,8 +1944,8 @@ mod tests {
         image.brokers.insert(1, broker(1, 7, 1_800));
         image.brokers.insert(2, broker(2, 9, 10));
 
-        assert!(leader_maintenance_commands(&image, 1, 1, Some(2), 2_000, 500).is_empty());
-        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500);
+        assert!(leader_maintenance_commands(&image, 1, 1, Some(2), 2_000, 500, false).is_empty());
+        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, false);
         assert_eq!(commands.len(), 2);
         assert!(matches!(
             commands[0],
@@ -1798,10 +1965,92 @@ mod tests {
             .unwrap()
             .roles
             .remove(&NodeRole::Controller);
-        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500);
+        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, false);
         assert!(!commands
             .iter()
             .any(|command| matches!(command, MetadataCommand::SetController { .. })));
+    }
+
+    #[test]
+    fn leadership_returns_to_the_preferred_replica_only_when_it_is_in_sync() {
+        let mut image = ClusterMetadata::new("test");
+        for id in 1..=3 {
+            image.brokers.insert(id, broker(id, 1, 1_900));
+        }
+        // Broker 2 is preferred but broker 3 is leading: what a restart of
+        // broker 2 leaves behind once it has caught up again.
+        image.topics.insert(
+            "orders".into(),
+            TopicMetadata {
+                name: "orders".into(),
+                replication_factor: 3,
+                partitions: BTreeMap::from([(
+                    0,
+                    PartitionMetadata {
+                        partition: 0,
+                        replicas: vec![2, 3, 1],
+                        leader: 3,
+                        isr: vec![1, 3],
+                        leader_epoch: 4,
+                        target_replicas: None,
+                    },
+                )]),
+                configs: BTreeMap::new(),
+            },
+        );
+
+        // Still catching up: leadership must not move to a replica that
+        // does not hold every committed record.
+        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, true);
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, MetadataCommand::ChangePartition { .. })));
+
+        let partition = image
+            .topics
+            .get_mut("orders")
+            .unwrap()
+            .partitions
+            .get_mut(&0)
+            .unwrap();
+        partition.isr = vec![1, 2, 3];
+
+        // Rejoined the ISR — but nothing moves until the rebalance is due.
+        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, false);
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, MetadataCommand::ChangePartition { .. })));
+
+        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, true);
+        let change = commands
+            .iter()
+            .find_map(|command| match command {
+                MetadataCommand::ChangePartition {
+                    topic,
+                    partition,
+                    leader,
+                    expected_leader_epoch,
+                    ..
+                } => Some((topic.clone(), *partition, *leader, *expected_leader_epoch)),
+                _ => None,
+            })
+            .expect("preferred leader handover");
+        assert_eq!(change, ("orders".to_owned(), 0, 2, 4));
+
+        // A partition mid-reassignment holds the union of old and new
+        // replicas, so its first replica is not yet a placement decision.
+        image
+            .topics
+            .get_mut("orders")
+            .unwrap()
+            .partitions
+            .get_mut(&0)
+            .unwrap()
+            .target_replicas = Some(vec![1, 3]);
+        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, true);
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, MetadataCommand::ChangePartition { .. })));
     }
 
     #[test]

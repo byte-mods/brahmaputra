@@ -42,7 +42,7 @@ async fn start_broker(data_dir: &Path) -> RunningBroker {
         .try_init();
     let broker = Broker::bind(BrokerConfig {
         port: 0,
-        data_dir: data_dir.to_path_buf(),
+        data_dirs: vec![data_dir.to_path_buf()],
         default_partitions: PARTITIONS,
         ..BrokerConfig::default()
     })

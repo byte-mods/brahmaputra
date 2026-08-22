@@ -21,6 +21,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::debug;
 
 use crate::error::ClientError;
+use crate::tls::TlsSettings;
 
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
@@ -62,24 +63,22 @@ impl TcpConnection {
 
     /// Connect with TLS 1.3 over the same TCP framing.
     ///
-    /// The broker presents a certificate it generated at startup, which
-    /// this client accepts without verifying a name: the data plane has no
-    /// identity story yet (M6 adds the user store), so this buys
-    /// confidentiality and integrity on the wire, not authentication.
+    /// With default settings the broker's certificate is accepted without
+    /// being checked against anything, which buys confidentiality on the
+    /// wire but not authenticity. Give [`TlsSettings::ca_path`] to check
+    /// it, and [`TlsSettings::cert_path`]/`key_path` to present an identity
+    /// of this client's own to a broker that demands one.
     pub async fn connect_tls(
         addr: SocketAddr,
         client_id: Option<String>,
         max_in_flight: usize,
+        tls: &TlsSettings,
     ) -> Result<TcpConnection, ClientError> {
         let socket = TcpStream::connect(addr).await?;
         socket.set_nodelay(true)?;
-        let mut config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(std::sync::Arc::new(crate::quic::AcceptAnyServerCert))
-            .with_no_client_auth();
-        config.alpn_protocols = vec![crate::quic::ALPN.to_vec()];
+        let config = crate::tls::client_config(tls)?;
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-        let server_name = rustls_pki_types::ServerName::try_from("brahmaputra")
+        let server_name = rustls_pki_types::ServerName::try_from(tls.server_name().to_owned())
             .map_err(|error| ClientError::Configuration(format!("tls server name: {error}")))?;
         let stream = connector.connect(server_name, socket).await?;
         TcpConnection::from_stream(Box::new(stream), client_id, max_in_flight)

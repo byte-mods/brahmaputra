@@ -26,7 +26,15 @@ from typing import List, Optional, Tuple
 # The BitPacker schema version every body carries as its first field.
 SCHEMA_VERSION = "1.0.0"
 # Wire version this client speaks. The broker requires an exact match.
-API_VERSION = 2
+# Version 3 added transactions: Fetch carries an isolation_level, and
+# MetadataResponse carries a request-level error code so an authorization
+# denial is no longer reported as an unknown topic.
+API_VERSION = 3
+
+# Isolation levels for a fetch. READ_UNCOMMITTED is the default and is what
+# every non-transactional topic gives either way.
+READ_UNCOMMITTED = 0
+READ_COMMITTED = 1
 
 BATCH_HEADER_LEN = 12
 MIN_BATCH_LENGTH = 4 + 1 + 4 + 2 + 4 + 8

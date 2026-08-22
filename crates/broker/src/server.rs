@@ -30,12 +30,15 @@ use tracing::{debug, info, warn};
 use crate::actor::{self, PartitionHandle};
 use crate::error::BrokerError;
 use crate::group::GroupCoordinator;
+use crate::transaction::TransactionCoordinator;
 use crate::handlers;
 use crate::producer_id::ProducerIdManager;
 use crate::quic::QuicListener;
 use crate::quota::{QuotaConfig, QuotaKind, QuotaManager};
 use crate::replication::{ReplicationHealthSnapshot, ReplicationTracker};
-use crate::state::{partition_dir, BrokerState};
+use crate::logdirs::LogDirs;
+use crate::state::BrokerState;
+use crate::tls::TlsIdentity;
 use tokio_rustls::TlsAcceptor;
 
 const TASK_DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -64,9 +67,13 @@ pub struct BrokerConfig {
     pub host: String,
     /// Port to bind; 0 picks an ephemeral port (tests).
     pub port: u16,
-    /// Data directory holding one `<topic>-<partition>` log dir per
-    /// partition plus `meta.toml`.
-    pub data_dir: PathBuf,
+    /// Directories holding partition logs, one per disk.
+    ///
+    /// Several means JBOD: each partition lives on exactly one of them, a
+    /// new one is placed on whichever holds the fewest, and a directory
+    /// that fails takes only its own partitions offline instead of the
+    /// whole broker.
+    pub data_dirs: Vec<PathBuf>,
     /// Partition count for auto-created topics.
     pub default_partitions: i32,
     /// Storage config applied to every partition log.
@@ -103,6 +110,10 @@ pub struct BrokerConfig {
     /// authorize every request against the cluster ACLs. Off by default,
     /// matching Kafka PLAINTEXT listeners; production must turn it on.
     pub require_auth: bool,
+    /// Which certificate the broker presents, and whose client certificates
+    /// it accepts. Default generates a self-signed identity at startup and
+    /// asks the client for nothing, which is the development behaviour.
+    pub tls: TlsIdentity,
 }
 
 impl Default for BrokerConfig {
@@ -112,7 +123,7 @@ impl Default for BrokerConfig {
             broker_epoch: None,
             host: "127.0.0.1".into(),
             port: 9092,
-            data_dir: PathBuf::from("./data"),
+            data_dirs: vec![PathBuf::from("./data")],
             default_partitions: 1,
             log_config: LogConfig::default(),
             channel_capacity: 1024,
@@ -126,6 +137,7 @@ impl Default for BrokerConfig {
             quota: QuotaConfig::default(),
             metrics: Metrics::default(),
             require_auth: false,
+            tls: TlsIdentity::default(),
         }
     }
 }
@@ -137,15 +149,27 @@ enum BoundListener {
     Quic(QuicListener),
 }
 
-/// TLS 1.3 acceptor over a freshly generated self-signed certificate.
-fn tls_acceptor() -> Result<TlsAcceptor, BrokerError> {
-    let (cert_der, key_der) = crate::quic::self_signed_identity()?;
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der.into())
-        .map_err(|error| BrokerError::Meta(format!("cannot build tls config: {error}")))?;
-    config.alpn_protocols = vec![crate::quic::ALPN.to_vec()];
-    Ok(TlsAcceptor::from(Arc::new(config)))
+/// TLS 1.3 acceptor for the configured identity.
+///
+/// With no `--tls-cert` this still generates a self-signed certificate at
+/// startup, so a development broker needs no files; with one, it presents
+/// what the operator gave it, and with `--tls-client-ca` it also demands a
+/// certificate from the client.
+/// Whether a storage error means the disk is gone rather than the data
+/// being wrong.
+///
+/// The distinction matters: a corrupt batch is this partition's problem and
+/// taking eleven other partitions offline for it would be an outage caused
+/// by the recovery. A directory that cannot be read at all is the disk's
+/// problem, and every partition on it is already affected.
+fn is_disk_failure(error: &brahmaputra_storage::StorageError) -> bool {
+    matches!(error, brahmaputra_storage::StorageError::Io(_))
+}
+
+fn tls_acceptor(identity: &TlsIdentity) -> Result<TlsAcceptor, BrokerError> {
+    Ok(TlsAcceptor::from(Arc::new(crate::tls::server_config(
+        identity,
+    )?)))
 }
 
 /// A bound broker: load state, (re)open logs, spawn partition actors.
@@ -162,6 +186,8 @@ pub struct Broker {
     replication: ReplicationTracker,
     producer_ids: ProducerIdManager,
     groups: GroupCoordinator,
+    log_dirs: Arc<LogDirs>,
+    transactions: TransactionCoordinator,
     quotas: QuotaManager,
     listener: Mutex<Option<BoundListener>>,
     shutdown_tx: watch::Sender<bool>,
@@ -178,8 +204,13 @@ impl Broker {
                 "replication_enabled requires a metadata cache".into(),
             ));
         }
-        let state = BrokerState::load(&config.data_dir, config.default_partitions)?;
-        let producer_ids = ProducerIdManager::open(&config.data_dir, config.broker_id)
+        let log_dirs = Arc::new(LogDirs::open(&config.data_dirs)?);
+        log_dirs.log_layout();
+        // Broker-wide state — the topic map and the producer-id journal —
+        // is not per-partition, so it lives in the first directory rather
+        // than being spread across them.
+        let state = BrokerState::load(log_dirs.primary(), config.default_partitions)?;
+        let producer_ids = ProducerIdManager::open(log_dirs.primary(), config.broker_id)
             .map_err(|error| BrokerError::Meta(error.to_string()))?;
         // One transport at a time: a broker either speaks TCP or QUIC, and
         // clients must be configured to match (see `Transport`).
@@ -192,11 +223,11 @@ impl Broker {
             Transport::TcpTls => {
                 let listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
                 let addr = listener.local_addr()?;
-                (BoundListener::TcpTls(listener, tls_acceptor()?), addr)
+                (BoundListener::TcpTls(listener, tls_acceptor(&config.tls)?), addr)
             }
             Transport::Quic => {
                 let bind = resolve_bind_addr(&config.host, config.port).await?;
-                let listener = QuicListener::bind(bind, config.max_frame_bytes)?;
+                let listener = QuicListener::bind(bind, config.max_frame_bytes, &config.tls)?;
                 let addr = listener.local_addr();
                 (BoundListener::Quic(listener), addr)
             }
@@ -214,6 +245,8 @@ impl Broker {
             replication: ReplicationTracker::default(),
             producer_ids,
             groups: GroupCoordinator::default(),
+            log_dirs,
+            transactions: TransactionCoordinator::default(),
             quotas: QuotaManager::new(config_quota),
             listener: Mutex::new(Some(listener)),
             shutdown_tx,
@@ -244,7 +277,23 @@ impl Broker {
                 .collect()
         };
         for (topic, partition) in local_partitions {
-            broker.open_partition(&topic, partition)?;
+            match broker.open_partition(&topic, partition) {
+                Ok(_) => {}
+                // A partition on a disk that is already broken must not stop
+                // the broker from starting. Refusing to start because one
+                // disk of twelve is bad would give up exactly the isolation
+                // several directories exist to provide — the other eleven
+                // disks are fine and their partitions are serveable.
+                //
+                // The partition is left unopened, so every request for it is
+                // refused as unavailable, and in a cluster the controller
+                // elects around it as it would for any replica that stopped
+                // fetching.
+                Err(error @ BrokerError::LogDirOffline { .. }) => {
+                    warn!(%topic, partition, %error, "skipping a partition on an offline log dir");
+                }
+                Err(error) => return Err(error),
+            }
         }
         info!(
             addr = %broker.addr,
@@ -506,7 +555,9 @@ impl Broker {
                 continue;
             };
             drop(handle);
-            let dir = crate::state::partition_dir(&self.config.data_dir, &topic_name, partition);
+            let Some(dir) = self.log_dirs.existing(&topic_name, partition) else {
+                continue;
+            };
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => tracing::info!(
                     topic = %topic_name,
@@ -521,6 +572,13 @@ impl Broker {
                     "could not remove drained partition data"
                 ),
             }
+            // Release the placement too. If this partition is ever assigned
+            // back to this broker it should be placed afresh — most likely
+            // on a different disk, since the one it used to be on now holds
+            // one fewer partition than it did.
+            self.log_dirs.forget(&topic_name, partition);
+            self.applied_topic_configs
+                .remove(&(topic_name.clone(), partition));
         }
     }
     pub(crate) fn replication_tracker(&self) -> &ReplicationTracker {
@@ -535,6 +593,84 @@ impl Broker {
     /// partition.
     pub(crate) fn groups(&self) -> &GroupCoordinator {
         &self.groups
+    }
+
+    /// Transaction coordinator, sharded by `__transaction_state` partition.
+    pub(crate) fn transactions(&self) -> &TransactionCoordinator {
+        &self.transactions
+    }
+
+    /// The broker's log directories and the partition placement over them.
+    pub(crate) fn log_dirs(&self) -> &Arc<LogDirs> {
+        &self.log_dirs
+    }
+
+    /// Stop serving these partitions locally.
+    ///
+    /// Called when the disk under them fails. Dropping the handle closes
+    /// the actor, which is what stops anything else touching a disk that
+    /// is returning errors; every later request resolves to a directory
+    /// that is now offline and is refused with `LOG_DIR_OFFLINE`.
+    ///
+    /// Deliberately does **not** delete anything or tell the controller. In
+    /// a cluster the replica simply stops fetching, and the ISR machinery
+    /// that already handles a broker going quiet handles this too — the
+    /// difference being that only these partitions go quiet rather than
+    /// every partition on the broker.
+    pub(crate) async fn close_partitions(&self, partitions: &[(String, i32)]) {
+        for (topic, partition) in partitions {
+            if let Some((_, handle)) = self.handles.remove(&(topic.clone(), *partition)) {
+                drop(handle);
+                warn!(
+                    %topic,
+                    partition,
+                    "partition closed: the log directory holding it went offline"
+                );
+            }
+            self.applied_topic_configs
+                .remove(&(topic.clone(), *partition));
+        }
+        self.metrics()
+            .gauge(names::OFFLINE_LOG_DIRS, self.offline_log_dirs() as i64);
+    }
+
+    /// How many configured log directories have failed.
+    pub(crate) fn offline_log_dirs(&self) -> usize {
+        self.log_dirs
+            .describe()
+            .iter()
+            .filter(|dir| !dir.online)
+            .count()
+    }
+
+    /// Attribute an IO failure to the disk it happened on and take that
+    /// disk offline.
+    ///
+    /// Synchronous, because it is called from paths that cannot await: the
+    /// directory is marked immediately so nothing else opens a partition on
+    /// it, and the health watcher closes the actors on its next tick.
+    /// Marking is what makes the difference; closing is cleanup.
+    pub(crate) fn note_log_dir_failure(&self, path: &std::path::Path, reason: &str) {
+        let Some(dir) = self.log_dirs.owning_dir(path) else {
+            return;
+        };
+        if !self.log_dirs.mark_offline(&dir, reason).is_empty() {
+            self.metrics()
+                .gauge(names::OFFLINE_LOG_DIRS, self.offline_log_dirs() as i64);
+        }
+    }
+
+    /// The data-plane address of another broker, from cluster metadata.
+    ///
+    /// `None` in standalone mode, or for a broker whose registration is not
+    /// in the current image — a caller that cannot reach a peer has to
+    /// treat that as a failure rather than as a reason to act locally.
+    pub(crate) fn broker_address(&self, broker_id: i32) -> Option<SocketAddr> {
+        let image = self.metadata_cache()?.snapshot();
+        let registered = image.brokers.get(&broker_id)?;
+        format!("{}:{}", registered.host, registered.data_port)
+            .parse()
+            .ok()
     }
 
     /// The shared metric registry (DESIGN.md §9.1).
@@ -654,16 +790,21 @@ impl Broker {
     /// client simply learns about it later (Kafka's model).
     pub(crate) async fn throttle(
         &self,
+        principal: Option<&str>,
         client_id: Option<&str>,
         kind: QuotaKind,
         bytes: u64,
     ) -> Duration {
-        if !self.quotas.is_enabled() {
+        let override_rate = self.quota_override(principal, client_id, kind);
+        if override_rate.is_none() && !self.quotas.is_enabled() {
             return Duration::ZERO;
         }
-        let delay = self.quotas.throttle_for(client_id, kind, bytes);
+        let delay = self
+            .quotas
+            .throttle_for(principal, client_id, kind, bytes, override_rate);
         if !delay.is_zero() {
             debug!(
+                user = principal.unwrap_or("<anonymous>"),
                 client = client_id.unwrap_or("<anonymous>"),
                 ?delay,
                 ?kind,
@@ -672,6 +813,34 @@ impl Broker {
             tokio::time::sleep(delay).await;
         }
         delay
+    }
+
+    /// The rate a configured quota entity imposes on this request, if any.
+    ///
+    /// Replication is deliberately excluded: it is charged against the
+    /// cluster's own catch-up traffic, not against a tenant, so a rule
+    /// written about a user has nothing to say about it.
+    fn quota_override(
+        &self,
+        principal: Option<&str>,
+        client_id: Option<&str>,
+        kind: QuotaKind,
+    ) -> Option<u64> {
+        if matches!(kind, QuotaKind::Replication) {
+            return None;
+        }
+        let cache = self.metadata_cache()?;
+        let image = cache.snapshot();
+        // Overwhelmingly the common case, and worth not paying for.
+        if image.quotas.is_empty() {
+            return None;
+        }
+        let limits = image.quota_for(principal, client_id)?;
+        match kind {
+            QuotaKind::Produce => limits.produce_bytes_per_sec,
+            QuotaKind::Fetch => limits.fetch_bytes_per_sec,
+            QuotaKind::Replication => None,
+        }
     }
 
     /// A receiver for the broker-wide shutdown/fence signal; background
@@ -801,6 +970,34 @@ impl Broker {
         self.open_partition(topic, partition)
     }
 
+    /// A handle to a partition this broker has *already opened*, or `None`.
+    ///
+    /// Reporting on disk usage must not itself allocate disk: going through
+    /// [`Broker::partition`] would create the log directory for a partition
+    /// this broker happens not to host yet, so a monitoring sweep would
+    /// leave a trail of empty partitions behind it.
+    pub fn hosted_partition(&self, topic: &str, partition: i32) -> Option<PartitionHandle> {
+        self.handles
+            .get(&(topic.to_owned(), partition))
+            .map(|entry| entry.clone())
+    }
+
+    /// Whether this broker is the leader for `partition` right now.
+    ///
+    /// Standalone brokers lead everything they host — there is nobody else
+    /// to lead it.
+    pub fn leads_partition(&self, topic: &str, partition: i32) -> bool {
+        match self.metadata_cache() {
+            Some(cache) => cache
+                .snapshot()
+                .topics
+                .get(topic)
+                .and_then(|topic| topic.partitions.get(&partition))
+                .is_some_and(|assignment| assignment.leader == self.config.broker_id),
+            None => true,
+        }
+    }
+
     /// Open the partition's log and spawn its actor, or return the existing
     /// handle. The lifecycle lock closes the actor-spawn gate atomically with
     /// shutdown; the `DashMap` entry lock makes concurrent spawns for the
@@ -816,7 +1013,7 @@ impl Broker {
         match self.handles.entry(key) {
             Entry::Occupied(e) => Ok(e.get().clone()),
             Entry::Vacant(e) => {
-                let dir = partition_dir(&self.config.data_dir, topic, partition);
+                let dir = self.log_dirs.resolve(topic, partition)?;
                 actor::complete_pending_replica_reset(&dir)?;
                 // Broker defaults, overridden by whatever this topic sets.
                 // Reading them here is what makes `retention.ms` on a topic
@@ -831,7 +1028,21 @@ impl Broker {
                     topic,
                     topic_configs,
                 );
-                let mut log = Log::open(&dir, log_config.clone())?;
+                // Opening a log is the first thing that touches the disk,
+                // so an IO failure here is the earliest evidence it is
+                // gone — earlier than the health probe, which runs on a
+                // timer. Recording it takes the directory offline for
+                // every other partition on it too, rather than letting
+                // each one discover the same dead disk separately.
+                let mut log = match Log::open(&dir, log_config.clone()) {
+                    Ok(log) => log,
+                    Err(error) => {
+                        if is_disk_failure(&error) {
+                            self.note_log_dir_failure(&dir, &error.to_string());
+                        }
+                        return Err(error.into());
+                    }
+                };
                 if !self.config.replication_enabled {
                     // A standalone leader owns the only replica, so every
                     // complete batch recovered from disk is committed. A
@@ -904,6 +1115,10 @@ impl Broker {
         let sweeper = tokio::spawn(async move {
             crate::group::run_expiry_sweeper(sweeper_broker).await;
         });
+        let watcher_broker = Arc::clone(&self);
+        let watcher = tokio::spawn(async move {
+            crate::logdirs::run_health_watcher(watcher_broker).await;
+        });
         let serving = listener.serve(Arc::clone(&self), self.config.max_frame_bytes);
         let mut serving = std::pin::pin!(serving);
 
@@ -915,6 +1130,7 @@ impl Broker {
         }
         let _ = self.shutdown_tx.send(true);
         sweeper.abort();
+        watcher.abort();
         self.graceful_shutdown_actors().await;
         Ok(())
     }
@@ -948,6 +1164,16 @@ impl Broker {
             let sweeper_broker = Arc::clone(&self);
             connection_tasks.spawn(async move {
                 crate::group::run_expiry_sweeper(sweeper_broker).await;
+            });
+        }
+        // Disk health: a directory that fails takes only its own partitions
+        // offline. Probed on a timer as well as noticed on IO errors,
+        // because a disk that dies under an idle topic would otherwise not
+        // be discovered until something next tried to use it.
+        {
+            let watcher_broker = Arc::clone(&self);
+            connection_tasks.spawn(async move {
+                crate::logdirs::run_health_watcher(watcher_broker).await;
             });
         }
         loop {
@@ -998,6 +1224,9 @@ impl Broker {
                                             reader,
                                             ResponseSink::Plain(writer),
                                             peer,
+                                            // Plaintext carries no certificate
+                                            // and therefore no identity.
+                                            None,
                                         ) => {
                                             if let Err(error) = result {
                                                 debug!(%peer, %error, "connection closed");
@@ -1006,8 +1235,22 @@ impl Broker {
                                     }
                                 }
                                 Some(acceptor) => {
-                                    let stream: Box<dyn BrokerStream> = match acceptor.accept(socket).await {
-                                        Ok(stream) => Box::new(stream),
+                                    let (stream, principal): (Box<dyn BrokerStream>, Option<String>) = match acceptor.accept(socket).await {
+                                        Ok(stream) => {
+                                            // rustls has already verified the
+                                            // chain against the configured CA
+                                            // by this point; with no client CA
+                                            // configured there is no peer
+                                            // certificate and the connection
+                                            // stays anonymous.
+                                            let principal = stream
+                                                .get_ref()
+                                                .1
+                                                .peer_certificates()
+                                                .and_then(|chain| chain.first())
+                                                .and_then(crate::tls::common_name);
+                                            (Box::new(stream), principal)
+                                        }
                                         Err(error) => {
                                             debug!(%peer, %error, "tls handshake failed");
                                             return;
@@ -1024,6 +1267,7 @@ impl Broker {
                                             reader,
                                             ResponseSink::Encrypted(writer),
                                             peer,
+                                            principal,
                                         ) => {
                                             if let Err(error) = result {
                                                 debug!(%peer, %error, "connection closed");
@@ -1311,6 +1555,11 @@ async fn handle_connection<R>(
     reader: R,
     mut sink: ResponseSink,
     peer: SocketAddr,
+    // Principal proven by a verified client certificate, if the listener
+    // demanded one. Binding it here rather than waiting for an
+    // `Authenticate` call is the point of mTLS: the identity was settled
+    // during the handshake and nothing the client sends can change it.
+    peer_principal: Option<String>,
 ) -> Result<(), BrokerError>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -1341,8 +1590,17 @@ where
     // Bound how many requests one connection may have in flight, so a
     // single client cannot spawn unbounded work on the broker.
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_CONNECTION));
-    // One identity per connection, shared by its concurrent requests.
-    let session = Arc::new(handlers::ConnectionSession::new());
+    // One identity per connection, shared by its concurrent requests. A
+    // certificate the CA signed is a stronger claim than a password sent
+    // afterwards, so when the handshake produced one the connection starts
+    // authenticated rather than anonymous.
+    let session = Arc::new(match peer_principal {
+        Some(principal) => {
+            debug!(%peer, %principal, "connection authenticated by client certificate");
+            handlers::ConnectionSession::authenticated(principal)
+        }
+        None => handlers::ConnectionSession::new(),
+    });
     let mut requests = JoinSet::new();
 
     while let Some(frame) = stream.next().await {
@@ -1484,7 +1742,7 @@ mod live_topic_config_tests {
 
         let broker = Broker::bind(BrokerConfig {
             port: 0,
-            data_dir: dir.path().to_path_buf(),
+            data_dirs: vec![dir.path().to_path_buf()],
             default_partitions: 1,
             metadata_cache: Some(cache.clone()),
             ..BrokerConfig::default()

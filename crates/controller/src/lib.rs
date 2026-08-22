@@ -26,7 +26,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-pub use brahmaputra_metadata::{ClusterMetadata, MetadataCommand, MetadataError, MetadataEvent};
+pub use brahmaputra_metadata::{
+    ClusterMetadata, MetadataCommand, MetadataError, MetadataEvent, QuotaEntity, QuotaLimits,
+};
 pub use network::HttpNetworkFactory;
 pub use store::TypeConfig as ControllerRaftTypeConfig;
 use store::{ClientRequest, DurableStore};

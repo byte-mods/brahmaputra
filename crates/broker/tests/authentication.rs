@@ -45,7 +45,7 @@ async fn start_secured_broker(data_dir: &Path, cache: MetadataCache) -> RunningB
             broker_id: 1,
             broker_epoch,
             port: 0,
-            data_dir: data_dir.to_owned(),
+            data_dirs: vec![data_dir.to_owned()],
             default_partitions: 1,
             transport: Transport::TcpTls,
             require_auth: true,
@@ -161,6 +161,7 @@ fn fetch_body(topic: &str) -> Vec<u8> {
         max_bytes: 1 << 20,
         max_wait_ms: 100,
         min_bytes: 1,
+        isolation_level: 0,
     }
     .encode()
     .expect("encode fetch")

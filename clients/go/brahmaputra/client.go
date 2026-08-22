@@ -225,10 +225,14 @@ func (m *ClusterMetadata) LeaderOf(topic string, partition int32) int32 {
 }
 
 func decodeMetadata(r *Reader) (*ClusterMetadata, error) {
-	// Field order is exactly the schema's: brokers, controller_id, topics.
-	// There is no leading error code — a per-topic one lives inside
-	// TopicInfo instead.
+	// Field order is exactly the schema's: error_code, brokers,
+	// controller_id, topics. The leading code is request-level — an
+	// authorization denial, say — and is distinct from the per-topic one
+	// inside TopicInfo, which is what "no such topic" uses.
 	metadata := &ClusterMetadata{}
+	if code := r.Int32(); code != ErrNone {
+		return nil, serverError(code, "metadata")
+	}
 	for count := int(r.Int32()); count > 0; count-- {
 		metadata.Brokers = append(metadata.Brokers, BrokerInfo{r.Int32(), r.String(), r.Int32()})
 	}
@@ -808,6 +812,11 @@ type ConsumerConfig struct {
 	FetchMinBytes int32
 	// FetchMaxWaitMs is the long-poll ceiling when caught up.
 	FetchMaxWaitMs int32
+
+	// IsolationLevel is ReadUncommitted (the default) or ReadCommitted.
+	// A committed read stops at the last stable offset and never sees a
+	// record written by a transaction that aborted.
+	IsolationLevel int32
 	// MaxPollRecords is how many records a poll returns; the rest stay
 	// buffered and uncommitted.
 	MaxPollRecords int
@@ -820,6 +829,7 @@ func DefaultConsumerConfig() ConsumerConfig {
 		FetchMaxBytes:  8 * 1024 * 1024,
 		FetchMinBytes:  1,
 		FetchMaxWaitMs: 500,
+		IsolationLevel: ReadUncommitted,
 		MaxPollRecords: 500,
 		DialTimeout:    30 * time.Second,
 	}
@@ -900,6 +910,7 @@ func (c *Consumer) FetchVerbose(
 	w.Int32(c.config.FetchMaxBytes)
 	w.Int32(maxWaitMs)
 	w.Int32(c.config.FetchMinBytes)
+	w.Int32(c.config.IsolationLevel)
 	body := w.Bytes()
 
 	conn, err := c.router.ConnFor(topic, partition)

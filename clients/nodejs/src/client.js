@@ -182,9 +182,14 @@ class Connection {
 // ---------------------------------------------------------------------------
 
 function decodeMetadata(reader) {
-  // Field order is exactly the schema's: brokers, controller_id, topics.
-  // There is no leading error code — a per-topic one lives inside each
-  // topic entry instead.
+  // Field order is exactly the schema's: error_code, brokers,
+  // controller_id, topics. The leading code is request-level — an
+  // authorization denial, say — and is distinct from the per-topic one,
+  // which is what "no such topic" uses.
+  const requestError = reader.int32();
+  if (requestError !== 0) {
+    throw serverError(requestError, 'metadata');
+  }
   const brokers = [];
   for (let count = reader.int32(); count > 0; count -= 1) {
     brokers.push({ nodeId: reader.int32(), host: reader.string(), port: reader.int32() });
@@ -559,6 +564,9 @@ const defaultConsumerConfig = () => ({
   fetchMaxBytes: 8 * 1024 * 1024,
   fetchMinBytes: 1,
   fetchMaxWaitMs: 500,
+  // READ_UNCOMMITTED (0) or READ_COMMITTED (1). A committed read stops at
+  // the last stable offset and never sees an aborted transaction's records.
+  isolationLevel: 0,
   maxPollRecords: 500,
 });
 
@@ -616,7 +624,8 @@ class Consumer {
       .int64(offset)
       .int32(this.config.fetchMaxBytes)
       .int32(wait)
-      .int32(this.config.fetchMinBytes);
+      .int32(this.config.fetchMinBytes)
+      .int32(this.config.isolationLevel);
     const body = writer.bytes();
 
     let connection = await this.router.connectionFor(topic, partition);

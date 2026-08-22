@@ -208,9 +208,13 @@ class ClusterMetadata:
 
     @staticmethod
     def decode(reader: Reader) -> "ClusterMetadata":
-        # Field order is exactly the schema's: brokers, controller_id,
-        # topics. There is no leading error code on this response — a
-        # per-topic one lives inside TopicInfo instead.
+        # Field order is exactly the schema's: error_code, brokers,
+        # controller_id, topics. The leading code is request-level — an
+        # authorization denial, say — and is distinct from the per-topic
+        # one inside TopicInfo, which is what "no such topic" uses.
+        request_error = reader.i32()
+        if request_error != 0:
+            raise ServerError(request_error, "metadata")
         brokers = []
         for _ in range(reader.i32()):
             brokers.append(BrokerInfo(reader.i32(), reader.string(), reader.i32()))
@@ -637,6 +641,9 @@ class ConsumerConfig:
     fetch_min_bytes: int = 1
     #: Long-poll ceiling when caught up.
     fetch_max_wait_ms: int = 500
+    # READ_UNCOMMITTED (0) or READ_COMMITTED (1). A committed read stops at
+    # the last stable offset and never sees an aborted transaction's records.
+    isolation_level: int = 0
     #: Records returned per poll; the rest stay buffered and uncommitted.
     max_poll_records: int = 500
 
@@ -707,6 +714,7 @@ class Consumer:
         writer.i32(self.config.fetch_max_bytes)
         writer.i32(min(wait, self.config.fetch_max_wait_ms))
         writer.i32(self.config.fetch_min_bytes)
+        writer.i32(self.config.isolation_level)
         body = writer.bytes()
 
         connection = self._router.connection_for(topic, partition)

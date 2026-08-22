@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-broker"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "brahmaputra-client",
  "brahmaputra-metadata",
@@ -306,6 +306,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -321,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "brahmaputra-broker",
@@ -340,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "brahmaputra-protocol",
  "bytes",
@@ -348,6 +349,7 @@ dependencies = [
  "futures",
  "quinn",
  "rustls",
+ "rustls-pemfile",
  "rustls-pki-types",
  "thiserror 2.0.20",
  "tokio",
@@ -358,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-controller"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -376,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-dashboard"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "async-stream",
@@ -397,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-metadata"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "rand_core 0.6.4",
@@ -408,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-metrics"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dashmap",
  "serde",
@@ -416,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "crc32c",
@@ -429,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -450,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-storage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "brahmaputra-protocol",
  "bytes",
@@ -1927,6 +1929,15 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

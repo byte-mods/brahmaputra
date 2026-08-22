@@ -21,7 +21,7 @@ async fn start_broker(data_dir: &std::path::Path) -> RunningBroker {
     let broker = Arc::new(
         Broker::bind(BrokerConfig {
             port: 0,
-            data_dir: data_dir.to_owned(),
+            data_dirs: vec![data_dir.to_owned()],
             ..BrokerConfig::default()
         })
         .await

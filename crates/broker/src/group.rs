@@ -17,7 +17,8 @@ use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
     AssignedPartition, DescribeGroupResponse, DescribedMember, GroupMemberInfo, GroupMemberRecord,
     GroupMetadataRecord, HeartbeatRequest, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest,
-    ListedGroup, OffsetCommitRecord, OffsetCommitRequest, OffsetFetchEntry, OffsetFetchRequest,
+    ListedGroup, OffsetCommitEntry, OffsetCommitRecord, OffsetCommitRequest, OffsetFetchEntry,
+    OffsetFetchRequest,
     OffsetFetchResponse, SyncGroupRequest, SyncGroupResponse, TombstoneRecord,
 };
 use brahmaputra_protocol::{Record, RecordBatch};
@@ -68,7 +69,7 @@ const KIND_OFFSET_COMMIT: u8 = 1;
 const KIND_GROUP_METADATA: u8 = 2;
 const KIND_TOMBSTONE: u8 = 3;
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -358,6 +359,74 @@ impl CoordinatorShard {
         );
         Ok(self.handle.append(batch).await?)
     }
+}
+
+/// Commit offsets as part of a transaction.
+///
+/// The records go to `__consumer_offsets` exactly as an ordinary commit
+/// does, but carry the producer's identity and the transactional bit — so a
+/// `read_committed` reader of that partition, which is what a coordinator
+/// replay is, does not see them until the transaction's marker arrives.
+/// That is the whole of exactly-once for a read-process-write pipeline: the
+/// offsets advance if and only if the output records do.
+///
+/// Deliberately not routed through [`GroupCoordinator::commit`]: there is
+/// no member and no generation to check here. The producer's epoch is the
+/// fence, and it was checked by the transaction coordinator when the group
+/// was added to the transaction.
+pub(crate) async fn commit_transactional_offsets(
+    broker: &Broker,
+    group_id: &str,
+    producer_id: i64,
+    producer_epoch: i16,
+    offsets: Vec<OffsetCommitEntry>,
+) -> Result<(), i32> {
+    if offsets.is_empty() {
+        return Ok(());
+    }
+    let shard = crate::handlers::coordinator_shard_for(broker, group_id)
+        .await
+        .map_err(|error| crate::handlers::code_of(&error))?;
+
+    let now = now_ms();
+    let mut records = Vec::with_capacity(offsets.len());
+    for entry in &offsets {
+        let record = OffsetCommitRecord {
+            group_id: group_id.to_owned(),
+            topic: entry.topic.clone(),
+            partition: entry.partition,
+            offset: entry.offset,
+            commit_timestamp_ms: now,
+        };
+        let mut value = vec![KIND_OFFSET_COMMIT];
+        value.extend(
+            record
+                .encode()
+                .map_err(|_| brahmaputra_protocol::error_code::INTERNAL)?,
+        );
+        records.push(Record::with_key(
+            format!("{group_id}/{}/{}", entry.topic, entry.partition).into_bytes(),
+            value,
+            0,
+        ));
+    }
+
+    let mut batch = RecordBatch::new(0, shard.leader_epoch, now, records);
+    batch.producer = Some(brahmaputra_protocol::ProducerMetadata {
+        producer_id,
+        producer_epoch,
+        // Offsets are not part of the producer's own record stream, so
+        // they carry no sequence and are not deduplicated against it.
+        base_sequence: -1,
+    });
+    batch.transactional = true;
+
+    shard
+        .handle
+        .append(batch)
+        .await
+        .map_err(|error| crate::handlers::code_of(&BrokerError::Storage(error)))?;
+    Ok(())
 }
 
 /// Broker-side consumer-group coordinator: one lazily loaded shard per local

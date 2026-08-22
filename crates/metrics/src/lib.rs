@@ -331,6 +331,13 @@ pub mod names {
     pub const GROUP_MEMBERS: &str = "brahmaputra_group_members";
     pub const GROUP_LAG: &str = "brahmaputra_group_lag";
     pub const LEADER_PARTITIONS: &str = "brahmaputra_leader_partitions";
+    /// Configured log directories that have failed on this broker.
+    ///
+    /// The one number worth alerting on for a JBOD deployment: non-zero
+    /// means a disk is gone and its partitions have failed over, while the
+    /// broker itself is still up and serving everything else — a state that
+    /// is invisible from liveness alone, because the process is healthy.
+    pub const OFFLINE_LOG_DIRS: &str = "brahmaputra_offline_log_dirs";
 }
 
 impl std::fmt::Debug for Metrics {
