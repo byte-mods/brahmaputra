@@ -9,11 +9,11 @@ binary, with no JVM, no ZooKeeper and no heap to tune.
 [![CI](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml/badge.svg)](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-355%20passing-brightgreen.svg)](#verification)
+[![Tests](https://img.shields.io/badge/tests-389%20passing-brightgreen.svg)](#verification)
 [![Throughput](https://img.shields.io/badge/vs%20Kafka-3.4%C3%97%20produce%20at%20RF%3D3-brightgreen.svg)](#performance)
 [![Transports](https://img.shields.io/badge/transport-TCP%20%C2%B7%20TLS%201.3%20%C2%B7%20QUIC-informational.svg)](#transports)
-[![Auth](https://img.shields.io/badge/auth-mTLS%20%C2%B7%20SASL--style%20%C2%B7%20ACLs-blueviolet.svg)](#authentication-and-access-control)
-[![Wire](https://img.shields.io/badge/wire-v3-lightgrey.svg)](docs/kafka-parity.md)
+[![Auth](https://img.shields.io/badge/auth-mTLS%20%C2%B7%20SCRAM--SHA--256%20%C2%B7%20ACLs-blueviolet.svg)](#authentication-and-access-control)
+[![Wire](https://img.shields.io/badge/wire-v4-lightgrey.svg)](docs/kafka-parity.md)
 
 </div>
 
@@ -32,7 +32,7 @@ open http://localhost:8080                              # dashboard
 | 🔌 **Three transports, one flag** | Plain TCP, TLS 1.3, or QUIC — same wire format, same correctness suite. |
 | 🧪 **Verified by killing things** | Live scripts start real brokers, `kill -9` them mid-write, and audit what survived. Not only unit tests. |
 | 📊 **Operations built in** | Browse and live-tail messages, add partitions, change topic config, consumer lag, Prometheus endpoint, login and RBAC — [in one container](#docker). |
-| 🔐 **Authentication and ACLs** | Principals bound per connection — by password or by a client certificate your CA signed — with deny-by-default authorization on topics, groups and the cluster. [Details →](#authentication-and-access-control) |
+| 🔐 **Authentication and ACLs** | Principals bound per connection — by SCRAM-SHA-256, which never sends the password, or by a client certificate your CA signed — with deny-by-default authorization on topics, groups and the cluster. [Details →](#authentication-and-access-control) |
 | 🔒 **Exactly-once** | Transactions across partitions, `read_committed` isolation, and offsets committed with the output they came from. [Details →](#transactions) |
 | 💽 **One disk failure is not one broker failure** | Give the broker its disks directly; a failed one takes only its own partitions offline. [Details →](#one-broker-several-disks) |
 
@@ -82,26 +82,37 @@ open http://localhost:8080                              # dashboard
 | M9 | Preferred-leader rebalancing, admin APIs, quota entities, mutual TLS | ✅ complete |
 | M10 | Transactions and `read_committed` isolation | ✅ complete |
 | M11 | JBOD: several disks per broker, failure isolated per disk | ✅ complete |
+| M12 | Tombstones and real compaction, transaction expiry, follower fetching, fetch sessions, SCRAM | ✅ complete |
 
 Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
 
-### Upgrading to 0.3.0
+### Upgrading to 0.4.0
 
-**The wire version moved from 2 to 3, so brokers and clients must be
-upgraded together.** A version-2 client gets a clean `UNSUPPORTED_VERSION`
+**The wire version moved from 3 to 4, so brokers and clients must be
+upgraded together.** A version-3 client gets a clean `UNSUPPORTED_VERSION`
 rather than misparsing, which makes the mismatch obvious instead of
 mysterious — but it does mean a rolling upgrade needs both halves. All four
 native drivers in [clients/](clients) ship updated.
 
-Version 3 added `isolation_level` to `Fetch`/`FetchMulti` (transactions)
-and a request-level `error_code` to `MetadataResponse`, without which an
-authorization denial reached the client as "unknown topic".
+Version 4 added **tombstones**: a record's value may be null, which is what
+deletes a key on a compacted topic. A version-3 client would read a
+tombstone's length prefix as a value length and misparse every record after
+it, which is exactly the case the exact-match rule exists to prevent.
+Alongside it: `client.rack` and incremental fetch sessions on
+`Fetch`/`FetchMulti`, a rack per broker in `Metadata`, a SASL mechanism on
+`Authenticate`, and five new APIs (`AlterConfigs`, `DescribeProducers`,
+`ListTransactions`, `DescribeTransactions`, `AlterReplicaLogDirs`).
 
-Nothing on disk changed shape: existing logs, indexes and checkpoints are
-read unchanged, and a broker started with a single `--data-dir` behaves
-exactly as it did.
+Nothing on disk changed shape: existing logs, indexes, checkpoints and
+transaction journals are read unchanged. A batch without a tombstone
+encodes to exactly the bytes it did before, which is why the record format
+gained an attributes bit rather than a magic bump.
+
+One behaviour changes for existing users. `__consumer_offsets` expiry now
+writes real tombstones, so a compacted offsets topic will actually shrink
+where before it only ever grew.
 
 ## Why it exists
 
@@ -212,17 +223,33 @@ widen access.
 
 ```rust
 let connection = Connection::connect_with(Transport::TcpTls, addr, id, 5).await?;
-connection.authenticate(&Credentials {
-    username: "billing".into(),
-    password: "…".into(),
-}).await?;
+connection
+    .authenticate(&Credentials::new("billing", "…"))
+    .await?;
 ```
 
-Credentials are checked against the same argon2 user store the dashboard
-uses, so there is one set of accounts rather than two to keep in sync. A
-password crosses the wire in the clear exactly as SASL/PLAIN does, so the
-broker **refuses to accept one on a plaintext listener** — use `tcp-tls`
-or `quic`.
+or from the command line, on any listener:
+
+```bash
+brahmaputra-cli --sasl-username billing --sasl-password … consume --topic orders
+```
+
+The default mechanism is **SCRAM-SHA-256**, in which the password never
+crosses the wire: the broker sends a challenge and the client answers with
+a proof derived from the password. That is what makes authentication
+meaningful on a listener that is not encrypted, and it is why SCRAM is the
+default rather than an option.
+
+`--sasl-mechanism plain` sends the password itself, exactly as SASL/PLAIN
+does, and the broker **refuses it on a plaintext listener** — use `tcp-tls`
+or `quic` for that one.
+
+Accounts are the same ones the dashboard uses, so there is one set to keep
+rather than two. Both credentials are derived when a password is set: the
+Argon2 hash the dashboard checks a login against, and the SCRAM credential
+the data plane uses. A user created before SCRAM existed cannot use it
+until their password is set again — a SCRAM credential cannot be
+back-derived from a hash, which is the point of a hash.
 
 ### Certificates instead of passwords
 
@@ -283,6 +310,10 @@ brahmaputra-cli produce --topic orders --key user-7 --value '{"id":1}'
 # A file, one record per line, waiting for the full ISR to acknowledge.
 brahmaputra-cli produce --topic orders --file orders.ndjson --acks all
 
+# A deletion: a record with a null value. On a compacted topic this is what
+# removes the key. Distinct from --value "", which sets it to nothing.
+brahmaputra-cli produce --topic registry --key retired-sku --tombstone
+
 # Load generation, with the producer knobs exposed.
 brahmaputra-cli produce --topic orders --count 1000000 --value-size 512 \
   --batch-size 65536 --linger-ms 10 --compression lz4 --in-flight 4096
@@ -297,6 +328,11 @@ brahmaputra-cli consume --topic orders --partition 3 --offset 4200
 `all` every in-sync replica. With `--idempotent`, an ambiguous send is
 retried safely — the broker recognises the replay and returns the original
 offset instead of appending twice.
+
+A tombstone reaches consumers as a **null** value, printed as `value=null`,
+and is never confused with an empty one. That distinction is the whole
+point: on a compacted topic the first deletes the key and the second sets
+it to nothing.
 
 ## Consumer groups
 
@@ -323,6 +359,24 @@ dies mid-batch has its partitions reassigned, and the replacement resumes
 from the last commit — see
 [verify-failures.sh](scripts/verify-failures.sh), which asserts nothing is
 skipped or duplicated across a mid-stream kill.
+
+A consumer that names its own failure domain is read by a replica in that
+domain rather than by the leader (KIP-392):
+
+```bash
+brahmaputra-cli consume --topic orders --group billing --rack us-east-1a
+```
+
+The leader picks the replica, and only ever an in-sync one — a follower
+outside the ISR is behind by an unbounded amount, and reading from it would
+turn a replication problem into a consumer that has quietly stopped. The
+cost is bounded staleness: a follower's high watermark trails its leader's.
+A consumer already in the leader's rack is left where it is.
+
+Fetches are also **incremental** (KIP-227): after the first one, a consumer
+sends only the partitions whose offset moved. A consumer holding a thousand
+partitions of which three are active sends three descriptors per poll
+instead of a thousand.
 
 ## Using the Rust client
 
@@ -421,12 +475,29 @@ Its records are left in doubt on every partition it touched, and a
 but at the last stable offset. That is the difference between a transaction
 and filtering after the fact.
 
-They are resolved by whoever claims the same `transactional.id` next. That
-claim fences the previous instance by bumping its epoch, and finishes what
-it left behind: `EndTxn` writes its decision to the coordinator's log
-*before* sending any marker, so a commit interrupted halfway is completed
-on recovery rather than guessed at. A transaction that never reached a
-decision aborts.
+They are resolved two ways, and both matter.
+
+Whoever claims the same `transactional.id` next fences the previous
+instance by bumping its epoch and finishes what it left behind: `EndTxn`
+writes its decision to the coordinator's log *before* sending any marker,
+so a commit interrupted halfway is completed on recovery rather than
+guessed at. A transaction that never reached a decision aborts.
+
+But a producer that is *never* replaced — scaled down, redeployed under a
+different id, gone for good — would leave that transaction open forever,
+and every `read_committed` consumer of those partitions stopped at it. So
+the coordinator also polices `transaction.timeout.ms` itself: past it, the
+producer is fenced and the transaction aborted, with nobody asking.
+
+```bash
+brahmaputra-cli describe-producers --topic orders --partition 0
+brahmaputra-cli list-transactions --state Ongoing
+```
+
+The first is what to run when a committed reader has stopped advancing: the
+gap between the last stable offset and the high watermark is the stall, and
+the producer holding it is named. `--transaction-max-timeout-ms` bounds how
+long any producer may ask to hold one.
 
 ## One broker, several disks
 
@@ -474,7 +545,7 @@ with a log.
 
 ## Inspecting and trimming a cluster
 
-Four questions an operator has at three in the morning, answerable from any
+The questions an operator has at three in the morning, answerable from any
 broker over the data plane rather than by reading the controller's HTTP API
 or walking each machine's disk by hand:
 
@@ -483,12 +554,30 @@ brahmaputra-cli describe-cluster                       # who is in it, who leads
 brahmaputra-cli describe-configs --type topic --name orders
 brahmaputra-cli describe-log-dirs --topic orders       # which partition ate the disk
 brahmaputra-cli offsets --topic orders --timestamp 1735689600000
+
+brahmaputra-cli describe-producers --topic orders --partition 0
+brahmaputra-cli list-transactions                      # and what they are doing
+brahmaputra-cli describe-transaction --id orders-etl
 ```
 
 `describe-configs` marks each value as `set` or `default`. That is the
 distinction that matters: a topic left at the default is one a broker
 restart with different flags will move, and a topic that was set to the
-same number is not.
+same number is not. `alter-configs` changes them from the same connection.
+
+`describe-producers` is the one to reach for when a `read_committed`
+consumer has stopped advancing. It reports the last stable offset and the
+high watermark together, because the gap between them *is* the symptom, and
+names the producer whose open transaction is holding it.
+
+`alter-replica-log-dirs` moves a partition between a broker's disks — for a
+disk added after the fact, which would otherwise only ever take new
+partitions, or one filling up. The partition is closed while its bytes are
+copied, so move a follower, or hand leadership away first:
+
+```bash
+brahmaputra-cli alter-replica-log-dirs --topic orders --partition 3 --log-dir /mnt/disk4
+```
 
 `delete-records` discards everything below an offset and reclaims the
 segments that held only such records — the only way to free space on a
@@ -682,15 +771,43 @@ the newest record per key is kept. Without it, a cluster committing every
 few seconds fills its disk, and coordinator failover slows without limit
 because it replays every superseded commit.
 
-Offsets are preserved exactly. A surviving record is rewritten as a
-single-record batch at its original offset, so compaction leaves gaps
-rather than renumbering anything, and a previously committed offset still
-means the record it always meant. Only sealed segments below the high
-watermark are eligible — the active segment is still being appended to, and
-uncommitted records are not the broker's to discard — and records with no
-key are never removed, having nothing that could supersede them. In a live
-run the offsets topic plateaus at tens of kilobytes instead of growing with
-the commit count.
+A key is **deleted** by writing a record with a null value — a tombstone:
+
+```bash
+brahmaputra-cli produce --topic registry --key retired-sku --tombstone
+```
+
+The tombstone is delivered to consumers as a null value, distinct from an
+empty one, because on a compacted topic the deletion is the event a
+consumer needs to see. It survives compaction for `delete.retention.ms`
+(default 24 hours) — the window a consumer has to observe it — and is then
+removed along with the key it deleted. Without that second step a compacted
+topic's key space could only ever grow.
+
+Offsets are preserved exactly. Contiguous survivors are re-emitted as one
+batch carrying the codec, producer metadata and transaction flags they were
+written with; compaction leaves gaps rather than renumbering anything, so a
+previously committed offset still means the record it always meant. Only
+sealed segments below the high watermark are eligible — the active segment
+is still being appended to, and uncommitted records are not the broker's to
+discard — and records with no key are never removed, having nothing that
+could supersede them.
+
+Removing the record at offset 0 does **not** make offset 0 out of range: a
+consumer reading from the beginning gets the oldest record that still
+exists. Only retention and `DeleteRecords` move the log start offset.
+
+When a pass runs is governed by the same knobs Kafka uses —
+`min.cleanable.dirty.ratio` (default 0.5), `min.compaction.lag.ms` and
+`max.compaction.lag.ms` — because a pass rewrites everything it cleans, and
+running one to remove a handful of records is how compaction becomes the
+dominant write load on a partition that is barely changing.
+
+A pass is crash-safe: its output is built in a staging directory, a commit
+marker is written, and only then are the originals replaced. A kill before
+the marker discards the output; a kill after it completes the swap on the
+next open. In a live run the offsets topic plateaus at tens of kilobytes
+instead of growing with the commit count.
 
 **Quotas** bound a noisy client without losing its data:
 
@@ -742,14 +859,25 @@ Each row is asserted by a script, not by argument.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--host`, `--port` | `127.0.0.1:9092` | data-plane bind and advertised address |
+| `--host`, `--port` | `127.0.0.1:9092` | data-plane bind address |
+| `--advertised-host`, `--advertised-port` | the bound address | what to publish in metadata, for a broker reachable at an address it did not bind (NAT, containers, pod IPs) |
+| `--internal-port`, `--internal-tls` | off | a second data-plane listener for broker-to-broker traffic, with its own transport. It is *not* exempt from `--require-auth` — a listener that skipped authorization would hand cluster-level access to anyone who could reach the port — so pair it with `--internal-tls` and a client CA when authentication is on |
 | `--data-dir` | `./data` | repeatable: one directory per disk (JBOD), each partition on exactly one |
 | `--default-partitions` | 1 | partitions for auto-created topics |
 | `--transport` | `tcp` | `tcp`, `tcp-tls` or `quic` |
 | `--segment-bytes` | 64 MiB | segment roll size |
 | `--retention-ms`, `--retention-bytes` | off | segment deletion policies |
-| `--retention-check-interval-ms` | 1000 | how often retention and timed flush run |
+| `--retention-check-interval-ms` | 1000 | how often retention, compaction and timed flush run |
+| `--cleanup-policy` | `delete` | default for topics that do not set one: `delete` or `compact` |
+| `--delete-retention-ms` | 24 h | how long a tombstone is kept once compaction could remove it |
+| `--min-cleanable-dirty-ratio` | 0.5 | how dirty a log must be before a compaction pass rewrites it |
+| `--min-compaction-lag-ms`, `--max-compaction-lag-ms` | 0 / off | protect a record from compaction for a while; force a pass regardless of the ratio |
 | `--flush-interval-messages`, `--flush-interval-ms` | off | fsync policy |
+| `--max-frame-bytes` | 32 MiB | largest request or response frame (`socket.request.max.bytes`) |
+| `--max-message-bytes` | off | largest batch a producer may send (`message.max.bytes`) |
+| `--index-interval-bytes` | 4096 | sparse-index density (`log.index.interval.bytes`) |
+| `--transaction-max-timeout-ms` | 900000 | ceiling on a producer's `transaction.timeout.ms`; past it the coordinator aborts and fences |
+| `--transactional-id-expiration-ms` | 7 days | how long an idle `transactional.id` is remembered |
 | `--quota-produce-bytes-per-sec`, `--quota-fetch-bytes-per-sec` | off | per-client byte rates |
 | `--quota-max-throttle-ms` | 30000 | ceiling on a single throttle |
 | `--http-port` | 8080 | dashboard and metrics; 0 disables |
@@ -757,12 +885,18 @@ Each row is asserted by a script, not by argument.
 | `--heartbeat-interval-ms`, `--session-timeout-ms` | 1000 / 5000 | broker liveness |
 | `--replica-lag-time-max-ms` | 10000 | ISR eviction threshold |
 | `--offsets-topic-partitions` | 50 | internal offsets topic |
+| `--offsets-topic-replication-factor` | derived | replicas for `__consumer_offsets` and `__transaction_state`; `0` derives it from cluster size, capped at 3 |
 | `--rack` | — | rack label, used for replica placement |
 | `--auto-leader-rebalance-interval-ms` | 300000 | how often leadership returns to each partition's preferred replica; 0 disables |
 | `--require-auth` | off | refuse unauthenticated connections and authorize every request against the ACLs |
 | `--tls-cert`, `--tls-key` | self-signed | certificate chain and key the broker presents on `tcp-tls` and `quic` |
 | `--tls-client-ca` | — | require a client certificate chaining to this CA, and take the principal from its subject common name |
 | `--admin-user`, `--admin-password` | `admin` / generated | first admin, created on first boot; also `BRAHMAPUTRA_ADMIN_USER` / `BRAHMAPUTRA_ADMIN_PASSWORD` |
+
+Clients authenticate with `--sasl-username` / `--sasl-password`, and
+`--sasl-mechanism` chooses between `scram-sha-256` (the default, which
+never sends the password) and `plain` (which does, and is refused on a
+plaintext listener).
 
 ### Producer (`brahmaputra-cli produce`, `ProducerConfig`)
 
@@ -807,6 +941,8 @@ wire.
 | `--group` | — | `group.id` | join a consumer group instead of reading standalone |
 | `--commit-interval-ms` | 5000 | `auto.commit.interval.ms` | `0` disables auto-commit |
 | `--assignor` | `range` | `partition.assignment.strategy` | `range` or `roundrobin` |
+| `--rack` | — | `client.rack` | read from an in-sync replica in this rack instead of the leader (KIP-392) |
+| `heartbeat_interval_ms` | timeout ÷ 3 | `heartbeat.interval.ms` | settable independently of the session timeout |
 | `max_poll_records` | 500 | `max.poll.records` | records returned per `poll`; the rest stay buffered and uncommitted |
 | `session_timeout_ms` | 10000 | `session.timeout.ms` | coordinator evicts a silent member after this |
 | `rebalance_timeout_ms` | 3000 | `max.poll.interval.ms` | how long the coordinator waits for members to rejoin |
@@ -822,45 +958,58 @@ is missing or inert, is in [docs/kafka-parity.md](docs/kafka-parity.md).
 Set at creation with `brahmaputra-cli topic create --config K=V`, stored in
 the Raft metadata, and **applied per topic**: `retention.ms`,
 `retention.bytes`, `segment.bytes`, `segment.ms`, `cleanup.policy`,
-`flush.messages`, `flush.ms`, `max.message.bytes` and
+`delete.retention.ms`, `min.cleanable.dirty.ratio`, `min.compaction.lag.ms`,
+`max.compaction.lag.ms`, `flush.messages`, `flush.ms`,
+`max.message.bytes`, `message.timestamp.type`, `compression.type` and
 `min.insync.replicas` all change broker behaviour. An unparseable value
 falls back to the broker-wide default rather than to zero, so a typo cannot
 delete a log.
 
-Changes reach running partitions on the maintenance tick rather than
-waiting for a restart. There is no data-plane `AlterConfigs`, so they go
-through the controller; read them back with:
+Change them on a running cluster, and read them back:
 
 ```bash
+brahmaputra-cli alter-configs --topic orders --config retention.ms=604800000
 brahmaputra-cli describe-configs --type topic --name orders
 ```
 
-which marks each value as `set` or inherited `default`.
+`describe-configs` marks each value as `set` or inherited `default`.
+`alter-configs` merges by default and takes `--replace` to overwrite the
+whole map; an empty value removes a setting, returning it to the broker
+default. A configuration name the broker does not read is **refused**
+rather than stored, so a typo cannot look like a setting that is being
+ignored. The broker forwards the change to the controller, so its
+durability and ordering are the same as they always were; changes reach
+running partitions on the maintenance tick rather than at a restart.
 
-`compression.type` is the one config that is stored but not applied: the
-producer chooses the codec and the broker stores the batch byte-identically,
-which is what keeps replication and the zero-copy fetch path free of a
-decompress-recompress round trip.
+`compression.type` is enforced by **refusing** a batch in another codec,
+not by converting it. Converting would mean decompressing and recompressing
+every batch on the way in, which is exactly the cost that byte-identical
+storage and the zero-copy fetch path exist to avoid. The guarantee is the
+same — every batch on the topic is in the named codec — and the producer is
+told what to send instead of having its data silently rewritten. The
+default, `producer`, keeps whatever the producer chose.
 
 ## Verification
 
 ```bash
-cargo test --workspace          # 355 unit and integration tests
+cargo test --workspace          # 389 unit and integration tests
 
-bash scripts/verify-m1.sh       # single-node storage and protocol
-bash scripts/verify-m2.ps1      # controller quorum and metadata
-bash scripts/verify-m3.sh       # exhaustive replication
-bash scripts/verify-m4.sh       # consumer groups, 5 nodes
-bash scripts/verify-m5.sh       # fsync, quotas, version negotiation
-bash scripts/verify-m6.sh       # metrics, login, RBAC, dashboard
-bash scripts/verify-replication.sh        # focused replication
-bash scripts/verify-retention.sh          # retention
-bash scripts/verify-failures.sh           # producer/broker/consumer kills
-bash scripts/verify-transport-parity.sh   # tcp vs tcp-tls vs quic
-bash scripts/verify-chaos.sh              # random kills under load
-bash scripts/verify-admin-and-security.sh # admin APIs, quotas, mutual TLS
-bash scripts/verify-transactions.sh       # commit, abort, in doubt, recovery
-bash scripts/verify-jbod.sh               # multi-disk placement and disk failure
+bash scripts/verify-m1.sh       # 31  single-node storage and protocol
+bash scripts/verify-m2.ps1      #     controller quorum and metadata
+bash scripts/verify-m3.sh       #     exhaustive replication
+bash scripts/verify-m4.sh       # 30  consumer groups, 5 nodes
+bash scripts/verify-m5.sh       # 15  fsync, quotas, version negotiation
+bash scripts/verify-m6.sh       # 29  metrics, login, RBAC, dashboard
+bash scripts/verify-replication.sh        # 14  focused replication
+bash scripts/verify-retention.sh          # 21  retention
+bash scripts/verify-failures.sh           # 15  producer/broker/consumer kills
+bash scripts/verify-transport-parity.sh   #     tcp vs tcp-tls vs quic
+bash scripts/verify-chaos.sh              # 7   random kills under load
+bash scripts/verify-reassignment.sh       # 12  rack placement, moves, follower fetching
+bash scripts/verify-admin-and-security.sh # 29  admin APIs, quotas, mTLS, SCRAM
+bash scripts/verify-transactions.sh       # 24  commit, abort, in doubt, expiry
+bash scripts/verify-compaction.sh         # 17  tombstones, superseding, horizons
+bash scripts/verify-jbod.sh               # 26  multi-disk placement, failure, moves
 ```
 
 Each script starts real brokers on real ports, fails loudly on the first
@@ -1139,11 +1288,13 @@ bash scripts/gen-protocol.sh
 Present: partitioned segmented logs, leader/ISR replication with
 leader-epoch truncation, preferred-leader election and rebalancing,
 high-watermark visibility, `acks=0/1/all`, idempotent producer, consumer
-groups with generation fencing, retention, log compaction, per-tenant
-quotas, fsync policies, API version negotiation, TLS with operator
-certificates and mutual authentication, data-plane authentication with
-ACLs, cluster/config/log-dir introspection, `DeleteRecords`, metrics and
-RBAC.
+groups with generation fencing, retention, log compaction with tombstones,
+transactions with coordinator-enforced timeouts, per-tenant quotas, fsync
+policies, API version negotiation, TLS with operator certificates and
+mutual authentication, SASL/SCRAM-SHA-256, ACLs, follower fetching,
+incremental fetch sessions, cluster/config/log-dir/producer/transaction
+introspection, `AlterConfigs`, `DeleteRecords`, `AlterReplicaLogDirs`,
+metrics and RBAC.
 
 Deliberately **not** in v1 (DESIGN.md §1): multi-datacentre replication and
 tiered storage. Transactions were on that list and are no longer — see
@@ -1154,7 +1305,7 @@ The ones that matter most:
 
 1. **No Kafka wire-protocol compatibility.** Existing Kafka clients,
    Connect, Streams and the surrounding ecosystem do not work against it;
-   this speaks its own protocol.
+   this speaks its own protocol. Nothing else on this list comes close.
 2. **No soak history.** The failure suites kill brokers under load and
    assert what survived, but they run for minutes. Nothing here has been
    run for a week.
@@ -1164,24 +1315,29 @@ The ones that matter most:
    non-Linux platforms the fallback reads the range and writes it: correct
    everywhere, just not free. That fallback is what every test on the
    Windows development host exercises.
-4. **No SASL mechanism negotiation** — no SCRAM, Kerberos or OAUTHBEARER,
-   and no delegation tokens. Certificate authentication covers the case
-   they usually cover, and is stronger, but a shop standardised on SCRAM
-   cannot bring its existing credentials.
-5. **One listener per broker.** No `advertised.listeners` and no
-   security-protocol map, so a broker cannot offer plaintext internally and
-   TLS externally.
-6. **No rebalancing between disks.** A disk added to a running broker takes
-   only new partitions, and there is no way to move an existing partition
-   from one disk to another without deleting it and letting it refetch.
+4. **No general listener map.** There are two listeners — clients and
+   inter-broker, each with its own transport — and an advertised address
+   distinct from the bound one. Kafka's arbitrary named `listeners` with a
+   security protocol each is not there; the shape it usually exists for,
+   plaintext between brokers and TLS to clients, is.
+5. **A log-directory move pauses the partition.** `AlterReplicaLogDirs`
+   closes it, copies, and reopens; Kafka builds the second copy alongside
+   and swaps. The pause is bounded by the partition's size, which is why
+   the thing to move is a follower.
+6. **SASL is SCRAM-SHA-256 and PLAIN.** No SCRAM-SHA-512, Kerberos or
+   OAUTHBEARER, and no delegation tokens.
+7. **Kafka 4.x is a moving target.** KIP-848's broker-side consumer group
+   protocol, KIP-932 share groups and KIP-890 transaction fencing are not
+   implemented. The group protocol here is the one Kafka still supports,
+   not the one it now defaults to.
 
-On production readiness: with `--require-auth`, a certificate from your own
-CA and `--tls-client-ca`, a broker is no longer open to anyone who can
-reach the port, clients are identified by something they cannot choose for
-themselves, and one tenant can be given a byte-rate ceiling without
-capping everyone. That is a real change in what can responsibly be run. It
-is still young software with no production track record, and gaps 1–4 above
-are the ones to close before trusting it with data you cannot lose.
+On production readiness: with `--require-auth`, SCRAM or a certificate from
+your own CA, a broker is no longer open to anyone who can reach the port,
+clients are identified by something they cannot choose for themselves, and
+one tenant can be given a byte-rate ceiling without capping everyone. That
+is a real change in what can responsibly be run. It is still young software
+with no production track record, and gaps 1 and 2 above are the ones to
+weigh before trusting it with data you cannot lose.
 
 ## License
 

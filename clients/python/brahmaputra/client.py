@@ -8,6 +8,10 @@ called out on the field.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import os
 import socket
 import struct
 import threading
@@ -50,6 +54,38 @@ def _now_ms() -> int:
 # --------------------------------------------------------------------------
 # Connection
 # --------------------------------------------------------------------------
+
+
+
+
+SCRAM_MECHANISM = "SCRAM-SHA-256"
+
+
+def _scram_field(message: str, key: str) -> Optional[str]:
+    """One `key=value` field out of a SCRAM message."""
+    for part in message.split(","):
+        if part.startswith(f"{key}="):
+            return part[len(key) + 1 :]
+    return None
+
+
+def _scram_client_proof(
+    password: str, salt: str, iterations: int, auth_message: str
+) -> str:
+    """The client half of RFC 5802: prove knowledge of the password without
+    sending it.
+
+    `hashlib.pbkdf2_hmac` is the same construction the broker derives its
+    stored key with, so the two cannot drift apart.
+    """
+    salted = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), base64.b64decode(salt), iterations, 32
+    )
+    client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    signature = hmac.new(stored_key, auth_message.encode("utf-8"), hashlib.sha256).digest()
+    proof = bytes(a ^ b for a, b in zip(client_key, signature))
+    return base64.b64encode(proof).decode("ascii")
 
 
 class Connection:
@@ -135,21 +171,67 @@ class Connection:
     # -- APIs that live on any connection ---------------------------------
 
     def authenticate(self, username: str, password: str) -> Tuple[str, str]:
-        """Bind a principal to this connection.
+        """Bind a principal to this connection using SCRAM-SHA-256.
 
-        The password crosses the wire in the clear exactly as SASL/PLAIN
-        does, so the broker refuses this on a plaintext listener. Use TLS.
+        The password never crosses the wire: the broker sends a challenge
+        and this answers with a proof derived from the password, which is
+        what makes authentication meaningful on a plaintext listener. Use
+        :meth:`authenticate_plain` only where the connection is already
+        encrypted.
         """
+        client_nonce = base64.b64encode(os.urandom(18)).decode("ascii").replace(",", ".")
+        bare = f"n={username},r={client_nonce}"
+        _, _, server_first, done = self._authenticate_step(
+            username, "", SCRAM_MECHANISM, f"n,,{bare}"
+        )
+        if done:
+            raise ProtocolError("broker ended the SCRAM exchange before it began")
+
+        nonce = _scram_field(server_first, "r")
+        salt = _scram_field(server_first, "s")
+        iterations = _scram_field(server_first, "i")
+        if nonce is None or salt is None or iterations is None or not iterations.isdigit():
+            raise ProtocolError("malformed SCRAM server-first message")
+        # The server must have kept this client's nonce, which is what makes
+        # the exchange this one rather than a replay of an earlier one.
+        if not nonce.startswith(client_nonce):
+            raise ProtocolError("SCRAM server nonce does not extend the client nonce")
+
+        # `biws` is base64 of the GS2 header "n,,", echoed so the server can
+        # see it was not altered in flight.
+        without_proof = f"c=biws,r={nonce}"
+        auth_message = f"{bare},{server_first},{without_proof}"
+        proof = _scram_client_proof(password, salt, int(iterations), auth_message)
+        principal, role, _, _ = self._authenticate_step(
+            username, "", SCRAM_MECHANISM, f"{without_proof},p={proof}"
+        )
+        return principal, role
+
+    def authenticate_plain(self, username: str, password: str) -> Tuple[str, str]:
+        """Send the password itself, as SASL/PLAIN does.
+
+        The broker refuses this on a plaintext listener.
+        """
+        principal, role, _, _ = self._authenticate_step(username, password, "PLAIN", "")
+        return principal, role
+
+    def _authenticate_step(
+        self, username: str, password: str, mechanism: str, payload: str
+    ) -> Tuple[str, str, str, bool]:
         writer = body_writer()
         writer.string(username)
         writer.string(password)
+        writer.string(mechanism)
+        writer.string(payload)
         reader = body_reader(self.request(ApiKey.AUTHENTICATE, writer.bytes()))
         code = reader.i32()
         principal = reader.string()
         role = reader.string()
+        response_payload = reader.string()
+        done = reader.boolean()
         if code != ErrorCode.NONE:
             raise ServerError(code, "authenticate")
-        return principal, role
+        return principal, role, response_payload, done
 
     def api_versions(self) -> Dict[int, Tuple[int, int]]:
         writer = body_writer()
@@ -184,6 +266,10 @@ class BrokerInfo:
     node_id: int
     host: str
     port: int
+    #: Failure domain this broker is in, empty when it was started without
+    #: --rack. A consumer that sets `ConsumerConfig.rack` can be redirected
+    #: to a replica in its own rack.
+    rack: str = ""
 
 
 @dataclass
@@ -217,7 +303,15 @@ class ClusterMetadata:
             raise ServerError(request_error, "metadata")
         brokers = []
         for _ in range(reader.i32()):
-            brokers.append(BrokerInfo(reader.i32(), reader.string(), reader.i32()))
+            brokers.append(
+                BrokerInfo(
+                    reader.i32(),
+                    reader.string(),
+                    reader.i32(),
+                    # Empty when the broker was started without --rack.
+                    reader.string(),
+                )
+            )
         reader.i32()  # controller_id
         topics = []
         for _ in range(reader.i32()):
@@ -644,6 +738,8 @@ class ConsumerConfig:
     # READ_UNCOMMITTED (0) or READ_COMMITTED (1). A committed read stops at
     # the last stable offset and never sees an aborted transaction's records.
     isolation_level: int = 0
+    #: This consumer's failure domain (`client.rack`), empty when it has none.
+    rack: str = ""
     #: Records returned per poll; the rest stay buffered and uncommitted.
     max_poll_records: int = 500
 
@@ -715,6 +811,9 @@ class Consumer:
         writer.i32(min(wait, self.config.fetch_max_wait_ms))
         writer.i32(self.config.fetch_min_bytes)
         writer.i32(self.config.isolation_level)
+        # `client.rack`: with it set the leader names an in-sync replica in
+        # the same rack, and this client reads from that instead.
+        writer.string(self.config.rack)
         body = writer.bytes()
 
         connection = self._router.connection_for(topic, partition)
@@ -740,6 +839,10 @@ def _decode_fetch_response(body: bytes) -> Tuple[int, int, List[DecodedBatch]]:
     high_watermark = reader.i64()
     reader.i64()  # last_stable_offset
     batches_length = reader.i64()
+    # Read even though this client does not act on it: the batches trail the
+    # whole struct, so skipping a field would take them from the wrong
+    # offset and every batch after it would fail to decode.
+    reader.i32()  # preferred_read_replica
     trailing = reader.rest()
     if batches_length > len(trailing):
         raise ProtocolError("fetch response claims more batch bytes than it carries")

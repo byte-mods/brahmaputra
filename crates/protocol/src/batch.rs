@@ -9,7 +9,8 @@
 //! magic:             u8    (MAGIC_V1 or MAGIC_V2)
 //! crc32c:            u32   (covers everything after this field)
 //! attributes:        u16   (bits 0..=2: compression; 3: headers;
-//!                            4: transactional; 5: control batch)
+//!                            4: transactional; 5: control batch;
+//!                            6: some record has a null value)
 //! last_offset_delta: i32
 //! max_timestamp:     i64
 //! producer_id:       i64   (magic v2 only)
@@ -24,7 +25,8 @@
 //! record_length:    uvarint  (bytes following this field)
 //! key_len_plus_one: uvarint  (0 => null key, else key length + 1)
 //! key:              [u8]
-//! value_len:        uvarint
+//! value_len:        uvarint  (NULL_VALUE_BIT clear: the length itself;
+//!                             set: 0 => null value, else length + 1)
 //! value:            [u8]
 //! timestamp_delta:  uvarint  (zigzag-encoded i64)
 //! header_count:     uvarint  (only when the batch's HEADERS_BIT is set)
@@ -83,6 +85,19 @@ pub const TRANSACTIONAL_BIT: u16 = 0x0010;
 /// transactional topic's offsets are not contiguous with its records — and
 /// are never delivered to any consumer.
 pub const CONTROL_BIT: u16 = 0x0020;
+/// Attributes bit 6: some record in this batch has a *null* value — a
+/// tombstone, which tells log compaction to delete the key rather than to
+/// keep this record as its latest value.
+///
+/// A bit, and a per-batch one, for the reason headers are: a null value has
+/// to be distinguishable from an empty one, which means the value length
+/// must be encoded as `length + 1` with zero reserved for null — and that
+/// re-encodes every record ever written. Setting the bit only when a batch
+/// actually contains a tombstone means a batch without one encodes to
+/// exactly the bytes it did before tombstones existed, so every log already
+/// on disk decodes unchanged and the feature costs nothing to anyone who
+/// does not use it.
+pub const NULL_VALUE_BIT: u16 = 0x0040;
 
 /// Compression applied to the records payload inside a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -248,7 +263,11 @@ impl RecordHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub key: Option<Bytes>,
-    pub value: Bytes,
+    /// `None` is a tombstone: on a compacted topic it deletes the key, and
+    /// it is delivered to consumers as a null value so they can see the
+    /// deletion. Distinct from `Some(empty)`, which is an ordinary record
+    /// that happens to carry no bytes.
+    pub value: Option<Bytes>,
     /// Milliseconds relative to the batch's `max_timestamp` base.
     ///
     /// The base is `max_timestamp` rather than a first-record timestamp, so
@@ -275,7 +294,7 @@ impl Record {
     pub fn new(value: impl Into<Bytes>) -> Self {
         Record {
             key: None,
-            value: value.into(),
+            value: Some(value.into()),
             timestamp_delta: 0,
             headers: Vec::new(),
         }
@@ -284,10 +303,42 @@ impl Record {
     pub fn with_key(key: impl Into<Bytes>, value: impl Into<Bytes>, timestamp_delta: i64) -> Self {
         Record {
             key: Some(key.into()),
-            value: value.into(),
+            value: Some(value.into()),
             timestamp_delta,
             headers: Vec::new(),
         }
+    }
+
+    /// A deletion for `key`: a record with a null value.
+    ///
+    /// On a compacted topic this is what makes a key go away; on any other
+    /// topic it is an ordinary record whose value happens to be null.
+    pub fn tombstone(key: impl Into<Bytes>, timestamp_delta: i64) -> Self {
+        Record {
+            key: Some(key.into()),
+            value: None,
+            timestamp_delta,
+            headers: Vec::new(),
+        }
+    }
+
+    /// Whether this record deletes its key rather than setting it.
+    pub fn is_tombstone(&self) -> bool {
+        self.value.is_none()
+    }
+
+    /// The value bytes, with a tombstone reading as empty.
+    ///
+    /// For size accounting and for the many call sites that only want the
+    /// payload; anything that must *distinguish* a deletion from an empty
+    /// value has to look at `value` itself.
+    pub fn payload(&self) -> &[u8] {
+        self.value.as_deref().unwrap_or(&[])
+    }
+
+    /// Bytes this record's value occupies, counting a tombstone as zero.
+    pub fn value_len(&self) -> usize {
+        self.value.as_ref().map_or(0, |value| value.len())
     }
 
     pub fn with_headers(mut self, headers: Vec<RecordHeader>) -> Self {
@@ -434,6 +485,9 @@ impl RecordBatch {
         // A batch with no headers must encode byte-identically to the way it
         // did before headers existed.
         let has_headers = self.records.iter().any(|r| !r.headers.is_empty());
+        // Same rule, same reason: only widen the value length encoding when
+        // a tombstone in this batch actually needs it.
+        let has_null_values = self.records.iter().any(|r| r.value.is_none());
 
         // Records payload.
         let mut payload = BytesMut::new();
@@ -446,8 +500,19 @@ impl RecordBatch {
                     rec.extend_from_slice(key);
                 }
             }
-            put_uvarint(&mut rec, record.value.len() as u64);
-            rec.extend_from_slice(&record.value);
+            match (&record.value, has_null_values) {
+                (Some(value), false) => {
+                    put_uvarint(&mut rec, value.len() as u64);
+                    rec.extend_from_slice(value);
+                }
+                (Some(value), true) => {
+                    put_uvarint(&mut rec, value.len() as u64 + 1);
+                    rec.extend_from_slice(value);
+                }
+                // Unreachable when the bit is clear: it is set from exactly
+                // this condition.
+                (None, _) => put_uvarint(&mut rec, 0),
+            }
             put_uvarint(&mut rec, zigzag_encode(record.timestamp_delta));
             if has_headers {
                 put_uvarint(&mut rec, record.headers.len() as u64);
@@ -497,6 +562,9 @@ impl RecordBatch {
         }
         if self.control {
             attributes |= CONTROL_BIT;
+        }
+        if has_null_values {
+            attributes |= NULL_VALUE_BIT;
         }
         out.put_u16(attributes);
         out.put_i32(self.last_offset_delta());
@@ -575,7 +643,11 @@ impl RecordBatch {
             codec => decompress(codec, &body)?,
         };
 
-        let records = decode_records(&payload, attributes & HEADERS_BIT != 0)?;
+        let records = decode_records(
+            &payload,
+            attributes & HEADERS_BIT != 0,
+            attributes & NULL_VALUE_BIT != 0,
+        )?;
         if !records.is_empty() && last_offset_delta != records.len() as i32 - 1 {
             return Err(ProtocolError::Malformed("last_offset_delta mismatch"));
         }
@@ -593,7 +665,11 @@ impl RecordBatch {
     }
 }
 
-fn decode_records(payload: &[u8], has_headers: bool) -> Result<Vec<Record>, ProtocolError> {
+fn decode_records(
+    payload: &[u8],
+    has_headers: bool,
+    has_null_values: bool,
+) -> Result<Vec<Record>, ProtocolError> {
     let mut records = Vec::new();
     let mut slice = payload;
     while !slice.is_empty() {
@@ -623,16 +699,25 @@ fn decode_records(payload: &[u8], has_headers: bool) -> Result<Vec<Record>, Prot
             Some(Bytes::copy_from_slice(k))
         };
 
-        let value_len = get_uvarint(&mut rec)? as usize;
-        if rec.len() < value_len {
-            return Err(ProtocolError::Truncated {
-                needed: value_len,
-                available: rec.len(),
-            });
-        }
-        let (v, r) = rec.split_at(value_len);
-        rec = r;
-        let value = Bytes::copy_from_slice(v);
+        let raw_value_len = get_uvarint(&mut rec)?;
+        let value = if has_null_values && raw_value_len == 0 {
+            None
+        } else {
+            let value_len = if has_null_values {
+                (raw_value_len - 1) as usize
+            } else {
+                raw_value_len as usize
+            };
+            if rec.len() < value_len {
+                return Err(ProtocolError::Truncated {
+                    needed: value_len,
+                    available: rec.len(),
+                });
+            }
+            let (v, r) = rec.split_at(value_len);
+            rec = r;
+            Some(Bytes::copy_from_slice(v))
+        };
 
         let timestamp_delta = zigzag_decode(get_uvarint(&mut rec)?);
 
@@ -830,7 +915,7 @@ pub fn read_control_marker(batch: &RecordBatch) -> Option<ControlMarker> {
     if !batch.control {
         return None;
     }
-    ControlMarker::from_bytes(batch.records.first()?.value.as_ref())
+    ControlMarker::from_bytes(batch.records.first()?.payload())
 }
 
 /// Validate a complete batch's framing and CRC without decoding its records
@@ -1013,6 +1098,85 @@ mod tests {
         );
     }
 
+    /// The distinction compaction is built on: a null value deletes a key,
+    /// an empty value sets it to nothing.
+    #[test]
+    fn a_tombstone_is_not_an_empty_value() {
+        let batch = RecordBatch::new(
+            0,
+            0,
+            1_700_000_000_000,
+            vec![
+                Record::with_key(b"k1".to_vec(), b"set".to_vec(), 0),
+                Record::with_key(b"k2".to_vec(), Vec::new(), 0),
+                Record::tombstone(b"k3".to_vec(), 0),
+            ],
+        );
+        let mut bytes = batch.encode();
+        let decoded = RecordBatch::decode(&mut bytes).unwrap();
+        assert_eq!(decoded.records, batch.records);
+        assert_eq!(decoded.records[0].value.as_deref(), Some(&b"set"[..]));
+        assert_eq!(decoded.records[1].value.as_deref(), Some(&b""[..]));
+        assert_eq!(decoded.records[2].value, None);
+        assert!(!decoded.records[1].is_tombstone());
+        assert!(decoded.records[2].is_tombstone());
+    }
+
+    /// A batch with no tombstone must encode to exactly the bytes it did
+    /// before tombstones existed, or every log already on disk changes
+    /// meaning.
+    #[test]
+    fn a_batch_without_a_tombstone_does_not_set_the_bit() {
+        let batch = RecordBatch::new(
+            0,
+            0,
+            1_700_000_000_000,
+            vec![Record::with_key(b"k".to_vec(), b"v".to_vec(), 0)],
+        );
+        let encoded = batch.encode();
+        // attributes sit after base_offset, batch_length, leader_epoch,
+        // magic and crc.
+        let attributes = u16::from_be_bytes([encoded[21], encoded[22]]);
+        assert_eq!(attributes & NULL_VALUE_BIT, 0);
+
+        let with_tombstone = RecordBatch::new(0, 0, 1, vec![Record::tombstone(b"k".to_vec(), 0)]);
+        let encoded = with_tombstone.encode();
+        let attributes = u16::from_be_bytes([encoded[21], encoded[22]]);
+        assert_eq!(attributes & NULL_VALUE_BIT, NULL_VALUE_BIT);
+    }
+
+    /// Tombstones must survive every codec, since the value length lives
+    /// inside the compressed payload.
+    #[test]
+    fn tombstones_survive_compression() {
+        for codec in [
+            Compression::None,
+            Compression::Lz4,
+            Compression::Zstd,
+            Compression::Snappy,
+            Compression::Gzip,
+        ] {
+            let batch = RecordBatch::new(
+                0,
+                0,
+                1,
+                vec![
+                    Record::tombstone(b"gone".to_vec(), 0),
+                    Record::with_key(b"here".to_vec(), b"value".to_vec(), 0),
+                ],
+            )
+            .with_compression(codec);
+            let mut bytes = batch.encode();
+            let decoded = RecordBatch::decode(&mut bytes).unwrap();
+            assert_eq!(decoded.records[0].value, None, "codec {codec:?}");
+            assert_eq!(
+                decoded.records[1].value.as_deref(),
+                Some(&b"value"[..]),
+                "codec {codec:?}"
+            );
+        }
+    }
+
     /// Kafka's header list is ordered and may repeat a key; a map would
     /// silently drop the duplicates that tracing systems rely on.
     #[test]
@@ -1172,7 +1336,7 @@ mod tests {
         put_uvarint(&mut payload, rec.len() as u64);
         payload.extend_from_slice(&rec);
 
-        let error = decode_records(&payload, true).unwrap_err();
+        let error = decode_records(&payload, true, false).unwrap_err();
         assert!(
             matches!(error, ProtocolError::Malformed(_)),
             "expected a malformed error, got {error:?}"
@@ -1364,7 +1528,10 @@ mod tests {
     #[test]
     fn iter_yields_absolute_offsets() {
         let batch = RecordBatch::new(100, 0, 0, sample_records(4));
-        let pairs: Vec<(i64, Bytes)> = batch.iter().map(|(o, r)| (o, r.value.clone())).collect();
+        let pairs: Vec<(i64, Bytes)> = batch
+            .iter()
+            .map(|(o, r)| (o, r.value.clone().unwrap_or_default()))
+            .collect();
         assert_eq!(pairs.len(), 4);
         assert_eq!(pairs[0].0, 100);
         assert_eq!(pairs[3].0, 103);

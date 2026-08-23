@@ -29,7 +29,7 @@ SCHEMA_VERSION = "1.0.0"
 # Version 3 added transactions: Fetch carries an isolation_level, and
 # MetadataResponse carries a request-level error code so an authorization
 # denial is no longer reported as an unknown topic.
-API_VERSION = 3
+API_VERSION = 4
 
 # Isolation levels for a fetch. READ_UNCOMMITTED is the default and is what
 # every non-transactional topic gives either way.
@@ -45,6 +45,10 @@ MAGIC_V2 = 2
 
 COMPRESSION_MASK = 0x0007
 HEADERS_BIT = 0x0008
+# Some record in this batch has a null value: a tombstone, which deletes its
+# key on a compacted topic. Set only when one is present, so a batch without
+# one encodes exactly as it always did.
+NULL_VALUE_BIT = 0x0040
 
 
 class ApiKey:
@@ -480,7 +484,10 @@ class RecordHeader:
 
 @dataclass
 class Record:
-    value: bytes
+    #: `None` is a tombstone: on a compacted topic it deletes the key, and it
+    #: reaches consumers as a null value. Distinct from `b""`, which is an
+    #: ordinary record that happens to carry no bytes.
+    value: Optional[bytes]
     key: Optional[bytes] = None
     timestamp_delta: int = 0
     headers: List[RecordHeader] = field(default_factory=list)
@@ -511,6 +518,9 @@ def encode_record_batch(
     therefore corrupts the log rather than merely failing a request.
     """
     has_headers = any(record.headers for record in records)
+    # A None value is a tombstone and needs the widened length encoding; an
+    # empty bytes value is an ordinary record and must not trigger it.
+    has_null_values = any(record.value is None for record in records)
 
     payload = bytearray()
     for record in records:
@@ -520,8 +530,15 @@ def encode_record_batch(
         else:
             _put_uvarint(rec, len(record.key) + 1)
             rec += record.key
-        _put_uvarint(rec, len(record.value))
-        rec += record.value
+        if has_null_values:
+            if record.value is None:
+                _put_uvarint(rec, 0)
+            else:
+                _put_uvarint(rec, len(record.value) + 1)
+                rec += record.value
+        else:
+            _put_uvarint(rec, len(record.value))
+            rec += record.value
         _put_uvarint(rec, zigzag_encode(record.timestamp_delta, 64))
         if has_headers:
             _put_uvarint(rec, len(record.headers))
@@ -541,6 +558,8 @@ def encode_record_batch(
     attributes = compression & COMPRESSION_MASK
     if has_headers:
         attributes |= HEADERS_BIT
+    if has_null_values:
+        attributes |= NULL_VALUE_BIT
 
     magic = MAGIC_V2 if producer is not None else MAGIC_V1
     extension = PRODUCER_EXTENSION_LEN if producer is not None else 0
@@ -600,11 +619,17 @@ def decode_record_batch(data: bytes, offset: int) -> Tuple[DecodedBatch, int]:
         cursor += PRODUCER_EXTENSION_LEN
 
     payload = decompress(attributes & COMPRESSION_MASK, data[cursor:end])
-    records = _decode_records(payload, bool(attributes & HEADERS_BIT))
+    records = _decode_records(
+        payload,
+        bool(attributes & HEADERS_BIT),
+        bool(attributes & NULL_VALUE_BIT),
+    )
     return DecodedBatch(base_offset, max_timestamp, records), end
 
 
-def _decode_records(payload: bytes, has_headers: bool) -> List[Record]:
+def _decode_records(
+    payload: bytes, has_headers: bool, has_null_values: bool
+) -> List[Record]:
     records: List[Record] = []
     pos = 0
     while pos < len(payload):
@@ -621,9 +646,15 @@ def _decode_records(payload: bytes, has_headers: bool) -> List[Record]:
             key = payload[pos : pos + size]
             pos += size
 
-        value_len, pos = _get_uvarint(payload, pos)
-        value = payload[pos : pos + value_len]
-        pos += value_len
+        raw_value_len, pos = _get_uvarint(payload, pos)
+        if has_null_values and raw_value_len == 0:
+            # A tombstone. None rather than b"", which is what
+            # distinguishes a deletion from a record whose value is empty.
+            value = None
+        else:
+            value_len = raw_value_len - 1 if has_null_values else raw_value_len
+            value = payload[pos : pos + value_len]
+            pos += value_len
 
         raw_delta, pos = _get_uvarint(payload, pos)
         timestamp_delta = zigzag_decode(raw_delta)

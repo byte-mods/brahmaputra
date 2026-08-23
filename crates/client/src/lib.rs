@@ -35,7 +35,7 @@ pub use quic::tune_for_datacenter as tune_quic_transport;
 pub use replica::{ReplicaClient, ReplicaFetchResult};
 pub use tls::TlsSettings;
 pub use transactional::{TransactionalProducer, DEFAULT_TRANSACTION_TIMEOUT_MS};
-pub use transport::{Connection, Credentials, Transport, TransportConfig};
+pub use transport::{Connection, Credentials, SaslMechanism, Transport, TransportConfig};
 
 pub use brahmaputra_protocol::gen::{BrokerInfo, MetadataResponse, PartitionInfo, TopicInfo};
 pub use brahmaputra_protocol::IsolationLevel;

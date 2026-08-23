@@ -339,9 +339,25 @@ impl Producer {
         topic: &str,
         partition: Option<i32>,
         key: Option<Bytes>,
-        value: Bytes,
+        value: impl Into<Option<Bytes>>,
     ) -> Result<i64, ClientError> {
         self.send_with_headers(topic, partition, key, value, Vec::new())
+            .await
+    }
+
+    /// Delete `key` on a compacted topic.
+    ///
+    /// A tombstone is an ordinary record with a null value: it is appended,
+    /// replicated and delivered like any other, and it is compaction that
+    /// gives it its meaning — the key and every earlier record for it stop
+    /// existing once the tombstone itself ages out of `delete.retention.ms`.
+    pub async fn send_tombstone(
+        &self,
+        topic: &str,
+        partition: Option<i32>,
+        key: Bytes,
+    ) -> Result<i64, ClientError> {
+        self.send_with_headers(topic, partition, Some(key), None, Vec::new())
             .await
     }
 
@@ -355,9 +371,10 @@ impl Producer {
         topic: &str,
         partition: Option<i32>,
         key: Option<Bytes>,
-        value: Bytes,
+        value: impl Into<Option<Bytes>>,
         headers: Vec<RecordHeader>,
     ) -> Result<i64, ClientError> {
+        let value = value.into();
         let partition = match (partition, key.as_ref()) {
             (Some(p), _) => p,
             (None, Some(key)) => self.key_partition(topic, key).await?,
@@ -371,7 +388,7 @@ impl Producer {
             timestamp_delta: 0,
             headers,
         };
-        let approx_size = record.value.len()
+        let approx_size = record.value_len()
             + record.key.as_ref().map_or(0, |k| k.len())
             + record
                 .headers

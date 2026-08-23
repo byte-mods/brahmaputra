@@ -57,7 +57,10 @@ fn read_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, Broker
     let certificates = rustls_pemfile::certs(&mut BufReader::new(file))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
-            BrokerError::Meta(format!("cannot read certificates from {}: {error}", path.display()))
+            BrokerError::Meta(format!(
+                "cannot read certificates from {}: {error}",
+                path.display()
+            ))
         })?;
     if certificates.is_empty() {
         return Err(BrokerError::Meta(format!(
@@ -73,7 +76,10 @@ fn read_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, BrokerError> 
         .map_err(|error| BrokerError::Meta(format!("cannot open {}: {error}", path.display())))?;
     rustls_pemfile::private_key(&mut BufReader::new(file))
         .map_err(|error| {
-            BrokerError::Meta(format!("cannot read a key from {}: {error}", path.display()))
+            BrokerError::Meta(format!(
+                "cannot read a key from {}: {error}",
+                path.display()
+            ))
         })?
         .ok_or_else(|| BrokerError::Meta(format!("{} contains no private key", path.display())))
 }

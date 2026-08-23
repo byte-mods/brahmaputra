@@ -10,15 +10,20 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use brahmaputra_protocol::gen::{
-    DeleteRecordsPartition, DeleteRecordsRequest, DeleteRecordsResponse, DescribeClusterRequest,
-    DescribeClusterResponse, DescribeConfigsRequest, DescribeConfigsResponse,
-    DescribeLogDirsRequest, DescribeLogDirsResponse,
+    AlterConfigEntry, AlterConfigsRequest, AlterConfigsResponse, AlterLogDirPartition,
+    AlterReplicaLogDirsRequest, AlterReplicaLogDirsResponse, DeleteRecordsPartition,
+    DeleteRecordsRequest, DeleteRecordsResponse, DescribeClusterRequest, DescribeClusterResponse,
+    DescribeConfigsRequest, DescribeConfigsResponse, DescribeLogDirsRequest,
+    DescribeLogDirsResponse, DescribeProducersRequest, DescribeProducersResponse,
+    DescribeTransactionsRequest, DescribeTransactionsResponse, ListTransactionsRequest,
+    ListTransactionsResponse,
 };
 use brahmaputra_protocol::ApiKey;
 
 use crate::error::ClientError;
 use crate::group_consumer::msg_err;
 use crate::router::BrokerRouter;
+use crate::transactional::{coordinator_partition, TRANSACTION_STATE_TOPIC};
 use crate::transport::{Transport, TransportConfig};
 
 /// One broker in a cluster description.
@@ -288,5 +293,292 @@ impl Admin {
     /// Partition ids of `topic`, for callers that want to sweep them all.
     pub async fn partitions(&self, topic: &str) -> Result<Vec<i32>, ClientError> {
         self.router.partitions(topic).await
+    }
+}
+
+/// One producer's state on a partition, as `DescribeProducers` reports it.
+#[derive(Debug, Clone)]
+pub struct PartitionProducer {
+    pub producer_id: i64,
+    pub producer_epoch: i32,
+    pub last_sequence: i32,
+    /// First offset of this producer's open transaction here, or -1 when
+    /// it has none. A value other than -1 on the oldest such producer is
+    /// what is holding the last stable offset.
+    pub current_txn_start_offset: i64,
+}
+
+/// The producer picture for one partition.
+#[derive(Debug, Clone)]
+pub struct PartitionProducers {
+    pub topic: String,
+    pub partition: i32,
+    /// Where a `read_committed` consumer stops.
+    pub last_stable_offset: i64,
+    /// Where it would stop if nothing were open. The gap between the two
+    /// is the symptom.
+    pub high_watermark: i64,
+    pub producers: Vec<PartitionProducer>,
+}
+
+/// One transaction, as `ListTransactions` reports it.
+#[derive(Debug, Clone)]
+pub struct TransactionSummary {
+    pub transactional_id: String,
+    pub producer_id: i64,
+    pub state: String,
+    pub last_update_ms: i64,
+    pub timeout_ms: i32,
+    pub partition_count: i32,
+}
+
+/// One transaction in full.
+#[derive(Debug, Clone)]
+pub struct TransactionDescription {
+    pub transactional_id: String,
+    pub producer_id: i64,
+    pub producer_epoch: i32,
+    pub state: String,
+    pub timeout_ms: i32,
+    pub last_update_ms: i64,
+    /// Partitions this transaction has announced, as `(topic, partition)`.
+    pub partitions: Vec<(String, i32)>,
+}
+
+impl Admin {
+    /// Change a topic's configuration.
+    ///
+    /// `incremental` merges the entries given into what is already set and
+    /// leaves the rest alone; an entry with an empty value removes that
+    /// key, returning it to the broker default. Without it the map given
+    /// *replaces* the topic's configuration entirely, which is the only way
+    /// to clear several settings at once and the wrong tool for changing
+    /// one of them.
+    pub async fn alter_configs(
+        &self,
+        resource_type: &str,
+        resource_name: &str,
+        configs: &[(String, String)],
+        incremental: bool,
+    ) -> Result<(), ClientError> {
+        let body = AlterConfigsRequest {
+            resource_type: resource_type.to_owned(),
+            resource_name: resource_name.to_owned(),
+            incremental,
+            configs: configs
+                .iter()
+                .map(|(name, value)| AlterConfigEntry {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }
+        .encode()
+        .map_err(msg_err)?;
+        let bytes = self
+            .router
+            .request_seed(ApiKey::AlterConfigs, &body)
+            .await?;
+        let response = AlterConfigsResponse::decode(&bytes).map_err(msg_err)?;
+        if response.error_code != 0 {
+            // The broker's reason is more useful than the code: "unknown
+            // topic configuration: retention.msec" names the typo.
+            return Err(ClientError::Server {
+                code: response.error_code,
+                message: response.error_message,
+            });
+        }
+        Ok(())
+    }
+
+    /// Which producers have written to a partition, and what is still open.
+    ///
+    /// The answer to a `read_committed` consumer that has stopped
+    /// advancing: the gap between the last stable offset and the high
+    /// watermark is the stall, and the producer whose
+    /// `current_txn_start_offset` equals the last stable offset is causing
+    /// it.
+    pub async fn describe_producers(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<PartitionProducers, ClientError> {
+        let body = DescribeProducersRequest {
+            topic: topic.to_owned(),
+            partition,
+        }
+        .encode()
+        .map_err(msg_err)?;
+        let bytes = self
+            .router
+            .request_partition(topic, partition, ApiKey::DescribeProducers, &body)
+            .await?;
+        let response = DescribeProducersResponse::decode(&bytes).map_err(msg_err)?;
+        ClientError::from_error_code(response.error_code)?;
+        Ok(PartitionProducers {
+            topic: response.topic,
+            partition: response.partition,
+            last_stable_offset: response.last_stable_offset,
+            high_watermark: response.high_watermark,
+            producers: response
+                .producers
+                .into_iter()
+                .map(|producer| PartitionProducer {
+                    producer_id: producer.producer_id,
+                    producer_epoch: producer.producer_epoch,
+                    last_sequence: producer.last_sequence,
+                    current_txn_start_offset: producer.current_txn_start_offset,
+                })
+                .collect(),
+        })
+    }
+
+    /// Every transaction the cluster is coordinating.
+    ///
+    /// A fan-out for the same reason `describe_log_dirs` is one: a
+    /// transactional id is coordinated by whichever broker leads its
+    /// `__transaction_state` partition, so asking one broker answers for
+    /// its share and no more.
+    pub async fn list_transactions(
+        &self,
+        states: &[String],
+    ) -> Result<Vec<TransactionSummary>, ClientError> {
+        let body = ListTransactionsRequest {
+            states: states.to_vec(),
+        }
+        .encode()
+        .map_err(msg_err)?;
+        let responses = self
+            .router
+            .request_every_broker(ApiKey::ListTransactions, &body)
+            .await?;
+        let mut out = Vec::new();
+        for (_, response) in responses {
+            let Ok(response) = response else { continue };
+            let Ok(decoded) = ListTransactionsResponse::decode(&response) else {
+                continue;
+            };
+            if decoded.error_code != 0 {
+                continue;
+            }
+            out.extend(
+                decoded
+                    .transactions
+                    .into_iter()
+                    .map(|listing| TransactionSummary {
+                        transactional_id: listing.transactional_id,
+                        producer_id: listing.producer_id,
+                        state: listing.state,
+                        last_update_ms: listing.last_update_ms,
+                        timeout_ms: listing.timeout_ms,
+                        partition_count: listing.partition_count,
+                    }),
+            );
+        }
+        out.sort_by(|a, b| a.transactional_id.cmp(&b.transactional_id));
+        out.dedup_by(|a, b| a.transactional_id == b.transactional_id);
+        Ok(out)
+    }
+
+    /// One transaction in full, asked of the broker that coordinates it.
+    pub async fn describe_transaction(
+        &self,
+        transactional_id: &str,
+    ) -> Result<TransactionDescription, ClientError> {
+        let body = DescribeTransactionsRequest {
+            transactional_id: transactional_id.to_owned(),
+        }
+        .encode()
+        .map_err(msg_err)?;
+        // Routed the way a group request is: the coordinator is the leader
+        // of the `__transaction_state` partition the id hashes to, which
+        // the client can work out without asking.
+        let partitions = self
+            .router
+            .partitions(TRANSACTION_STATE_TOPIC)
+            .await
+            .unwrap_or_default();
+        let bytes = if partitions.is_empty() {
+            self.router
+                .request_seed(ApiKey::DescribeTransactions, &body)
+                .await?
+        } else {
+            let partition = coordinator_partition(transactional_id, partitions.len() as i32);
+            self.router
+                .request_partition(
+                    TRANSACTION_STATE_TOPIC,
+                    partition,
+                    ApiKey::DescribeTransactions,
+                    &body,
+                )
+                .await?
+        };
+        let response = DescribeTransactionsResponse::decode(&bytes).map_err(msg_err)?;
+        ClientError::from_error_code(response.error_code)?;
+        Ok(TransactionDescription {
+            transactional_id: response.transactional_id,
+            producer_id: response.producer_id,
+            producer_epoch: response.producer_epoch,
+            state: response.state,
+            timeout_ms: response.timeout_ms,
+            last_update_ms: response.last_update_ms,
+            partitions: response
+                .partitions
+                .into_iter()
+                .map(|partition| (partition.topic, partition.partition))
+                .collect(),
+        })
+    }
+}
+
+/// Where one partition ended up after a log-directory move.
+#[derive(Debug, Clone)]
+pub struct MovedPartition {
+    pub topic: String,
+    pub partition: i32,
+    pub log_dir: String,
+    pub bytes_moved: i64,
+}
+
+impl Admin {
+    /// Move partitions between the disks of the broker that leads them.
+    ///
+    /// The partition is unavailable while its bytes are copied, which is
+    /// why this is an explicit operator action rather than something the
+    /// broker does on its own: only the operator knows whether this
+    /// partition can afford the pause now.
+    pub async fn alter_replica_log_dirs(
+        &self,
+        targets: &[(String, i32, String)],
+    ) -> Result<Vec<MovedPartition>, ClientError> {
+        let mut moved = Vec::new();
+        for (topic, partition, log_dir) in targets {
+            let body = AlterReplicaLogDirsRequest {
+                partitions: vec![AlterLogDirPartition {
+                    topic: topic.clone(),
+                    partition: *partition,
+                    log_dir: log_dir.clone(),
+                }],
+            }
+            .encode()
+            .map_err(msg_err)?;
+            // To the broker that holds it, which is the partition's leader
+            // as far as routing is concerned.
+            let bytes = self
+                .router
+                .request_partition(topic, *partition, ApiKey::AlterReplicaLogDirs, &body)
+                .await?;
+            let response = AlterReplicaLogDirsResponse::decode(&bytes).map_err(msg_err)?;
+            for result in response.results {
+                ClientError::from_error_code(result.error_code)?;
+                moved.push(MovedPartition {
+                    topic: result.topic,
+                    partition: result.partition,
+                    log_dir: result.log_dir,
+                    bytes_moved: result.bytes_moved,
+                });
+            }
+        }
+        Ok(moved)
     }
 }

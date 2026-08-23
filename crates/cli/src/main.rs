@@ -9,14 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use brahmaputra_client::{
-    Admin, Assignor, AutoOffsetReset, Connection, Consumer, FetchedRecord, GroupAdmin,
-    GroupConsumer, IsolationLevel, Producer, ProducerConfig, TlsSettings, TransactionalProducer,
-    Transport, TransportConfig, DEFAULT_TRANSACTION_TIMEOUT_MS, EARLIEST,
-    LATEST,
+    Admin, Assignor, AutoOffsetReset, Connection, Consumer, Credentials, FetchedRecord, GroupAdmin,
+    GroupConsumer, IsolationLevel, Producer, ProducerConfig, SaslMechanism, TlsSettings,
+    TransactionalProducer, Transport, TransportConfig, EARLIEST, LATEST,
 };
-
-
-
 
 use brahmaputra_controller::{
     ClusterMetadata, ControllerCommandResult, MetadataCommand, MetadataEvent, QuotaEntity,
@@ -62,6 +58,27 @@ struct Cli {
     #[arg(long, global = true, default_value = "tcp")]
     transport: Transport,
 
+    /// Username to authenticate as. Requires --sasl-password.
+    #[arg(long = "sasl-username", global = true)]
+    sasl_username: Option<String>,
+
+    /// Password for --sasl-username.
+    ///
+    /// Under the default SCRAM-SHA-256 mechanism this never crosses the
+    /// wire — the broker is answered with a proof derived from it — so it
+    /// is usable on a plaintext listener. PLAIN sends it, and a broker
+    /// refuses that unless the connection is encrypted.
+    #[arg(long = "sasl-password", global = true, requires = "sasl_username")]
+    sasl_password: Option<String>,
+
+    /// SASL mechanism: `scram-sha-256` (default) or `plain`.
+    #[arg(
+        long = "sasl-mechanism",
+        global = true,
+        default_value = "scram-sha-256"
+    )]
+    sasl_mechanism: String,
+
     /// PEM CA bundle the broker's certificate must chain to. Without it any
     /// certificate is accepted, which encrypts the connection but proves
     /// nothing about who is on the other end of it.
@@ -100,6 +117,11 @@ enum Command {
         /// One record with this value.
         #[arg(long, conflicts_with_all = ["file", "count"])]
         value: Option<String>,
+        /// One record with a *null* value, deleting `--key` on a compacted
+        /// topic. Distinct from `--value ""`, which sets the key to an
+        /// empty value and keeps it.
+        #[arg(long, requires = "key", conflicts_with_all = ["value", "file", "count"])]
+        tombstone: bool,
         /// One record per line of this file.
         #[arg(long, conflicts_with_all = ["value", "count"])]
         file: Option<String>,
@@ -225,6 +247,14 @@ enum Command {
             default_value = "read_uncommitted"
         )]
         isolation_level: String,
+        /// This consumer's failure domain (`client.rack`).
+        ///
+        /// With it set, the leader names an in-sync replica in the same
+        /// rack and the consumer reads from that instead — which is the
+        /// difference between every fetch crossing an availability zone
+        /// and none of them doing so.
+        #[arg(long, default_value = "")]
+        rack: String,
         /// Join this consumer group instead of consuming standalone.
         #[arg(long, conflicts_with_all = ["partition", "from", "offset"])]
         group: Option<String>,
@@ -326,6 +356,11 @@ enum Command {
         /// Consumer group the `--offset` values belong to.
         #[arg(long)]
         group: Option<String>,
+        /// How long the coordinator waits before aborting this transaction
+        /// on its own (`transaction.timeout.ms`). Clamped by the broker's
+        /// `--transaction-max-timeout-ms`.
+        #[arg(long = "timeout-ms", default_value_t = brahmaputra_client::DEFAULT_TRANSACTION_TIMEOUT_MS)]
+        transaction_timeout_ms: i32,
     },
     /// Describe the cluster: brokers, racks, and the current controller.
     DescribeCluster,
@@ -341,6 +376,63 @@ enum Command {
         /// including the ones left at their default.
         #[arg(long = "config")]
         config_names: Vec<String>,
+    },
+    /// Change a topic's configuration over the data plane.
+    ///
+    /// The same change the controller API makes, reachable from the same
+    /// connection that produces and consumes — so a client does not need a
+    /// second protocol and a second address to alter what
+    /// `describe-configs` already lets it read.
+    AlterConfigs {
+        /// Topic to reconfigure.
+        #[arg(long)]
+        topic: String,
+        /// `KEY=VALUE`, repeatable. An empty value removes the setting,
+        /// returning the topic to the broker default.
+        #[arg(long = "config", value_parser = parse_topic_config)]
+        configs: Vec<TopicConfig>,
+        /// Replace the topic's whole configuration instead of merging.
+        /// Every setting not named is cleared.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Move a partition to another of its broker's disks.
+    ///
+    /// The partition is unavailable while its bytes are copied, so this
+    /// is an explicit operator action: only the operator knows whether
+    /// this partition can afford the pause now. Move followers, or hand
+    /// leadership away first.
+    AlterReplicaLogDirs {
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        partition: i32,
+        /// Absolute path of one of the broker's --data-dir directories.
+        #[arg(long = "log-dir")]
+        log_dir: String,
+    },
+    /// Show which producers have written to a partition, and what is open.
+    ///
+    /// The first thing to run when a `read_committed` consumer stops
+    /// advancing: the gap between the last stable offset and the high
+    /// watermark is the stall, and the producer holding it is named here.
+    DescribeProducers {
+        #[arg(long)]
+        topic: String,
+        #[arg(long, default_value_t = 0)]
+        partition: i32,
+    },
+    /// List the transactions the cluster is coordinating.
+    ListTransactions {
+        /// Only these states (Ongoing, PrepareCommit, CompleteAbort, ...);
+        /// repeatable. Default lists every one.
+        #[arg(long = "state")]
+        states: Vec<String>,
+    },
+    /// Describe one transaction, including the partitions it announced.
+    DescribeTransaction {
+        #[arg(long = "id")]
+        transactional_id: String,
     },
     /// Print per-partition disk usage, asked of every broker.
     DescribeLogDirs {
@@ -493,6 +585,7 @@ struct ProduceOptions {
     partition: Option<i32>,
     key: Option<String>,
     value: Option<String>,
+    tombstone: bool,
     file: Option<String>,
     count: Option<u64>,
     value_size: Option<usize>,
@@ -706,15 +799,28 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let _ = TRANSPORT.set(TransportConfig::new(
-        cli.transport,
-        TlsSettings {
-            ca_path: cli.tls_ca.clone(),
-            cert_path: cli.tls_cert.clone(),
-            key_path: cli.tls_key.clone(),
-            server_name: cli.tls_server_name.clone(),
-        },
-    ));
+    let credentials = match (&cli.sasl_username, &cli.sasl_password) {
+        (Some(username), Some(password)) => {
+            let mechanism = SaslMechanism::parse(&cli.sasl_mechanism).ok_or_else(|| {
+                anyhow::anyhow!("unknown SASL mechanism {:?}", cli.sasl_mechanism)
+            })?;
+            Some(Credentials::new(username, password).with_mechanism(mechanism))
+        }
+        (Some(_), None) => anyhow::bail!("--sasl-username requires --sasl-password"),
+        _ => None,
+    };
+    let _ = TRANSPORT.set(
+        TransportConfig::new(
+            cli.transport,
+            TlsSettings {
+                ca_path: cli.tls_ca.clone(),
+                cert_path: cli.tls_cert.clone(),
+                key_path: cli.tls_key.clone(),
+                server_name: cli.tls_server_name.clone(),
+            },
+        )
+        .with_credentials(credentials),
+    );
     let broker = if matches!(&cli.command, Command::Topic { .. } | Command::Quota { .. }) {
         None
     } else {
@@ -727,6 +833,7 @@ async fn run(cli: Cli) -> Result<()> {
             partition,
             key,
             value,
+            tombstone,
             file,
             count,
             value_size,
@@ -752,6 +859,7 @@ async fn run(cli: Cli) -> Result<()> {
                 partition,
                 key,
                 value,
+                tombstone,
                 file,
                 count,
                 value_size,
@@ -781,6 +889,7 @@ async fn run(cli: Cli) -> Result<()> {
             max,
             follow,
             isolation_level,
+            rack,
             group,
             commit_interval_ms,
             assignor,
@@ -802,6 +911,7 @@ async fn run(cli: Cli) -> Result<()> {
                             max,
                             follow,
                             quiet,
+                            rack: &rack,
                         },
                     )
                     .await
@@ -817,6 +927,7 @@ async fn run(cli: Cli) -> Result<()> {
                             max,
                             follow,
                             isolation_level: &isolation_level,
+                            rack: &rack,
                             quiet,
                             show_timestamp,
                         },
@@ -853,6 +964,7 @@ async fn run(cli: Cli) -> Result<()> {
             abandon,
             offsets,
             group,
+            transaction_timeout_ms,
         } => {
             run_transaction(
                 broker.expect("data-plane commands resolve a broker"),
@@ -862,6 +974,7 @@ async fn run(cli: Cli) -> Result<()> {
                 abandon,
                 &offsets,
                 group.as_deref(),
+                transaction_timeout_ms,
             )
             .await
         }
@@ -878,6 +991,54 @@ async fn run(cli: Cli) -> Result<()> {
                 &resource_type,
                 &name,
                 &config_names,
+            )
+            .await
+        }
+        Command::AlterConfigs {
+            topic,
+            configs,
+            replace,
+        } => {
+            alter_configs(
+                broker.expect("data-plane commands resolve a broker"),
+                &topic,
+                configs,
+                replace,
+            )
+            .await
+        }
+        Command::AlterReplicaLogDirs {
+            topic,
+            partition,
+            log_dir,
+        } => {
+            alter_replica_log_dirs(
+                broker.expect("data-plane commands resolve a broker"),
+                &topic,
+                partition,
+                &log_dir,
+            )
+            .await
+        }
+        Command::DescribeProducers { topic, partition } => {
+            describe_producers(
+                broker.expect("data-plane commands resolve a broker"),
+                &topic,
+                partition,
+            )
+            .await
+        }
+        Command::ListTransactions { states } => {
+            list_transactions(
+                broker.expect("data-plane commands resolve a broker"),
+                &states,
+            )
+            .await
+        }
+        Command::DescribeTransaction { transactional_id } => {
+            describe_transaction(
+                broker.expect("data-plane commands resolve a broker"),
+                &transactional_id,
             )
             .await
         }
@@ -1121,6 +1282,7 @@ async fn topic_admin(controller: &str, command: TopicCommand) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_transaction(
     broker: SocketAddr,
     transactional_id: &str,
@@ -1129,12 +1291,13 @@ async fn run_transaction(
     abandon: bool,
     offsets: &[TransactionalRecord],
     group: Option<&str>,
+    transaction_timeout_ms: i32,
 ) -> Result<()> {
     let mut producer = TransactionalProducer::init_with(
         transport(),
         broker,
         transactional_id,
-        DEFAULT_TRANSACTION_TIMEOUT_MS,
+        transaction_timeout_ms,
     )
     .await?;
     let (producer_id, producer_epoch) = producer.producer_identity();
@@ -1248,6 +1411,124 @@ async fn describe_configs(
     Ok(())
 }
 
+async fn alter_configs(
+    broker: SocketAddr,
+    topic: &str,
+    configs: Vec<TopicConfig>,
+    replace: bool,
+) -> Result<()> {
+    if configs.is_empty() {
+        anyhow::bail!("at least one --config KEY=VALUE is required");
+    }
+    let entries: Vec<(String, String)> = configs
+        .into_iter()
+        .map(|config| (config.key, config.value))
+        .collect();
+    let admin = Admin::connect_with(transport(), broker, "brahmaputra-cli").await?;
+    admin
+        .alter_configs("topic", topic, &entries, !replace)
+        .await?;
+    for (name, value) in &entries {
+        if value.is_empty() && !replace {
+            println!("removed {name} from {topic}");
+        } else {
+            println!("set {name}={value} on {topic}");
+        }
+    }
+    Ok(())
+}
+
+async fn alter_replica_log_dirs(
+    broker: SocketAddr,
+    topic: &str,
+    partition: i32,
+    log_dir: &str,
+) -> Result<()> {
+    let admin = Admin::connect_with(transport(), broker, "brahmaputra-cli").await?;
+    let moved = admin
+        .alter_replica_log_dirs(&[(topic.to_owned(), partition, log_dir.to_owned())])
+        .await?;
+    for partition in &moved {
+        println!(
+            "moved {}:{} to {} ({} bytes)",
+            partition.topic, partition.partition, partition.log_dir, partition.bytes_moved
+        );
+    }
+    Ok(())
+}
+
+async fn describe_producers(broker: SocketAddr, topic: &str, partition: i32) -> Result<()> {
+    let admin = Admin::connect_with(transport(), broker, "brahmaputra-cli").await?;
+    let state = admin.describe_producers(topic, partition).await?;
+    println!(
+        "topic={} partition={} last_stable_offset={} high_watermark={}",
+        state.topic, state.partition, state.last_stable_offset, state.high_watermark
+    );
+    // The line an operator is looking for. Printed rather than left to be
+    // inferred, because the whole reason to run this is that something is
+    // stuck and the arithmetic is the answer.
+    if state.high_watermark > state.last_stable_offset {
+        println!(
+            "held: {} committed record(s) are waiting on an open transaction",
+            state.high_watermark - state.last_stable_offset
+        );
+    }
+    println!(
+        "{:<20} {:<8} {:<14} {:<24}",
+        "PRODUCER_ID", "EPOCH", "LAST_SEQUENCE", "OPEN_TXN_START_OFFSET"
+    );
+    for producer in &state.producers {
+        println!(
+            "{:<20} {:<8} {:<14} {:<24}",
+            producer.producer_id,
+            producer.producer_epoch,
+            producer.last_sequence,
+            producer.current_txn_start_offset
+        );
+    }
+    println!("{} producer(s)", state.producers.len());
+    Ok(())
+}
+
+async fn list_transactions(broker: SocketAddr, states: &[String]) -> Result<()> {
+    let admin = Admin::connect_with(transport(), broker, "brahmaputra-cli").await?;
+    let transactions = admin.list_transactions(states).await?;
+    println!(
+        "{:<28} {:<16} {:<16} {:<12} {:<10}",
+        "TRANSACTIONAL_ID", "PRODUCER_ID", "STATE", "TIMEOUT_MS", "PARTITIONS"
+    );
+    for transaction in &transactions {
+        println!(
+            "{:<28} {:<16} {:<16} {:<12} {:<10}",
+            transaction.transactional_id,
+            transaction.producer_id,
+            transaction.state,
+            transaction.timeout_ms,
+            transaction.partition_count
+        );
+    }
+    println!("{} transaction(s)", transactions.len());
+    Ok(())
+}
+
+async fn describe_transaction(broker: SocketAddr, transactional_id: &str) -> Result<()> {
+    let admin = Admin::connect_with(transport(), broker, "brahmaputra-cli").await?;
+    let transaction = admin.describe_transaction(transactional_id).await?;
+    println!(
+        "transactional_id={} producer_id={} producer_epoch={} state={} timeout_ms={} last_update_ms={}",
+        transaction.transactional_id,
+        transaction.producer_id,
+        transaction.producer_epoch,
+        transaction.state,
+        transaction.timeout_ms,
+        transaction.last_update_ms
+    );
+    for (topic, partition) in &transaction.partitions {
+        println!("partition {topic}:{partition}");
+    }
+    println!("{} partition(s)", transaction.partitions.len());
+    Ok(())
+}
 async fn describe_log_dirs(broker: SocketAddr, topics: &[String]) -> Result<()> {
     let admin = Admin::connect_with(transport(), broker, "brahmaputra-cli").await?;
     let (dirs, unreachable) = admin.describe_log_dirs(topics).await?;
@@ -1277,7 +1558,10 @@ async fn describe_log_dirs(broker: SocketAddr, topics: &[String]) -> Result<()> 
                 )
             },
         );
-        println!("  {:<28} {:>14} {:>10} {:>8}", "PARTITION", "SIZE", "LAG", "ROLE");
+        println!(
+            "  {:<28} {:>14} {:>10} {:>8}",
+            "PARTITION", "SIZE", "LAG", "ROLE"
+        );
         for partition in &dir.partitions {
             total += partition.size_bytes;
             println!(
@@ -1463,6 +1747,7 @@ async fn produce(options: ProduceOptions) -> Result<()> {
         partition,
         key,
         value,
+        tombstone,
         file,
         count,
         value_size,
@@ -1538,6 +1823,15 @@ async fn produce(options: ProduceOptions) -> Result<()> {
         .map(|header| parse_header(header))
         .collect::<Result<Vec<_>>>()?;
 
+    if tombstone {
+        let offset = producer
+            .send_with_headers(&topic, partition, key, None, headers)
+            .await?;
+        println!("acked offset={offset} tombstone=true");
+        producer.flush().await?;
+        return Ok(());
+    }
+
     match (value, file, count) {
         (Some(value), _, _) => {
             let offset = producer
@@ -1582,8 +1876,7 @@ async fn produce(options: ProduceOptions) -> Result<()> {
                     // that runs long steals from the next interval instead
                     // of pushing the whole schedule back.
                     if let Some(rate) = rate {
-                        let slot =
-                            started + Duration::from_secs_f64(i as f64 / rate as f64);
+                        let slot = started + Duration::from_secs_f64(i as f64 / rate as f64);
                         tokio::time::sleep_until(tokio::time::Instant::from_std(slot)).await;
                     }
                     // Timed from the moment this record is admitted — the
@@ -1637,7 +1930,7 @@ async fn explicit_produce(
 ) -> Result<i64> {
     let record = Record {
         key: key.map(|key| Bytes::copy_from_slice(key.as_bytes())),
-        value: Bytes::copy_from_slice(value.as_bytes()),
+        value: Some(Bytes::copy_from_slice(value.as_bytes())),
         timestamp_delta: 0,
         headers: Vec::new(),
     };
@@ -1696,6 +1989,7 @@ struct ConsumeOptions<'a> {
     max: Option<u64>,
     follow: bool,
     isolation_level: &'a str,
+    rack: &'a str,
     quiet: bool,
     show_timestamp: bool,
 }
@@ -1708,14 +2002,16 @@ async fn consume(broker: SocketAddr, topic: String, options: ConsumeOptions<'_>)
         max,
         follow,
         isolation_level,
+        rack,
         quiet,
         show_timestamp,
     } = options;
-    let consumer = Consumer::connect_with(transport(), broker, "brahmaputra-cli")
+    let mut consumer = Consumer::connect_with(transport(), broker, "brahmaputra-cli")
         .await?
-        .with_isolation_level(
-            IsolationLevel::parse(isolation_level).unwrap_or_default(),
-        );
+        .with_isolation_level(IsolationLevel::parse(isolation_level).unwrap_or_default());
+    if !rack.is_empty() {
+        consumer = consumer.with_rack(rack);
+    }
     let started = Instant::now();
     let mut bytes = 0u64;
     let partitions = topic_partitions(&consumer, &topic, partition).await?;
@@ -1828,6 +2124,7 @@ struct GroupConsumeOptions<'a> {
     commit_interval_ms: u64,
     assignor: &'a str,
     auto_offset_reset: &'a str,
+    rack: &'a str,
     max: Option<u64>,
     follow: bool,
     quiet: bool,
@@ -1846,6 +2143,7 @@ async fn consume_group(
         max,
         follow,
         quiet,
+        rack,
     } = options;
     let topics: Vec<&str> = topic
         .split(',')
@@ -1874,6 +2172,9 @@ async fn consume_group(
         .with_assignor(assignor)
         .with_auto_offset_reset(auto_offset_reset)
         .with_auto_commit(auto_commit);
+    if !rack.is_empty() {
+        consumer = consumer.with_rack(rack);
+    }
     consumer.subscribe(&topics);
 
     if max == Some(0) {
@@ -1899,7 +2200,8 @@ async fn consume_group(
         }
         let idle = records.is_empty();
         for record in records {
-            bytes += (record.value.len() + record.key.as_ref().map_or(0, |key| key.len())) as u64;
+            bytes += (record.value.as_ref().map_or(0, |value| value.len())
+                + record.key.as_ref().map_or(0, |key| key.len())) as u64;
             if !quiet {
                 let key = record
                     .key
@@ -1910,7 +2212,7 @@ async fn consume_group(
                     record.partition,
                     record.offset,
                     key,
-                    String::from_utf8_lossy(&record.value)
+                    render_value(&record.value)
                 );
             }
             printed += 1;
@@ -1957,6 +2259,20 @@ fn print_assignment(assignment: &[(String, i32)]) {
     );
 }
 
+/// How a record's value is printed, with a tombstone shown as `null`.
+///
+/// The distinction is the whole point of a tombstone: `value=` (an empty
+/// value) and `value=null` (a deletion) mean different things to a
+/// compacted topic, and a reader of this output has to be able to tell
+/// them apart. Existing scripts are unaffected — nothing that never
+/// produced a tombstone can print one.
+fn render_value(value: &Option<Bytes>) -> String {
+    match value {
+        Some(value) => String::from_utf8_lossy(value).into_owned(),
+        None => "null".into(),
+    }
+}
+
 fn emit_records(
     partition: i32,
     next: &mut i64,
@@ -1968,7 +2284,8 @@ fn emit_records(
     bytes: &mut u64,
 ) -> bool {
     for record in records {
-        *bytes += (record.value.len() + record.key.as_ref().map_or(0, |key| key.len())) as u64;
+        *bytes += (record.value.as_ref().map_or(0, |value| value.len())
+            + record.key.as_ref().map_or(0, |key| key.len())) as u64;
         if !quiet {
             let key = record
                 .key
@@ -2006,7 +2323,7 @@ fn emit_records(
             println!(
                 "partition={partition} offset={}{timestamp} key={key} value={}{headers}",
                 record.offset,
-                String::from_utf8_lossy(&record.value)
+                render_value(&record.value)
             );
         }
         *printed += 1;
@@ -2107,7 +2424,10 @@ mod tests {
     fn latency_percentiles_handle_one_and_none() {
         assert!(super::format_latency(&mut []).contains("no samples"));
         let line = super::format_latency(&mut [2_500]);
-        assert!(line.contains("p50=2.50") && line.contains("p99.9=2.50"), "{line}");
+        assert!(
+            line.contains("p50=2.50") && line.contains("p99.9=2.50"),
+            "{line}"
+        );
     }
 
     use brahmaputra_broker::{Broker, BrokerConfig};
@@ -2843,7 +3163,10 @@ mod tests {
         let records = consumer.fetch("acks-all", 0, 0, 500).await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].offset, 0);
-        assert_eq!(records[0].value, Bytes::from_static(b"replicated-value"));
+        assert_eq!(
+            records[0].value,
+            Some(Bytes::from_static(b"replicated-value"))
+        );
 
         let _ = shutdown_tx.send(());
         tokio::time::timeout(Duration::from_secs(2), server)
@@ -2908,7 +3231,7 @@ mod tests {
             .unwrap();
         let records = consumer.fetch("cli-idempotent", 0, 0, 100).await.unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].value, Bytes::from_static(b"one"));
+        assert_eq!(records[0].value, Some(Bytes::from_static(b"one")));
 
         let _ = shutdown_tx.send(());
         server.await.unwrap().unwrap();
@@ -2963,6 +3286,7 @@ mod tests {
                     max: Some(1),
                     follow: true,
                     isolation_level: "read_uncommitted",
+                    rack: "",
                     quiet: false,
                     show_timestamp: false,
                 },

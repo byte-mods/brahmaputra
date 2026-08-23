@@ -39,6 +39,21 @@ a last stable offset and `read_committed` isolation are implemented and
 verified, which removes the ceiling on which workloads qualify —
 read-process-write pipelines can now be built on this.
 
+Two things this document previously recorded as present have since been
+found *half* present, and are now finished. **Log compaction could not
+delete a key**: the record format had no null value, so a compacted topic's
+key space could only grow, and the group coordinator's own deletions were
+markers compaction could not act on. And **`transaction.timeout.ms` was
+stored and never read**: a producer that died mid-transaction pinned the
+last stable offset on every partition it had touched, permanently, unless
+something happened to claim its `transactional.id` again. Both were worse
+than the gaps this document ranked, because both looked like features.
+
+With those closed, the remaining efficiency work is done too: consumers can
+read from an in-sync replica in their own rack (KIP-392), a fetch sends
+only what changed (KIP-227), and authentication no longer requires
+encryption to be meaningful (SCRAM-SHA-256).
+
 The one gap that dominates every other consideration is **§2: this speaks
 its own wire protocol, not Kafka's**. No Kafka client, Connect, Streams,
 Schema Registry, MirrorMaker or ecosystem tool works against it. That is
@@ -62,10 +77,10 @@ are cheap to write; besides the in-repo Rust one, four exist
 | Language | State |
 |---|---|
 | Rust | the in-repo client; covered by the workspace suite |
-| Go | updated for wire v3, verified against a live v3 broker, 34/34 |
-| Node.js | updated for wire v3, verified against a live v3 broker, 34/34 |
-| Python | updated for wire v3, still never executed (no interpreter on the build host) |
-| Java | updated for wire v3, still never compiled (no JDK on the build host) |
+| Go | updated for wire v4, verified against a live v4 broker, 38/38 |
+| Node.js | updated for wire v4, verified against a live v4 broker, 38/38 |
+| Python | updated for wire v4, still never executed (no interpreter on the build host) |
+| Java | updated for wire v4, still never compiled (no JDK on the build host) |
 
 They cover producer, consumer and group APIs including sticky assignment,
 static membership and `auto.offset.reset`. They do **not** cover TLS, QUIC
@@ -85,39 +100,50 @@ or the idempotent producer.
 | OffsetCommit / OffsetFetch | ✅ keys 10–11 | |
 | ListGroups / DescribeGroups | ✅ keys 12–13 | |
 | ApiVersions | ✅ key 14 | answered at any requested version |
-| Authenticate | ✅ key 17 | SASL/PLAIN-equivalent; refused on a plaintext listener |
+| Authenticate | ✅ key 17 | SCRAM-SHA-256 (two round trips, password never sent) and PLAIN (refused on a plaintext listener) |
 | **LeaveGroup** | ✅ key 18 | **added since the last audit** |
 | LeaderAndIsr / UpdateMetadata | 🟡 | equivalent effect via Raft metadata subscription |
 | **DescribeCluster** | ✅ key 19 | brokers, racks, current controller |
 | **DescribeConfigs** | ✅ key 20 | topic and broker resources; marks inherited defaults |
 | **DescribeLogDirs** | ✅ key 21 | per-partition disk usage, fanned out across brokers |
 | **DeleteRecords** | ✅ key 22 | leader-only, clamped to the high watermark |
-| AlterConfigs | 🟡 | `SetTopicConfig` through the controller, not a data-plane API |
+| **AlterConfigs** | ✅ key 28 | forwards to the controller; incremental or replace, unknown names refused |
 | **AddPartitionsToTxn** | ✅ key 23 | announced before the first write to a partition |
 | **AddOffsetsToTxn** | ✅ key 24 | brings a group's offsets into the transaction |
 | **EndTxn** | ✅ key 25 | prepare, mark every partition, complete |
 | **TxnOffsetCommit** | ✅ key 26 | to the group coordinator, as transactional records |
 | **WriteTxnMarkers** | ✅ key 27 | cluster-internal, as in Kafka |
+| **DescribeProducers** | ✅ key 29 | who has written to a partition, and what transaction is open |
+| **ListTransactions** | ✅ key 30 | every transactional id the cluster coordinates, fanned out |
+| **DescribeTransactions** | ✅ key 31 | one transaction in full, routed to its coordinator |
+| **AlterReplicaLogDirs** | ✅ key 32 | move a partition between a broker's disks; the partition is offline while it copies |
 | FindCoordinator | 🟡 | not needed: a client hashes the id to a coordinator partition and routes to its leader, exactly as it does for a group |
 
-The wire version is **3**. The broker requires an exact match, so an older
-client gets `UNSUPPORTED_VERSION` rather than misparsing. Version 3 added
-`isolation_level` to `Fetch`/`FetchMulti` and a request-level `error_code`
-to `MetadataResponse`; all four native drivers were updated with it, and
-the Go and Node.js suites were re-run against a version-3 broker (34/34
-each).
+The wire version is **4**. The broker requires an exact match, so an older
+client gets `UNSUPPORTED_VERSION` rather than misparsing.
 
-`ApiVersions` now advertises all **28** dispatched APIs. It previously
-listed 16, omitting `ProduceMulti`, `FetchMulti` and `Authenticate` — the
-multi-partition forms being precisely the ones a client is supposed to
-prefer, and undiscoverable to any client that trusted the answer.
+Version 4 added **tombstones**: a record's value may be null, signalled by
+a new attributes bit on the batch. That bit is the reason the version had
+to move — a version-3 client would read a tombstone's length prefix as a
+value length and misparse every record after it, which is precisely the
+failure the exact-match rule exists to make impossible. Alongside it:
+`client.rack` and an incremental fetch session on `Fetch`/`FetchMulti`, a
+rack per broker in `Metadata`, a SASL mechanism and payload on
+`Authenticate`, and five new APIs.
+
+All four native drivers were updated; the Go and Node.js suites were re-run
+against a version-4 broker (**38/38** each, including new tombstone
+coverage). Python and Java are updated and, as before, unexecuted — there
+is no interpreter and no JDK on the build host.
+
+`ApiVersions` advertises all **33** dispatched APIs.
 
 ## 3. Broker configuration
 
 | Kafka config | Kafka default | Brahmaputra | Status |
 |---|---|---|---|
 | `broker.id` | — | `--node-id` | ✅ |
-| `listeners` / `advertised.listeners` | — | `--host` + `--port` | 🟡 single listener, no security protocol map |
+| `listeners` / `advertised.listeners` | — | `--host`/`--port`, `--advertised-host`/`--advertised-port`, `--internal-port`/`--internal-tls` | 🟡 two listeners (client, inter-broker) with an advertised address; no arbitrary named listener map |
 | `log.dirs` | `/tmp/kafka-logs` | `--data-dir`, repeatable | ✅ JBOD: one partition per disk, failure isolated per disk |
 | `num.partitions` | 1 | `--default-partitions` | ✅ |
 | `log.segment.bytes` | 1 GiB | `--segment-bytes`, **per topic** | ✅ |
@@ -133,38 +159,57 @@ prefer, and undiscoverable to any client that trusted the answer.
 | `replica.lag.time.max.ms` | 30 s | `--replica-lag-time-max-ms` | ✅ |
 | `offsets.topic.num.partitions` | 50 | `--offsets-topic-partitions` | ✅ |
 | `offsets.retention.minutes` | 7 days | **`--offsets-retention-ms`** | ✅ *new* |
-| `offsets.topic.replication.factor` | 3 | derived from cluster size | 🟡 not configurable |
+| `offsets.topic.replication.factor` | 3 | `--offsets-topic-replication-factor`, or derived | ✅ *new* |
 | `group.initial.rebalance.delay.ms` | 3 s | fixed 1 s | ✅ not tunable |
 | `group.min/max.session.timeout.ms` | 6 s / 30 min | clamped to 1 s / 30 min | ✅ not tunable |
 | `num.network.threads` / `num.io.threads` | 3 / 8 | tokio runtime + per-partition actor | ✅ different model, same effect |
-| `socket.request.max.bytes` | 100 MiB | `max_frame_bytes` (32 MiB) | 🟡 no flag |
-| `log.index.interval.bytes` | 4096 | `LogConfig` | 🟡 no flag |
+| `socket.request.max.bytes` | 100 MiB | `--max-frame-bytes` (32 MiB) | ✅ *new* |
+| `log.index.interval.bytes` | 4096 | `--index-interval-bytes` | ✅ *new* |
 | `broker.rack` | — | `--rack`, used for replica placement | ✅ |
 | `auto.create.topics.enable` | true | standalone on, cluster off | ✅ |
 | `quota.producer.default` / `.consumer.` | — | `--quota-*-bytes-per-sec`, plus per-user / per-client-id entities | ✅ throttles by delaying the ack |
 | `replication.quota.*` | — | `--quota-replication-bytes-per-sec` | ✅ |
 | `ssl.*` | — | `--transport tcp-tls` / `quic`, `--tls-cert` / `--tls-key` / `--tls-client-ca` | ✅ operator certificates and mutual TLS |
-| `sasl.*` | — | `--require-auth` + ACLs, or a client certificate's subject | 🟡 no SASL mechanism negotiation |
+| `sasl.enabled.mechanisms` | GSSAPI | SCRAM-SHA-256 and PLAIN, chosen per connection | 🟡 no SCRAM-SHA-512, GSSAPI, OAUTHBEARER or delegation tokens |
+| `log.cleaner.delete.retention.ms` | 24 h | `--delete-retention-ms`, per topic | ✅ *new* |
+| `log.cleaner.min.cleanable.ratio` | 0.5 | `--min-cleanable-dirty-ratio`, per topic | ✅ *new* |
+| `log.cleaner.min.compaction.lag.ms` | 0 | `--min-compaction-lag-ms`, per topic | ✅ *new* |
+| `log.cleaner.max.compaction.lag.ms` | ∞ | `--max-compaction-lag-ms`, per topic | ✅ *new* |
+| `message.max.bytes` (broker default) | 1 MiB | `--max-message-bytes` | ✅ *new* |
+| `transaction.max.timeout.ms` | 15 min | `--transaction-max-timeout-ms` | ✅ *new*, and enforced |
+| `transactional.id.expiration.ms` | 7 days | `--transactional-id-expiration-ms` | ✅ *new* |
 
 ## 4. Topic configuration
 
 **Applied per topic**: `retention.ms`, `retention.bytes`, `segment.bytes`,
-`segment.ms`, `cleanup.policy`, `flush.messages`, `flush.ms`,
-`max.message.bytes` and `min.insync.replicas` all change broker behaviour.
-An unparseable value falls back to the broker-wide default rather than to
-zero, so a typo cannot delete a log.
+`segment.ms`, `cleanup.policy`, `delete.retention.ms`,
+`min.cleanable.dirty.ratio`, `min.compaction.lag.ms`,
+`max.compaction.lag.ms`, `flush.messages`, `flush.ms`,
+`max.message.bytes`, `message.timestamp.type`, `compression.type` and
+`min.insync.replicas` all change broker behaviour. An unparseable value
+falls back to the broker-wide default rather than to zero, so a typo cannot
+delete a log.
 
-Configs are **not** fixed at creation, contrary to what this section said
-for two revisions: `MetadataCommand::SetTopicConfig` changes them on a
-running cluster and §7 has recorded the live-reload path working the whole
-time. What is missing is a data-plane `AlterConfigs` — changes go through
-the controller. Reading them back is now `DescribeConfigs` (key 20), which
-distinguishes a value that was set from one merely inherited.
+Configs are not fixed at creation. `AlterConfigs` (key 20's counterpart,
+key 28) changes them from the data plane — the broker forwards to the
+controller, so durability and ordering are unchanged and a client no longer
+needs a second protocol and a second address to write what
+`DescribeConfigs` already let it read. A name the broker does not read is
+**refused** rather than stored, because a config that is accepted, echoed
+back and silently ignored is indistinguishable from a broker that does not
+honour it.
 
-Still missing: `compression.type` per topic. The producer chooses the
-codec and the broker stores the batch byte-identically, which is what keeps
-replication and the zero-copy fetch path free; enforcing a topic-level
-codec would mean the broker decompressing and recompressing every batch.
+`compression.type` is applied by **refusal**: a topic that names a codec
+rejects a batch in any other one. Kafka would recompress it; doing that
+means decompressing and recompressing every batch on the way in, which is
+exactly the cost byte-identical storage and the zero-copy fetch path exist
+to avoid. The operator's guarantee is the same, and the producer is told
+what to send rather than having its data rewritten.
+
+`message.timestamp.type=LogAppendTime` overwrites the batch timestamp in
+place and recomputes the CRC — no decompression. Kafka additionally
+flattens every record in the batch to that instant; here the per-record
+deltas survive, so records inside one batch keep their relative spacing.
 
 ## 5. Producer configuration
 
@@ -197,14 +242,14 @@ codec would mean the broker decompressing and recompressing every batch.
 | `enable.auto.commit` / `auto.commit.interval.ms` | true / 5 s | ✅ | ✅ |
 | `max.poll.records` | 500 | 500 | ✅ |
 | `session.timeout.ms` | 45 s | 10 s, clamped 1 s–30 min | ✅ configurable |
-| `heartbeat.interval.ms` | 3 s | derived | 🟡 not independently configurable |
+| `heartbeat.interval.ms` | 3 s | `with_heartbeat_interval`, else timeout ÷ 3 | ✅ *new* |
 | **`max.poll.interval.ms`** | 5 min | **300 s** | ✅ *new* |
 | **`group.instance.id`** | — | **supported** | ✅ *new*, static membership |
 | `fetch.min.bytes` / `fetch.max.wait.ms` | 1 / 500 | same | ✅ |
 | `max.partition.fetch.bytes` | 1 MiB | `max_bytes` (8 MiB) | 🟡 one knob |
 | **`auto.offset.reset`** | latest | **earliest/latest/none** | ✅ *new*, default differs |
 | `isolation.level` | read_uncommitted | `read_uncommitted` / `read_committed` | ✅ LSO-bounded, aborted records and markers withheld |
-| `client.rack` / follower fetching | — | — | ❌ consumers always read the leader |
+| `client.rack` / follower fetching | — | `--rack`, `Consumer::with_rack` | ✅ *new*, KIP-392: the leader names an in-sync replica in the consumer's rack |
 | `check.crcs` | true | always | ✅ |
 
 ## 7. Architecture and behaviour
@@ -223,12 +268,18 @@ codec would mean the broker decompressing and recompressing every batch.
 | **Rack-aware replica placement** | ✅ interleaved, leadership rotated | ✅ |
 | **Preferred-leader election and rebalancing** | ✅ failover follows replica order; leadership returns on `--auto-leader-rebalance-interval-ms` | ✅ |
 | **Live topic-config changes** | ✅ pushed to running partitions | ✅ |
-| **Administrative introspection** | ✅ DescribeCluster / DescribeConfigs / DescribeLogDirs | ✅ |
+| **Administrative introspection** | ✅ DescribeCluster / DescribeConfigs / DescribeLogDirs / DescribeProducers / ListTransactions / DescribeTransactions | ✅ |
+| **Data-plane configuration changes** | ✅ AlterConfigs, forwarded to the controller | ✅ |
 | **DeleteRecords** | ✅ leader-only, checkpointed log start offset | ✅ |
 | Consumer groups, coordinator failover by log replay | ✅ verified live | ✅ |
 | Rebalance protocol | ✅ eager and cooperative (KIP-429) | ✅ |
 | **Offset expiry** | ✅ *new* | ✅ |
-| Log compaction | ✅ | ✅ |
+| Log compaction | ✅ tombstones delete keys; `delete.retention.ms`, dirty ratio and lag knobs; batches, codecs and producer metadata preserved; crash-safe swap | ✅ |
+| **Transaction timeout enforcement** | ✅ the coordinator aborts and fences past `transaction.timeout.ms`, re-sends half-written markers, expires idle ids | ✅ |
+| **Follower fetching (KIP-392)** | ✅ the leader names an in-sync replica in the consumer's rack | ✅ |
+| **Incremental fetch sessions (KIP-227)** | ✅ bounded, LRU-evicted, epoch-checked | ✅ |
+| **SASL mechanisms** | 🟡 SCRAM-SHA-256 and PLAIN | 🟡 |
+| **Moving a partition between disks** | 🟡 AlterReplicaLogDirs, but the partition is offline while it copies | 🟡 |
 | Quotas / throttling | ✅ client produce/fetch **and replication**, bound to user and/or client id | ✅ |
 | TLS / auth / ACLs | ✅ | ✅ |
 | **Transactions and exactly-once** | ✅ coordinator, control batches, LSO, `read_committed` | ✅ |
@@ -294,37 +345,205 @@ equally, which is what preserves the ratios.
    and offset monotonicity — but the longest run to date is measured in
    minutes. A soak that would actually move this is measured in weeks.
    Nothing in this document can close this one.
-3. `sendfile` is Linux-plus-plaintext only; elsewhere the fallback reads
-   the range and writes it — correct, just not free.
-4. No SASL mechanism negotiation. Password authentication is a single
-   custom `Authenticate` exchange: no SCRAM, GSSAPI or OAUTHBEARER, and no
-   delegation tokens. Certificate authentication is the stronger option
-   and is available today.
-5. Single listener: no `advertised.listeners`, no security-protocol map, so
-   a broker cannot offer plaintext internally and TLS externally.
-6. No cross-directory rebalancing. A disk added to a running broker takes
-   only *new* partitions, and there is no `AlterReplicaLogDirs` to move an
-   existing one between disks without deleting and refetching it.
+3. **A controller node that stays down takes the surviving brokers with
+   it.** With three combined nodes and `--session-timeout-ms 3000`, killing
+   the node holding Raft leadership and *leaving it down* leaves the other
+   two unable to renew their broker lease before it expires; they
+   self-terminate, and a cluster that should have survived one failure
+   loses all three.
+
+   The distinction matters, and it is what makes this survivable in
+   practice: killing that node and restarting it within a couple of seconds
+   — a rolling restart, a crash with a supervisor — is handled cleanly, and
+   `scripts/soak.sh` does exactly that repeatedly without a single failed
+   write. It is the sustained outage of the leader that is not.
+
+   Reproduced identically on 0.3.0, so this is not new. Both halves are
+   individually deliberate: a broker that cannot renew its lease must stop
+   serving rather than risk split brain, and the controller must fence a
+   broker it has not heard from. What is missing is the distinction between
+   "a controller told me I am fenced" and "I could not reach a controller
+   at all" — the second is a re-registration, not a death sentence. Setting
+   `--session-timeout-ms` above the worst-case election time avoids it
+   today.
+
+4. `sendfile` is Linux-plus-plaintext only; elsewhere the fallback reads
+   the range and writes it — correct, just not free. This is a property of
+   the platform rather than a thing left undone: macOS, BSD and Windows
+   have no equivalent that covers this case, and TLS and QUIC must see the
+   bytes to encrypt them. Kafka draws the same line for SSL.
+5. **No general listener map.** There are now two listeners — a client one
+   and an optional inter-broker one, each with its own transport — and an
+   advertised address distinct from the bound one. What is still missing is
+   Kafka's arbitrary `listeners` / `advertised.listeners` map with named
+   endpoints and a security-protocol per name. The common shape it exists
+   for, plaintext between brokers and TLS to clients, is covered; three or
+   more listeners with different protocols is not.
+6. **A log-directory move takes the partition offline while it copies.**
+   `AlterReplicaLogDirs` (key 32) moves a partition between a broker's
+   disks, which is the gap that mattered — a disk added to a running broker
+   used to take only new partitions forever. But Kafka builds the second
+   copy alongside, lets it catch up, and swaps; this closes the partition,
+   copies, and reopens. The pause is bounded by the partition's size and is
+   the reason to move followers, or to hand leadership away first.
+7. **SASL is SCRAM-SHA-256 and PLAIN only.** No SCRAM-SHA-512, GSSAPI,
+   OAUTHBEARER, and no delegation tokens. SCRAM covers the case that
+   actually blocked deployments — authentication that is meaningful on a
+   listener that is not encrypted — and certificate authentication remains
+   the strongest option available.
 
 **Efficiency at scale**
 
-7. No follower fetching (`client.rack`), so every consumer read crosses
-   AZs.
-8. No tiered storage: retention is bounded by local disk.
-9. No incremental fetch sessions (KIP-227), so per-fetch metadata cost
-   grows with partition count.
-10. `heartbeat.interval.ms` is derived from the session timeout rather
-    than set independently.
-11. A `read_committed` fetch cannot use the zero-copy path: choosing which
-    batches to withhold means reading their headers, and the point of
-    handing the kernel a file range is that nobody reads them. Filtering is
-    per batch rather than per record, so this costs a copy and never a
-    decompression.
+8. No tiered storage: retention is bounded by local disk. A v1 non-goal,
+   and the one item on this list that is a deliberate scope decision rather
+   than something not yet built.
+9. A `read_committed` fetch cannot use the zero-copy path: choosing which
+   batches to withhold means reading their headers, and the point of
+   handing the kernel a file range is that nobody reads them. Filtering is
+   per batch rather than per record, so this costs a copy and never a
+   decompression.
+10. **`compression.type` is enforced by refusal, not conversion.** A topic
+   that names a codec rejects a batch in any other one; Kafka would
+   recompress it. Converting means decompressing and recompressing every
+   batch on the way in, which is exactly the cost that byte-identical
+   storage and the zero-copy fetch path exist to avoid — so the guarantee
+   an operator gets ("every batch on this topic is zstd") is the same, and
+   the producer is told what to send rather than having its data silently
+   rewritten.
+11. **`message.timestamp.type=LogAppendTime` keeps per-record deltas.**
+    Kafka flattens every record in a batch to the same instant; here the
+    batch timestamp becomes the broker's clock and the per-record deltas
+    survive, so records inside one batch keep their relative spacing. What
+    the setting is *for* — retention and timestamp seeks no longer
+    depending on a client's clock — holds either way, and the batch is
+    never decompressed to do it.
+
+**Newer Kafka**
+
+12. **KIP-848**, the broker-side consumer group protocol and the default in
+    Kafka 4.0. The client-side JoinGroup/SyncGroup rebalance implemented
+    here is the older protocol, which Kafka still supports. Moving the
+    assignment into the coordinator is a re-architecture of the group
+    machinery rather than a feature to add to it.
+13. **KIP-932 share groups** (queue semantics) and **KIP-890 transaction
+    fencing v2**. Both are Kafka 4.x work; neither is a gap against the
+    Kafka most deployments are running.
 
 ## 9a. Closed since the last audit
 
 Recorded because this document has drifted before, and a gap list that
 only ever grows is not being read against the code.
+
+The first two were not on the previous gap list at all. They were found by
+reading the code against this document's own claims, and both are worse
+than anything that *was* listed, because a missing feature is visible and a
+half-present one is not.
+
+- **Log compaction can delete a key.** `Record.value` is `Option<Bytes>`; a
+  null value is a tombstone, and a new attributes bit (0x0040) says a batch
+  contains one so that a batch without one encodes to exactly the bytes it
+  always did.
+
+  Before this, compaction kept the newest record for every key that had
+  ever existed. Half of what `cleanup.policy=compact` means in Kafka was
+  missing, and `__consumer_offsets` expiry wrote an application-level
+  marker under a *different key* than the records it was deleting — which
+  replay understood and compaction could not act on, so the comment
+  claiming it "lets compaction reclaim them" was false.
+
+  The pass itself was rewritten around the same change:
+
+  | Was | Is |
+  |---|---|
+  | every survivor re-emitted as its own single-record batch | contiguous survivors share one batch |
+  | compression dropped, producer metadata erased, control batches turned into data | codec, producer identity and transactional/control flags preserved |
+  | one segment for the whole cleaned range | rolls at `segment.bytes` |
+  | every survivor held in memory | streamed, with the key map covering only the dirty range |
+  | ran whenever anything was removable | `min.cleanable.dirty.ratio`, `min/max.compaction.lag.ms` |
+  | tombstones did not exist | `delete.retention.ms`, after which the tombstone goes too |
+  | a crash mid-swap could lose the survivors | staging directory, commit marker, swap; recovered on open |
+  | advanced the log start offset | leaves it alone, as Kafka does |
+
+  Verified live by `scripts/verify-compaction.sh` (17 checks), including
+  that an empty value is not a deletion and that a `kill -9` mid-run
+  changes nothing about what a consumer reads.
+
+- **`transaction.timeout.ms` is enforced.** The coordinator sweeps its
+  shards, fences the producer and aborts any transaction that has outlived
+  its timeout.
+
+  The field was persisted in `TransactionMetadata` and read by nothing. A
+  producer that died mid-transaction — scaled down, redeployed under a
+  different id, crashed for good — left records in doubt on every partition
+  it had written to, and the last stable offset there never advanced past
+  them. Every `read_committed` consumer stopped, permanently. The only
+  resolution path was the same `transactional.id` being claimed again,
+  which for a producer that is not coming back is never.
+
+  The epoch bump is the part that makes it safe: without it a producer that
+  was merely slow would carry on writing into a transaction already marked
+  aborted, producing exactly the stall the timeout was meant to prevent.
+  The same sweep re-sends the markers of a transaction left in `Prepare*`
+  and retires `transactional.id`s idle past
+  `transactional.id.expiration.ms`, writing a tombstone so their state
+  stops occupying disk. Verified live by `scripts/verify-transactions.sh`
+  (24 checks, up from 17).
+
+- **Follower fetching (KIP-392).** A consumer that sets `client.rack` is
+  told by the leader which in-sync replica in its own rack to read from.
+  Only ISR members are ever named — a follower outside it is behind by an
+  unbounded amount, and pointing a consumer there converts a replication
+  problem into a consumer that has silently stopped — and a consumer
+  already in the leader's rack is not redirected, which would trade a
+  fresher read for nothing. Verified live by `scripts/verify-reassignment.sh`.
+
+- **Incremental fetch sessions (KIP-227).** A consumer holding a thousand
+  partitions of which three are moving sends three descriptors instead of a
+  thousand. The client remains the authority on where it is reading: the
+  session is a cache of what it last said, so a broker that has evicted or
+  forgotten one answers `FETCH_SESSION_NOT_FOUND` and the client sends a
+  full fetch again. The failure mode is a wasted round trip, never a
+  consumer reading from the wrong offset. Sessions are bounded and
+  LRU-evicted, because a session is memory a *client* causes a broker to
+  allocate.
+
+- **SASL/SCRAM-SHA-256.** The password never crosses the wire, which is
+  what makes authentication meaningful on a plaintext listener — where
+  PLAIN remains, correctly, refused. Both credentials are derived when a
+  password is set; a SCRAM credential cannot be back-derived from an Argon2
+  hash, so a user created before this must have their password set again.
+  Every connection a client's router opens authenticates, not just the
+  first: a pooled connection created after a reconnect would otherwise be
+  anonymous.
+
+- **An inter-broker listener and an advertised address.**
+  `--internal-port` / `--internal-tls` give replication and transaction
+  markers their own socket and transport, so a cluster can present TLS to
+  clients and speak plaintext to itself — without encrypting every record
+  two or three more times to reach the followers.
+  `--advertised-host` / `--advertised-port` publish an address that differs
+  from the bound one, which is what a broker behind NAT, in a bridged
+  container network, or on a pod IP needs.
+
+- **`AlterReplicaLogDirs`.** A partition can be moved between a broker's
+  disks. JBOD placed partitions once, at creation, so a disk added to a
+  running broker took only new partitions forever. The partition is closed
+  while its bytes are copied — the honest cost of moving data that is being
+  appended to — which is why this is an explicit operator action.
+
+- **`AlterConfigs`, `DescribeProducers`, `ListTransactions`,
+  `DescribeTransactions`** (keys 28–31), with matching `Admin` methods and
+  CLI commands. The first removes the need for a second protocol to change
+  what the data plane could already read; the other three answer "why has
+  my committed reader stopped?" without reading the log by hand.
+
+- **Configuration that was unreachable.** `socket.request.max.bytes`,
+  `log.index.interval.bytes`, `message.max.bytes`,
+  `offsets.topic.replication.factor` and `heartbeat.interval.ms` were
+  hard-coded constants this document listed as such. All are flags now, as
+  are the compaction settings and `message.timestamp.type`.
+
+### Closed in earlier audits
 
 - **Multi-log-dir / JBOD.** `--data-dir` is repeatable, one directory per
   disk. A new partition is placed on the online directory holding the
@@ -432,7 +651,7 @@ only ever grows is not being read against the code.
 ## 10. Verification
 
 ```bash
-cargo test --workspace                    # 355
+cargo test --workspace                    # 389
 bash scripts/verify-m1.sh                 # 31  storage, protocol, SIGKILL recovery
 bash scripts/verify-m4.sh                 # 30  consumer groups across 5 nodes
 bash scripts/verify-m5.sh                 # 15  fsync, quotas, version negotiation
@@ -442,10 +661,11 @@ bash scripts/verify-retention.sh          # 21  time and size retention
 bash scripts/verify-failures.sh           # 15  producer/broker/consumer kills
 bash scripts/verify-transport-parity.sh   #     tcp vs tls vs quic, identical
 bash scripts/verify-chaos.sh              # 7   random kills under load
-bash scripts/verify-reassignment.sh       # 10  rack placement, partition moves, disk freed
-bash scripts/verify-admin-and-security.sh # 23  admin APIs, quotas, mTLS principals
-bash scripts/verify-transactions.sh       # 17  commit, abort, in doubt, recovery
-bash scripts/verify-jbod.sh               # 18  multi-disk placement and disk failure
+bash scripts/verify-reassignment.sh       # 12  rack placement, moves, follower fetching
+bash scripts/verify-admin-and-security.sh # 29  admin APIs, quotas, mTLS, SCRAM, AlterConfigs
+bash scripts/verify-transactions.sh       # 24  commit, abort, in doubt, expiry
+bash scripts/verify-compaction.sh         # 17  tombstones, superseding, delete horizons
+bash scripts/verify-jbod.sh               # 26  multi-disk placement, failure, moves between disks
 SOAK_MINUTES=20 bash scripts/soak.sh      # 5   sustained load through repeated kills
 bash scripts/bench-replicated.sh          #     RF=3 acks=all vs RF=1 acks=1
 ```
@@ -455,8 +675,8 @@ All of the above pass on the development host as of this audit.
 Client drivers, against a live broker:
 
 ```bash
-cd clients/go     && go run ./cmd/manualtest      # 34/34
-cd clients/nodejs && node test_manual.js          # 34/34
+cd clients/go     && go run ./cmd/manualtest      # 38/38
+cd clients/nodejs && node test_manual.js          # 38/38
 cd clients/python && python3 test_manual.py       # never run
 cd clients/java   && javac ... && java ManualTest # never run
 ```

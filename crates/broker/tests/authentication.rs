@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use brahmaputra_broker::{Broker, BrokerConfig};
-use brahmaputra_client::{Connection, Credentials, Transport};
+use brahmaputra_client::{Connection, Credentials, SaslMechanism, Transport};
 use brahmaputra_metadata::{
     AclOperation, AclPermission, AclRule, ClusterMetadata, MetadataCache, MetadataCommand,
     NodeRole, ResourceType, Role, UserRecord,
@@ -86,6 +86,7 @@ fn image_with_users() -> ClusterMetadata {
             host: "127.0.0.1".into(),
             data_port: 19_099,
             control_port: 29_099,
+            internal_port: 0,
             roles: vec![NodeRole::Broker, NodeRole::Controller],
             rack: None,
             now_ms: 1_000,
@@ -106,13 +107,8 @@ fn image_with_users() -> ClusterMetadata {
     for (username, role) in [("writer", Role::Operator), ("reader", Role::Viewer)] {
         image
             .apply(MetadataCommand::PutUser {
-                user: UserRecord {
-                    username: username.into(),
-                    password_hash: brahmaputra_metadata::password::hash("correct horse")
-                        .expect("hash"),
-                    role,
-                    force_password_change: false,
-                },
+                // Both credentials, as every real creation path produces.
+                user: UserRecord::new(username, "correct horse", role, false).expect("user"),
             })
             .expect("put user");
     }
@@ -162,6 +158,7 @@ fn fetch_body(topic: &str) -> Vec<u8> {
         max_wait_ms: 100,
         min_bytes: 1,
         isolation_level: 0,
+        rack: String::new(),
     }
     .encode()
     .expect("encode fetch")
@@ -212,6 +209,7 @@ async fn a_wrong_password_is_refused_and_leaves_the_connection_anonymous() {
         .authenticate(&Credentials {
             username: "writer".into(),
             password: "wrong".into(),
+            mechanism: SaslMechanism::Plain,
         })
         .await;
     assert!(outcome.is_err(), "a wrong password must not authenticate");
@@ -237,12 +235,14 @@ async fn an_unknown_user_fails_exactly_like_a_wrong_password() {
         .authenticate(&Credentials {
             username: "nobody".into(),
             password: "correct horse".into(),
+            mechanism: SaslMechanism::Plain,
         })
         .await;
     let wrong = connection
         .authenticate(&Credentials {
             username: "writer".into(),
             password: "wrong".into(),
+            mechanism: SaslMechanism::Plain,
         })
         .await;
     // Identical failures: probing must not reveal which accounts exist.
@@ -267,6 +267,7 @@ async fn an_authenticated_principal_is_still_bound_by_its_acls() {
         .authenticate(&Credentials {
             username: "reader".into(),
             password: "correct horse".into(),
+            mechanism: SaslMechanism::Plain,
         })
         .await
         .expect("reader authenticates");
@@ -304,6 +305,7 @@ async fn permission_is_scoped_to_the_named_resource() {
         .authenticate(&Credentials {
             username: "writer".into(),
             password: "correct horse".into(),
+            mechanism: SaslMechanism::Plain,
         })
         .await
         .expect("writer authenticates");
@@ -362,6 +364,7 @@ async fn a_deny_rule_overrides_a_wildcard_allow() {
         .authenticate(&Credentials {
             username: "reader".into(),
             password: "correct horse".into(),
+            mechanism: SaslMechanism::Plain,
         })
         .await
         .expect("reader authenticates");
@@ -375,6 +378,106 @@ async fn a_deny_rule_overrides_a_wildcard_allow() {
         response.error_code,
         ec::AUTHORIZATION_FAILED,
         "a deny rule must beat a wildcard allow"
+    );
+
+    stop(running).await;
+}
+
+/// SCRAM's whole reason to exist: authentication that is meaningful on a
+/// listener that is not encrypted.
+///
+/// PLAIN is refused there — a password in the clear is not authentication,
+/// it is a password on the network — so before this a plaintext deployment
+/// had no way to authenticate at all short of client certificates.
+#[tokio::test]
+async fn scram_authenticates_over_a_plaintext_listener_and_plain_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MetadataCache::new(image_with_users());
+    let broker_epoch = cache.snapshot().brokers.get(&1).map(|b| b.broker_epoch);
+    let broker = Arc::new(
+        Broker::bind(BrokerConfig {
+            broker_id: 1,
+            broker_epoch,
+            port: 0,
+            data_dirs: vec![dir.path().to_owned()],
+            default_partitions: 1,
+            // Plaintext, deliberately.
+            transport: Transport::Tcp,
+            require_auth: true,
+            metadata_cache: Some(cache),
+            ..BrokerConfig::default()
+        })
+        .await
+        .expect("bind broker"),
+    );
+    let addr = broker.local_addr();
+    let serving = Arc::clone(&broker);
+    let (shutdown, stopped) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        serving
+            .run(async {
+                let _ = stopped.await;
+            })
+            .await
+            .expect("broker run");
+    });
+    let running = RunningBroker {
+        addr,
+        shutdown,
+        task,
+    };
+
+    let connection = Connection::connect(running.addr, Some("scram-test".into()), 4)
+        .await
+        .expect("connect");
+    let principal = connection
+        .authenticate(&Credentials::new("writer", "correct horse"))
+        .await
+        .expect("SCRAM authenticates without sending the password");
+    assert_eq!(principal, "writer");
+
+    // The same credentials under PLAIN are refused here, which is the
+    // distinction: the objection is to sending the password, not to the
+    // password being wrong.
+    let plain = Connection::connect(running.addr, Some("plain-test".into()), 4)
+        .await
+        .expect("connect");
+    assert!(
+        plain
+            .authenticate(&Credentials {
+                username: "writer".into(),
+                password: "correct horse".into(),
+                mechanism: SaslMechanism::Plain,
+            })
+            .await
+            .is_err(),
+        "PLAIN must stay refused on a plaintext listener"
+    );
+
+    // And a wrong password fails under SCRAM too — the proof is what is
+    // checked, not merely that the exchange completed.
+    let wrong = Connection::connect(running.addr, Some("scram-wrong".into()), 4)
+        .await
+        .expect("connect");
+    assert!(
+        wrong
+            .authenticate(&Credentials::new("writer", "wrong horse"))
+            .await
+            .is_err(),
+        "a wrong password must not authenticate"
+    );
+
+    // As does a user that has no SCRAM credential, without revealing which
+    // case it was.
+    let unknown = Connection::connect(running.addr, Some("scram-unknown".into()), 4)
+        .await
+        .expect("connect");
+    assert!(
+        unknown
+            .authenticate(&Credentials::new("nobody", "correct horse"))
+            .await
+            .is_err(),
+        "an unknown user must not authenticate"
     );
 
     stop(running).await;

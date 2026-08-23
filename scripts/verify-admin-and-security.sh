@@ -92,7 +92,7 @@ cli() { "$CLI_EXE" --broker "$BROKER" "$@"; }
 # Every API the broker dispatches must be advertised: a client that trusts
 # ApiVersions to describe the broker cannot use what it is not told about.
 ADVERTISED="$(cli api-versions | grep -c '^  api ')"
-assert_eq "$ADVERTISED" "28" "ApiVersions advertises every dispatched API"
+assert_eq "$ADVERTISED" "33" "ApiVersions advertises every dispatched API"
 
 CLUSTER="$(cli describe-cluster)"
 assert_contains "$CLUSTER" "cluster id:" "DescribeCluster reports a cluster id"
@@ -381,4 +381,103 @@ if as_client mallory produce --topic secured --value evil >/dev/null 2>&1; then
 fi
 pass "a different subject from the same CA is a different principal, and is denied"
 
+
+# ------------------------------------------------------------- SCRAM
+
+stage "SCRAM-SHA-256 authenticates over a listener that is not encrypted"
+
+for pid in "${PIDS[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
+PIDS=()
+DATA_PORT="$(allocate_port)"
+CONTROL_PORT="$(allocate_port)"
+BROKER="127.0.0.1:$DATA_PORT"
+CONTROLLER="http://127.0.0.1:$CONTROL_PORT"
+mkdir -p "$WORK_DIR/scram"
+# Plaintext, deliberately: this is the case PLAIN cannot serve, because a
+# password in the clear is not authentication.
+"$SERVER_EXE" --host 127.0.0.1 --port "$DATA_PORT" --data-dir "$WORK_DIR/scram" \
+  --node-id 1 --cluster-id verify-scram --control-port "$CONTROL_PORT" \
+  --http-port 0 --bootstrap --controller-peer "1=127.0.0.1:$CONTROL_PORT" \
+  --require-auth --admin-user admin --admin-password "correct horse battery" \
+  --heartbeat-interval-ms 500 --session-timeout-ms 3000 \
+  >"$WORK_DIR/scram.out" 2>"$WORK_DIR/scram.err" &
+PIDS+=($!)
+
+DEADLINE=$((SECONDS + 40))
+until curl -sf "$CONTROLLER/api/v1/controller/metadata" >/dev/null 2>&1; do
+  (( SECONDS < DEADLINE )) || die "the SCRAM broker's controller never became ready"
+  sleep 0.3
+done
+sleep 3
+
+"$CLI_EXE" --controller "$CONTROLLER" topic create --name scrammed \
+  --partitions 1 --replication-factor 1 >/dev/null
+for operation in read write describe; do
+  curl -sf -X POST "$CONTROLLER/api/v1/controller/command" \
+    -H 'content-type: application/json' \
+    -d "{\"type\":\"put_acl\",\"rule\":{\"principal\":\"admin\",\"resource_type\":\"topic\",\"resource_name\":\"scrammed\",\"operation\":\"$operation\",\"permission\":\"allow\"}}" \
+    >/dev/null
+done
+curl -sf -X POST "$CONTROLLER/api/v1/controller/command" \
+  -H 'content-type: application/json' \
+  -d '{"type":"put_acl","rule":{"principal":"admin","resource_type":"cluster","resource_name":"cluster","operation":"describe","permission":"allow"}}' \
+  >/dev/null
+curl -sf -X POST "$CONTROLLER/api/v1/controller/command" \
+  -H 'content-type: application/json' \
+  -d '{"type":"put_acl","rule":{"principal":"admin","resource_type":"cluster","resource_name":"cluster","operation":"write","permission":"allow"}}' \
+  >/dev/null
+sleep 2
+
+# Anonymous is refused, which is what makes the rest of this meaningful.
+if "$CLI_EXE" --broker "$BROKER" produce --topic scrammed --value hello >/dev/null 2>&1; then
+  die "an unauthenticated connection was allowed to produce"
+fi
+pass "an unauthenticated connection is refused"
+
+sasl() {
+  "$CLI_EXE" --broker "$BROKER" \
+    --sasl-username admin --sasl-password "correct horse battery" "$@"
+}
+
+ACKED="$(sasl produce --topic scrammed --value hello 2>&1 | tail -1)"
+assert_contains "$ACKED" "acked" \
+  "SCRAM authenticates on a plaintext listener, without the password crossing the wire"
+
+# The distinction being made: the objection is to *sending* the password,
+# not to the password being wrong.
+if "$CLI_EXE" --broker "$BROKER" --sasl-mechanism plain \
+    --sasl-username admin --sasl-password "correct horse battery" \
+    produce --topic scrammed --value hello >/dev/null 2>&1; then
+  die "PLAIN was accepted on a plaintext listener"
+fi
+pass "PLAIN stays refused there"
+
+if "$CLI_EXE" --broker "$BROKER" \
+    --sasl-username admin --sasl-password "wrong horse" \
+    produce --topic scrammed --value hello >/dev/null 2>&1; then
+  die "a wrong password authenticated under SCRAM"
+fi
+pass "a wrong password is refused: the proof is checked, not merely the exchange"
+
+# ------------------------------------------------- data-plane AlterConfigs
+
+stage "a topic's configuration can be changed over the data plane"
+
+sasl alter-configs --topic scrammed --config retention.ms=604800000 >/dev/null
+DEADLINE=$((SECONDS + 20))
+while (( SECONDS < DEADLINE )); do
+  CONFIGS="$(sasl describe-configs --type topic --name scrammed 2>/dev/null)"
+  grep -qE '^retention\.ms +604800000 +set' <<<"$CONFIGS" && break
+  sleep 0.5
+done
+grep -qE '^retention\.ms +604800000 +set' <<<"$CONFIGS" \
+  || die "AlterConfigs did not reach the topic: $CONFIGS"
+pass "AlterConfigs reaches the controller and DescribeConfigs reads it back as set"
+
+# A name nothing reads is refused rather than stored, so a typo cannot look
+# like a setting that is being ignored.
+if sasl alter-configs --topic scrammed --config retention.msec=1000 >/dev/null 2>&1; then
+  die "an unknown topic configuration was accepted"
+fi
+pass "an unknown configuration name is refused rather than silently stored"
 printf '\n\033[32mAll %d checks passed.\033[0m\n' "$CHECKS"

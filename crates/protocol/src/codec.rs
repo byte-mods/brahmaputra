@@ -159,12 +159,29 @@ pub fn decode_produce_multi(
     Ok((request, batches))
 }
 
+/// Which incremental fetch session a response belongs to.
+///
+/// Carried separately from the results because it describes the request
+/// rather than any partition in it: a session that has gone out of step
+/// fails the whole fetch, and the client recovers by starting again with
+/// a full one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchSessionInfo {
+    pub session_id: i32,
+    pub session_epoch: i32,
+    pub error_code: i32,
+}
+
 /// Encode a multi-partition Fetch response. Each result's
 /// `batches_length` is filled in from its batches.
 pub fn encode_fetch_multi_response(
+    session: FetchSessionInfo,
     results: &[(FetchMultiResult, Vec<Bytes>)],
 ) -> Result<Bytes, ProtocolError> {
     let response = FetchMultiResponse {
+        session_id: session.session_id,
+        session_epoch: session.session_epoch,
+        error_code: session.error_code,
         results: results
             .iter()
             .map(|(result, batches)| FetchMultiResult {
@@ -419,6 +436,7 @@ mod multi_tests {
                     high_watermark: 42,
                     last_stable_offset: 42,
                     batches_length: 0,
+                    preferred_read_replica: -1,
                 },
                 vec![batch(40, b"x"), batch(41, b"y")],
             ),
@@ -430,11 +448,12 @@ mod multi_tests {
                     high_watermark: -1,
                     last_stable_offset: -1,
                     batches_length: 0,
+                    preferred_read_replica: -1,
                 },
                 vec![],
             ),
         ];
-        let body = encode_fetch_multi_response(&results).unwrap();
+        let body = encode_fetch_multi_response(FetchSessionInfo::default(), &results).unwrap();
         let (response, decoded) = decode_fetch_multi_response(body).unwrap();
 
         assert_eq!(response.results.len(), 2);
@@ -457,10 +476,11 @@ mod multi_tests {
                 high_watermark: 1,
                 last_stable_offset: 1,
                 batches_length: 0,
+                preferred_read_replica: -1,
             },
             vec![batch(0, b"z")],
         )];
-        let body = encode_fetch_multi_response(&results).unwrap();
+        let body = encode_fetch_multi_response(FetchSessionInfo::default(), &results).unwrap();
         let (mut response, _) = decode_fetch_multi_response(body).unwrap();
 
         // Claim more trailing bytes than the frame carries.
@@ -496,9 +516,13 @@ pub fn encode_fetch_response_chunks(
 
 /// The multi-partition form of [`encode_fetch_response_chunks`].
 pub fn encode_fetch_multi_response_chunks(
+    session: FetchSessionInfo,
     results: &[(FetchMultiResult, Vec<Bytes>)],
 ) -> Result<Vec<Bytes>, ProtocolError> {
     let response = FetchMultiResponse {
+        session_id: session.session_id,
+        session_epoch: session.session_epoch,
+        error_code: session.error_code,
         results: results
             .iter()
             .map(|(result, batches)| FetchMultiResult {
@@ -530,6 +554,7 @@ mod chunked_tests {
             high_watermark: 42,
             last_stable_offset: 42,
             batches_length: 0,
+            preferred_read_replica: -1,
         };
         let batches = vec![Bytes::from_static(b"abcdef"), Bytes::from_static(b"gh")];
         let contiguous = encode_fetch_response(&response, &batches).unwrap();
@@ -549,6 +574,7 @@ mod chunked_tests {
                     high_watermark: 7,
                     last_stable_offset: 7,
                     batches_length: 0,
+                    preferred_read_replica: -1,
                 },
                 vec![Bytes::from_static(b"one"), Bytes::from_static(b"two")],
             ),
@@ -560,12 +586,15 @@ mod chunked_tests {
                     high_watermark: -1,
                     last_stable_offset: -1,
                     batches_length: 0,
+                    preferred_read_replica: -1,
                 },
                 Vec::new(),
             ),
         ];
-        let contiguous = encode_fetch_multi_response(&results).unwrap();
-        let chunked = encode_fetch_multi_response_chunks(&results).unwrap();
+        let contiguous =
+            encode_fetch_multi_response(FetchSessionInfo::default(), &results).unwrap();
+        let chunked =
+            encode_fetch_multi_response_chunks(FetchSessionInfo::default(), &results).unwrap();
         let joined: Vec<u8> = chunked.iter().flat_map(|c| c.to_vec()).collect();
         assert_eq!(joined, contiguous.to_vec());
     }
@@ -578,9 +607,13 @@ mod chunked_tests {
 /// the socket straight from the page cache — so it can supply their length
 /// but not their bytes.
 pub fn encode_fetch_multi_header(
+    session: FetchSessionInfo,
     results: &[(FetchMultiResult, usize)],
 ) -> Result<Bytes, ProtocolError> {
     let response = FetchMultiResponse {
+        session_id: session.session_id,
+        session_epoch: session.session_epoch,
+        error_code: session.error_code,
         results: results
             .iter()
             .map(|(result, batches_length)| FetchMultiResult {
@@ -607,13 +640,18 @@ mod header_only_tests {
             high_watermark: 9,
             last_stable_offset: 9,
             batches_length: 0,
+            preferred_read_replica: -1,
         };
         let batches = vec![Bytes::from_static(b"aaaa"), Bytes::from_static(b"bb")];
-        let buffered = encode_fetch_multi_response_chunks(&[(result.clone(), batches.clone())])
-            .expect("buffered header");
+        let buffered = encode_fetch_multi_response_chunks(
+            FetchSessionInfo::default(),
+            &[(result.clone(), batches.clone())],
+        )
+        .expect("buffered header");
         let lengths: usize = batches.iter().map(Bytes::len).sum();
         let header_only =
-            encode_fetch_multi_header(&[(result, lengths)]).expect("header-only encoding");
+            encode_fetch_multi_header(FetchSessionInfo::default(), &[(result, lengths)])
+                .expect("header-only encoding");
         assert_eq!(buffered[0], header_only);
     }
 }

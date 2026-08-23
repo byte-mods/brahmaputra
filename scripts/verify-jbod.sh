@@ -146,6 +146,63 @@ for partition in $(seq 0 $((PARTITIONS - 1))); do
 done
 assert_eq "$RESTORED" "6000" "every record is still readable after the restart"
 
+
+# ------------------------------------------------------------- moving
+
+stage "a partition can be moved to another disk"
+
+# Placement is decided once, when a partition is created. Without a way to
+# revisit it, a disk added to a running broker takes only new partitions and
+# a filling disk can only be relieved by deleting a partition and letting it
+# re-replicate — a full re-replication to solve a local problem.
+MOVED_PARTITION="$(on_disk 1 | awk '{print $1}')"
+[[ -n "$MOVED_PARTITION" ]] || die "no partition on disk1 to move"
+BEFORE_LATEST="$(latest "$MOVED_PARTITION")"
+info "moving partition $MOVED_PARTITION from disk1 to disk2 ($BEFORE_LATEST records)"
+
+MOVE_OUTPUT="$(cli alter-replica-log-dirs --topic t --partition "$MOVED_PARTITION" \
+  --log-dir "$WORK_DIR/disk2" 2>&1)"
+grep -q "moved t:$MOVED_PARTITION" <<<"$MOVE_OUTPUT" \
+  || die "the move was not reported: $MOVE_OUTPUT"
+pass "the broker reports the move and the bytes it copied"
+
+grep -qw "$MOVED_PARTITION" <<<" $(on_disk 2) " \
+  || die "partition $MOVED_PARTITION is not on disk2: $(on_disk 2)"
+pass "the partition is on its new disk"
+grep -qw "$MOVED_PARTITION" <<<" $(on_disk 1) " \
+  && die "the old copy was left behind on disk1: $(on_disk 1)"
+pass "and the old copy is gone, so the move reclaims the space it freed"
+
+# The point of moving rather than deleting: not one record is lost.
+assert_eq "$(latest "$MOVED_PARTITION")" "$BEFORE_LATEST" \
+  "every record moved with it"
+cli produce --topic t --partition "$MOVED_PARTITION" --value after-move >/dev/null
+assert_eq "$(latest "$MOVED_PARTITION")" "$((BEFORE_LATEST + 1))" \
+  "and the partition accepts writes again from its new home"
+
+# Placement is rebuilt by scanning the disks, so a restart must agree.
+stop_broker
+start_broker
+grep -qw "$MOVED_PARTITION" <<<" $(on_disk 2) " \
+  || die "the move did not survive a restart: $(on_disk 2)"
+pass "the move survives a restart, rebuilt from the disks themselves"
+
+# A destination this broker was never given would put data somewhere
+# nothing scans on startup: a partition that vanishes at the next reboot.
+if cli alter-replica-log-dirs --topic t --partition "$MOVED_PARTITION" \
+    --log-dir "$WORK_DIR/not-a-disk" >/dev/null 2>&1; then
+  die "a move to an unconfigured directory was accepted"
+fi
+pass "a destination that is not one of the broker's log directories is refused"
+
+# Move it home, both because a move that cannot be undone is half a
+# feature and because the stages below assume an even spread.
+cli alter-replica-log-dirs --topic t --partition "$MOVED_PARTITION" \
+  --log-dir "$WORK_DIR/disk1" >/dev/null
+grep -qw "$MOVED_PARTITION" <<<" $(on_disk 1) " \
+  || die "the partition did not move back to disk1: $(on_disk 1)"
+assert_eq "$(latest "$MOVED_PARTITION")" "$((BEFORE_LATEST + 1))" \
+  "a move can be undone, records and all"
 # ---------------------------------------------------------- isolation
 
 stage "a disk that fails takes only its own partitions"
@@ -153,6 +210,9 @@ stage "a disk that fails takes only its own partitions"
 VICTIM_DISK=2
 VICTIM="$(on_disk "$VICTIM_DISK" | awk '{print $1}')"
 SURVIVOR="$(on_disk 1 | awk '{print $1}')"
+# What that partition actually holds, rather than the count the produce
+# loop wrote: an earlier stage may have added to it.
+SURVIVOR_RECORDS="$(latest "$SURVIVOR")"
 [[ -n "$VICTIM" && -n "$SURVIVOR" ]] || die "could not pick a victim and a survivor partition"
 info "failing disk$VICTIM_DISK (holds partition $VICTIM); partition $SURVIVOR is on disk1"
 
@@ -163,11 +223,11 @@ sleep "$PROBE_GRACE"
 # The survivor must still serve reads *and* writes. A broker that went
 # read-only, or that answered stale offsets from memory, would pass a
 # read-only check and still be broken.
-assert_eq "$(latest "$SURVIVOR")" "1000" "a partition on a healthy disk still reads"
+assert_eq "$(latest "$SURVIVOR")" "$SURVIVOR_RECORDS" "a partition on a healthy disk still reads"
 ACKED="$(cli produce --topic t --partition "$SURVIVOR" --value still-working 2>&1 | tail -1)"
 [[ "$ACKED" == *"acked"* ]] || die "a partition on a healthy disk stopped accepting writes ($ACKED)"
 pass "a partition on a healthy disk still accepts writes"
-assert_eq "$(latest "$SURVIVOR")" "1001" "and the write landed"
+assert_eq "$(latest "$SURVIVOR")" "$((SURVIVOR_RECORDS + 1))" "and the write landed"
 
 # The casualty must be refused as unavailable, never as a missing topic —
 # a client that read it as "unknown topic" would conclude the topic had
@@ -228,7 +288,7 @@ STARTUP_ERROR="$(cli offsets --topic t --partition "$VICTIM" 2>&1 | tail -1 || t
   || die "a partition on a disk broken at startup was not reported as offline ($STARTUP_ERROR)"
 pass "a partition on a disk broken at startup is unavailable, not silently empty"
 
-assert_eq "$(latest "$SURVIVOR")" "1001" \
+assert_eq "$(latest "$SURVIVOR")" "$((SURVIVOR_RECORDS + 1))" \
   "the surviving disk's data is intact and unchanged"
 
 printf '\n\033[32mAll %d checks passed.\033[0m\n' "$CHECKS"

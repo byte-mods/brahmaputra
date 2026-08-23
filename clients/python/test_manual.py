@@ -195,6 +195,28 @@ def main() -> int:
             f"timestamps {[r.timestamp for r in got]} outside {before}..{after}",
         )
 
+    section("tombstones")
+    tomb_topic = unique("py-tombstones")
+    with Producer(HOST, PORT, ProducerConfig(linger_ms=0, compression_type="none")) as producer:
+        producer.send(tomb_topic, b"set", key=b"k1", partition=0)
+        producer.send(tomb_topic, b"", key=b"k2", partition=0)
+        # A None value is a deletion, and must stay distinguishable from the
+        # empty value above all the way through the round trip.
+        producer.send(tomb_topic, None, key=b"k3", partition=0)
+        producer.flush()
+
+    with Consumer(HOST, PORT) as consumer:
+        got = consumer.fetch(tomb_topic, 0, 0)
+    check("all three records arrive", len(got) == 3, f"got {len(got)}")
+    if len(got) == 3:
+        check("an ordinary value round-trips", got[0].value == b"set")
+        check(
+            "an empty value is empty, not null",
+            got[1].value is not None and len(got[1].value) == 0,
+        )
+        check("a tombstone arrives as a null value", got[2].value is None,
+              f"{got[2].value!r}")
+
     section("offsets")
     with Consumer(HOST, PORT) as consumer:
         earliest = consumer.list_offsets(topic, 0, EARLIEST)

@@ -126,7 +126,13 @@ impl TransactionIndex {
         }
     }
 
-    fn append(&mut self, kind: u8, producer_id: i64, first: i64, last: i64) -> Result<(), StorageError> {
+    fn append(
+        &mut self,
+        kind: u8,
+        producer_id: i64,
+        first: i64,
+        last: i64,
+    ) -> Result<(), StorageError> {
         let Some(file) = self.file.as_mut() else {
             return Ok(());
         };
@@ -227,6 +233,14 @@ impl TransactionIndex {
         self.ongoing.keys().copied().collect()
     }
 
+    /// Each open transaction as `(producer_id, first_offset)`.
+    pub fn open_transactions(&self) -> Vec<(i64, i64)> {
+        self.ongoing
+            .iter()
+            .map(|(producer_id, first)| (*producer_id, *first))
+            .collect()
+    }
+
     /// Drop aborted transactions that ended below `log_start_offset` and
     /// rewrite the journal without them.
     ///
@@ -259,7 +273,12 @@ impl TransactionIndex {
             encode(KIND_BEGIN, *producer_id, *first_offset, -1);
         }
         for txn in &self.aborted {
-            encode(KIND_ABORT, txn.producer_id, txn.first_offset, txn.last_offset);
+            encode(
+                KIND_ABORT,
+                txn.producer_id,
+                txn.first_offset,
+                txn.last_offset,
+            );
         }
 
         // Write beside the live file and rename over it, so a crash leaves
@@ -374,7 +393,10 @@ mod tests {
         }
         let overlapping = index.aborted_in_range(10, 20);
         assert_eq!(
-            overlapping.iter().map(|t| t.producer_id).collect::<Vec<_>>(),
+            overlapping
+                .iter()
+                .map(|t| t.producer_id)
+                .collect::<Vec<_>>(),
             vec![2],
             "a read of [10, 20) needs only the transaction whose records are in it"
         );

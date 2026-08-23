@@ -33,7 +33,14 @@ use crate::error::ProtocolError;
 ///   and MetadataResponse gained a request-level `error_code` so that an
 ///   authorization denial stops being indistinguishable from a topic that
 ///   does not exist.
-pub const API_VERSION: i16 = 3;
+/// * **4** — tombstones. A record's value may now be null, which is what
+///   deletes a key on a compacted topic; the batch attributes gained a bit
+///   saying so. A version-3 client would read a tombstone's length prefix
+///   as a value length and misparse every record after it, which is
+///   exactly the case this exact-match rule exists to prevent. Also adds
+///   AlterConfigs, DescribeProducers, ListTransactions and
+///   DescribeTransactions.
+pub const API_VERSION: i16 = 4;
 
 /// Bytes in a payload header: api_key + api_version + correlation_id.
 /// (`client_id` is variable-length and follows.)
@@ -98,6 +105,16 @@ pub enum ApiKey {
     TxnOffsetCommit = 26,
     /// Cluster-internal: write commit/abort markers to partitions.
     WriteTxnMarkers = 27,
+    /// Change a topic's configuration without a second protocol.
+    AlterConfigs = 28,
+    /// Which producers have written to a partition, and what is open.
+    DescribeProducers = 29,
+    /// Every transactional id this broker coordinates.
+    ListTransactions = 30,
+    /// One transaction in full, including the partitions it announced.
+    DescribeTransactions = 31,
+    /// Move a partition between the disks of one broker.
+    AlterReplicaLogDirs = 32,
 }
 
 impl ApiKey {
@@ -131,6 +148,11 @@ impl ApiKey {
             25 => Ok(ApiKey::EndTxn),
             26 => Ok(ApiKey::TxnOffsetCommit),
             27 => Ok(ApiKey::WriteTxnMarkers),
+            28 => Ok(ApiKey::AlterConfigs),
+            29 => Ok(ApiKey::DescribeProducers),
+            30 => Ok(ApiKey::ListTransactions),
+            31 => Ok(ApiKey::DescribeTransactions),
+            32 => Ok(ApiKey::AlterReplicaLogDirs),
             other => Err(ProtocolError::UnknownApiKey(other)),
         }
     }
@@ -214,6 +236,24 @@ pub mod error_code {
     /// disk does not work. A client must treat this as unavailable and
     /// refresh metadata, never as a topic that has been deleted.
     pub const LOG_DIR_OFFLINE: i32 = 23;
+    /// A change had to reach the controller and could not: there is no
+    /// controller right now, or it did not answer. Distinct from a
+    /// rejection — the change was not applied, and retrying is the right
+    /// response rather than correcting the request.
+    pub const CONTROLLER_NOT_AVAILABLE: i32 = 24;
+    /// The configuration named in the request is not one this broker
+    /// understands, so accepting it would mean storing a setting nothing
+    /// reads.
+    pub const INVALID_CONFIG: i32 = 25;
+    /// The incremental fetch session named does not exist here, or its
+    /// epoch is out of step with what the broker holds. Both mean the
+    /// same thing to a client: forget the session and fetch in full.
+    pub const FETCH_SESSION_NOT_FOUND: i32 = 26;
+    /// The SASL mechanism the client asked for is not one this broker
+    /// offers. Distinct from a failed authentication: the credentials were
+    /// never examined, and retrying with the same ones under a mechanism
+    /// the broker does support will work.
+    pub const UNSUPPORTED_SASL_MECHANISM: i32 = 27;
 }
 
 /// Encode `header` + `body` as a complete frame including the `length:i32`

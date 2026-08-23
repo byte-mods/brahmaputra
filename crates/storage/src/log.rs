@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brahmaputra_protocol::{
-    read_control_marker, validate_batch_header, BatchHeader, ControlMarker, Record, RecordBatch,
-    BATCH_HEADER_LEN, MIN_BATCH_LENGTH,
+    read_control_marker, validate_batch_header, BatchHeader, Compression, ControlMarker, Record,
+    RecordBatch, BATCH_HEADER_LEN, MIN_BATCH_LENGTH,
 };
 use bytes::{Bytes, BytesMut};
 
@@ -86,6 +86,11 @@ fn write_log_start(dir: &Path, offset: i64) -> Result<(), StorageError> {
 /// How often the high-watermark checkpoint reaches disk. Kafka's
 /// `replica.high.watermark.checkpoint.interval.ms` defaults to the same 5 s.
 const DEFAULT_HWM_CHECKPOINT_INTERVAL_MS: u64 = 5_000;
+/// Kafka's `delete.retention.ms` default: a day for a consumer to see a
+/// deletion before the tombstone that carries it is removed.
+const DEFAULT_DELETE_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
+/// Kafka's `min.cleanable.dirty.ratio` default.
+const DEFAULT_MIN_CLEANABLE_DIRTY_RATIO: f64 = 0.5;
 
 const HWM_RECORD_MAGIC: [u8; 4] = *b"HWMJ";
 const HWM_RECORD_VERSION: u8 = 1;
@@ -367,7 +372,9 @@ fn decode_hwm_record(
 }
 
 /// Configuration for a [`Log`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: `min_cleanable_dirty_ratio` is a ratio, and Kafka spells it as
+// one too.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogConfig {
     /// Roll the active segment once it reaches this many bytes.
     /// Must fit in a `u32` (index positions are 32-bit, as in Kafka).
@@ -397,6 +404,35 @@ pub struct LogConfig {
     /// segments — Kafka's `cleanup.policy=compact`. Set for the internal
     /// offsets topic, whose keys are rewritten forever.
     pub compact: bool,
+    /// How long a tombstone is kept after compaction could first have
+    /// removed it — Kafka's `delete.retention.ms`, default 24 hours.
+    ///
+    /// This is the grace period a consumer gets to observe a deletion. Too
+    /// short and a slow consumer never learns the key is gone; too long and
+    /// a delete-heavy compacted topic never shrinks.
+    pub delete_retention_ms: u64,
+    /// Fraction of the cleanable log that must be dirty before a pass runs
+    /// — Kafka's `min.cleanable.dirty.ratio`, default 0.5.
+    ///
+    /// Compaction rewrites everything it cleans, so running it to remove a
+    /// handful of records makes it the dominant write load on a partition
+    /// that is barely changing.
+    pub min_cleanable_dirty_ratio: f64,
+    /// How long a record is protected from being compacted away, in
+    /// milliseconds — Kafka's `min.compaction.lag.ms`, default 0.
+    pub min_compaction_lag_ms: u64,
+    /// How long a dirty record may wait before a pass runs regardless of
+    /// the dirty ratio — Kafka's `max.compaction.lag.ms`. `None` never
+    /// forces one.
+    pub max_compaction_lag_ms: Option<u64>,
+    /// Stamp every appended batch with the broker's clock rather than
+    /// trusting the producer's — Kafka's
+    /// `message.timestamp.type=LogAppendTime`.
+    ///
+    /// Retention, `ListOffsets` by timestamp and the time index all read
+    /// these timestamps, so a single client with a wrong clock can
+    /// otherwise make a whole partition look ancient or far in the future.
+    pub log_append_time: bool,
     /// How often the high-watermark checkpoint reaches disk, in
     /// milliseconds. Kafka's equivalent is
     /// `replica.high.watermark.checkpoint.interval.ms`, default 5 s. Zero
@@ -418,6 +454,11 @@ impl Default for LogConfig {
             flush_interval_messages: None,
             flush_interval_ms: None,
             compact: false,
+            delete_retention_ms: DEFAULT_DELETE_RETENTION_MS,
+            min_cleanable_dirty_ratio: DEFAULT_MIN_CLEANABLE_DIRTY_RATIO,
+            min_compaction_lag_ms: 0,
+            max_compaction_lag_ms: None,
+            log_append_time: false,
             hwm_checkpoint_interval_ms: DEFAULT_HWM_CHECKPOINT_INTERVAL_MS,
         }
     }
@@ -446,6 +487,10 @@ pub struct Log {
     /// aborted. Empty and free for a partition nobody writes
     /// transactionally to.
     transactions: TransactionIndex,
+    /// Where the deduplicated prefix ends: everything below this was
+    /// compacted by an earlier pass, so the next pass only has to build a
+    /// key map for what arrived since.
+    first_dirty_offset: i64,
 }
 
 impl Log {
@@ -468,6 +513,10 @@ impl Log {
         }
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+        // Before the directory is scanned: a compaction pass interrupted by
+        // a crash leaves files that are not segments yet, and finishing or
+        // discarding it is what makes the scan below see one coherent set.
+        recover_compaction(&dir)?;
 
         let mut base_offsets = Vec::new();
         for entry in fs::read_dir(&dir)? {
@@ -518,6 +567,13 @@ impl Log {
 
         let leader_epochs = LeaderEpochCheckpoint::open(&dir)?;
         let transactions = TransactionIndex::open(&dir)?;
+        // Clamped for the same reason the log start is: a checkpoint that
+        // disagrees with the segments must not be believed over them. Too
+        // low only costs a wider key map; too high would let a superseded
+        // record survive forever.
+        let first_dirty_offset = read_cleaner_checkpoint(&dir)?
+            .unwrap_or(start_offset)
+            .clamp(start_offset, next_offset);
 
         Ok(Log {
             dir,
@@ -532,6 +588,7 @@ impl Log {
             last_flush_ms: now_ms(),
             active_segment_created_ms: now_ms(),
             transactions,
+            first_dirty_offset,
         })
     }
 
@@ -595,6 +652,9 @@ impl Log {
             return Err(StorageError::EmptyBatch);
         }
         batch.base_offset = self.next_offset;
+        if self.config.log_append_time {
+            batch.max_timestamp = now_ms();
+        }
         let base_offset = self.next_offset;
         let bytes = batch.encode();
         let active = self.segments.last_mut().expect("log always has a segment");
@@ -646,9 +706,28 @@ impl Log {
         stamped.extend_from_slice(batch);
         stamped[0..8].copy_from_slice(&base_offset.to_be_bytes());
         stamped[12..16].copy_from_slice(&leader_epoch.to_be_bytes());
+        // `message.timestamp.type=LogAppendTime`: the broker's clock, not
+        // the producer's, decides when this batch happened.
+        //
+        // Overwritten in place and the CRC recomputed over the covered
+        // region — the records are never decompressed, because the batch
+        // timestamp lives in the header. Kafka additionally flattens every
+        // record to the same instant; here the per-record deltas survive,
+        // so records inside one batch keep their relative spacing. The
+        // property that matters is the same either way: retention and
+        // timestamp seeks stop depending on a client's clock.
+        let max_timestamp = if self.config.log_append_time {
+            let now = now_ms();
+            stamped[27..35].copy_from_slice(&now.to_be_bytes());
+            let crc = crc32c::crc32c(&stamped[21..]);
+            stamped[17..21].copy_from_slice(&crc.to_be_bytes());
+            now
+        } else {
+            header.max_timestamp
+        };
 
         let active = self.segments.last_mut().expect("log always has a segment");
-        active.append_batch(base_offset, &stamped, header.max_timestamp)?;
+        active.append_batch(base_offset, &stamped, max_timestamp)?;
         self.next_offset = next_offset;
         self.track_transaction(&header, &stamped, base_offset, next_offset - 1)?;
         self.maybe_flush((next_offset - base_offset) as u64)?;
@@ -863,6 +942,14 @@ impl Log {
     /// Whether any transaction is open on this partition.
     pub fn has_ongoing_transactions(&self) -> bool {
         self.transactions.has_ongoing()
+    }
+
+    /// Where each open transaction started, by producer id.
+    ///
+    /// The answer to "why will the last stable offset not advance": the
+    /// minimum of these *is* the LSO whenever one is open.
+    pub fn open_transactions(&self) -> Vec<(i64, i64)> {
+        self.transactions.open_transactions()
     }
 
     /// Read batches from `offset` as [`Log::read`] does, but showing only
@@ -1087,8 +1174,14 @@ impl Log {
         // `max`, not assignment: an explicit DeleteRecords may have moved
         // the start past this segment's base already, and retention must
         // not hand those records back.
+        //
+        // Only when this pass actually deleted something. Compaction can
+        // leave the first surviving segment above the start offset, and
+        // that must not be read as "retention deleted those records" —
+        // they were superseded, and a fetch from the start has to return
+        // what survived rather than fail.
         let start = self.segments[0].base_offset.max(self.start_offset);
-        if start != self.start_offset {
+        if deleted > 0 && start != self.start_offset {
             self.start_offset = start;
             write_log_start(&self.dir, start)?;
             self.transactions.prune_below(start)?;
@@ -1188,7 +1281,11 @@ mod tests {
         for raw in batches {
             let mut buf = raw.clone();
             let batch = RecordBatch::decode(&mut buf).unwrap();
-            out.extend(batch.iter().map(|(o, r)| (o, r.value.clone())));
+            out.extend(
+                batch
+                    .iter()
+                    .map(|(o, r)| (o, r.value.clone().unwrap_or_default())),
+            );
         }
         out
     }
@@ -1227,7 +1324,7 @@ mod tests {
                 batch
                     .records
                     .into_iter()
-                    .map(|record| String::from_utf8(record.value.to_vec()).unwrap())
+                    .map(|record| String::from_utf8(record.payload().to_vec()).unwrap())
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -2581,9 +2678,131 @@ mod region_tests {
     }
 }
 
+/// What one compaction pass did, for logging and for the tests that have
+/// to distinguish "nothing was removable" from "the pass did not run".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactionOutcome {
+    /// Superseded records dropped because a later record has the same key.
+    pub records_removed: usize,
+    /// Tombstones dropped because they aged past `delete.retention.ms`.
+    pub tombstones_removed: usize,
+    /// Bytes of sealed log before and after the rewrite.
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// False when the pass declined to run — nothing sealed, or not enough
+    /// of the log is dirty to be worth rewriting.
+    pub ran: bool,
+}
+
+/// The shape of the batch a record came out of.
+///
+/// Survivors are regrouped into batches, and two records may only share an
+/// output batch if every one of these matches: they are what the batch
+/// header says about all of its records at once, so mixing them would
+/// change what the records mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchShape {
+    leader_epoch: i32,
+    compression: Compression,
+    /// Producer id and epoch. The base sequence is per output batch and is
+    /// derived from the first survivor's position, so it is not part of the
+    /// identity.
+    producer: Option<(i64, i16)>,
+    transactional: bool,
+}
+
+/// One record that survived, with everything needed to re-emit it at its
+/// original offset.
+struct Survivor {
+    offset: i64,
+    timestamp: i64,
+    /// The producer sequence this record had, or -1 when its batch carried
+    /// none.
+    sequence: i32,
+    record: Record,
+}
+
+/// Accumulates survivors into segments under a staging directory.
+///
+/// Rolls at `segment_bytes` rather than writing one segment for the whole
+/// log: a compacted partition that has been running for a year is still a
+/// partition whose segments retention, fetch and recovery expect to be
+/// bounded.
+struct CompactionWriter {
+    dir: PathBuf,
+    segment_bytes: u64,
+    index_interval_bytes: u64,
+    current: Option<Segment>,
+    bases: Vec<i64>,
+    bytes_written: u64,
+}
+
+impl CompactionWriter {
+    fn new(dir: PathBuf, segment_bytes: u64, index_interval_bytes: u64) -> Self {
+        CompactionWriter {
+            dir,
+            segment_bytes,
+            index_interval_bytes,
+            current: None,
+            bases: Vec::new(),
+            bytes_written: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        base_offset: i64,
+        bytes: &[u8],
+        max_timestamp: i64,
+    ) -> Result<(), StorageError> {
+        let roll = match &self.current {
+            None => true,
+            Some(segment) => {
+                segment.size > 0 && segment.size + bytes.len() as u64 > self.segment_bytes
+            }
+        };
+        if roll {
+            if let Some(segment) = self.current.take() {
+                segment.sync()?;
+            }
+            let segment = Segment::open(&self.dir, base_offset, self.index_interval_bytes)?;
+            self.bases.push(base_offset);
+            self.current = Some(segment);
+        }
+        let segment = self.current.as_mut().expect("a segment was just opened");
+        segment.append_batch(base_offset, bytes, max_timestamp)?;
+        self.bytes_written += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<i64>, StorageError> {
+        if let Some(segment) = self.current.take() {
+            segment.sync()?;
+        }
+        Ok(self.bases)
+    }
+}
+
+/// Name of the marker that says a compaction pass got far enough that its
+/// output must be kept.
+///
+/// Everything before this file exists is discardable: the original
+/// segments are still whole. Everything after it is a swap that has to be
+/// finished, because the originals are being deleted. Recovery therefore
+/// never has to decide which copy is authoritative — the marker decides.
+const COMPACTION_COMMIT_FILE: &str = "compaction.commit";
+/// Where a pass builds its output before any original is touched.
+const COMPACTION_STAGING_DIR: &str = "compaction";
+/// Suffix an output file carries while the originals are being removed.
+const SWAP_SUFFIX: &str = ".swap";
+/// Where the first dirty offset is remembered, so `min.cleanable.dirty.ratio`
+/// survives a restart instead of resetting to "everything is dirty".
+const CLEANER_CHECKPOINT_FILE: &str = "cleaner";
+
 impl Log {
     /// Keep only the most recent record for each key among the sealed
-    /// segments, discarding the versions it supersedes.
+    /// segments, discarding the versions it supersedes and the deletions
+    /// that have outlived their grace period.
     ///
     /// This is what stops a keyed topic — `__consumer_offsets` above all —
     /// from growing without bound. A group that commits every five seconds
@@ -2591,129 +2810,529 @@ impl Log {
     /// coordinator failover gets slower without limit because it replays
     /// every superseded commit.
     ///
-    /// Offsets are preserved exactly. A surviving record is rewritten as a
-    /// single-record batch at its original offset, so compaction leaves
-    /// gaps rather than renumbering anything — a consumer's committed
-    /// offset still means what it meant before. Records without a key
-    /// cannot be superseded and are always kept.
+    /// Offsets are preserved exactly: a survivor keeps the offset it was
+    /// written at, so compaction leaves gaps rather than renumbering
+    /// anything and a consumer's committed offset still means what it
+    /// meant. Contiguous survivors are re-emitted as one batch, which is
+    /// why this does not quietly convert a compressed, batched log into a
+    /// stream of single-record batches.
     ///
     /// Only sealed segments below the high watermark are touched: the
     /// active segment is still being appended to, and uncommitted records
     /// are not ours to discard.
-    pub fn compact(&mut self) -> Result<usize, StorageError> {
-        if self.segments.len() < 2 {
-            return Ok(0);
+    pub fn compact(&mut self) -> Result<CompactionOutcome, StorageError> {
+        let now = now_ms();
+        let mut outcome = CompactionOutcome::default();
+        let Some((cleanable_end, cleanable_segments)) = self.cleanable_range(now) else {
+            return Ok(outcome);
+        };
+        let first_dirty = self
+            .first_dirty_offset
+            .clamp(self.segments[0].base_offset, cleanable_end);
+        if !self.worth_compacting(first_dirty, cleanable_end, cleanable_segments, now) {
+            return Ok(outcome);
         }
-        let boundary = self
-            .segments
-            .last()
-            .map(|active| active.base_offset)
-            .unwrap_or(self.next_offset)
-            .min(self.high_watermark);
-        if boundary <= self.start_offset {
-            return Ok(0);
-        }
+        outcome.ran = true;
+        outcome.bytes_before = self.segments[..cleanable_segments]
+            .iter()
+            .map(|segment| segment.size)
+            .sum();
 
-        // Pass one: the offset of the last record written for each key.
+        // Pass one: the offset of the last record written for each key in
+        // the dirty range. Only the dirty range, because everything below
+        // it was deduplicated by an earlier pass — which is what keeps this
+        // map proportional to what has arrived since, not to the log.
         let mut latest: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
-        let mut survivors: Vec<(i64, Record, i64)> = Vec::new();
-        for segment_index in 0..self.segments.len() - 1 {
-            let mut position = 0u64;
-            let segment = &self.segments[segment_index];
-            while position + BATCH_HEADER_LEN as u64 <= segment.size {
-                let mut header = [0u8; BATCH_HEADER_LEN];
-                segment.read_at(position, &mut header)?;
-                let batch_length = i32::from_be_bytes(header[8..12].try_into().unwrap());
-                if batch_length < MIN_BATCH_LENGTH as i32 {
-                    break;
+        for index in 0..cleanable_segments {
+            Self::for_each_batch(&self.segments[index], |_, batch| {
+                if batch.control {
+                    return Ok(());
                 }
-                let total_len = BATCH_HEADER_LEN + batch_length as usize;
-                if position + total_len as u64 > segment.size {
-                    break;
-                }
-                let mut buf = BytesMut::zeroed(total_len);
-                segment.read_at(position, &mut buf)?;
-                let mut bytes = buf.freeze();
-                let batch = RecordBatch::decode(&mut bytes)?;
-                let base = batch.base_offset;
-                let max_timestamp = batch.max_timestamp;
-                for (index, record) in batch.records.into_iter().enumerate() {
-                    let offset = base + index as i64;
-                    // Records at or above the boundary are uncommitted or
-                    // belong to the still-open range: collect them so they
-                    // are rewritten untouched, but never let them supersede
-                    // anything, and never discard them.
-                    if offset < boundary {
-                        if let Some(key) = record.key.as_ref() {
-                            latest.insert(key.to_vec(), offset);
-                        }
+                for (offset, record) in batch.iter() {
+                    if offset < first_dirty || offset >= cleanable_end {
+                        continue;
                     }
-                    survivors.push((offset, record, max_timestamp));
+                    if let Some(key) = record.key.as_ref() {
+                        let entry = latest.entry(key.to_vec()).or_insert(offset);
+                        *entry = (*entry).max(offset);
+                    }
                 }
-                position += total_len as u64;
-            }
+                Ok(())
+            })?;
         }
 
-        // Pass two: drop every record a later one supersedes.
-        let before = survivors.len();
-        survivors.retain(|(offset, record, _)| {
-            // Above the boundary nothing is eligible; below it, a record
-            // survives only if it is the latest for its key. A record with
-            // no key has no successor that could replace it.
-            if *offset >= boundary {
-                return true;
-            }
-            match record.key.as_ref() {
-                Some(key) => latest.get(key.as_ref() as &[u8]) == Some(offset),
-                None => true,
-            }
-        });
-        let removed = before - survivors.len();
-        if removed == 0 {
-            return Ok(0);
-        }
-
-        // Rewrite the sealed range as one segment based at the first
-        // surviving offset. Gaps are expected and are what a fetch already
-        // copes with: it returns the first batch covering the requested
-        // offset.
-        let new_base = survivors
-            .first()
-            .map(|(offset, _, _)| *offset)
-            .unwrap_or(boundary);
-        let staging = self.dir.join("compaction");
+        // Pass two: rewrite the cleanable segments, dropping what a later
+        // record supersedes and the tombstones that have done their job.
+        let staging = self.dir.join(COMPACTION_STAGING_DIR);
         if staging.exists() {
             fs::remove_dir_all(&staging)?;
         }
         fs::create_dir_all(&staging)?;
-        let mut rebuilt = Segment::open(&staging, new_base, self.config.index_interval_bytes)?;
-        for (offset, record, max_timestamp) in &survivors {
-            let batch = RecordBatch::new(*offset, 0, *max_timestamp, vec![record.clone()]);
-            rebuilt.append_batch(*offset, &batch.encode(), *max_timestamp)?;
-        }
-        rebuilt.sync()?;
-        drop(rebuilt);
+        let mut writer = CompactionWriter::new(
+            staging.clone(),
+            self.config.segment_bytes,
+            self.config.index_interval_bytes,
+        );
+        let delete_horizon = now.saturating_sub(self.config.delete_retention_ms as i64);
+        let mut run: Vec<Survivor> = Vec::new();
+        let mut run_shape: Option<BatchShape> = None;
 
-        // Swap: remove the old sealed segments, move the rebuilt one into
-        // place, and reopen it.
-        let active = self.segments.pop().expect("active segment");
-        for segment in self.segments.drain(..) {
-            segment.delete()?;
-        }
-        for suffix in ["log", "index", "timeindex"] {
-            let from = staging.join(format!("{new_base:020}.{suffix}"));
-            let to = self.dir.join(format!("{new_base:020}.{suffix}"));
-            if from.exists() {
-                fs::rename(&from, &to)?;
+        for index in 0..cleanable_segments {
+            let mut error: Option<StorageError> = None;
+            Self::for_each_batch(&self.segments[index], |raw, batch| {
+                // A control batch is a transaction marker. It is what tells
+                // a committed reader that the records around it resolved,
+                // and the partition's transaction index is written in terms
+                // of its offset, so it is copied through untouched.
+                if batch.control {
+                    if let Err(e) = Self::flush_run(&mut writer, &mut run, &mut run_shape) {
+                        error = Some(e);
+                        return Ok(());
+                    }
+                    if let Err(e) = writer.push(batch.base_offset, &raw, batch.max_timestamp) {
+                        error = Some(e);
+                    }
+                    return Ok(());
+                }
+                let shape = BatchShape {
+                    leader_epoch: batch.leader_epoch,
+                    compression: batch.compression,
+                    producer: batch
+                        .producer
+                        .map(|producer| (producer.producer_id, producer.producer_epoch)),
+                    transactional: batch.transactional,
+                };
+                let base_sequence = batch.producer.map_or(-1, |producer| producer.base_sequence);
+                let batch_base = batch.base_offset;
+                let max_timestamp = batch.max_timestamp;
+                for (position, record) in batch.records.into_iter().enumerate() {
+                    let offset = batch_base + position as i64;
+                    let superseded = record
+                        .key
+                        .as_ref()
+                        .and_then(|key| latest.get(key.as_ref() as &[u8]))
+                        .is_some_and(|newest| *newest > offset);
+                    let timestamp = record.timestamp(max_timestamp);
+                    // A tombstone is kept until it has been visible long
+                    // enough for a consumer to have seen the deletion —
+                    // that grace period is the whole contract of
+                    // `delete.retention.ms`. After it, the tombstone goes
+                    // too, which is the only way a compacted topic's key
+                    // space ever shrinks.
+                    let expired_tombstone = record.is_tombstone() && timestamp <= delete_horizon;
+                    if superseded {
+                        outcome.records_removed += 1;
+                        continue;
+                    }
+                    if expired_tombstone {
+                        outcome.records_removed += 1;
+                        outcome.tombstones_removed += 1;
+                        continue;
+                    }
+                    let contiguous = run
+                        .last()
+                        .is_none_or(|previous| previous.offset + 1 == offset);
+                    if !contiguous || run_shape.is_some_and(|current| current != shape) {
+                        if let Err(e) = Self::flush_run(&mut writer, &mut run, &mut run_shape) {
+                            error = Some(e);
+                            return Ok(());
+                        }
+                    }
+                    run_shape = Some(shape);
+                    run.push(Survivor {
+                        offset,
+                        timestamp,
+                        sequence: if base_sequence < 0 {
+                            -1
+                        } else {
+                            base_sequence.saturating_add(position as i32)
+                        },
+                        record,
+                    });
+                }
+                Ok(())
+            })?;
+            if let Some(error) = error {
+                return Err(error);
             }
         }
+        Self::flush_run(&mut writer, &mut run, &mut run_shape)?;
+        let new_bases = writer.finish()?;
+
+        if outcome.records_removed == 0 {
+            // Nothing came out: the rewrite would be byte-for-byte what is
+            // already there, so throw the copy away rather than swap it in
+            // and pay for the fsyncs.
+            fs::remove_dir_all(&staging)?;
+            self.set_first_dirty_offset(cleanable_end)?;
+            outcome.bytes_after = outcome.bytes_before;
+            return Ok(outcome);
+        }
+
+        // The swap. Everything up to the marker is discardable; everything
+        // after it must be finished, and `recover_compaction` finishes it
+        // if this process does not survive to.
+        let first_base = self.segments[0].base_offset;
+        Self::stage_swap_files(&staging, &self.dir, &new_bases)?;
+        write_compaction_marker(&self.dir, first_base, cleanable_end, &new_bases)?;
+        for index in (0..cleanable_segments).rev() {
+            let segment = self.segments.remove(index);
+            segment.delete()?;
+        }
+        finish_swap(&self.dir, &new_bases)?;
         fs::remove_dir_all(&staging)?;
-        let reopened = Segment::open(&self.dir, new_base, self.config.index_interval_bytes)?;
-        self.segments.push(reopened);
-        self.segments.push(active);
-        self.start_offset = new_base;
-        Ok(removed)
+        fs::remove_file(self.dir.join(COMPACTION_COMMIT_FILE))?;
+
+        // Reopen what was written and splice it in ahead of the segments
+        // the pass never touched.
+        let mut reopened = Vec::with_capacity(new_bases.len());
+        for &base in &new_bases {
+            let mut segment = Segment::open(&self.dir, base, self.config.index_interval_bytes)?;
+            segment.max_timestamp = segment.scan_max_timestamp()?;
+            reopened.push(segment);
+        }
+        outcome.bytes_after = reopened.iter().map(|segment| segment.size).sum();
+        for (position, segment) in reopened.into_iter().enumerate() {
+            self.segments.insert(position, segment);
+        }
+
+        // The log start offset deliberately does *not* move. Compaction
+        // removing the record at offset 0 does not make offset 0 out of
+        // range — a consumer reading a compacted topic from the beginning
+        // must get the oldest record that still exists, not an error. This
+        // is Kafka's rule too: only retention and `DeleteRecords` move the
+        // start, because only those two say records are gone rather than
+        // superseded.
+        self.set_first_dirty_offset(cleanable_end)?;
+        Ok(outcome)
     }
+
+    /// How far compaction may clean, and how many segments that covers.
+    ///
+    /// Never the active segment (it is still being appended to), never
+    /// above the high watermark (uncommitted records are not ours to
+    /// discard), and never a segment younger than
+    /// `min.compaction.lag.ms` — that last one is what lets a consumer be
+    /// promised it will see every update to a key if it stays within the
+    /// lag, rather than only the ones compaction happened not to have
+    /// reached yet.
+    fn cleanable_range(&self, now: i64) -> Option<(i64, usize)> {
+        if !self.config.compact || self.segments.len() < 2 {
+            return None;
+        }
+        let mut count = self.segments.len() - 1;
+        let min_lag = self.config.min_compaction_lag_ms as i64;
+        if min_lag > 0 {
+            while count > 0 {
+                let too_young = self.segments[count - 1]
+                    .max_timestamp
+                    .is_some_and(|timestamp| now.saturating_sub(timestamp) < min_lag);
+                if too_young {
+                    count -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        while count > 0 && self.segments[count].base_offset > self.high_watermark {
+            count -= 1;
+        }
+        if count == 0 {
+            return None;
+        }
+        let end = self.segments[count].base_offset;
+        if end <= self.segments[0].base_offset {
+            return None;
+        }
+        Some((end, count))
+    }
+
+    /// Whether enough of the cleanable range is dirty to be worth
+    /// rewriting it.
+    ///
+    /// Without this gate a pass runs on every maintenance tick and rewrites
+    /// the whole cleanable log to remove a handful of records — which is
+    /// how compaction turns into the dominant write load on a partition
+    /// that is barely changing. `max.compaction.lag.ms` overrides it, so a
+    /// slow-moving topic still gets cleaned eventually.
+    fn worth_compacting(&self, first_dirty: i64, end: i64, segments: usize, now: i64) -> bool {
+        let dirty: u64 = self.segments[..segments]
+            .iter()
+            .filter(|segment| segment.base_offset >= first_dirty)
+            .map(|segment| segment.size)
+            .sum();
+        let total: u64 = self.segments[..segments]
+            .iter()
+            .map(|segment| segment.size)
+            .sum();
+        if total == 0 || end <= first_dirty {
+            return false;
+        }
+        if dirty as f64 / total as f64 >= self.config.min_cleanable_dirty_ratio {
+            return true;
+        }
+        self.config.max_compaction_lag_ms.is_some_and(|lag| {
+            self.segments[..segments]
+                .iter()
+                .filter(|segment| segment.base_offset >= first_dirty)
+                .filter_map(|segment| segment.max_timestamp)
+                .any(|timestamp| now.saturating_sub(timestamp) >= lag as i64)
+        })
+    }
+
+    /// Emit the accumulated run of contiguous survivors as one batch.
+    fn flush_run(
+        writer: &mut CompactionWriter,
+        run: &mut Vec<Survivor>,
+        shape: &mut Option<BatchShape>,
+    ) -> Result<(), StorageError> {
+        if run.is_empty() {
+            *shape = None;
+            return Ok(());
+        }
+        let shape = shape.take().expect("a non-empty run has a shape");
+        let base_offset = run[0].offset;
+        let base_sequence = run[0].sequence;
+        let timestamped: Vec<(Record, i64)> = run
+            .drain(..)
+            .map(|survivor| (survivor.record, survivor.timestamp))
+            .collect();
+        let mut batch =
+            RecordBatch::from_timestamped(base_offset, shape.leader_epoch, timestamped, 0)
+                .with_compression(shape.compression);
+        if let Some((producer_id, producer_epoch)) = shape.producer {
+            batch = batch.with_producer(producer_id, producer_epoch, base_sequence);
+        }
+        batch.transactional = shape.transactional;
+        let max_timestamp = batch.max_timestamp;
+        let bytes = batch.encode();
+        writer.push(base_offset, &bytes, max_timestamp)
+    }
+
+    /// Walk every whole batch in a segment, in order.
+    fn for_each_batch<F>(segment: &Segment, mut visit: F) -> Result<(), StorageError>
+    where
+        F: FnMut(Bytes, RecordBatch) -> Result<(), StorageError>,
+    {
+        let mut position = 0u64;
+        while position + BATCH_HEADER_LEN as u64 <= segment.size {
+            let mut header = [0u8; BATCH_HEADER_LEN];
+            segment.read_at(position, &mut header)?;
+            let batch_length = i32::from_be_bytes(header[8..12].try_into().unwrap());
+            if batch_length < MIN_BATCH_LENGTH as i32 {
+                break;
+            }
+            let total_len = BATCH_HEADER_LEN + batch_length as usize;
+            if position + total_len as u64 > segment.size {
+                break;
+            }
+            let mut buf = BytesMut::zeroed(total_len);
+            segment.read_at(position, &mut buf)?;
+            let raw = buf.freeze();
+            let mut cursor = raw.clone();
+            let batch = RecordBatch::decode(&mut cursor)?;
+            visit(raw, batch)?;
+            position += total_len as u64;
+        }
+        Ok(())
+    }
+
+    /// Move the staged output alongside the originals under `.swap` names,
+    /// which cannot collide with them.
+    fn stage_swap_files(staging: &Path, dir: &Path, bases: &[i64]) -> Result<(), StorageError> {
+        for &base in bases {
+            for suffix in ["log", "index", "timeindex"] {
+                let from = staging.join(format!("{base:020}.{suffix}"));
+                if from.exists() {
+                    let to = dir.join(format!("{base:020}.{suffix}{SWAP_SUFFIX}"));
+                    fs::rename(&from, &to)?;
+                }
+            }
+        }
+        sync_dir(dir)
+    }
+
+    /// Remember where the clean prefix ends, so a restart does not decide
+    /// the whole log is dirty and rewrite it.
+    fn set_first_dirty_offset(&mut self, offset: i64) -> Result<(), StorageError> {
+        if offset == self.first_dirty_offset {
+            return Ok(());
+        }
+        self.first_dirty_offset = offset;
+        write_cleaner_checkpoint(&self.dir, offset)
+    }
+}
+
+/// Record that a compaction pass has reached the point of no return.
+///
+/// Names both the range being replaced and the segments replacing it. The
+/// second half is what lets recovery tell a segment this pass *produced*
+/// from a stale original at a base offset inside the same range — once a
+/// swap file has been renamed the two look identical on disk, and deleting
+/// the wrong one loses every record the pass kept.
+fn write_compaction_marker(
+    dir: &Path,
+    from: i64,
+    to: i64,
+    output: &[i64],
+) -> Result<(), StorageError> {
+    let path = dir.join(COMPACTION_COMMIT_FILE);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    let bases: Vec<String> = output.iter().map(|base| base.to_string()).collect();
+    file.write_all(format!("{from} {to} {}\n", bases.join(",")).as_bytes())?;
+    file.sync_all()?;
+    sync_dir(dir)
+}
+
+/// Put the `.swap` output into its final place.
+fn finish_swap(dir: &Path, bases: &[i64]) -> Result<(), StorageError> {
+    for &base in bases {
+        for suffix in ["log", "index", "timeindex"] {
+            let from = dir.join(format!("{base:020}.{suffix}{SWAP_SUFFIX}"));
+            if from.exists() {
+                fs::rename(&from, dir.join(format!("{base:020}.{suffix}")))?;
+            }
+        }
+    }
+    sync_dir(dir)
+}
+
+/// Finish or discard a compaction pass interrupted by a crash.
+///
+/// With no marker the pass never committed: the originals are whole and the
+/// staged output is thrown away. With a marker, the originals in the
+/// compacted range are on their way out — some may already be gone — so the
+/// only consistent state is the one the pass was heading for, and the swap
+/// is completed.
+fn recover_compaction(dir: &Path) -> Result<(), StorageError> {
+    let marker = dir.join(COMPACTION_COMMIT_FILE);
+    let staging = dir.join(COMPACTION_STAGING_DIR);
+    if !marker.exists() {
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path
+                .to_str()
+                .is_some_and(|name| name.ends_with(SWAP_SUFFIX))
+            {
+                fs::remove_file(path)?;
+            }
+        }
+        return Ok(());
+    }
+
+    let (from, to, output) = read_compaction_marker(&marker)?;
+
+    // Which base offsets in the compacted range belong to the *output* is
+    // read from the marker rather than inferred from what is on disk,
+    // because once a swap file has been renamed the two are
+    // indistinguishable: both are plain segments at a base offset inside
+    // the range. Inferring would delete the output of a pass that had
+    // already finished, which is the one interruption point that must not
+    // lose data.
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".log") else {
+            continue;
+        };
+        let Ok(base) = stem.parse::<i64>() else {
+            continue;
+        };
+        // A stale original: inside the range this pass replaced, and not
+        // one of the segments it produced.
+        if base >= from && base < to && !output.contains(&base) {
+            for suffix in ["log", "index", "timeindex"] {
+                let path = dir.join(format!("{base:020}.{suffix}"));
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+    }
+    // A swap file whose base collides with a stale original it is replacing
+    // needs that original gone first, which the loop above has done.
+    for &base in &output {
+        for suffix in ["log", "index", "timeindex"] {
+            let swap = dir.join(format!("{base:020}.{suffix}{SWAP_SUFFIX}"));
+            if swap.exists() {
+                let final_path = dir.join(format!("{base:020}.{suffix}"));
+                if final_path.exists() {
+                    fs::remove_file(&final_path)?;
+                }
+            }
+        }
+    }
+    finish_swap(dir, &output)?;
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::remove_file(&marker)?;
+    Ok(())
+}
+
+/// Read a commit marker: the replaced range and the segments produced.
+fn read_compaction_marker(path: &Path) -> Result<(i64, i64, Vec<i64>), StorageError> {
+    let contents = fs::read_to_string(path)?;
+    let mut parts = contents.split_whitespace();
+    let from: i64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let to: i64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let output: Vec<i64> = parts
+        .next()
+        .map(|bases| {
+            bases
+                .split(',')
+                .filter_map(|base| base.parse::<i64>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((from, to, output))
+}
+
+fn read_cleaner_checkpoint(dir: &Path) -> Result<Option<i64>, StorageError> {
+    match fs::read_to_string(dir.join(CLEANER_CHECKPOINT_FILE)) {
+        Ok(contents) => Ok(contents.trim().parse::<i64>().ok()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_cleaner_checkpoint(dir: &Path, offset: i64) -> Result<(), StorageError> {
+    let path = dir.join(CLEANER_CHECKPOINT_FILE);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    file.write_all(format!("{offset}\n").as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// fsync a directory so a rename in it is durable.
+///
+/// Renaming a file is not enough on its own: the directory entry that
+/// points at the new name is itself a write, and a crash can lose it. On
+/// Windows there is no directory handle to sync, and `ReplaceFile`-style
+/// renames are already ordered, so this is a no-op there.
+fn sync_dir(dir: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2727,8 +3346,23 @@ mod compaction_tests {
             segment_bytes: 256,
             index_interval_bytes: 64,
             hwm_checkpoint_interval_ms: 0,
+            compact: true,
+            // These tests are about what compaction decides, not about when
+            // it decides to run, so let every pass run.
+            min_cleanable_dirty_ratio: 0.0,
             ..LogConfig::default()
         }
+    }
+
+    /// A deletion written now, so `delete.retention.ms` has not run out on
+    /// it yet.
+    fn tombstone(key: &str) -> RecordBatch {
+        RecordBatch::new(
+            0,
+            0,
+            now_ms(),
+            vec![Record::tombstone(Bytes::from(key.to_string()), 0)],
+        )
     }
 
     fn keyed(key: &str, value: &str) -> RecordBatch {
@@ -2744,7 +3378,11 @@ mod compaction_tests {
         )
     }
 
-    fn read_all(log: &Log) -> Vec<(i64, Option<Vec<u8>>, Vec<u8>)> {
+    /// Offset, key and value; both key and value are `None` when absent,
+    /// and a `None` value is a tombstone.
+    type ReadRecord = (i64, Option<Vec<u8>>, Option<Vec<u8>>);
+
+    fn read_all(log: &Log) -> Vec<ReadRecord> {
         let mut out = Vec::new();
         let mut offset = log.log_start_offset();
         while offset < log.log_end_offset() {
@@ -2761,7 +3399,7 @@ mod compaction_tests {
                     out.push((
                         record_offset,
                         record.key.map(|key| key.to_vec()),
-                        record.value.to_vec(),
+                        record.value.map(|value| value.to_vec()),
                     ));
                 }
             }
@@ -2782,8 +3420,11 @@ mod compaction_tests {
         log.set_high_watermark(log.log_end_offset()).unwrap();
         let before = read_all(&log).len();
 
-        let removed = log.compact().unwrap();
-        assert!(removed > 0, "compaction must remove superseded records");
+        let outcome = log.compact().unwrap();
+        assert!(
+            outcome.records_removed > 0,
+            "compaction must remove superseded records"
+        );
 
         let after = read_all(&log);
         assert!(
@@ -2801,7 +3442,10 @@ mod compaction_tests {
         // The newest values, not the oldest.
         let values: Vec<String> = after
             .iter()
-            .map(|(_, _, value)| String::from_utf8_lossy(value).into_owned())
+            .map(|(_, _, value)| match value {
+                Some(value) => String::from_utf8_lossy(value).into_owned(),
+                None => "<tombstone>".to_owned(),
+            })
             .collect();
         assert!(values.contains(&"v11".to_string()), "got {values:?}");
         assert!(values.contains(&"w11".to_string()), "got {values:?}");
@@ -2911,8 +3555,311 @@ mod compaction_tests {
         log.set_high_watermark(log.log_end_offset()).unwrap();
         let before = read_all(&log);
 
-        assert_eq!(log.compact().unwrap(), 0);
+        assert_eq!(log.compact().unwrap().records_removed, 0);
         assert_eq!(read_all(&log), before);
+    }
+
+    /// The half of compaction that did not exist before: a null value
+    /// deletes its key, and once the tombstone itself ages out, the key is
+    /// gone from the log entirely.
+    #[test]
+    fn a_tombstone_deletes_its_key_and_then_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for round in 0..6 {
+            log.append(keyed("doomed", &format!("v{round}"))).unwrap();
+            log.append(keyed("kept", &format!("w{round}"))).unwrap();
+        }
+        log.append(tombstone("doomed")).unwrap();
+        // Enough afterwards that the tombstone lands in a sealed segment.
+        for round in 6..12 {
+            log.append(keyed("kept", &format!("w{round}"))).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+
+        // Within the grace period the tombstone stays, and it is the only
+        // thing left of its key: a consumer reading the log now sees the
+        // deletion.
+        log.compact().unwrap();
+        let after = read_all(&log);
+        let doomed: Vec<_> = after
+            .iter()
+            .filter(|(_, key, _)| key.as_deref() == Some(&b"doomed"[..]))
+            .collect();
+        assert_eq!(doomed.len(), 1, "only the tombstone may survive: {after:?}");
+        assert_eq!(doomed[0].2, None, "and it must still be a tombstone");
+
+        // Past the grace period the tombstone goes too, and the key stops
+        // occupying the log at all.
+        //
+        // The pass that removes it is the next one that has something to
+        // do — as in Kafka, a tombstone is dropped while cleaning the range
+        // it sits in, not by a sweep of its own, so a topic nobody writes
+        // to keeps its tombstones until it is written to again.
+        let mut config = config();
+        config.delete_retention_ms = 0;
+        let mut log = Log::open(dir.path(), config).unwrap();
+        for round in 12..20 {
+            log.append(keyed("kept", &format!("w{round}"))).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        log.compact().unwrap();
+        let after = read_all(&log);
+        assert!(
+            !after
+                .iter()
+                .any(|(_, key, _)| key.as_deref() == Some(&b"doomed"[..])),
+            "the tombstone must age out: {after:?}"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|(_, key, _)| key.as_deref() == Some(&b"kept"[..])),
+            "and must take nothing else with it"
+        );
+    }
+
+    /// An empty value is a value. Only a null one deletes.
+    #[test]
+    fn an_empty_value_is_not_a_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.delete_retention_ms = 0;
+        let mut log = Log::open(dir.path(), config).unwrap();
+        for round in 0..8 {
+            log.append(keyed("k", &format!("v{round}"))).unwrap();
+        }
+        log.append(keyed("k", "")).unwrap();
+        for round in 0..8 {
+            log.append(keyed("filler", &format!("f{round}"))).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+
+        log.compact().unwrap();
+
+        let surviving: Vec<_> = read_all(&log)
+            .into_iter()
+            .filter(|(_, key, _)| key.as_deref() == Some(&b"k"[..]))
+            .collect();
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(
+            surviving[0].2,
+            Some(Vec::new()),
+            "an empty value survives as an empty value"
+        );
+    }
+
+    /// Compaction must not quietly convert a batched, compressed log into
+    /// a stream of single-record batches: that is a throughput and a disk
+    /// regression on every partition it touches.
+    #[test]
+    fn contiguous_survivors_stay_in_one_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        // One segment big enough to hold everything, so the whole run can
+        // be re-emitted together.
+        config.segment_bytes = 1 << 20;
+        let mut log = Log::open(dir.path(), config).unwrap();
+        // Ten distinct keys in one compressed batch: nothing is removable,
+        // and they must come back out as one batch.
+        let records: Vec<Record> = (0..10)
+            .map(|index| {
+                Record::with_key(
+                    Bytes::from(format!("k{index}")),
+                    Bytes::from(format!("v{index}")),
+                    0,
+                )
+            })
+            .collect();
+        log.append(RecordBatch::new(0, 0, 1, records).with_compression(Compression::Lz4))
+            .unwrap();
+        // One superseded key, so the pass actually rewrites.
+        log.append(keyed("k0", "old")).unwrap();
+        log.append(keyed("k0", "new")).unwrap();
+        log.roll_segment().unwrap();
+        log.append(keyed("tail", "t")).unwrap();
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+
+        assert!(log.compact().unwrap().records_removed > 0);
+
+        let batches = log.read(0, 1 << 20).unwrap();
+        let mut decoded = Vec::new();
+        for raw in batches {
+            let mut bytes = raw;
+            decoded.push(RecordBatch::decode(&mut bytes).unwrap());
+        }
+        let first = &decoded[0];
+        assert!(
+            first.records.len() > 1,
+            "contiguous survivors must share a batch, got {:?}",
+            decoded.iter().map(|b| b.records.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first.compression,
+            Compression::Lz4,
+            "and must keep the codec they were written with"
+        );
+    }
+
+    /// A pass that rewrites the whole cleanable log to remove a handful of
+    /// records is how compaction becomes the dominant write load on a
+    /// partition that is barely changing.
+    #[test]
+    fn a_mostly_clean_log_is_left_alone_until_it_is_dirty_enough() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.min_cleanable_dirty_ratio = 0.5;
+        let mut log = Log::open(dir.path(), config).unwrap();
+        for round in 0..24 {
+            log.append(keyed("k", &format!("v{round}"))).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+
+        // Everything is dirty on the first pass, so it runs.
+        assert!(log.compact().unwrap().ran);
+        // Immediately afterwards nothing is dirty, so it must not.
+        assert!(!log.compact().unwrap().ran);
+
+        // A trickle of new records is still not worth a rewrite.
+        log.append(keyed("k", "trickle")).unwrap();
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        assert!(!log.compact().unwrap().ran);
+    }
+
+    /// The dirty point has to survive a restart, or every restart makes the
+    /// whole log dirty again and the ratio gate stops meaning anything.
+    #[test]
+    fn the_clean_prefix_is_remembered_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.min_cleanable_dirty_ratio = 0.5;
+        {
+            let mut log = Log::open(dir.path(), config.clone()).unwrap();
+            for round in 0..24 {
+                log.append(keyed("k", &format!("v{round}"))).unwrap();
+            }
+            log.set_high_watermark(log.log_end_offset()).unwrap();
+            assert!(log.compact().unwrap().ran);
+        }
+        let mut log = Log::open(dir.path(), config).unwrap();
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        assert!(
+            !log.compact().unwrap().ran,
+            "a restart must not make the clean prefix dirty again"
+        );
+    }
+
+    /// A compaction pass interrupted before it committed must leave the
+    /// log exactly as it found it.
+    #[test]
+    fn an_uncommitted_pass_is_discarded_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for round in 0..10 {
+            log.append(keyed("k", &format!("v{round}"))).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        let before = read_all(&log);
+        drop(log);
+
+        // Half-written output, no marker: this is what a crash during the
+        // rewrite leaves behind.
+        let staging = dir.path().join(COMPACTION_STAGING_DIR);
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("00000000000000000000.log"), b"garbage").unwrap();
+        fs::write(dir.path().join("00000000000000000000.log.swap"), b"garbage").unwrap();
+
+        let log = Log::open(dir.path(), config()).unwrap();
+        assert_eq!(read_all(&log), before, "the original log must be intact");
+        assert!(!staging.exists(), "the staged output must be gone");
+    }
+
+    /// One interrupted after it committed must be finished, because the
+    /// originals it replaces are already being deleted.
+    #[test]
+    fn a_committed_pass_is_finished_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for round in 0..10 {
+            log.append(keyed("k", &format!("v{round}"))).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        let active_base = log.segments.last().unwrap().base_offset;
+        drop(log);
+
+        // Stand in for a pass that wrote its output and got as far as the
+        // marker: one swap file holding the single surviving record, and
+        // every original below the active segment still present.
+        let survivor = RecordBatch::new(
+            0,
+            0,
+            1,
+            vec![Record::with_key(
+                Bytes::from_static(b"k"),
+                Bytes::from_static(b"survivor"),
+                0,
+            )],
+        );
+        fs::write(
+            dir.path().join("00000000000000000000.log.swap"),
+            survivor.encode(),
+        )
+        .unwrap();
+        write_compaction_marker(dir.path(), 0, active_base, &[0]).unwrap();
+
+        let log = Log::open(dir.path(), config()).unwrap();
+        let after = read_all(&log);
+        assert_eq!(
+            after[0].2.as_deref(),
+            Some(&b"survivor"[..]),
+            "the committed output must be what survives: {after:?}"
+        );
+        assert!(
+            !dir.path().join(COMPACTION_COMMIT_FILE).exists(),
+            "and the marker must be cleared"
+        );
+    }
+
+    /// The interruption point that is easiest to get wrong: the swap has
+    /// *finished* and only the marker is still there.
+    ///
+    /// At that moment the output segments are ordinary segments at base
+    /// offsets inside the range the marker says was replaced, so recovery
+    /// that inferred "inside the range means stale" would delete every
+    /// record the pass kept. Naming the output in the marker is what makes
+    /// the two distinguishable.
+    #[test]
+    fn a_finished_swap_with_only_the_marker_left_keeps_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        for round in 0..10 {
+            log.append(keyed("k", &format!("v{round}"))).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        let active_base = log.segments.last().unwrap().base_offset;
+        drop(log);
+
+        // Stand in for a completed swap: the output is already in place
+        // under its final name, no swap files remain, and the crash landed
+        // between the last rename and removing the marker.
+        let compacted: Vec<i64> = {
+            let log = Log::open(dir.path(), config()).unwrap();
+            log.segments
+                .iter()
+                .map(|segment| segment.base_offset)
+                .filter(|base| *base < active_base)
+                .collect()
+        };
+        assert!(!compacted.is_empty(), "the fixture needs sealed segments");
+        write_compaction_marker(dir.path(), 0, active_base, &compacted).unwrap();
+
+        let log = Log::open(dir.path(), config()).unwrap();
+        assert_eq!(
+            read_all(&log).len(),
+            10,
+            "a finished pass must not have its own output deleted by recovery"
+        );
+        assert!(!dir.path().join(COMPACTION_COMMIT_FILE).exists());
     }
 }
 

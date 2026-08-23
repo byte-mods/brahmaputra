@@ -101,8 +101,10 @@ impl InitProducerIdRequest {
                 available: body.remaining(),
             });
         }
-        let transactional_id = String::from_utf8(body.copy_to_bytes(length).to_vec())
-            .map_err(|_| ProtocolError::Malformed("InitProducerId transactional id is not UTF-8"))?;
+        let transactional_id =
+            String::from_utf8(body.copy_to_bytes(length).to_vec()).map_err(|_| {
+                ProtocolError::Malformed("InitProducerId transactional id is not UTF-8")
+            })?;
         let transaction_timeout_ms = body.get_i32();
         if !body.is_empty() {
             return Err(ProtocolError::Malformed(

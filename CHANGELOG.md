@@ -1,5 +1,262 @@
 # Changelog
 
+## 0.4.0 — 2026-08-23
+
+The release that finishes log compaction and makes `transaction.timeout.ms`
+mean something. Both were features the system claimed to have: a compacted
+topic could not delete a key, and a transaction timeout was a number the
+client sent and nothing enforced.
+
+Around those, the gaps the parity audit had ranked below the wire protocol
+are closed: consumers can read from a replica in their own availability
+zone, a fetch no longer resends a thousand partition descriptors to say
+nothing changed, authentication works on a plaintext listener, brokers can
+talk to each other on their own listener, and a partition can be moved
+between a broker's disks.
+
+**Breaking:** the wire version is now 4. Broker and clients must be
+upgraded together — a version-3 client gets a clean `UNSUPPORTED_VERSION`
+rather than misparsing a tombstone's length prefix and losing every record
+after it. All four native drivers ship updated.
+
+**Nothing on disk changes shape.** Existing logs, indexes, checkpoints and
+transaction journals are read unchanged: a batch without a tombstone
+encodes to exactly the bytes it did before, which is why the record format
+gained an attributes bit rather than a magic bump.
+
+### Fixed
+
+- **Log compaction can now delete a key.** A record's value may be null —
+  a tombstone — and that is what removes a key from a compacted topic.
+
+  Before this, `Record.value` was `Bytes` with no null form, so compaction
+  kept the newest record for every key that had ever existed and a
+  compacted topic's key space could only grow. Half of what
+  `cleanup.policy=compact` means in Kafka was missing, and the group
+  coordinator worked around it with an application-level marker that
+  compaction could not act on.
+
+  - A tombstone is delivered to consumers as a null value, distinct from an
+    empty one, because on a compacted topic the deletion *is* the event a
+    consumer needs to see.
+  - It is itself removed once `delete.retention.ms` (default 24 h) has
+    passed, which is the window a consumer has to observe the deletion.
+  - `brahmaputra-cli produce --key k --tombstone` writes one;
+    `value=null` is how the consumer prints it.
+  - `__consumer_offsets` group expiry now writes real tombstones, keyed to
+    the records they delete. It previously wrote one marker under a
+    different key, which replay understood and compaction ignored — so the
+    offsets topic grew forever with groups that no longer existed.
+
+- **`transaction.timeout.ms` is enforced.** The coordinator sweeps for
+  transactions that have outlived it, fences the producer and aborts them.
+
+  Before this the timeout was stored and never read. A producer that died
+  mid-transaction — scaled down, redeployed under a different
+  `transactional.id`, crashed for good — left records in doubt on every
+  partition it had written to, and the last stable offset on those
+  partitions never advanced past them. Every `read_committed` consumer
+  stopped there, permanently, and the only thing that would ever resolve it
+  was the same `transactional.id` being claimed again.
+
+  - The producer is fenced before the abort, so one that is merely slow
+    cannot carry on writing into a transaction that has already been
+    marked aborted.
+  - A transaction left in `Prepare*` — decision durable, markers not all
+    written — has its markers re-sent rather than waiting for the next
+    `InitProducerId`.
+  - The sweeper loads the coordinator shards it leads, so a failover
+    resolves what the previous coordinator left open without anyone asking.
+  - `--transaction-max-timeout-ms` (15 min) clamps what a client may ask
+    for; `--transactional-id-expiration-ms` (7 days) retires idle ids,
+    writing a tombstone so their state stops occupying disk.
+
+- **Compaction no longer destroys batching, compression or producer
+  metadata.** Every surviving record used to be rewritten as its own
+  single-record batch with compression dropped, producer identity erased
+  and control batches turned into ordinary records — so compacting a
+  transactional or idempotent topic corrupted exactly the state that made
+  it one.
+
+  Contiguous survivors are now re-emitted as one batch carrying the codec,
+  producer metadata and transactional/control flags they were written with.
+  Offsets are still preserved exactly; compaction leaves gaps rather than
+  renumbering anything.
+
+- **Compaction is crash-safe.** A pass writes its output to a staging
+  directory, records a commit marker, then swaps. Interrupted before the
+  marker, the output is discarded and the original log is untouched;
+  interrupted after it, the swap is completed on the next open. Previously
+  a crash between deleting the old segments and moving the new ones in
+  would have lost the records that survived the pass.
+
+- **Compaction no longer moves the log start offset.** Removing the record
+  at offset 0 does not make offset 0 out of range: a consumer reading a
+  compacted topic from the beginning gets the oldest record that still
+  exists, as in Kafka. Only retention and `DeleteRecords` move the start.
+
+### Added
+
+- **Compaction has the settings that decide when it runs.**
+  `min.cleanable.dirty.ratio` (0.5), `min.compaction.lag.ms`,
+  `max.compaction.lag.ms` and `delete.retention.ms`, per topic and as
+  broker-wide defaults. Without the dirty ratio a pass ran on every
+  maintenance tick and rewrote the whole cleanable log to remove a handful
+  of records, which is how compaction becomes the dominant write load on a
+  partition that is barely changing.
+
+- **Follower fetching (KIP-392).** A consumer that sets `client.rack` is
+  told by the leader which in-sync replica in its own rack to read from,
+  and reads from that instead.
+
+  ```bash
+  brahmaputra-cli consume --topic orders --rack us-east-1a
+  ```
+
+  Only in-sync replicas are ever named, and a consumer already in the
+  leader's rack is not redirected — trading a fresher read for nothing.
+  Any error forgets the redirect and goes back to the leader.
+
+- **Incremental fetch sessions (KIP-227).** A consumer holding a thousand
+  partitions of which three are moving now resends three descriptors
+  instead of a thousand. The client stays the authority on where it is
+  reading: a broker that has forgotten a session answers
+  `FETCH_SESSION_NOT_FOUND` and the client sends a full fetch again, so the
+  failure mode is one wasted round trip rather than a consumer reading from
+  the wrong offset.
+
+- **SASL/SCRAM-SHA-256.** The password never crosses the wire, which is
+  what makes authentication meaningful on a plaintext listener — where
+  PLAIN is, correctly, still refused.
+
+  ```bash
+  brahmaputra-cli --sasl-username alice --sasl-password ... consume --topic orders
+  ```
+
+  Every connection a client opens authenticates, not just the first: a
+  pooled connection created after a reconnect would otherwise be anonymous.
+  Credentials are derived when a password is set, so a user created before
+  this cannot use SCRAM until their password is set again — a SCRAM
+  credential cannot be back-derived from a hash, which is the point of a
+  hash.
+
+- **An inter-broker listener.** `--internal-port` and `--internal-tls` bind
+  a second data-plane listener that replication and transaction markers
+  use, so a cluster can present TLS to its clients and speak plaintext to
+  itself on a private network — without encrypting every record two or
+  three more times to reach the followers.
+
+- **`--advertised-host` and `--advertised-port`.** What a broker publishes
+  in metadata, when it differs from what it bound. A broker behind NAT, in
+  a bridged container network, or on a Kubernetes pod IP used to publish
+  the address it bound and send every client somewhere unreachable.
+
+- **`AlterConfigs` (key 28).** Change a topic's configuration over the data
+  plane. The broker forwards to the controller, so durability and ordering
+  are unchanged; what changes is that one connection is enough to both read
+  and write a topic's configuration. An unknown config name is refused
+  rather than stored and ignored.
+
+  ```bash
+  brahmaputra-cli alter-configs --topic orders --config retention.ms=604800000
+  ```
+
+- **`DescribeProducers` (key 29), `ListTransactions` (key 30),
+  `DescribeTransactions` (key 31).** The answer to "why has my
+  `read_committed` consumer stopped?" — the gap between the last stable
+  offset and the high watermark is the stall, and the producer holding it
+  is named.
+
+  ```bash
+  brahmaputra-cli describe-producers --topic orders --partition 0
+  brahmaputra-cli list-transactions
+  ```
+
+- **`AlterReplicaLogDirs` (key 32).** Move a partition between a broker's
+  disks. JBOD placed partitions once, at creation, so a disk added to a
+  running broker took only new partitions and a filling disk could only be
+  relieved by deleting a partition and letting it re-replicate. The
+  partition is closed while its bytes are copied, so this is an explicit
+  operator action rather than something the broker does on its own.
+
+- **`heartbeat.interval.ms`** is settable independently of the session
+  timeout. Deriving one from the other forced a fleet that wanted a
+  generous failure-detection window to also accept being blind for a third
+  of it.
+
+- **`offsets.topic.replication.factor`.** The internal topics are created
+  once, when the first nodes register, so a three-node cluster whose other
+  two nodes had not started yet would pin committed offsets to a single
+  broker forever.
+
+- **`message.timestamp.type=LogAppendTime`**, so retention and timestamp
+  seeks stop depending on a client's clock. The batch timestamp is
+  overwritten in place and the CRC recomputed — the records are never
+  decompressed.
+
+- **`compression.type` per topic**, enforced by refusing a batch in another
+  codec rather than by recompressing it. The guarantee is the same and the
+  producer is told what to send instead of having its data silently
+  rewritten.
+
+- **`--max-frame-bytes`, `--index-interval-bytes`, `--max-message-bytes`,
+  `--cleanup-policy`** and the compaction defaults, as broker flags. Three
+  of these were hard-coded constants the parity audit had listed as
+  unreachable.
+
+### Changed
+
+- `Record.value`, `FetchedRecord.value` and `ConsumedRecord.value` are now
+  `Option<Bytes>`. `None` is a tombstone.
+- `LogConfig` gained the compaction and timestamp settings and is no longer
+  `Eq` (a dirty *ratio* is a ratio, as it is in Kafka).
+- `Log::compact` returns a `CompactionOutcome` describing what the pass did
+  rather than a bare count.
+- `ApiVersions` advertises 33 APIs, up from 28.
+
+### Also fixed, found while verifying the above
+
+- **A node that lost the internal-topic creation race could die at
+  startup.** Several nodes attempt to create `__consumer_offsets` and
+  `__transaction_state` at once and all but one is expected to lose. The
+  loser confirmed the topic exists by reading its *own* Raft copy, which
+  trails the leader that just refused the create — so a single look could
+  miss a topic that certainly existed, and the node exited. It now waits
+  for its copy to catch up before treating the failure as real.
+
+- The transaction-expiry sweep observes partitions that are already open
+  rather than opening them. A background timer that creates partition
+  actors as a side effect is a timer that does I/O for topics nothing has
+  used.
+
+### Known, unchanged, and not from this release
+
+A controller node that *stays* down takes the surviving brokers with it:
+with `--session-timeout-ms 3000` they cannot renew their lease before it
+expires and self-terminate. Killing and restarting that node — a rolling
+restart, or a crash with a supervisor — is handled cleanly, which is why
+the soak survives repeated kills of it. Reproduced identically on 0.3.0, so
+this release neither causes nor fixes it; recorded in
+[docs/kafka-parity.md](docs/kafka-parity.md) §9 with the reproduction.
+
+### Verification
+
+```bash
+cargo test --workspace                    # 389
+bash scripts/verify-compaction.sh         # 17  tombstones, superseding, horizons
+bash scripts/verify-transactions.sh       # 24  commit, abort, in doubt, expiry
+bash scripts/verify-admin-and-security.sh # 29  admin APIs, quotas, mTLS, SCRAM
+bash scripts/verify-jbod.sh               # 26  placement, disk failure, moves
+SOAK_MINUTES=3 bash scripts/soak.sh       # 5   sustained acks=all through kills
+cd clients/go     && go run ./cmd/manualtest      # 38/38
+cd clients/nodejs && node test_manual.js          # 38/38
+```
+
+Produce throughput was measured against 0.3.0 on the same host: RF=1
+394k → 423k msgs/sec, RF=3 `acks=all` 344k → 363k. Group consume 295k →
+302k. No path regressed.
+
+
 ## 0.3.0 — 2026-08-23
 
 The release that closes the two gaps the parity audit had ranked most

@@ -228,6 +228,7 @@ fn proxy_cluster_image(proxy_port: u16) -> ClusterMetadata {
                 host: "127.0.0.1".into(),
                 data_port: proxy_port,
                 control_port: 0,
+                internal_port: 0,
                 broker_epoch: 1,
                 roles: BTreeSet::from([NodeRole::Broker]),
                 rack: None,
@@ -377,7 +378,7 @@ async fn idempotent_client_retries_lost_response_without_duplicate_append() {
         let records = consumer.fetch(TOPIC, 0, 0, 100).await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].offset, 0);
-        assert_eq!(records[0].value, Bytes::from_static(b"exactly-once"));
+        assert_eq!(records[0].value, Some(Bytes::from_static(b"exactly-once")));
         assert_eq!(consumer.list_offsets(TOPIC, 0, LATEST).await.unwrap(), 1);
 
         let _ = proxy_shutdown.send(true);

@@ -146,7 +146,11 @@ async fn serve_connection(
     // connection starts as that principal rather than anonymous.
     let peer_principal = connection
         .peer_identity()
-        .and_then(|identity| identity.downcast::<Vec<rustls_pki_types::CertificateDer>>().ok())
+        .and_then(|identity| {
+            identity
+                .downcast::<Vec<rustls_pki_types::CertificateDer>>()
+                .ok()
+        })
         .and_then(|chain| chain.first().and_then(crate::tls::common_name));
     let session = Arc::new(match peer_principal {
         Some(principal) => {

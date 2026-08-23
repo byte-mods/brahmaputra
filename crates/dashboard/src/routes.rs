@@ -23,8 +23,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::auth::{
-    bearer_token, hash_password, issue_token, require_role, verify_password, verify_token,
-    AuthError, Claims,
+    bearer_token, issue_token, require_role, verify_password, verify_token, AuthError, Claims,
 };
 use crate::ui;
 
@@ -497,18 +496,16 @@ async fn put_user(
         )
             .into_response();
     }
-    let Ok(password_hash) = hash_password(&body.password) else {
+    // Both credentials, derived here because this is the last place the
+    // plaintext password exists: a user created with only the Argon2 hash
+    // could log into the dashboard and not into the data plane, which is
+    // an account that looks correct until it is used.
+    let Ok(user) = UserRecord::new(body.username.clone(), &body.password, body.role, false) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "cannot hash password" })),
         )
             .into_response();
-    };
-    let user = UserRecord {
-        username: body.username.clone(),
-        password_hash,
-        role: body.role,
-        force_password_change: false,
     };
     match state
         .submit(json!({ "type": "put_user", "user": user }))
@@ -623,6 +620,10 @@ struct BrowsedMessage {
     /// True when the payload was not valid UTF-8 and had to be rendered
     /// lossily, so the UI can say so rather than quietly showing mojibake.
     binary: bool,
+    /// True when the record has a null value: a deletion on a compacted
+    /// topic, which an operator must be able to tell apart from a record
+    /// whose value is merely empty.
+    tombstone: bool,
     size_bytes: usize,
 }
 
@@ -683,10 +684,11 @@ async fn read_partition_messages(
                 if record_offset < start || record_offset >= high_watermark {
                     continue;
                 }
-                let size_bytes = record.value.len();
-                let (value, binary) = match std::str::from_utf8(&record.value) {
+                let size_bytes = record.value_len();
+                let tombstone = record.is_tombstone();
+                let (value, binary) = match std::str::from_utf8(record.payload()) {
                     Ok(text) => (text.to_owned(), false),
-                    Err(_) => (String::from_utf8_lossy(&record.value).into_owned(), true),
+                    Err(_) => (String::from_utf8_lossy(record.payload()).into_owned(), true),
                 };
                 out.push(BrowsedMessage {
                     partition,
@@ -698,6 +700,7 @@ async fn read_partition_messages(
                         .map(|key| String::from_utf8_lossy(key).into_owned()),
                     value,
                     binary,
+                    tombstone,
                     size_bytes,
                 });
             }

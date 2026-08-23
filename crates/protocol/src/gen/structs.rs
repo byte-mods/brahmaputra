@@ -30,6 +30,7 @@ pub struct FetchRequest {
 	pub max_wait_ms: i32,
 	pub min_bytes: i32,
 	pub isolation_level: i32,
+	pub rack: String,
 	
 }
 
@@ -41,6 +42,7 @@ pub struct FetchResponse {
 	pub high_watermark: i64,
 	pub last_stable_offset: i64,
 	pub batches_length: i64,
+	pub preferred_read_replica: i32,
 	
 }
 
@@ -67,6 +69,7 @@ pub struct BrokerInfo {
 	pub broker_id: i32,
 	pub host: String,
 	pub port: i32,
+	pub rack: String,
 	
 }
 
@@ -313,11 +316,22 @@ pub struct FetchMultiPartition {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct ForgottenPartition {
+	pub topic: String,
+	pub partition: i32,
+	
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct FetchMultiRequest {
 	pub max_wait_ms: i32,
 	pub min_bytes: i32,
 	pub isolation_level: i32,
+	pub rack: String,
+	pub session_id: i32,
+	pub session_epoch: i32,
 	pub partitions: Vec<FetchMultiPartition>,
+	pub forgotten: Vec<ForgottenPartition>,
 	
 }
 
@@ -329,11 +343,15 @@ pub struct FetchMultiResult {
 	pub high_watermark: i64,
 	pub last_stable_offset: i64,
 	pub batches_length: i64,
+	pub preferred_read_replica: i32,
 	
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct FetchMultiResponse {
+	pub session_id: i32,
+	pub session_epoch: i32,
+	pub error_code: i32,
 	pub results: Vec<FetchMultiResult>,
 	
 }
@@ -402,6 +420,8 @@ pub struct TombstoneRecord {
 pub struct AuthenticateRequest {
 	pub username: String,
 	pub password: String,
+	pub mechanism: String,
+	pub payload: String,
 	
 }
 
@@ -410,6 +430,8 @@ pub struct AuthenticateResponse {
 	pub error_code: i32,
 	pub principal: String,
 	pub role: String,
+	pub payload: String,
+	pub done: bool,
 	
 }
 
@@ -645,5 +667,131 @@ pub struct TxnMarkerResult {
 #[derive(Debug, Default, Clone)]
 pub struct WriteTxnMarkersResponse {
 	pub results: Vec<TxnMarkerResult>,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AlterConfigEntry {
+	pub name: String,
+	pub value: String,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AlterConfigsRequest {
+	pub resource_type: String,
+	pub resource_name: String,
+	pub incremental: bool,
+	pub configs: Vec<AlterConfigEntry>,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AlterConfigsResponse {
+	pub error_code: i32,
+	pub resource_type: String,
+	pub resource_name: String,
+	pub error_message: String,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ProducerState {
+	pub producer_id: i64,
+	pub producer_epoch: i32,
+	pub last_sequence: i32,
+	pub last_timestamp_ms: i64,
+	pub current_txn_start_offset: i64,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DescribeProducersRequest {
+	pub topic: String,
+	pub partition: i32,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DescribeProducersResponse {
+	pub error_code: i32,
+	pub topic: String,
+	pub partition: i32,
+	pub last_stable_offset: i64,
+	pub high_watermark: i64,
+	pub producers: Vec<ProducerState>,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TransactionListing {
+	pub transactional_id: String,
+	pub producer_id: i64,
+	pub state: String,
+	pub last_update_ms: i64,
+	pub timeout_ms: i32,
+	pub partition_count: i32,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ListTransactionsRequest {
+	pub states: Vec<String>,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ListTransactionsResponse {
+	pub error_code: i32,
+	pub transactions: Vec<TransactionListing>,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DescribeTransactionsRequest {
+	pub transactional_id: String,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DescribeTransactionsResponse {
+	pub error_code: i32,
+	pub transactional_id: String,
+	pub producer_id: i64,
+	pub producer_epoch: i32,
+	pub state: String,
+	pub timeout_ms: i32,
+	pub last_update_ms: i64,
+	pub partitions: Vec<TxnPartition>,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AlterLogDirPartition {
+	pub topic: String,
+	pub partition: i32,
+	pub log_dir: String,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AlterReplicaLogDirsRequest {
+	pub partitions: Vec<AlterLogDirPartition>,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AlterLogDirResult {
+	pub topic: String,
+	pub partition: i32,
+	pub error_code: i32,
+	pub log_dir: String,
+	pub bytes_moved: i64,
+	
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AlterReplicaLogDirsResponse {
+	pub results: Vec<AlterLogDirResult>,
 	
 }

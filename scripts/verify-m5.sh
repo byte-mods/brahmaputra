@@ -111,7 +111,7 @@ start_broker api-versions
 OUTPUT="$(cli api-versions)"
 printf '%s\n' "$OUTPUT" | sed 's/^/     /' | head -4
 API_COUNT="$(printf '%s\n' "$OUTPUT" | grep -c '^  api ')"
-assert_eq "$API_COUNT" "28" "the broker advertises all 28 data-plane APIs"
+assert_eq "$API_COUNT" "33" "the broker advertises all 33 data-plane APIs"
 INCOMPATIBLE="$(printf '%s\n' "$OUTPUT" | grep -c 'INCOMPATIBLE' || true)"
 assert_eq "$INCOMPATIBLE" "0" "this client's wire version is inside every advertised range"
 printf '%s\n' "$OUTPUT" | grep -q '^broker version: ' \

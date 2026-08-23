@@ -13,9 +13,10 @@
 //!
 //! Async lives here; `storage` and `protocol` stay pure/sync.
 
-mod admin;
 mod actor;
+mod admin;
 mod error;
+mod fetchsession;
 mod group;
 mod handlers;
 mod logdirs;
@@ -36,6 +37,6 @@ pub use replication::{
     FetcherState, FollowerFetcherHealth, LeaderFollowerHealth, ReplicaManager,
     ReplicaManagerConfig, ReplicaPartition, ReplicationHealthSnapshot,
 };
-pub use server::{Broker, BrokerConfig};
-pub use tls::TlsIdentity;
+pub use server::{Broker, BrokerConfig, InternalListener};
 pub use state::BrokerState;
+pub use tls::TlsIdentity;

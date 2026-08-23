@@ -8,18 +8,18 @@ use brahmaputra_client::Transport;
 use brahmaputra_protocol::codec;
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
-    ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, AuthenticateRequest,
     AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, AddPartitionsToTxnRequest,
-    AddPartitionsToTxnResponse, AuthenticateResponse, BrokerInfo, DeleteRecordsRequest,
-    DescribeConfigsRequest, EndTxnRequest, EndTxnResponse, TxnMarkerResult,
-    TxnOffsetCommitRequest, TxnOffsetCommitResponse, WriteTxnMarkersRequest,
-    WriteTxnMarkersResponse,
-    DescribeGroupRequest, DescribeGroupResponse,
-    FetchMultiRequest, FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest,
-    ListGroupsResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
+    AddPartitionsToTxnResponse, AlterConfigsRequest, ApiVersionRange, ApiVersionsRequest,
+    ApiVersionsResponse, AuthenticateRequest, AuthenticateResponse, BrokerInfo,
+    DeleteRecordsRequest, DescribeConfigsRequest, DescribeGroupRequest, DescribeGroupResponse,
+    DescribeProducersRequest, EndTxnRequest, EndTxnResponse, FetchMultiRequest, FetchRequest,
+    FetchResponse, HeartbeatRequest, HeartbeatResponse, JoinGroupRequest, JoinGroupResponse,
+    LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest, ListGroupsResponse,
+    ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
     OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
     PartitionInfo, ProduceResponse, SyncGroupRequest, SyncGroupResponse, TopicInfo,
+    TxnMarkerResult, TxnOffsetCommitRequest, TxnOffsetCommitResponse, WriteTxnMarkersRequest,
+    WriteTxnMarkersResponse,
 };
 use brahmaputra_protocol::producer::{InitProducerIdRequest, InitProducerIdResponse};
 use brahmaputra_protocol::replica::{
@@ -39,7 +39,7 @@ use crate::group::{coordinator_partition, CoordinatorShard, OFFSETS_TOPIC};
 use crate::producer_id::ProducerIdError;
 use crate::quota::QuotaKind;
 use crate::server::Broker;
-use brahmaputra_metadata::{AclOperation, ResourceType};
+use brahmaputra_metadata::{scram, AclOperation, ResourceType};
 use brahmaputra_metrics::{names, MetricKey};
 
 /// Sentinels for `ListOffsetsRequest.timestamp` (Kafka convention).
@@ -63,6 +63,25 @@ const REPLICA_FETCH_MAX_WAIT_MS: u64 = 500;
 #[derive(Debug, Default)]
 pub struct ConnectionSession {
     principal: std::sync::RwLock<Option<String>>,
+    /// A SCRAM exchange in progress on this connection.
+    ///
+    /// Per connection, and never shared, because that is what binds the two
+    /// halves of the exchange together: a client-final message can only
+    /// answer the server-first message sent on the same socket, so a proof
+    /// captured elsewhere has nothing to attach itself to.
+    scram: std::sync::Mutex<Option<ScramExchange>>,
+}
+
+/// What the server remembers between the two steps of a SCRAM exchange.
+#[derive(Debug, Clone)]
+struct ScramExchange {
+    username: String,
+    /// Client nonce + server nonce, which the client must echo back.
+    nonce: String,
+    /// `client-first-bare,server-first,client-final-without-proof`, the
+    /// string both sides sign. Built as the exchange proceeds so neither
+    /// side can change what was said earlier.
+    auth_message_prefix: String,
 }
 
 impl ConnectionSession {
@@ -75,6 +94,7 @@ impl ConnectionSession {
     pub fn authenticated(principal: String) -> Self {
         ConnectionSession {
             principal: std::sync::RwLock::new(Some(principal)),
+            scram: std::sync::Mutex::new(None),
         }
     }
 
@@ -304,13 +324,198 @@ fn required_access(api_key: ApiKey, body: &Bytes) -> Vec<(ResourceType, String, 
                     .collect()
             })
             .unwrap_or_default(),
+        // Changing configuration is not describing it: `retention.ms` set
+        // to zero deletes a topic's data as surely as deleting the topic
+        // would, so this needs write permission on the resource.
+        ApiKey::AlterConfigs => AlterConfigsRequest::decode(body)
+            .map(|request| {
+                if request.resource_type.eq_ignore_ascii_case("topic") {
+                    vec![(
+                        ResourceType::Topic,
+                        request.resource_name,
+                        AclOperation::Write,
+                    )]
+                } else {
+                    vec![(
+                        ResourceType::Cluster,
+                        "cluster".to_string(),
+                        AclOperation::Write,
+                    )]
+                }
+            })
+            .unwrap_or_default(),
+        // Producer state on a partition is information about that
+        // partition, so it is gated exactly as describing the topic is.
+        ApiKey::DescribeProducers => DescribeProducersRequest::decode(body)
+            .map(|request| vec![(ResourceType::Topic, request.topic, AclOperation::Describe)])
+            .unwrap_or_default(),
+        // A transaction listing names every transactional id on the
+        // broker, which is cluster-wide information however narrow the
+        // filter.
+        ApiKey::ListTransactions | ApiKey::DescribeTransactions => vec![(
+            ResourceType::Cluster,
+            "cluster".to_string(),
+            AclOperation::Describe,
+        )],
+        // Moving data between disks is an operation on the broker, not on
+        // any one topic: it takes partitions offline while it runs.
+        ApiKey::AlterReplicaLogDirs => vec![(
+            ResourceType::Cluster,
+            "cluster".to_string(),
+            AclOperation::Write,
+        )],
         // Answered before authentication: a client has to be able to
         // discover versions and to authenticate at all.
         ApiKey::ApiVersions | ApiKey::Authenticate => Vec::new(),
     }
 }
 
-/// Bind a principal to this connection.
+/// One step of a SCRAM-SHA-256 exchange (RFC 5802).
+///
+/// Two round trips, and the connection remembers what happened in between:
+///
+/// ```text
+/// client -> n,,n=alice,r=CLIENTNONCE
+/// server -> r=CLIENTNONCESERVERNONCE,s=SALT,i=4096
+/// client -> c=biws,r=CLIENTNONCESERVERNONCE,p=PROOF
+/// server -> v=SERVERSIGNATURE
+/// ```
+///
+/// The password appears nowhere. The client proves it can compute a key
+/// derived from the password over a message *both* sides contributed
+/// randomness to, which is what makes a captured exchange useless: replayed
+/// against a new connection it answers a challenge nobody asked.
+fn scram_step(
+    broker: &Broker,
+    request: &AuthenticateRequest,
+    session: &ConnectionSession,
+) -> Bytes {
+    let respond = |error_code, principal: &str, role: &str, payload: String, done: bool| {
+        Bytes::from(
+            AuthenticateResponse {
+                error_code,
+                principal: principal.to_owned(),
+                role: role.to_owned(),
+                payload,
+                done,
+            }
+            .encode()
+            .unwrap_or_default(),
+        )
+    };
+    let failed = || respond(ec::SASL_AUTHENTICATION_FAILED, "", "", String::new(), true);
+
+    let Some(cache) = broker.metadata_cache() else {
+        // Standalone has no user store to authenticate against.
+        return failed();
+    };
+    let image = cache.snapshot();
+
+    let in_progress = session
+        .scram
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+
+    let Some(exchange) = in_progress else {
+        // Step one: the client-first message.
+        let message = &request.payload;
+        // The GS2 header is the part before the second comma. Channel
+        // binding is not offered, so anything other than "n" or "y" is a
+        // client asking for something this broker cannot honour.
+        let Some(bare) = message
+            .split_once(",,")
+            .map(|(_, bare)| bare)
+            .filter(|_| message.starts_with("n,") || message.starts_with("y,"))
+        else {
+            return failed();
+        };
+        let (Some(username), Some(client_nonce)) =
+            (scram::field(bare, "n"), scram::field(bare, "r"))
+        else {
+            return failed();
+        };
+        // A user that does not exist, and one without a SCRAM credential,
+        // are answered exactly as a wrong password is — including with a
+        // well-formed challenge, so an attacker cannot enumerate accounts
+        // by watching which usernames get one.
+        let credential = image
+            .users
+            .get(username)
+            .and_then(|user| user.scram.clone());
+        let server_nonce = scram::random_nonce();
+        let nonce = format!("{client_nonce}{server_nonce}");
+        let (salt, iterations) = match &credential {
+            Some(credential) => (credential.salt.clone(), credential.iterations),
+            None => (
+                // A decoy of the right shape. The exchange proceeds and
+                // fails at the proof, which is where a wrong password
+                // fails too.
+                base64_of(scram::random_salt()),
+                scram::DEFAULT_ITERATIONS,
+            ),
+        };
+        let server_first = format!("r={nonce},s={salt},i={iterations}");
+        *session
+            .scram
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ScramExchange {
+            username: username.to_owned(),
+            nonce,
+            auth_message_prefix: format!("{bare},{server_first}"),
+        });
+        return respond(ec::NONE, "", "", server_first, false);
+    };
+
+    // Step two: the client-final message.
+    let message = &request.payload;
+    let (Some(nonce), Some(proof)) = (scram::field(message, "r"), scram::field(message, "p"))
+    else {
+        return failed();
+    };
+    if nonce != exchange.nonce {
+        // The client answered a different challenge than the one this
+        // connection issued.
+        return failed();
+    }
+    let without_proof = match message.rsplit_once(",p=") {
+        Some((head, _)) => head,
+        None => return failed(),
+    };
+    let auth_message = format!("{},{}", exchange.auth_message_prefix, without_proof);
+
+    let Some(user) = image.users.get(&exchange.username) else {
+        return failed();
+    };
+    let Some(credential) = user.scram.as_ref() else {
+        return failed();
+    };
+    if !credential.verify_proof(&auth_message, proof) {
+        warn!(username = %exchange.username, "failed SCRAM authentication");
+        return failed();
+    }
+
+    // The server proves itself in the same breath, so the client knows it
+    // is not talking to something that merely collected a proof.
+    let server_final = format!("v={}", credential.server_signature(&auth_message));
+    session.set_principal(user.username.clone());
+    *session
+        .scram
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    respond(
+        ec::NONE,
+        &user.username,
+        &format!("{:?}", user.role).to_lowercase(),
+        server_final,
+        true,
+    )
+}
+
+fn base64_of(bytes: Vec<u8>) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
 async fn authenticate(broker: &Broker, body: Bytes, session: &ConnectionSession) -> Bytes {
     let respond = |error_code, principal: &str, role: &str| {
         Bytes::from(
@@ -318,6 +523,8 @@ async fn authenticate(broker: &Broker, body: Bytes, session: &ConnectionSession)
                 error_code,
                 principal: principal.to_owned(),
                 role: role.to_owned(),
+                payload: String::new(),
+                done: true,
             }
             .encode()
             .unwrap_or_default(),
@@ -330,11 +537,24 @@ async fn authenticate(broker: &Broker, body: Bytes, session: &ConnectionSession)
             return respond(ec::INVALID_REQUEST, "", "");
         }
     };
+
+    if request.mechanism.eq_ignore_ascii_case(scram::MECHANISM) {
+        return scram_step(broker, &request, session);
+    }
+    if !request.mechanism.is_empty() && !request.mechanism.eq_ignore_ascii_case("PLAIN") {
+        warn!(mechanism = %request.mechanism, "unsupported SASL mechanism");
+        return respond(ec::UNSUPPORTED_SASL_MECHANISM, "", "");
+    }
+
     // A password in the clear is only meaningful under encryption. Refusing
     // it on a plaintext listener stops a deployment from believing it has
     // authentication when it is handing credentials to the network.
+    //
+    // SCRAM is the answer for a plaintext listener, and it is checked above
+    // this line for exactly that reason: it never sends the password, so
+    // the objection does not apply to it.
     if broker.config().transport == Transport::Tcp {
-        warn!("Authenticate refused on a plaintext listener");
+        warn!("PLAIN authentication refused on a plaintext listener");
         return respond(ec::SASL_AUTHENTICATION_FAILED, "", "");
     }
     let Some(cache) = broker.metadata_cache() else {
@@ -459,9 +679,7 @@ pub async fn dispatch(
         1,
     );
     match header.api_key {
-        ApiKey::Produce => produce(broker, body, client)
-            .await
-            .map(ResponseBody::from),
+        ApiKey::Produce => produce(broker, body, client).await.map(ResponseBody::from),
         // The fetch paths return their pieces rather than one buffer, so
         // the record batches reach the socket without being copied again.
         ApiKey::Fetch => Some(fetch(broker, body, client).await.into()),
@@ -493,6 +711,23 @@ pub async fn dispatch(
         ApiKey::DescribeConfigs => Some(crate::admin::describe_configs(broker, body).into()),
         ApiKey::DescribeLogDirs => Some(crate::admin::describe_log_dirs(broker, body).await.into()),
         ApiKey::DeleteRecords => Some(crate::admin::delete_records(broker, body).await.into()),
+        ApiKey::AlterConfigs => Some(crate::admin::alter_configs(broker, body).await.into()),
+        ApiKey::DescribeProducers => {
+            Some(crate::admin::describe_producers(broker, body).await.into())
+        }
+        ApiKey::ListTransactions => {
+            Some(crate::admin::list_transactions(broker, body).await.into())
+        }
+        ApiKey::DescribeTransactions => Some(
+            crate::admin::describe_transactions(broker, body)
+                .await
+                .into(),
+        ),
+        ApiKey::AlterReplicaLogDirs => Some(
+            crate::admin::alter_replica_log_dirs(broker, body)
+                .await
+                .into(),
+        ),
     }
 }
 
@@ -621,10 +856,9 @@ pub(crate) fn encode_error_for(api_key: ApiKey, error_code: i32) -> Bytes {
             ..Default::default()
         }
         .encode(),
-        ApiKey::AddPartitionsToTxn => brahmaputra_protocol::gen::AddPartitionsToTxnResponse {
-            error_code,
+        ApiKey::AddPartitionsToTxn => {
+            brahmaputra_protocol::gen::AddPartitionsToTxnResponse { error_code }.encode()
         }
-        .encode(),
         ApiKey::AddOffsetsToTxn => {
             brahmaputra_protocol::gen::AddOffsetsToTxnResponse { error_code }.encode()
         }
@@ -635,6 +869,30 @@ pub(crate) fn encode_error_for(api_key: ApiKey, error_code: i32) -> Bytes {
         // Per-partition results; a request-level failure names none of them.
         ApiKey::WriteTxnMarkers => {
             brahmaputra_protocol::gen::WriteTxnMarkersResponse::default().encode()
+        }
+        ApiKey::AlterConfigs => brahmaputra_protocol::gen::AlterConfigsResponse {
+            error_code,
+            ..Default::default()
+        }
+        .encode(),
+        ApiKey::DescribeProducers => brahmaputra_protocol::gen::DescribeProducersResponse {
+            error_code,
+            ..Default::default()
+        }
+        .encode(),
+        ApiKey::ListTransactions => brahmaputra_protocol::gen::ListTransactionsResponse {
+            error_code,
+            ..Default::default()
+        }
+        .encode(),
+        ApiKey::DescribeTransactions => brahmaputra_protocol::gen::DescribeTransactionsResponse {
+            error_code,
+            ..Default::default()
+        }
+        .encode(),
+        // Per-partition results; a request-level failure names none.
+        ApiKey::AlterReplicaLogDirs => {
+            brahmaputra_protocol::gen::AlterReplicaLogDirsResponse::default().encode()
         }
     };
     Bytes::from(bytes.unwrap_or_default())
@@ -663,10 +921,14 @@ async fn init_producer_id(broker: &Broker, body: Bytes) -> Bytes {
     // bare identity allocation: the coordinator fences whatever instance
     // held the id before and resolves anything that instance abandoned.
     if let Some(transactional_id) = request.transactional_id.as_deref() {
+        // Clamped, because the timeout is what bounds how long an abandoned
+        // transaction can hold every committed reader of the partitions it
+        // touched — that is the broker's problem, not the client's to
+        // decide without limit.
         return match crate::transaction::init_transactional_producer(
             broker,
             transactional_id,
-            request.transaction_timeout_ms,
+            crate::transaction::clamp_transaction_timeout(broker, request.transaction_timeout_ms),
         )
         .await
         {
@@ -1181,6 +1443,29 @@ async fn produce(broker: &Broker, body: Bytes, client: ClientIdentity<'_>) -> Op
             return Some(respond(ec::INVALID_REQUEST, -1));
         }
     }
+    // `compression.type`, per topic — enforced by refusing a batch in the
+    // wrong codec rather than by converting it.
+    //
+    // Converting would mean decompressing and recompressing every batch on
+    // the way in, which is exactly the cost that byte-identical storage and
+    // the zero-copy fetch path exist to avoid. Refusing gives the operator
+    // the same guarantee — every batch on this topic is in the named codec
+    // — and tells the producer which one to use, which is more useful than
+    // silently rewriting its data.
+    if let Some(required) = broker.required_compression(&req.topic) {
+        if let Some(wrong) = headers.iter().find(|header| header.compression != required) {
+            warn!(
+                topic = %req.topic,
+                required = required.name(),
+                actual = wrong.compression.name(),
+                "rejecting a batch that is not in the topic's compression.type"
+            );
+            if acks == 0 {
+                return None;
+            }
+            return Some(respond(ec::INVALID_REQUEST, -1));
+        }
+    }
     let idempotent = headers[0].producer.is_some();
     if headers
         .iter()
@@ -1436,6 +1721,94 @@ pub(crate) async fn wait_for_high_watermark(
 
 // ---------- Fetch (api_key 1) ----------
 
+/// Which broker this consumer should read the partition from.
+///
+/// `-1` means "keep reading here", which is the answer for a consumer with
+/// no rack, a cluster with no rack information, and a consumer that is
+/// already in the leader's rack — the last of which matters, because
+/// redirecting it to a follower in the same rack would trade a fresher read
+/// for nothing.
+///
+/// Only in-sync replicas are ever named. A follower outside the ISR is by
+/// definition behind by an unbounded amount, and pointing a consumer at one
+/// converts a replication problem into a consumer that has silently stopped
+/// making progress.
+pub(crate) fn preferred_read_replica(
+    broker: &Broker,
+    topic: &str,
+    partition: i32,
+    rack: &str,
+) -> i32 {
+    if rack.is_empty() {
+        return -1;
+    }
+    let Some(cache) = broker.metadata_cache() else {
+        return -1;
+    };
+    preferred_read_replica_in(&cache.snapshot(), topic, partition, rack)
+}
+
+/// The rack decision itself, over a metadata image.
+pub(crate) fn preferred_read_replica_in(
+    image: &brahmaputra_metadata::ClusterMetadata,
+    topic: &str,
+    partition: i32,
+    rack: &str,
+) -> i32 {
+    if rack.is_empty() {
+        return -1;
+    }
+    let Some(assignment) = image
+        .topics
+        .get(topic)
+        .and_then(|topic| topic.partitions.get(&partition))
+    else {
+        return -1;
+    };
+    let rack_of = |broker_id: &i32| {
+        image
+            .brokers
+            .get(broker_id)
+            .and_then(|member| member.rack.clone())
+    };
+    if rack_of(&assignment.leader).as_deref() == Some(rack) {
+        return -1;
+    }
+    assignment
+        .isr
+        .iter()
+        .filter(|broker_id| **broker_id != assignment.leader)
+        .find(|broker_id| {
+            rack_of(broker_id).as_deref() == Some(rack)
+                && image
+                    .brokers
+                    .get(broker_id)
+                    .is_some_and(|member| member.alive)
+        })
+        .copied()
+        .unwrap_or(-1)
+}
+
+/// Resolve a partition for a consumer fetch.
+///
+/// A consumer that named a rack may be here because the leader sent it, so
+/// a follower must answer rather than refusing. It answers only up to its
+/// *own* high watermark, which the log already enforces — a follower cannot
+/// serve what it has not replicated — so the worst case is a consumer that
+/// is briefly behind, never one that sees a record the cluster has not
+/// committed.
+pub(crate) fn consumer_partition(
+    broker: &Broker,
+    topic: &str,
+    partition: i32,
+    rack: &str,
+) -> Result<crate::actor::PartitionHandle, BrokerError> {
+    if rack.is_empty() {
+        return broker.partition(topic, partition);
+    }
+    broker.replica_partition_for_read(topic, partition)
+}
+
 async fn fetch(broker: &Broker, body: Bytes, client: ClientIdentity<'_>) -> Vec<Bytes> {
     let req = match FetchRequest::decode(&body) {
         Ok(r) => r,
@@ -1445,6 +1818,11 @@ async fn fetch(broker: &Broker, body: Bytes, client: ClientIdentity<'_>) -> Vec<
         }
     };
     let isolation = IsolationLevel::from_wire(req.isolation_level);
+    // Which replica this consumer should be reading from. Computed before
+    // the read so that even a fetch that returns nothing carries the
+    // redirect: a caught-up consumer must not have to wait for a record to
+    // arrive before it stops crossing an availability zone.
+    let preferred = preferred_read_replica(broker, &req.topic, req.partition, &req.rack);
     // A committed read is already bounded at the last stable offset, and
     // the actor reports that offset in place of the high watermark — so the
     // two fields agree about the ceiling that actually applied.
@@ -1455,12 +1833,13 @@ async fn fetch(broker: &Broker, body: Bytes, client: ClientIdentity<'_>) -> Vec<
             error_code,
             high_watermark: hw,
             last_stable_offset: hw,
-            batches_length: 0,      // filled in by encode_fetch_response
+            batches_length: 0, // filled in by encode_fetch_response
+            preferred_read_replica: preferred,
         };
         codec::encode_fetch_response_chunks(&resp, batches).unwrap_or_default()
     };
 
-    let handle = match broker.partition(&req.topic, req.partition) {
+    let handle = match consumer_partition(broker, &req.topic, req.partition, &req.rack) {
         Ok(h) => h,
         Err(e) => return respond(code_of(&e), -1, &[]),
     };
@@ -1503,12 +1882,7 @@ async fn fetch(broker: &Broker, body: Bytes, client: ClientIdentity<'_>) -> Vec<
     metrics.count(names::FETCH_REQUESTS, 1);
     metrics.count(names::FETCH_BYTES, served);
     let throttle = broker
-        .throttle(
-            client.principal,
-            client.client_id,
-            QuotaKind::Fetch,
-            served,
-        )
+        .throttle(client.principal, client.client_id, QuotaKind::Fetch, served)
         .await;
     if !throttle.is_zero() {
         metrics.count(names::THROTTLED_REQUESTS, 1);
@@ -1644,11 +2018,7 @@ macro_rules! decode_or_reject {
 }
 
 async fn add_partitions_to_txn(broker: &Broker, body: Bytes) -> Bytes {
-    let request = decode_or_reject!(
-        AddPartitionsToTxnRequest,
-        body,
-        ApiKey::AddPartitionsToTxn
-    );
+    let request = decode_or_reject!(AddPartitionsToTxnRequest, body, ApiKey::AddPartitionsToTxn);
     let partitions = request
         .partitions
         .into_iter()
@@ -1767,6 +2137,9 @@ fn metadata(broker: &Broker, body: Bytes) -> Bytes {
                 broker_id: broker.broker_id,
                 host: broker.host.clone(),
                 port: i32::from(broker.data_port),
+                // Empty when the broker was started without --rack, which
+                // is what tells a client there is no locality to exploit.
+                rack: broker.rack.clone().unwrap_or_default(),
             })
             .collect();
         let names: Vec<&str> = if req.topics.is_empty() {
@@ -1857,6 +2230,9 @@ fn metadata(broker: &Broker, body: Bytes) -> Bytes {
             broker_id,
             host: addr.ip().to_string(),
             port: addr.port() as i32,
+            // A standalone broker is the only replica there is, so there is
+            // nothing a rack could route to.
+            rack: String::new(),
         }],
         controller_id: broker_id,
         topics,
@@ -1944,6 +2320,11 @@ const SUPPORTED_APIS: &[ApiKey] = &[
     ApiKey::EndTxn,
     ApiKey::TxnOffsetCommit,
     ApiKey::WriteTxnMarkers,
+    ApiKey::AlterConfigs,
+    ApiKey::DescribeProducers,
+    ApiKey::ListTransactions,
+    ApiKey::DescribeTransactions,
+    ApiKey::AlterReplicaLogDirs,
 ];
 
 // ---------- Consumer groups (api_keys 7-11, Blueprint 05) ----------
@@ -2176,6 +2557,11 @@ fn api_name(api_key: ApiKey) -> &'static str {
         ApiKey::EndTxn => "end_txn",
         ApiKey::TxnOffsetCommit => "txn_offset_commit",
         ApiKey::WriteTxnMarkers => "write_txn_markers",
+        ApiKey::AlterConfigs => "alter_configs",
+        ApiKey::DescribeProducers => "describe_producers",
+        ApiKey::ListTransactions => "list_transactions",
+        ApiKey::DescribeTransactions => "describe_transactions",
+        ApiKey::AlterReplicaLogDirs => "alter_replica_log_dirs",
     }
 }
 
@@ -2185,6 +2571,107 @@ mod tests {
     use crate::actor;
     use brahmaputra_protocol::Record;
     use brahmaputra_storage::{Log, LogConfig};
+
+    mod rack_aware_reads {
+        use super::*;
+        use brahmaputra_metadata::{
+            BrokerMetadata, ClusterMetadata, NodeRole, PartitionMetadata, TopicMetadata,
+        };
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// Three brokers, one per rack, with a partition whose leader is on
+        /// broker 1 and whose ISR is what each test sets.
+        fn image(isr: Vec<i32>) -> ClusterMetadata {
+            let mut image = ClusterMetadata::default();
+            for (broker_id, rack) in [(1, "east"), (2, "west"), (3, "north")] {
+                image.brokers.insert(
+                    broker_id,
+                    BrokerMetadata {
+                        broker_id,
+                        host: "127.0.0.1".into(),
+                        data_port: 9092 + broker_id as u16,
+                        control_port: 19092 + broker_id as u16,
+                        internal_port: 0,
+                        broker_epoch: 1,
+                        roles: BTreeSet::from([NodeRole::Broker]),
+                        rack: Some(rack.to_owned()),
+                        alive: true,
+                        last_heartbeat_ms: 0,
+                    },
+                );
+            }
+            image.topics.insert(
+                "orders".into(),
+                TopicMetadata {
+                    name: "orders".into(),
+                    replication_factor: 3,
+                    partitions: BTreeMap::from([(
+                        0,
+                        PartitionMetadata {
+                            partition: 0,
+                            replicas: vec![1, 2, 3],
+                            leader: 1,
+                            isr,
+                            leader_epoch: 1,
+                            target_replicas: None,
+                        },
+                    )]),
+                    configs: BTreeMap::new(),
+                },
+            );
+            image
+        }
+
+        /// A consumer that names no rack is not being redirected anywhere.
+        #[test]
+        fn no_rack_means_read_from_the_leader() {
+            assert_eq!(
+                preferred_read_replica_in(&image(vec![1, 2, 3]), "orders", 0, ""),
+                -1
+            );
+        }
+
+        /// A consumer already in the leader's rack must stay there:
+        /// redirecting it to a follower alongside would trade a fresher
+        /// read for nothing at all.
+        #[test]
+        fn a_consumer_in_the_leaders_rack_is_not_redirected() {
+            assert_eq!(
+                preferred_read_replica_in(&image(vec![1, 2, 3]), "orders", 0, "east"),
+                -1
+            );
+        }
+
+        /// The point of the feature.
+        #[test]
+        fn a_consumer_is_sent_to_an_in_sync_replica_in_its_own_rack() {
+            assert_eq!(
+                preferred_read_replica_in(&image(vec![1, 2, 3]), "orders", 0, "west"),
+                2
+            );
+        }
+
+        /// A replica out of the ISR is behind by an unbounded amount.
+        /// Sending a consumer there turns a replication problem into a
+        /// consumer that has silently stopped making progress.
+        #[test]
+        fn a_replica_outside_the_isr_is_never_named() {
+            assert_eq!(
+                preferred_read_replica_in(&image(vec![1, 3]), "orders", 0, "west"),
+                -1
+            );
+        }
+
+        /// A rack nothing is in falls back to the leader rather than to
+        /// whichever replica happened to be listed first.
+        #[test]
+        fn an_unknown_rack_falls_back_to_the_leader() {
+            assert_eq!(
+                preferred_read_replica_in(&image(vec![1, 2, 3]), "orders", 0, "south"),
+                -1
+            );
+        }
+    }
 
     #[tokio::test]
     async fn unread_watermark_notification_wakes_long_poll_immediately() {
@@ -2209,7 +2696,16 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_millis(100),
-            long_poll_until_min_bytes(&handle, &mut watch, 0, usize::MAX, 1, 2_000, IsolationLevel::ReadUncommitted, stale_outcome),
+            long_poll_until_min_bytes(
+                &handle,
+                &mut watch,
+                0,
+                usize::MAX,
+                1,
+                2_000,
+                IsolationLevel::ReadUncommitted,
+                stale_outcome,
+            ),
         )
         .await
         .expect("an unread watermark update should wake without waiting for the deadline")

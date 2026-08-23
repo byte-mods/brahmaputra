@@ -27,7 +27,7 @@ const SCHEMA_VERSION = '1.0.0';
 // Version 3 added transactions: Fetch carries an isolation_level, and
 // MetadataResponse carries a request-level error code so an authorization
 // denial is no longer reported as an unknown topic.
-const API_VERSION = 3;
+const API_VERSION = 4;
 
 // Isolation levels for a fetch. READ_UNCOMMITTED is the default and is what
 // every non-transactional topic gives either way.
@@ -43,6 +43,10 @@ const MAGIC_V2 = 2;
 
 const COMPRESSION_MASK = 0x0007;
 const HEADERS_BIT = 0x0008;
+// Some record in this batch has a null value: a tombstone, which deletes
+// its key on a compacted topic. Set only when one is present, so a batch
+// without one encodes exactly as it always did.
+const NULL_VALUE_BIT = 0x0040;
 
 const MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024;
 
@@ -486,6 +490,11 @@ function getUvarint(data, pos) {
  */
 function encodeRecordBatch(records, maxTimestamp, codec = Compression.NONE) {
   const hasHeaders = records.some((record) => record.headers && record.headers.length > 0);
+  // A null or undefined value is a tombstone and needs the widened length
+  // encoding; an empty buffer is an ordinary record and must not trigger it.
+  const hasNullValues = records.some(
+    (record) => record.value === null || record.value === undefined,
+  );
 
   const payloadParts = [];
   for (const record of records) {
@@ -496,8 +505,17 @@ function encodeRecordBatch(records, maxTimestamp, codec = Compression.NONE) {
       putUvarint(rec, record.key.length + 1);
       rec.push(...record.key);
     }
-    putUvarint(rec, record.value.length);
-    rec.push(...record.value);
+    if (hasNullValues) {
+      if (record.value === null || record.value === undefined) {
+        putUvarint(rec, 0);
+      } else {
+        putUvarint(rec, record.value.length + 1);
+        rec.push(...record.value);
+      }
+    } else {
+      putUvarint(rec, record.value.length);
+      rec.push(...record.value);
+    }
     const delta = BigInt.asIntN(64, BigInt(record.timestampDelta || 0));
     putUvarint(rec, BigInt.asUintN(64, (delta << 1n) ^ (delta >> 63n)));
     if (hasHeaders) {
@@ -523,6 +541,7 @@ function encodeRecordBatch(records, maxTimestamp, codec = Compression.NONE) {
   const compressed = compress(codec, Buffer.concat(payloadParts));
   let attributes = codec & COMPRESSION_MASK;
   if (hasHeaders) attributes |= HEADERS_BIT;
+  if (hasNullValues) attributes |= NULL_VALUE_BIT;
 
   const batchLength = MIN_BATCH_LENGTH + compressed.length;
   const head = Buffer.allocUnsafe(BATCH_HEADER_LEN + MIN_BATCH_LENGTH);
@@ -570,11 +589,15 @@ function decodeRecordBatch(data, offset) {
   if (magic === MAGIC_V2) cursor += PRODUCER_EXTENSION_LEN;
 
   const payload = decompress(attributes & COMPRESSION_MASK, data.subarray(cursor, end));
-  const records = decodeRecords(payload, (attributes & HEADERS_BIT) !== 0);
+  const records = decodeRecords(
+    payload,
+    (attributes & HEADERS_BIT) !== 0,
+    (attributes & NULL_VALUE_BIT) !== 0,
+  );
   return { batch: { baseOffset, maxTimestamp, records }, next: end };
 }
 
-function decodeRecords(payload, hasHeaders) {
+function decodeRecords(payload, hasHeaders, hasNullValues) {
   const records = [];
   let pos = 0;
   while (pos < payload.length) {
@@ -593,10 +616,18 @@ function decodeRecords(payload, hasHeaders) {
       pos += keyLen;
     }
 
-    let valueLen;
-    [valueLen, pos] = getUvarint(payload, pos);
-    const value = Buffer.from(payload.subarray(pos, pos + Number(valueLen)));
-    pos += Number(valueLen);
+    let rawValueLen;
+    [rawValueLen, pos] = getUvarint(payload, pos);
+    let value;
+    if (hasNullValues && rawValueLen === 0n) {
+      // A tombstone. Null rather than an empty buffer, which is what
+      // distinguishes a deletion from a record whose value is empty.
+      value = null;
+    } else {
+      const valueLen = hasNullValues ? Number(rawValueLen) - 1 : Number(rawValueLen);
+      value = Buffer.from(payload.subarray(pos, pos + valueLen));
+      pos += valueLen;
+    }
 
     let rawDelta;
     [rawDelta, pos] = getUvarint(payload, pos);

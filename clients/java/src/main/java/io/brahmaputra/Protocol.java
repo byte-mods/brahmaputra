@@ -42,7 +42,7 @@ public final class Protocol {
     // Version 3 added transactions: Fetch carries an isolation_level, and
     // MetadataResponse carries a request-level error code so an authorization
     // denial is no longer reported as an unknown topic.
-    public static final short API_VERSION = 3;
+    public static final short API_VERSION = 4;
 
     /** Isolation levels for a fetch. READ_UNCOMMITTED is the default. */
     public static final int READ_UNCOMMITTED = 0;
@@ -57,6 +57,10 @@ public final class Protocol {
 
     static final int COMPRESSION_MASK = 0x0007;
     static final int HEADERS_BIT = 0x0008;
+    /// Some record in this batch has a null value: a tombstone, which
+    /// deletes its key on a compacted topic. Set only when one is present,
+    /// so a batch without one encodes exactly as it always did.
+    static final int NULL_VALUE_BIT = 0x0040;
 
     static final int MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024;
 
@@ -646,6 +650,15 @@ public final class Protocol {
                 break;
             }
         }
+        // A null value is a tombstone and needs the widened length encoding;
+        // a zero-length value is an ordinary record and must not trigger it.
+        boolean hasNullValues = false;
+        for (Record record : records) {
+            if (record.value == null) {
+                hasNullValues = true;
+                break;
+            }
+        }
 
         ByteArrayOutputStream payload = new ByteArrayOutputStream(1024);
         for (Record record : records) {
@@ -656,8 +669,17 @@ public final class Protocol {
                 putUvarint(rec, record.key.length + 1L);
                 rec.write(record.key, 0, record.key.length);
             }
-            putUvarint(rec, record.value.length);
-            rec.write(record.value, 0, record.value.length);
+            if (hasNullValues) {
+                if (record.value == null) {
+                    putUvarint(rec, 0);
+                } else {
+                    putUvarint(rec, record.value.length + 1L);
+                    rec.write(record.value, 0, record.value.length);
+                }
+            } else {
+                putUvarint(rec, record.value.length);
+                rec.write(record.value, 0, record.value.length);
+            }
             putUvarint(rec, (record.timestampDelta << 1) ^ (record.timestampDelta >> 63));
             if (hasHeaders) {
                 putUvarint(rec, record.headers.size());
@@ -682,6 +704,9 @@ public final class Protocol {
         int attributes = codec.value & COMPRESSION_MASK;
         if (hasHeaders) {
             attributes |= HEADERS_BIT;
+        }
+        if (hasNullValues) {
+            attributes |= NULL_VALUE_BIT;
         }
         int batchLength = MIN_BATCH_LENGTH + compressed.length;
 
@@ -754,11 +779,16 @@ public final class Protocol {
         System.arraycopy(data, cursor, region, 0, region.length);
         byte[] decompressed =
                 decompress(Compression.fromValue(attributes & COMPRESSION_MASK), region);
-        List<Record> records = decodeRecords(decompressed, (attributes & HEADERS_BIT) != 0);
+        List<Record> records =
+                decodeRecords(
+                        decompressed,
+                        (attributes & HEADERS_BIT) != 0,
+                        (attributes & NULL_VALUE_BIT) != 0);
         return new BatchAt(new DecodedBatch(baseOffset, maxTimestamp, records), end);
     }
 
-    private static List<Record> decodeRecords(byte[] payload, boolean hasHeaders) {
+    private static List<Record> decodeRecords(
+            byte[] payload, boolean hasHeaders, boolean hasNullValues) {
         List<Record> records = new ArrayList<>();
         int pos = 0;
         while (pos < payload.length) {
@@ -782,11 +812,19 @@ public final class Protocol {
             }
 
             read = getUvarint(payload, pos);
-            int valueLen = (int) read[0];
+            long rawValueLen = read[0];
             pos = (int) read[1];
-            byte[] value = new byte[valueLen];
-            System.arraycopy(payload, pos, value, 0, valueLen);
-            pos += valueLen;
+            byte[] value;
+            if (hasNullValues && rawValueLen == 0) {
+                // A tombstone. Null rather than an empty array, which is
+                // what distinguishes a deletion from an empty value.
+                value = null;
+            } else {
+                int valueLen = (int) (hasNullValues ? rawValueLen - 1 : rawValueLen);
+                value = new byte[valueLen];
+                System.arraycopy(payload, pos, value, 0, valueLen);
+                pos += valueLen;
+            }
 
             read = getUvarint(payload, pos);
             long rawDelta = read[0];

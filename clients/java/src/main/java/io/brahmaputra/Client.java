@@ -16,6 +16,7 @@ import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -129,21 +130,78 @@ public final class Client {
         }
 
         /**
-         * Bind a principal to this connection.
+         * Bind a principal to this connection using SCRAM-SHA-256.
          *
-         * <p>The password crosses the wire in the clear exactly as SASL/PLAIN does, so the broker
-         * refuses this on a plaintext listener. Use TLS.
+         * <p>The password never crosses the wire: the broker sends a challenge and this answers
+         * with a proof derived from the password, which is what makes authentication meaningful on
+         * a plaintext listener. Use {@link #authenticatePlain} only where the connection is already
+         * encrypted.
          */
         public String[] authenticate(String username, String password) {
-            Writer writer = Writer.body().string(username).string(password);
+            byte[] nonceBytes = new byte[18];
+            new java.security.SecureRandom().nextBytes(nonceBytes);
+            String clientNonce =
+                    java.util.Base64.getEncoder().encodeToString(nonceBytes).replace(',', '.');
+            String bare = "n=" + username + ",r=" + clientNonce;
+            Object[] first = authenticateStep(username, "", SCRAM_MECHANISM, "n,," + bare);
+            if ((Boolean) first[3]) {
+                throw new ProtocolException("broker ended the SCRAM exchange before it began");
+            }
+
+            String serverFirst = (String) first[2];
+            String nonce = scramField(serverFirst, "r");
+            String salt = scramField(serverFirst, "s");
+            String iterationsField = scramField(serverFirst, "i");
+            if (nonce == null || salt == null || iterationsField == null) {
+                throw new ProtocolException("malformed SCRAM server-first message");
+            }
+            int iterations;
+            try {
+                iterations = Integer.parseInt(iterationsField);
+            } catch (NumberFormatException error) {
+                throw new ProtocolException("malformed SCRAM iteration count");
+            }
+            // The server must have kept this client's nonce, which is what makes the exchange this
+            // one rather than a replay of an earlier one.
+            if (!nonce.startsWith(clientNonce)) {
+                throw new ProtocolException("SCRAM server nonce does not extend the client nonce");
+            }
+
+            // `biws` is base64 of the GS2 header "n,,", echoed so the server can see it was not
+            // altered in flight.
+            String withoutProof = "c=biws,r=" + nonce;
+            String authMessage = bare + "," + serverFirst + "," + withoutProof;
+            String proof = scramClientProof(password, salt, iterations, authMessage);
+            Object[] last =
+                    authenticateStep(
+                            username, "", SCRAM_MECHANISM, withoutProof + ",p=" + proof);
+            return new String[] {(String) last[0], (String) last[1]};
+        }
+
+        /** Send the password itself, as SASL/PLAIN does. Refused on a plaintext listener. */
+        public String[] authenticatePlain(String username, String password) {
+            Object[] result = authenticateStep(username, password, "PLAIN", "");
+            return new String[] {(String) result[0], (String) result[1]};
+        }
+
+        private Object[] authenticateStep(
+                String username, String password, String mechanism, String payload) {
+            Writer writer =
+                    Writer.body()
+                            .string(username)
+                            .string(password)
+                            .string(mechanism)
+                            .string(payload);
             Reader reader = Reader.body(request(ApiKey.AUTHENTICATE, writer.bytes()));
             int code = reader.int32();
             String principal = reader.string();
             String role = reader.string();
+            String responsePayload = reader.string();
+            boolean done = reader.bool();
             if (code != ErrorCode.NONE) {
                 throw new ServerException(code, "authenticate");
             }
-            return new String[] {principal, role};
+            return new Object[] {principal, role, responsePayload, done};
         }
 
         /** What the broker speaks — the one call that works across a version mismatch. */
@@ -169,15 +227,74 @@ public final class Client {
     // Metadata and routing
     // -----------------------------------------------------------------------
 
+
+    private static final String SCRAM_MECHANISM = "SCRAM-SHA-256";
+
+    /** One {@code key=value} field out of a SCRAM message. */
+    private static String scramField(String message, String key) {
+        for (String part : message.split(",")) {
+            if (part.startsWith(key + "=")) {
+                return part.substring(key.length() + 1);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The client half of RFC 5802: prove knowledge of the password without sending it.
+     *
+     * <p>PBKDF2-HMAC-SHA256 is the same construction the broker derives its stored key with, so
+     * the two cannot drift apart.
+     */
+    private static String scramClientProof(
+            String password, String salt, int iterations, String authMessage) {
+        try {
+            javax.crypto.SecretKeyFactory factory =
+                    javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+            java.security.spec.KeySpec spec =
+                    new javax.crypto.spec.PBEKeySpec(
+                            password.toCharArray(),
+                            java.util.Base64.getDecoder().decode(salt),
+                            iterations,
+                            256);
+            byte[] salted = factory.generateSecret(spec).getEncoded();
+            byte[] clientKey = scramHmac(salted, "Client Key".getBytes(StandardCharsets.UTF_8));
+            byte[] storedKey =
+                    java.security.MessageDigest.getInstance("SHA-256").digest(clientKey);
+            byte[] signature =
+                    scramHmac(storedKey, authMessage.getBytes(StandardCharsets.UTF_8));
+            byte[] proof = new byte[clientKey.length];
+            for (int i = 0; i < clientKey.length; i++) {
+                proof[i] = (byte) (clientKey[i] ^ signature[i]);
+            }
+            return java.util.Base64.getEncoder().encodeToString(proof);
+        } catch (java.security.GeneralSecurityException error) {
+            throw new ProtocolException("cannot compute a SCRAM proof: " + error.getMessage());
+        }
+    }
+
+    private static byte[] scramHmac(byte[] key, byte[] message) {
+        try {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(message);
+        } catch (java.security.GeneralSecurityException error) {
+            throw new ProtocolException("cannot compute an HMAC: " + error.getMessage());
+        }
+    }
+
     public static final class BrokerInfo {
         public final int nodeId;
         public final String host;
         public final int port;
+        /** Failure domain this broker is in, empty when it was started without --rack. */
+        public final String rack;
 
-        BrokerInfo(int nodeId, String host, int port) {
+        BrokerInfo(int nodeId, String host, int port, String rack) {
             this.nodeId = nodeId;
             this.host = host;
             this.port = port;
+            this.rack = rack;
         }
     }
 
@@ -256,7 +373,9 @@ public final class Client {
         }
         List<BrokerInfo> brokers = new ArrayList<>();
         for (int count = reader.int32(); count > 0; count--) {
-            brokers.add(new BrokerInfo(reader.int32(), reader.string(), reader.int32()));
+            brokers.add(
+                    new BrokerInfo(
+                            reader.int32(), reader.string(), reader.int32(), reader.string()));
         }
         reader.skipInt32(); // controller_id
         List<TopicInfo> topics = new ArrayList<>();
@@ -764,6 +883,8 @@ public final class Client {
         /** READ_UNCOMMITTED (0) or READ_COMMITTED (1). A committed read stops at the
          * last stable offset and never sees an aborted transaction's records. */
         public int isolationLevel = Protocol.READ_UNCOMMITTED;
+        /** This consumer's failure domain (`client.rack`), empty when it has none. */
+        public String rack = "";
         public int maxPollRecords = 500;
         public int dialTimeoutMs = 30_000;
     }
@@ -820,6 +941,9 @@ public final class Client {
                     .int32(Math.min(maxWaitMs, config.fetchMaxWaitMs))
                     .int32(config.fetchMinBytes)
                     .int32(config.isolationLevel)
+                    // `client.rack`: with it set the leader names an in-sync replica in
+                    // the same rack, and this client reads from that instead.
+                    .string(config.rack)
                     .bytes();
 
             Object[] result = fetchOnce(router.connectionFor(topic, partition), body);
@@ -861,6 +985,10 @@ public final class Client {
             long highWatermark = reader.int64();
             reader.skipInt64();  // last_stable_offset
             long batchesLength = reader.int64();
+            // Read even though this client does not act on it: the batches trail the
+            // whole struct, so skipping a field would take them from the wrong offset
+            // and every batch after it would fail to decode.
+            reader.skipInt32(); // preferred_read_replica
             byte[] trailing = reader.rest();
             if (batchesLength > trailing.length) {
                 throw new ProtocolException(

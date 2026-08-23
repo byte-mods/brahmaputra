@@ -18,10 +18,13 @@ use tracing::warn;
 use brahmaputra_metadata::NodeRole;
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
-    ConfigEntry, DeleteRecordsRequest, DeleteRecordsResponse, DeleteRecordsResult,
-    DescribeClusterBroker, DescribeClusterRequest, DescribeClusterResponse, DescribeConfigsRequest,
-    DescribeConfigsResponse, DescribeLogDirsRequest, DescribeLogDirsResponse, LogDirInfo,
-    LogDirPartition,
+    AlterConfigsRequest, AlterConfigsResponse, AlterLogDirResult, AlterReplicaLogDirsRequest,
+    AlterReplicaLogDirsResponse, ConfigEntry, DeleteRecordsRequest, DeleteRecordsResponse,
+    DeleteRecordsResult, DescribeClusterBroker, DescribeClusterRequest, DescribeClusterResponse,
+    DescribeConfigsRequest, DescribeConfigsResponse, DescribeLogDirsRequest,
+    DescribeLogDirsResponse, DescribeProducersRequest, DescribeProducersResponse,
+    DescribeTransactionsRequest, DescribeTransactionsResponse, ListTransactionsRequest,
+    ListTransactionsResponse, LogDirInfo, LogDirPartition, ProducerState,
 };
 use brahmaputra_protocol::ApiKey;
 
@@ -98,7 +101,8 @@ fn topic_config_defaults(broker: &Broker) -> Vec<(&'static str, String)> {
         ("segment.bytes", log.segment_bytes.to_string()),
         (
             "segment.ms",
-            log.segment_ms.map_or_else(|| "-1".to_owned(), |v| v.to_string()),
+            log.segment_ms
+                .map_or_else(|| "-1".to_owned(), |v| v.to_string()),
         ),
         (
             "retention.ms",
@@ -114,7 +118,27 @@ fn topic_config_defaults(broker: &Broker) -> Vec<(&'static str, String)> {
             "cleanup.policy",
             if log.compact { "compact" } else { "delete" }.to_owned(),
         ),
-        ("max.message.bytes", "-1".to_owned()),
+        ("delete.retention.ms", log.delete_retention_ms.to_string()),
+        (
+            "min.cleanable.dirty.ratio",
+            log.min_cleanable_dirty_ratio.to_string(),
+        ),
+        (
+            "min.compaction.lag.ms",
+            log.min_compaction_lag_ms.to_string(),
+        ),
+        (
+            "max.compaction.lag.ms",
+            log.max_compaction_lag_ms
+                .map_or_else(|| "-1".to_owned(), |v| v.to_string()),
+        ),
+        (
+            "max.message.bytes",
+            broker
+                .config()
+                .max_message_bytes
+                .map_or_else(|| "-1".to_owned(), |limit| limit.to_string()),
+        ),
         (
             "flush.messages",
             log.flush_interval_messages
@@ -126,6 +150,23 @@ fn topic_config_defaults(broker: &Broker) -> Vec<(&'static str, String)> {
                 .map_or_else(|| "-1".to_owned(), |v| v.to_string()),
         ),
         ("index.interval.bytes", log.index_interval_bytes.to_string()),
+        (
+            "message.timestamp.type",
+            if log.log_append_time {
+                "LogAppendTime"
+            } else {
+                "CreateTime"
+            }
+            .to_owned(),
+        ),
+        // Reported as Kafka's `producer` value, which is exactly what this
+        // broker does: it stores the codec the producer chose, byte for
+        // byte. Converting a batch to a topic-wide codec would mean
+        // decompressing and recompressing every one of them, which is the
+        // cost the zero-copy fetch path and byte-identical replication
+        // exist to avoid. `compression.type` on a topic is enforced by
+        // *refusing* a batch in another codec, never by rewriting it.
+        ("compression.type", "producer".to_owned()),
         ("min.insync.replicas", "1".to_owned()),
     ]
 }
@@ -152,7 +193,10 @@ fn broker_configs(broker: &Broker) -> Vec<(String, String)> {
             "num.partitions".to_owned(),
             config.default_partitions.to_string(),
         ),
-        ("log.segment.bytes".to_owned(), log.segment_bytes.to_string()),
+        (
+            "log.segment.bytes".to_owned(),
+            log.segment_bytes.to_string(),
+        ),
         (
             "socket.request.max.bytes".to_owned(),
             config.max_frame_bytes.to_string(),
@@ -431,4 +475,444 @@ pub(crate) async fn delete_records(broker: &Broker, body: Bytes) -> Bytes {
     }
 
     codec_bytes(DeleteRecordsResponse { results }.encode())
+}
+
+// ---------- AlterConfigs (api_key 28) ----------
+
+/// Topic configuration keys the broker actually acts on.
+///
+/// A rejected name is the point: `retention.ms` set as `retention.msec`
+/// would otherwise be accepted, stored, echoed back by `DescribeConfigs`,
+/// and silently ignored by the log — which looks exactly like a broker
+/// that does not honour retention.
+const KNOWN_TOPIC_CONFIGS: &[&str] = &[
+    "retention.ms",
+    "retention.bytes",
+    "segment.bytes",
+    "segment.ms",
+    "cleanup.policy",
+    "delete.retention.ms",
+    "min.cleanable.dirty.ratio",
+    "min.compaction.lag.ms",
+    "max.compaction.lag.ms",
+    "flush.messages",
+    "flush.ms",
+    "max.message.bytes",
+    "min.insync.replicas",
+    "message.timestamp.type",
+    "compression.type",
+];
+
+/// Change a topic's configuration over the data plane.
+///
+/// The broker does not own topic configuration — the controller does, and
+/// that is what makes a change durable and ordered against every other
+/// metadata change. So this forwards rather than applies, and a success
+/// means the controller committed it, not that this broker wrote it down.
+pub(crate) async fn alter_configs(broker: &Broker, body: Bytes) -> Bytes {
+    let request = match AlterConfigsRequest::decode(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(%error, "undecodable alter-configs request");
+            return encode_error_for(ApiKey::AlterConfigs, ec::INVALID_REQUEST);
+        }
+    };
+
+    let respond = |error_code, message: String| {
+        codec_bytes(
+            AlterConfigsResponse {
+                error_code,
+                resource_type: request.resource_type.clone(),
+                resource_name: request.resource_name.clone(),
+                error_message: message,
+            }
+            .encode(),
+        )
+    };
+
+    if !request.resource_type.eq_ignore_ascii_case("topic") {
+        return respond(
+            ec::INVALID_REQUEST,
+            format!(
+                "only topic configuration can be altered, not {:?}",
+                request.resource_type
+            ),
+        );
+    }
+
+    let unknown: Vec<&str> = request
+        .configs
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .filter(|name| !KNOWN_TOPIC_CONFIGS.contains(name))
+        .collect();
+    if !unknown.is_empty() {
+        return respond(
+            ec::INVALID_CONFIG,
+            format!(
+                "unknown topic configuration: {} (known: {})",
+                unknown.join(", "),
+                KNOWN_TOPIC_CONFIGS.join(", ")
+            ),
+        );
+    }
+
+    let Some(cache) = broker.metadata_cache() else {
+        return respond(
+            ec::INVALID_REQUEST,
+            "a standalone broker has no topic configuration to alter; its settings come from its command line"
+                .to_owned(),
+        );
+    };
+    let image = cache.snapshot();
+    let Some(topic) = image.topics.get(&request.resource_name) else {
+        return respond(
+            ec::UNKNOWN_TOPIC_OR_PARTITION,
+            format!("no topic named {:?}", request.resource_name),
+        );
+    };
+
+    // Incremental merges into what is there; the other form replaces it.
+    // That is Kafka's distinction and it matters: replacing is how a config
+    // is removed, and merging is how one is changed without resending the
+    // rest and clobbering a concurrent change.
+    let mut configs = if request.incremental {
+        topic.configs.clone()
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    for entry in &request.configs {
+        if request.incremental && entry.value.is_empty() {
+            configs.remove(&entry.name);
+        } else {
+            configs.insert(entry.name.clone(), entry.value.clone());
+        }
+    }
+
+    let command = brahmaputra_metadata::MetadataCommand::SetTopicConfig {
+        name: request.resource_name.clone(),
+        configs,
+    };
+    match submit_to_controller(&image, &command).await {
+        Ok(()) => respond(ec::NONE, String::new()),
+        Err(error) => respond(ec::CONTROLLER_NOT_AVAILABLE, error),
+    }
+}
+
+/// Send a metadata command to whichever node is currently the controller.
+async fn submit_to_controller(
+    image: &brahmaputra_metadata::ClusterMetadata,
+    command: &brahmaputra_metadata::MetadataCommand,
+) -> Result<(), String> {
+    let controller_id = image
+        .controller_id
+        .ok_or_else(|| "the cluster has no controller right now".to_owned())?;
+    let member = image
+        .brokers
+        .get(&controller_id)
+        .ok_or_else(|| format!("controller {controller_id} is not in the metadata"))?;
+    let url = format!(
+        "http://{}:{}/api/v1/controller/command",
+        member.host, member.control_port
+    );
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(command)
+        .send()
+        .await
+        .map_err(|error| format!("cannot reach the controller at {url}: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("controller returned HTTP {status}: {body}"));
+    }
+    // The controller answers with a Result-shaped body, so a rejected
+    // command arrives as HTTP 200 carrying an error. Reading the status
+    // alone would report that as success.
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("controller returned an unreadable response: {error}"))?;
+    if text.contains("\"Err\"") {
+        return Err(format!("controller rejected the change: {text}"));
+    }
+    Ok(())
+}
+
+// ---------- DescribeProducers (api_key 29) ----------
+
+/// Who has written to a partition, and what they have left open.
+pub(crate) async fn describe_producers(broker: &Broker, body: Bytes) -> Bytes {
+    let request = match DescribeProducersRequest::decode(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(%error, "undecodable describe-producers request");
+            return encode_error_for(ApiKey::DescribeProducers, ec::INVALID_REQUEST);
+        }
+    };
+
+    let respond = |error_code, state: Option<crate::actor::PartitionProducers>| {
+        let state = state.unwrap_or_default();
+        codec_bytes(
+            DescribeProducersResponse {
+                error_code,
+                topic: request.topic.clone(),
+                partition: request.partition,
+                last_stable_offset: state.last_stable_offset,
+                high_watermark: state.high_watermark,
+                producers: state
+                    .producers
+                    .into_iter()
+                    .map(|producer| ProducerState {
+                        producer_id: producer.producer_id,
+                        producer_epoch: i32::from(producer.producer_epoch),
+                        last_sequence: producer.last_sequence,
+                        // The producer state table remembers sequences, not
+                        // wall-clock times; the timestamps that would answer
+                        // this live in the batches themselves.
+                        last_timestamp_ms: -1,
+                        current_txn_start_offset: producer.current_txn_start_offset,
+                    })
+                    .collect(),
+            }
+            .encode(),
+        )
+    };
+
+    let handle = match broker.partition(&request.topic, request.partition) {
+        Ok(handle) => handle,
+        Err(error) => return respond(code_of(&error), None),
+    };
+    match handle.producers().await {
+        Ok(state) => respond(ec::NONE, Some(state)),
+        Err(error) => respond(code_of(&BrokerError::Storage(error)), None),
+    }
+}
+
+// ---------- ListTransactions / DescribeTransactions (api_keys 30, 31) ----------
+
+/// Every transactional id this broker coordinates.
+pub(crate) async fn list_transactions(broker: &Broker, body: Bytes) -> Bytes {
+    let request = match ListTransactionsRequest::decode(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(%error, "undecodable list-transactions request");
+            return encode_error_for(ApiKey::ListTransactions, ec::INVALID_REQUEST);
+        }
+    };
+
+    let wanted: Vec<String> = request
+        .states
+        .iter()
+        .map(|state| state.to_ascii_lowercase())
+        .collect();
+    let transactions = crate::transaction::list_local_transactions(broker)
+        .await
+        .into_iter()
+        .filter(|listing| wanted.is_empty() || wanted.contains(&listing.state.to_ascii_lowercase()))
+        .collect();
+
+    codec_bytes(
+        ListTransactionsResponse {
+            error_code: ec::NONE,
+            transactions,
+        }
+        .encode(),
+    )
+}
+
+/// One transaction in full, including the partitions it has announced.
+pub(crate) async fn describe_transactions(broker: &Broker, body: Bytes) -> Bytes {
+    let request = match DescribeTransactionsRequest::decode(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(%error, "undecodable describe-transactions request");
+            return encode_error_for(ApiKey::DescribeTransactions, ec::INVALID_REQUEST);
+        }
+    };
+
+    match crate::transaction::describe_local_transaction(broker, &request.transactional_id).await {
+        Ok(Some(response)) => codec_bytes(response.encode()),
+        // Not found is not an error about the id: this broker may simply
+        // not coordinate it. The client routes to the coordinator the same
+        // way it routes a group, so a wrong broker is a client bug worth
+        // naming rather than an empty answer that looks like "no such
+        // transaction".
+        Ok(None) => codec_bytes(
+            DescribeTransactionsResponse {
+                error_code: ec::UNKNOWN_TOPIC_OR_PARTITION,
+                transactional_id: request.transactional_id,
+                ..Default::default()
+            }
+            .encode(),
+        ),
+        Err(error) => codec_bytes(
+            DescribeTransactionsResponse {
+                error_code: code_of(&error),
+                transactional_id: request.transactional_id,
+                ..Default::default()
+            }
+            .encode(),
+        ),
+    }
+}
+
+// ---------- AlterReplicaLogDirs (api_key 32) ----------
+
+/// Move partitions between the disks of the broker that answers.
+///
+/// The partition is closed for the duration of the copy. That is the honest
+/// cost of moving bytes that are being appended to: Kafka builds a second
+/// copy alongside, lets it catch up, and swaps — which avoids the pause but
+/// needs both copies to fit and a whole state machine to manage the
+/// catch-up. Here the pause is visible and bounded by the partition's size,
+/// and an operator who cannot afford it moves a follower or hands
+/// leadership away first.
+pub(crate) async fn alter_replica_log_dirs(broker: &Broker, body: Bytes) -> Bytes {
+    let request = match AlterReplicaLogDirsRequest::decode(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(%error, "undecodable alter-replica-log-dirs request");
+            return encode_error_for(ApiKey::AlterReplicaLogDirs, ec::INVALID_REQUEST);
+        }
+    };
+
+    let mut results = Vec::with_capacity(request.partitions.len());
+    for target in request.partitions {
+        let outcome =
+            move_partition(broker, &target.topic, target.partition, &target.log_dir).await;
+        results.push(match outcome {
+            Ok((log_dir, bytes_moved)) => AlterLogDirResult {
+                topic: target.topic,
+                partition: target.partition,
+                error_code: ec::NONE,
+                log_dir,
+                bytes_moved,
+            },
+            Err(error) => {
+                warn!(topic = %target.topic, partition = target.partition, %error, "log dir move failed");
+                AlterLogDirResult {
+                    topic: target.topic,
+                    partition: target.partition,
+                    error_code: code_of(&error),
+                    log_dir: String::new(),
+                    bytes_moved: 0,
+                }
+            }
+        });
+    }
+
+    codec_bytes(AlterReplicaLogDirsResponse { results }.encode())
+}
+
+async fn move_partition(
+    broker: &Broker,
+    topic: &str,
+    partition: i32,
+    destination: &str,
+) -> Result<(String, i64), BrokerError> {
+    let destination = std::path::PathBuf::from(destination);
+    // The destination has to be a directory this broker was actually given.
+    // Copying into an arbitrary path would put data somewhere nothing
+    // scans on restart, which is a partition that vanishes at the next
+    // reboot.
+    let known = broker
+        .log_dirs()
+        .paths()
+        .any(|path| path == destination.as_path());
+    if !known {
+        return Err(BrokerError::Meta(format!(
+            "{} is not one of this broker's log directories",
+            destination.display()
+        )));
+    }
+    if !broker.log_dirs().is_online(&destination) {
+        return Err(BrokerError::LogDirOffline {
+            topic: topic.to_owned(),
+            partition,
+            dir: destination.display().to_string(),
+        });
+    }
+
+    let Some(current) = broker.log_dirs().existing(topic, partition) else {
+        return Err(BrokerError::UnknownTopicOrPartition {
+            topic: topic.to_owned(),
+            partition,
+        });
+    };
+    let target = crate::logdirs::partition_path(&destination, topic, partition);
+    if current == target {
+        // Already there. A no-op rather than an error: an operator
+        // levelling a broker's disks should be able to name every
+        // partition and let the ones already in place stay.
+        let bytes = directory_size(&current);
+        return Ok((destination.display().to_string(), bytes));
+    }
+
+    // Stop writing before copying. A copy taken while appends continue is
+    // a copy of no particular moment, and the difference would be silently
+    // lost records rather than a visible failure.
+    broker
+        .close_partitions(&[(topic.to_owned(), partition)])
+        .await;
+
+    let copied = copy_directory(&current, &target).map_err(|error| {
+        BrokerError::Meta(format!(
+            "copying {} to {}: {error}",
+            current.display(),
+            target.display()
+        ))
+    })?;
+
+    // Only now is the move real. Placement first, then the old copy: a
+    // crash between the two leaves a stale directory that nothing points
+    // at, which the next startup scan reconciles. The other order would
+    // leave a partition with no copy at all.
+    broker
+        .log_dirs()
+        .reassign(topic, partition, &destination)
+        .map_err(BrokerError::Meta)?;
+    if let Err(error) = std::fs::remove_dir_all(&current) {
+        warn!(
+            path = %current.display(),
+            %error,
+            "moved partition's old directory could not be removed"
+        );
+    }
+
+    // Reopen from its new home, so the partition is serving again before
+    // this request is answered.
+    broker.partition(topic, partition)?;
+    Ok((destination.display().to_string(), copied))
+}
+
+fn directory_size(path: &std::path::Path) -> i64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len() as i64)
+        .sum()
+}
+
+/// Copy a partition directory, returning the bytes written.
+///
+/// Flat by construction — a partition directory holds segment files and
+/// checkpoints, never subdirectories — so this does not recurse, and a
+/// subdirectory appearing would be a bug worth noticing rather than
+/// something to copy silently.
+fn copy_directory(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<i64> {
+    std::fs::create_dir_all(to)?;
+    let mut copied = 0i64;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        if !entry.metadata()?.is_file() {
+            continue;
+        }
+        copied += std::fs::copy(entry.path(), to.join(entry.file_name()))? as i64;
+    }
+    Ok(copied)
 }

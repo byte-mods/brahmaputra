@@ -179,6 +179,40 @@ BEFORE_HOLDERS="$(holders_on_disk 0)"
 echo "   metadata replicas: [$BEFORE_REPLICAS]"
 echo "   brokers with data: [$BEFORE_HOLDERS]"
 
+stage "Follower fetching: a consumer reads from a replica in its own rack"
+
+# Without this every consumer read crosses to whichever rack happens to
+# hold the leader, which on a cloud provider is a cross-AZ transfer charge
+# on every byte consumed.
+LEADER_0="$(metadata_json | perl -MJSON::PP -0777 -e '
+  my $d = eval { decode_json(<STDIN>) } or exit 0;
+  my $t = $d->{topics}{$ARGV[0]} or exit 0;
+  print $t->{partitions}{0}{leader};
+' "$TOPIC" 2>/dev/null)"
+LEADER_RACK="${RACK[$LEADER_0]}"
+# A rack that is not the leader's, so a redirect is the only way to be
+# served from it.
+OTHER_RACK="a"
+for candidate in a b c; do
+  if [[ "$candidate" != "$LEADER_RACK" ]]; then OTHER_RACK="$candidate"; break; fi
+done
+echo "   partition 0 leader is broker $LEADER_0 in rack $LEADER_RACK; reading as rack $OTHER_RACK"
+
+RACK_READ="$("$CLI_EXE" --broker "127.0.0.1:${DATA_PORT[1]}" consume \
+  --topic "$TOPIC" --partition 0 --from earliest --max "$RECORDS" --rack "$OTHER_RACK" \
+  --quiet 2>/dev/null | sed -n 's/consumed \([0-9]*\) records.*/\1/p')"
+check "$([[ "$RACK_READ" == "$RECORDS" ]] && echo true || echo false)" \
+  "a rack-aware consumer reads every record" "read $RACK_READ of $RECORDS"
+
+# And a rack nothing is in must fall back to the leader rather than fail or
+# be sent to whichever replica happened to be listed first.
+UNKNOWN_READ="$("$CLI_EXE" --broker "127.0.0.1:${DATA_PORT[1]}" consume \
+  --topic "$TOPIC" --partition 0 --from earliest --max "$RECORDS" --rack nowhere \
+  --quiet 2>/dev/null | sed -n 's/consumed \([0-9]*\) records.*/\1/p')"
+check "$([[ "$UNKNOWN_READ" == "$RECORDS" ]] && echo true || echo false)" \
+  "a consumer in a rack no broker is in falls back to the leader" \
+  "read $UNKNOWN_READ of $RECORDS"
+
 stage "Reassign partition 0 to a set that excludes one current replica"
 # Target: keep two current replicas, swap the third for whichever broker is
 # not currently holding it. That is the realistic operation — draining one

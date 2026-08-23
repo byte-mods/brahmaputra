@@ -93,7 +93,8 @@ fn assert_partition(records: &[FetchedRecord], partition: i32, expected: &Expect
             "partition {partition} offset {offset}"
         );
         assert_eq!(
-            &record.value, want_value,
+            record.value.as_ref(),
+            Some(want_value),
             "partition {partition} offset {offset}"
         );
     }
@@ -386,7 +387,7 @@ async fn large_records_across_partitions_stay_inside_the_frame_limit() {
         let mut progressed = false;
         for (_, partition, records) in fetched {
             for record in records {
-                assert_eq!(record.value.len(), RECORD_BYTES);
+                assert_eq!(record.value.as_ref().map_or(0, |v| v.len()), RECORD_BYTES);
                 positions[partition as usize] = record.offset + 1;
                 seen[partition as usize] += 1;
                 progressed = true;
@@ -460,7 +461,7 @@ async fn headers_and_timestamps_survive_a_real_round_trip() {
     assert_eq!(records.len(), 2);
 
     let first = &records[0];
-    assert_eq!(first.value, Bytes::from_static(b"with-headers"));
+    assert_eq!(first.value, Some(Bytes::from_static(b"with-headers")));
     assert_eq!(first.headers.len(), 2, "both headers survived");
     assert_eq!(first.headers[0].key, "trace-id");
     assert_eq!(
@@ -471,7 +472,7 @@ async fn headers_and_timestamps_survive_a_real_round_trip() {
     assert_eq!(first.headers[1].key, "content-type");
 
     let second = &records[1];
-    assert_eq!(second.value, Bytes::from_static(b"no-headers"));
+    assert_eq!(second.value, Some(Bytes::from_static(b"no-headers")));
     assert!(
         second.headers.is_empty(),
         "a record with no headers must not gain any from its batch"

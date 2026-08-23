@@ -232,8 +232,7 @@ pub(crate) fn log_config_for_topic(
 ) -> LogConfig {
     let mut config = defaults.clone();
 
-    if topic == crate::group::OFFSETS_TOPIC
-        || topic == crate::transaction::TRANSACTION_STATE_TOPIC
+    if topic == crate::group::OFFSETS_TOPIC || topic == crate::transaction::TRANSACTION_STATE_TOPIC
     {
         // Both rewrite the same key over and over — one per group offset,
         // one per transactional id — so they must be compacted or they grow
@@ -286,6 +285,38 @@ pub(crate) fn log_config_for_topic(
             "compact" => config.compact = true,
             "delete" => config.compact = false,
             _ => warn!(topic, value, "ignoring unknown cleanup.policy"),
+        }
+    }
+    if let Some(value) = configs.get("message.timestamp.type") {
+        match value.as_str() {
+            "CreateTime" => config.log_append_time = false,
+            "LogAppendTime" => config.log_append_time = true,
+            _ => warn!(topic, value, "ignoring unknown message.timestamp.type"),
+        }
+    }
+    if let Some(value) = configs.get("delete.retention.ms") {
+        match value.parse::<u64>() {
+            Ok(ms) => config.delete_retention_ms = ms,
+            _ => warn!(topic, value, "ignoring unparseable delete.retention.ms"),
+        }
+    }
+    if let Some(value) = configs.get("min.cleanable.dirty.ratio") {
+        match value.parse::<f64>() {
+            Ok(ratio) if (0.0..=1.0).contains(&ratio) => config.min_cleanable_dirty_ratio = ratio,
+            _ => warn!(topic, value, "ignoring unusable min.cleanable.dirty.ratio"),
+        }
+    }
+    if let Some(value) = configs.get("min.compaction.lag.ms") {
+        match value.parse::<u64>() {
+            Ok(ms) => config.min_compaction_lag_ms = ms,
+            _ => warn!(topic, value, "ignoring unparseable min.compaction.lag.ms"),
+        }
+    }
+    if let Some(value) = configs.get("max.compaction.lag.ms") {
+        match value.parse::<i64>() {
+            Ok(-1) => config.max_compaction_lag_ms = None,
+            Ok(ms) if ms > 0 => config.max_compaction_lag_ms = Some(ms as u64),
+            _ => warn!(topic, value, "ignoring unparseable max.compaction.lag.ms"),
         }
     }
     if let Some(value) = configs.get("flush.messages") {

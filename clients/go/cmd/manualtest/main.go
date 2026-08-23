@@ -216,6 +216,35 @@ func main() {
 		consumer.Close()
 	}
 
+	section("tombstones")
+	{
+		tombTopic := unique("go-tombstones")
+		config := bp.DefaultProducerConfig()
+		config.LingerMs = 0
+		producer := must(bp.NewProducer(address, config))
+		must(0, producer.SendTo(tombTopic, 0, []byte("set"), []byte("k1")))
+		must(0, producer.SendTo(tombTopic, 0, []byte{}, []byte("k2")))
+		// A nil value is a deletion, and must stay distinguishable from
+		// the empty value above all the way through the round trip.
+		must(0, producer.SendTo(tombTopic, 0, nil, []byte("k3")))
+		must(0, producer.Flush())
+		must(0, producer.Close())
+
+		consumer := must(bp.NewConsumer(address, bp.DefaultConsumerConfig()))
+		got := must(consumer.Fetch(tombTopic, 0, 0, 500))
+		check("all three records arrive", len(got) == 3, fmt.Sprintf("got %d", len(got)))
+		if len(got) == 3 {
+			check("an ordinary value round-trips",
+				bytes.Equal(got[0].Value, []byte("set")), "")
+			check("an empty value is empty, not null",
+				got[1].Value != nil && len(got[1].Value) == 0,
+				fmt.Sprintf("%v", got[1].Value))
+			check("a tombstone arrives as a null value", got[2].Value == nil,
+				fmt.Sprintf("%v", got[2].Value))
+		}
+		consumer.Close()
+	}
+
 	section("offsets")
 	{
 		consumer := must(bp.NewConsumer(address, bp.DefaultConsumerConfig()))

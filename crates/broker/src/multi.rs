@@ -21,7 +21,8 @@ use brahmaputra_metrics::names;
 use brahmaputra_protocol::codec;
 use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::gen::{
-    FetchMultiRequest, FetchMultiResult, ProduceMultiResponse, ProduceMultiResult,
+    FetchMultiPartition, FetchMultiRequest, FetchMultiResult, ProduceMultiResponse,
+    ProduceMultiResult,
 };
 use brahmaputra_protocol::{validate_batch_header, ApiKey, IsolationLevel};
 use bytes::Bytes;
@@ -97,7 +98,12 @@ pub(crate) async fn produce_multi(
     metrics.count(names::PRODUCE_RECORDS, total_records);
     metrics.count(names::PRODUCE_BYTES, total_bytes);
     let throttle = broker
-        .throttle(client.principal, client.client_id, QuotaKind::Produce, total_bytes)
+        .throttle(
+            client.principal,
+            client.client_id,
+            QuotaKind::Produce,
+            total_bytes,
+        )
         .await;
     if !throttle.is_zero() {
         metrics.count(names::THROTTLED_REQUESTS, 1);
@@ -308,6 +314,7 @@ fn zero_copy_fetch_available(broker: &Broker) -> bool {
 async fn fetch_multi_zero_copy(
     broker: &Broker,
     request: &FetchMultiRequest,
+    session: codec::FetchSessionInfo,
 ) -> Option<(Bytes, Vec<LogRegion>, u64)> {
     let count = request.partitions.len().max(1);
     let budget = broker
@@ -317,9 +324,16 @@ async fn fetch_multi_zero_copy(
     let per_partition = (budget / count).max(64 * 1024);
 
     let reads = futures::future::join_all(request.partitions.iter().map(|descriptor| async move {
-        let handle = broker
-            .partition(&descriptor.topic, descriptor.partition)
-            .ok()?;
+        // The rack-aware resolution, so a consumer redirected to a
+        // follower still gets the zero-copy path rather than quietly
+        // falling back to the buffered one on every fetch.
+        let handle = crate::handlers::consumer_partition(
+            broker,
+            &descriptor.topic,
+            descriptor.partition,
+            &request.rack,
+        )
+        .ok()?;
         let allowance = (descriptor.max_bytes.max(0) as usize).min(per_partition);
         let outcome = handle
             .read_regions(descriptor.fetch_offset, allowance)
@@ -355,6 +369,12 @@ async fn fetch_multi_zero_copy(
                 high_watermark: outcome.high_watermark,
                 last_stable_offset: outcome.high_watermark,
                 batches_length: 0,
+                preferred_read_replica: crate::handlers::preferred_read_replica(
+                    broker,
+                    &descriptor.topic,
+                    descriptor.partition,
+                    &request.rack,
+                ),
             },
             kept,
         ));
@@ -362,7 +382,7 @@ async fn fetch_multi_zero_copy(
     if served == 0 {
         return None;
     }
-    let header = codec::encode_fetch_multi_header(&header_inputs).ok()?;
+    let header = codec::encode_fetch_multi_header(session, &header_inputs).ok()?;
     Some((header, regions, served))
 }
 
@@ -371,7 +391,9 @@ async fn record_fetch(broker: &Broker, client: ClientIdentity<'_>, served: u64) 
     let metrics = broker.metrics();
     metrics.count(names::FETCH_REQUESTS, 1);
     metrics.count(names::FETCH_BYTES, served);
-    let throttle = broker.throttle(client.principal, client.client_id, QuotaKind::Fetch, served).await;
+    let throttle = broker
+        .throttle(client.principal, client.client_id, QuotaKind::Fetch, served)
+        .await;
     if !throttle.is_zero() {
         metrics.count(names::THROTTLED_REQUESTS, 1);
         metrics.count(names::THROTTLE_MS, throttle.as_millis() as u64);
@@ -391,6 +413,22 @@ pub(crate) async fn fetch_multi(
         }
     };
 
+    // Resolve the incremental fetch session (KIP-227) before anything
+    // reads a partition: what the client sent is a *delta*, and every path
+    // below wants the full set the session stands for.
+    let (session, request) = match resolve_session(broker, request) {
+        Ok(resolved) => resolved,
+        Err(session) => {
+            // The session is unknown or out of step. Answering with no
+            // results and the error at request level is what tells the
+            // client to start again in full — a per-partition error would
+            // send it looking for a partition problem it does not have.
+            return codec::encode_fetch_multi_response_chunks(session, &[])
+                .unwrap_or_default()
+                .into();
+        }
+    };
+
     let isolation = IsolationLevel::from_wire(request.isolation_level);
     // The fast path: hand the socket file ranges and let the kernel move
     // the bytes. Anything unusual — an idle partition, an error — falls
@@ -401,7 +439,9 @@ pub(crate) async fn fetch_multi(
     // kernel a file range is that nobody looks at the bytes. Filtering is
     // still per batch, so this costs a copy, not a decompression.
     if isolation == IsolationLevel::ReadUncommitted && zero_copy_fetch_available(broker) {
-        if let Some((header, regions, served)) = fetch_multi_zero_copy(broker, &request).await {
+        if let Some((header, regions, served)) =
+            fetch_multi_zero_copy(broker, &request, session).await
+        {
             record_fetch(broker, client, served).await;
             return ResponseBody::with_regions(header, regions);
         }
@@ -430,9 +470,79 @@ pub(crate) async fn fetch_multi(
 
     record_fetch(broker, client, served).await;
 
-    codec::encode_fetch_multi_response_chunks(&results)
+    codec::encode_fetch_multi_response_chunks(session, &results)
         .unwrap_or_default()
         .into()
+}
+
+/// Expand an incremental fetch into the full set of partitions it means.
+///
+/// `Ok` carries the session to answer with and a request whose partition
+/// list is complete; `Err` carries the session error to answer with when
+/// the client named a session this broker does not have.
+fn resolve_session(
+    broker: &Broker,
+    request: FetchMultiRequest,
+) -> Result<(codec::FetchSessionInfo, FetchMultiRequest), codec::FetchSessionInfo> {
+    let updates: Vec<(String, i32, i64, i32)> = request
+        .partitions
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.topic.clone(),
+                descriptor.partition,
+                descriptor.fetch_offset,
+                descriptor.max_bytes,
+            )
+        })
+        .collect();
+    let forgotten: Vec<(String, i32)> = request
+        .forgotten
+        .iter()
+        .map(|partition| (partition.topic.clone(), partition.partition))
+        .collect();
+
+    match broker.fetch_sessions().resolve(
+        request.session_id,
+        request.session_epoch,
+        &updates,
+        &forgotten,
+    ) {
+        crate::fetchsession::SessionOutcome::None => {
+            Ok((codec::FetchSessionInfo::default(), request))
+        }
+        crate::fetchsession::SessionOutcome::Resolved {
+            session_id,
+            session_epoch,
+            partitions,
+        } => {
+            let mut request = request;
+            request.partitions = partitions
+                .into_iter()
+                .map(
+                    |(topic, partition, fetch_offset, max_bytes)| FetchMultiPartition {
+                        topic,
+                        partition,
+                        fetch_offset,
+                        max_bytes,
+                    },
+                )
+                .collect();
+            Ok((
+                codec::FetchSessionInfo {
+                    session_id,
+                    session_epoch,
+                    error_code: ec::NONE,
+                },
+                request,
+            ))
+        }
+        crate::fetchsession::SessionOutcome::Invalid(session_id) => Err(codec::FetchSessionInfo {
+            session_id,
+            session_epoch: 0,
+            error_code: ec::FETCH_SESSION_NOT_FOUND,
+        }),
+    }
 }
 
 /// Read every requested partition once. Returns the total bytes gathered.
@@ -460,8 +570,19 @@ async fn read_all_partitions(
             high_watermark: -1,
             last_stable_offset: -1,
             batches_length: 0,
+            preferred_read_replica: crate::handlers::preferred_read_replica(
+                broker,
+                &descriptor.topic,
+                descriptor.partition,
+                &request.rack,
+            ),
         };
-        let handle = match broker.partition(&descriptor.topic, descriptor.partition) {
+        let handle = match crate::handlers::consumer_partition(
+            broker,
+            &descriptor.topic,
+            descriptor.partition,
+            &request.rack,
+        ) {
             Ok(handle) => handle,
             Err(error) => {
                 result.error_code = code_of(&error);
@@ -469,7 +590,10 @@ async fn read_all_partitions(
             }
         };
         let allowance = (descriptor.max_bytes.max(0) as usize).min(per_partition);
-        match handle.read_at(descriptor.fetch_offset, allowance, isolation).await {
+        match handle
+            .read_at(descriptor.fetch_offset, allowance, isolation)
+            .await
+        {
             Ok(outcome) => {
                 result.high_watermark = outcome.high_watermark;
                 result.last_stable_offset = outcome.high_watermark;

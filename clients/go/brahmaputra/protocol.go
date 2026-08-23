@@ -37,7 +37,14 @@ const SchemaVersion = "1.0.0"
 // isolation_level, and MetadataResponse carries a request-level error
 // code so an authorization denial is no longer reported as an unknown
 // topic.
-const APIVersion int16 = 3
+//
+// Version 4 added tombstones — a record whose value is null, which is
+// what deletes a key on a compacted topic — signalled by a new attributes
+// bit. It also added `client.rack` and an incremental fetch session to
+// Fetch and FetchMulti, a rack to each broker in Metadata, and the
+// AlterConfigs, DescribeProducers, ListTransactions,
+// DescribeTransactions and AlterReplicaLogDirs APIs.
+const APIVersion int16 = 4
 
 // Isolation levels for a fetch. ReadUncommitted is the default and is what
 // every non-transactional topic gives either way.
@@ -56,6 +63,10 @@ const (
 
 	compressionMask = 0x0007
 	headersBit      = 0x0008
+	// Some record in this batch has a null value: a tombstone, which
+	// deletes its key on a compacted topic. Set only when one is present,
+	// so a batch without one encodes exactly as it always did.
+	nullValueBit = 0x0040
 )
 
 // API keys, in wire order.
@@ -555,6 +566,15 @@ func EncodeRecordBatch(
 			break
 		}
 	}
+	// A nil value is a tombstone and needs the widened length encoding; an
+	// empty non-nil value is an ordinary record and must not trigger it.
+	hasNullValues := false
+	for i := range records {
+		if records[i].Value == nil {
+			hasNullValues = true
+			break
+		}
+	}
 
 	var payload []byte
 	for i := range records {
@@ -566,8 +586,17 @@ func EncodeRecordBatch(
 			rec = appendUvarint(rec, uint64(len(record.Key))+1)
 			rec = append(rec, record.Key...)
 		}
-		rec = appendUvarint(rec, uint64(len(record.Value)))
-		rec = append(rec, record.Value...)
+		if hasNullValues {
+			if record.Value == nil {
+				rec = appendUvarint(rec, 0)
+			} else {
+				rec = appendUvarint(rec, uint64(len(record.Value))+1)
+				rec = append(rec, record.Value...)
+			}
+		} else {
+			rec = appendUvarint(rec, uint64(len(record.Value)))
+			rec = append(rec, record.Value...)
+		}
 		rec = appendUvarint(rec, uint64((record.TimestampDelta<<1)^(record.TimestampDelta>>63)))
 		if hasHeaders {
 			rec = appendUvarint(rec, uint64(len(record.Headers)))
@@ -594,6 +623,9 @@ func EncodeRecordBatch(
 	attributes := uint16(codec) & compressionMask
 	if hasHeaders {
 		attributes |= headersBit
+	}
+	if hasNullValues {
+		attributes |= nullValueBit
 	}
 	batchLength := minBatchLength + len(compressed)
 
@@ -665,14 +697,14 @@ func DecodeRecordBatch(data []byte, offset int) (DecodedBatch, int, error) {
 	if err != nil {
 		return batch, 0, err
 	}
-	records, err := decodeRecords(payload, attributes&headersBit != 0)
+	records, err := decodeRecords(payload, attributes&headersBit != 0, attributes&nullValueBit != 0)
 	if err != nil {
 		return batch, 0, err
 	}
 	return DecodedBatch{baseOffset, maxTimestamp, records}, end, nil
 }
 
-func decodeRecords(payload []byte, hasHeaders bool) ([]Record, error) {
+func decodeRecords(payload []byte, hasHeaders, hasNullValues bool) ([]Record, error) {
 	var records []Record
 	pos := 0
 	for pos < len(payload) {
@@ -698,13 +730,26 @@ func decodeRecords(payload []byte, hasHeaders bool) ([]Record, error) {
 			pos += size
 		}
 
-		valueLen, next, err := getUvarint(payload, pos)
+		rawValueLen, next, err := getUvarint(payload, pos)
 		if err != nil {
 			return nil, err
 		}
 		pos = next
-		record.Value = append([]byte(nil), payload[pos:pos+int(valueLen)]...)
-		pos += int(valueLen)
+		if hasNullValues && rawValueLen == 0 {
+			// A tombstone. Left nil, which is what distinguishes it from a
+			// record whose value is merely empty.
+			record.Value = nil
+		} else {
+			valueLen := int(rawValueLen)
+			if hasNullValues {
+				valueLen = int(rawValueLen - 1)
+			}
+			if pos+valueLen > len(payload) {
+				return nil, errors.New("truncated record value")
+			}
+			record.Value = append([]byte{}, payload[pos:pos+valueLen]...)
+			pos += valueLen
+		}
 
 		rawDelta, next, err := getUvarint(payload, pos)
 		if err != nil {

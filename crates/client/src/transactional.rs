@@ -89,13 +89,9 @@ impl TransactionalProducer {
                 "a transactional id must not be empty".into(),
             ));
         }
-        let router = BrokerRouter::connect_with(
-            transport,
-            addr,
-            Some(format!("txn-{transactional_id}")),
-            5,
-        )
-        .await?;
+        let router =
+            BrokerRouter::connect_with(transport, addr, Some(format!("txn-{transactional_id}")), 5)
+                .await?;
 
         let request = InitProducerIdRequest::transactional(transactional_id, timeout_ms);
         let response = router
@@ -164,7 +160,9 @@ impl TransactionalProducer {
             }],
         };
         let body = request.encode().map_err(msg_err)?;
-        let response = self.coordinator_request(ApiKey::AddPartitionsToTxn, &body).await?;
+        let response = self
+            .coordinator_request(ApiKey::AddPartitionsToTxn, &body)
+            .await?;
         let decoded = AddPartitionsToTxnResponse::decode(&response).map_err(msg_err)?;
         ClientError::from_error_code(decoded.error_code)?;
         self.announced.insert(key);
@@ -273,7 +271,9 @@ impl TransactionalProducer {
             group_id: group_id.to_owned(),
         };
         let body = add.encode().map_err(msg_err)?;
-        let response = self.coordinator_request(ApiKey::AddOffsetsToTxn, &body).await?;
+        let response = self
+            .coordinator_request(ApiKey::AddOffsetsToTxn, &body)
+            .await?;
         ClientError::from_error_code(
             AddOffsetsToTxnResponse::decode(&response)
                 .map_err(msg_err)?
@@ -354,10 +354,10 @@ impl TransactionalProducer {
 
 /// Internal topic names and hashes, mirrored from the broker so a client can
 /// route to a coordinator without asking.
-const TRANSACTION_STATE_TOPIC: &str = "__transaction_state";
+pub(crate) const TRANSACTION_STATE_TOPIC: &str = "__transaction_state";
 const OFFSETS_TOPIC: &str = "__consumer_offsets";
 
-fn coordinator_partition(transactional_id: &str, partition_count: i32) -> i32 {
+pub(crate) fn coordinator_partition(transactional_id: &str, partition_count: i32) -> i32 {
     (crc32c::crc32c(transactional_id.as_bytes()) % partition_count.max(1) as u32) as i32
 }
 

@@ -116,6 +116,7 @@ fn broker_metadata(broker_id: i32) -> BrokerMetadata {
         host: "127.0.0.1".into(),
         data_port: 0,
         control_port: 0,
+        internal_port: 0,
         broker_epoch: 100 + broker_id as u64,
         roles: BTreeSet::from([NodeRole::Broker]),
         rack: None,

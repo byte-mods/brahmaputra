@@ -169,6 +169,9 @@ impl BrokerRouter {
         let connection =
             Connection::connect_with(transport.clone(), seed, client_id.clone(), max_in_flight)
                 .await?;
+        if let Some(credentials) = transport.credentials.as_ref() {
+            connection.authenticate(credentials).await?;
+        }
         let pooled = PooledConnection {
             address: seed,
             generation: 0,
@@ -383,6 +386,42 @@ impl BrokerRouter {
         routes.brokers.get(broker_id).cloned()
     }
 
+    /// Issue a request to a specific broker id, falling back to the
+    /// partition leader when that broker is not in the routing table.
+    ///
+    /// This is the follower-fetch path: the leader names a replica in the
+    /// consumer's own rack, and the consumer reads from it until it is told
+    /// otherwise or the read fails. Falling back rather than erroring
+    /// matters — a preferred replica that has since gone away must cost a
+    /// redirect, not a stalled consumer.
+    pub(crate) async fn request_broker_or_leader(
+        &self,
+        topic: &str,
+        partition: i32,
+        broker_id: i32,
+        api_key: ApiKey,
+        body: &[u8],
+    ) -> Result<Bytes, ClientError> {
+        let endpoint = {
+            let routes = self.inner.routes.lock().expect("routes");
+            routes.brokers.get(&broker_id).cloned()
+        };
+        let Some(endpoint) = endpoint else {
+            return self
+                .request_partition(topic, partition, api_key, body)
+                .await;
+        };
+        let address = self.resolve(&endpoint).await?;
+        let pooled = self.connection(address).await?;
+        match pooled.connection.request(api_key, body).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.invalidate(&pooled);
+                Err(error)
+            }
+        }
+    }
+
     fn cached_partitions(&self, topic: &str) -> Option<Vec<i32>> {
         self.inner
             .routes
@@ -465,6 +504,13 @@ impl BrokerRouter {
             self.inner.max_in_flight,
         )
         .await?;
+        // Every connection authenticates, not just the first: a pooled
+        // connection opened after a reconnect that skipped this would be
+        // anonymous, and its requests would start failing authorization
+        // for no reason the caller could see.
+        if let Some(credentials) = self.inner.transport.credentials.as_ref() {
+            connection.authenticate(credentials).await?;
+        }
         let candidate = PooledConnection {
             address,
             generation: self.inner.next_generation.fetch_add(1, Ordering::Relaxed),
@@ -532,6 +578,22 @@ impl BrokerRouter {
         &self,
         partitions: &[(String, i32)],
     ) -> (Vec<(SocketAddr, Vec<(String, i32)>)>, Vec<(String, i32)>) {
+        self.group_by_target(partitions, &HashMap::new()).await
+    }
+
+    /// As [`group_by_leader`](Self::group_by_leader), but honouring an
+    /// override of which broker to read each partition from.
+    ///
+    /// Grouping by *target* rather than by leader is what makes
+    /// follower fetching work in the multi-partition form: a consumer whose
+    /// partitions have been redirected to several replicas must send one
+    /// request to each, not one request to a leader that no longer serves
+    /// them.
+    pub(crate) async fn group_by_target(
+        &self,
+        partitions: &[(String, i32)],
+        overrides: &HashMap<(String, i32), i32>,
+    ) -> (Vec<(SocketAddr, Vec<(String, i32)>)>, Vec<(String, i32)>) {
         let mut unknown_topics: HashSet<String> = HashSet::new();
         for (topic, partition) in partitions {
             if self.cached_endpoint(topic, *partition).is_none() {
@@ -546,7 +608,16 @@ impl BrokerRouter {
         let mut grouped: BTreeMap<SocketAddr, Vec<(String, i32)>> = BTreeMap::new();
         let mut unroutable = Vec::new();
         for (topic, partition) in partitions {
-            let Some(endpoint) = self.cached_endpoint(topic, *partition) else {
+            let override_endpoint =
+                overrides
+                    .get(&(topic.clone(), *partition))
+                    .and_then(|broker_id| {
+                        let routes = self.inner.routes.lock().expect("routes");
+                        routes.brokers.get(broker_id).cloned()
+                    });
+            let Some(endpoint) =
+                override_endpoint.or_else(|| self.cached_endpoint(topic, *partition))
+            else {
                 unroutable.push((topic.clone(), *partition));
                 continue;
             };

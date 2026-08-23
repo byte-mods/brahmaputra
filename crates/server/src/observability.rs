@@ -147,17 +147,10 @@ pub async fn bootstrap_admin(
         }
         None => (generate_secret(), true),
     };
-    let password_hash = brahmaputra_dashboard::hash_password(&password)
+    let user = UserRecord::new(admin_user, &password, Role::Admin, generated)
         .map_err(|_| anyhow::anyhow!("cannot hash the initial admin password"))?;
     controller
-        .write_metadata(MetadataCommand::PutUser {
-            user: UserRecord {
-                username: admin_user.to_owned(),
-                password_hash,
-                role: Role::Admin,
-                force_password_change: generated,
-            },
-        })
+        .write_metadata(MetadataCommand::PutUser { user })
         .await
         .map_err(|error| anyhow::anyhow!("cannot create the admin user: {}", error.message))?;
 

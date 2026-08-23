@@ -8,6 +8,7 @@
  * vocabulary. Where a default differs from Kafka's it is called out.
  */
 
+const crypto = require('crypto');
 const net = require('net');
 
 const {
@@ -50,6 +51,40 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * correlation id rather than by arrival order — which is also what lets
  * several requests be in flight at once on one socket.
  */
+
+const SCRAM_MECHANISM = 'SCRAM-SHA-256';
+
+/** One `key=value` field out of a SCRAM message. */
+function scramField(message, key) {
+  for (const part of message.split(',')) {
+    if (part.startsWith(`${key}=`)) return part.slice(key.length + 1);
+  }
+  return null;
+}
+
+/**
+ * The client half of RFC 5802: prove knowledge of the password without
+ * sending it.
+ *
+ * Node's PBKDF2 is used directly rather than hand-rolled — it is the same
+ * construction the broker derives its stored key with.
+ */
+function scramClientProof(password, salt, iterations, authMessage) {
+  const salted = crypto.pbkdf2Sync(
+    Buffer.from(password, 'utf8'),
+    Buffer.from(salt, 'base64'),
+    iterations,
+    32,
+    'sha256'
+  );
+  const clientKey = crypto.createHmac('sha256', salted).update('Client Key').digest();
+  const storedKey = crypto.createHash('sha256').update(clientKey).digest();
+  const signature = crypto.createHmac('sha256', storedKey).update(authMessage).digest();
+  const proof = Buffer.alloc(clientKey.length);
+  for (let i = 0; i < clientKey.length; i += 1) proof[i] = clientKey[i] ^ signature[i];
+  return proof.toString('base64');
+}
+
 class Connection {
   constructor(socket, clientId) {
     this.socket = socket;
@@ -149,14 +184,66 @@ class Connection {
     this.pending.clear();
   }
 
+  /**
+   * Bind a principal to this connection using SCRAM-SHA-256.
+   *
+   * The password never crosses the wire: the broker sends a challenge and
+   * this answers with a proof derived from the password, which is what
+   * makes authentication meaningful on a plaintext listener. Use
+   * `authenticatePlain` only where the connection is already encrypted.
+   */
   async authenticate(username, password) {
-    const writer = bodyWriter().string(username).string(password);
+    const clientNonce = crypto.randomBytes(18).toString('base64').replace(/,/g, '.');
+    const bare = `n=${username},r=${clientNonce}`;
+    const first = await this._authenticateStep(username, '', SCRAM_MECHANISM, `n,,${bare}`);
+    if (first.done) throw new ProtocolError('broker ended the SCRAM exchange before it began');
+
+    const serverFirst = first.payload;
+    const nonce = scramField(serverFirst, 'r');
+    const salt = scramField(serverFirst, 's');
+    const iterations = Number(scramField(serverFirst, 'i'));
+    if (!nonce || !salt || !Number.isInteger(iterations) || iterations <= 0) {
+      throw new ProtocolError('malformed SCRAM server-first message');
+    }
+    // The server must have kept this client's nonce, which is what makes
+    // the exchange this one rather than a replay of an earlier one.
+    if (!nonce.startsWith(clientNonce)) {
+      throw new ProtocolError('SCRAM server nonce does not extend the client nonce');
+    }
+    // `biws` is base64 of the GS2 header "n,,", echoed so the server can
+    // see it was not altered in flight.
+    const withoutProof = `c=biws,r=${nonce}`;
+    const authMessage = `${bare},${serverFirst},${withoutProof}`;
+    const proof = scramClientProof(password, salt, iterations, authMessage);
+    const final = await this._authenticateStep(
+      username,
+      '',
+      SCRAM_MECHANISM,
+      `${withoutProof},p=${proof}`
+    );
+    return { principal: final.principal, role: final.role };
+  }
+
+  /** Send the password itself, as SASL/PLAIN does. Refused on a plaintext listener. */
+  async authenticatePlain(username, password) {
+    const result = await this._authenticateStep(username, password, 'PLAIN', '');
+    return { principal: result.principal, role: result.role };
+  }
+
+  async _authenticateStep(username, password, mechanism, payload) {
+    const writer = bodyWriter()
+      .string(username)
+      .string(password)
+      .string(mechanism)
+      .string(payload);
     const reader = bodyReader(await this.request(ApiKey.AUTHENTICATE, writer.bytes()));
     const code = reader.int32();
     const principal = reader.string();
     const role = reader.string();
+    const responsePayload = reader.string();
+    const done = reader.bool();
     if (code !== ErrorCode.NONE) throw new ServerError(code, 'authenticate');
-    return { principal, role };
+    return { principal, role, payload: responsePayload, done };
   }
 
   async apiVersions() {
@@ -192,7 +279,13 @@ function decodeMetadata(reader) {
   }
   const brokers = [];
   for (let count = reader.int32(); count > 0; count -= 1) {
-    brokers.push({ nodeId: reader.int32(), host: reader.string(), port: reader.int32() });
+    brokers.push({
+      nodeId: reader.int32(),
+      host: reader.string(),
+      port: reader.int32(),
+      // Empty when the broker was started without --rack.
+      rack: reader.string(),
+    });
   }
   reader.skipInt32(); // controller_id
   const topics = [];
@@ -403,7 +496,8 @@ class Producer {
     }
 
     const record = { key, value, timestampDelta: 0, headers };
-    let size = value.length + (key ? key.length : 0) + 16;
+    // A null value is a tombstone and carries no payload bytes.
+    let size = (value ? value.length : 0) + (key ? key.length : 0) + 16;
     for (const header of headers) {
       size += header.key.length + (header.value ? header.value.length : 0) + 4;
     }
@@ -567,6 +661,8 @@ const defaultConsumerConfig = () => ({
   // READ_UNCOMMITTED (0) or READ_COMMITTED (1). A committed read stops at
   // the last stable offset and never sees an aborted transaction's records.
   isolationLevel: 0,
+  // This consumer's failure domain (`client.rack`), empty when it has none.
+  rack: "",
   maxPollRecords: 500,
 });
 
@@ -625,7 +721,10 @@ class Consumer {
       .int32(this.config.fetchMaxBytes)
       .int32(wait)
       .int32(this.config.fetchMinBytes)
-      .int32(this.config.isolationLevel);
+      .int32(this.config.isolationLevel)
+      // `client.rack`: with it set the leader names an in-sync replica in
+      // the same rack, and this client reads from that instead.
+      .string(this.config.rack || "");
     const body = writer.bytes();
 
     let connection = await this.router.connectionFor(topic, partition);
@@ -672,6 +771,10 @@ class Consumer {
     const highWatermark = reader.int64();
     reader.skipInt64(); // last_stable_offset
     const batchesLength = Number(reader.int64());
+    // Read even though this client does not act on it: the batches trail
+    // the whole struct, so skipping a field would take them from the
+    // wrong offset and every batch after it would fail to decode.
+    reader.skipInt32(); // preferred_read_replica
     const trailing = reader.rest();
     if (batchesLength > trailing.length) {
       throw new ProtocolError('fetch response claims more batch bytes than it carries');

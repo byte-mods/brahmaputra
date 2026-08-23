@@ -81,6 +81,7 @@ fn cluster_image() -> ClusterMetadata {
                 host: host.into(),
                 data_port,
                 control_port: data_port + 10_000,
+                internal_port: 0,
                 roles: vec![NodeRole::Broker, NodeRole::Controller],
                 rack: None,
                 now_ms: 1_000,
@@ -296,6 +297,7 @@ async fn client_io_rejects_a_follower_but_replica_io_can_open_its_log() {
         max_wait_ms: 0,
         min_bytes: 1,
         isolation_level: 0,
+        rack: String::new(),
     };
     let response = raw_request(follower.addr, ApiKey::Fetch, &fetch.encode().unwrap()).await;
     let (response, batches) = codec::decode_fetch_response(response).unwrap();
@@ -315,6 +317,7 @@ async fn client_io_rejects_a_follower_but_replica_io_can_open_its_log() {
             host: "broker-three".into(),
             data_port: 19_093,
             control_port: 29_093,
+            internal_port: 0,
             roles: vec![NodeRole::Broker],
             rack: None,
             now_ms: 1_000,

@@ -10,7 +10,7 @@ mod observability;
 
 use anyhow::{anyhow, bail, Context, Result};
 use brahmaputra_broker::{
-    Broker, BrokerConfig, QuotaConfig, ReplicaManager, ReplicaManagerConfig,
+    Broker, BrokerConfig, InternalListener, QuotaConfig, ReplicaManager, ReplicaManagerConfig,
     ReplicationHealthSnapshot, TlsIdentity,
 };
 use brahmaputra_client::Transport;
@@ -42,6 +42,11 @@ const REPLICATION_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
 const OFFSETS_TOPIC: &str = "__consumer_offsets";
 const TRANSACTION_STATE_TOPIC: &str = "__transaction_state";
 const DEFAULT_OFFSETS_TOPIC_PARTITIONS: i32 = 50;
+/// How long a node that lost the internal-topic creation race waits for
+/// its own Raft copy to show the topic the leader already has, before
+/// treating the failure as real.
+const INTERNAL_TOPIC_SETTLE: Duration = Duration::from_secs(15);
+
 const DEFAULT_RETENTION_CHECK_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_HTTP_PORT: u16 = 8080;
 /// How often partition gauges are refreshed and every metric sampled into
@@ -98,6 +103,58 @@ struct Args {
     /// How often partitions apply the retention policies above.
     #[arg(long, default_value_t = DEFAULT_RETENTION_CHECK_INTERVAL_MS)]
     retention_check_interval_ms: u64,
+
+    /// Largest request or response frame this broker will handle
+    /// (`socket.request.max.bytes`).
+    ///
+    /// It bounds a multi-partition fetch response as well as a produce
+    /// request, so raising it costs memory per in-flight request and
+    /// lowering it below the largest batch a producer sends makes those
+    /// batches unproduceable.
+    #[arg(long = "max-frame-bytes", default_value_t = 32 * 1024 * 1024)]
+    max_frame_bytes: usize,
+
+    /// Add a sparse-index entry at least every this many log bytes
+    /// (`log.index.interval.bytes`).
+    ///
+    /// Smaller narrows the scan a lookup ends with and costs index file
+    /// size; larger does the opposite. Kafka's default is the same 4 KiB.
+    #[arg(long = "index-interval-bytes", default_value_t = 4096)]
+    index_interval_bytes: u64,
+
+    /// Largest record batch a producer may send, in bytes
+    /// (`message.max.bytes`); `-1` leaves it bounded only by
+    /// `--max-frame-bytes`.
+    #[arg(long = "max-message-bytes", default_value_t = -1, allow_hyphen_values = true)]
+    max_message_bytes: i64,
+
+    /// Default `cleanup.policy` for topics that do not set one
+    /// (`log.cleanup.policy`): `delete` drops whole aged segments,
+    /// `compact` keeps the newest record per key.
+    #[arg(long = "cleanup-policy", value_parser = ["delete", "compact"], default_value = "delete")]
+    cleanup_policy: String,
+
+    /// How long a tombstone is kept once compaction could remove it
+    /// (`log.cleaner.delete.retention.ms`). This is the window a consumer
+    /// has to observe a deletion before the record carrying it is gone.
+    #[arg(long = "delete-retention-ms", default_value_t = 24 * 60 * 60 * 1000)]
+    delete_retention_ms: u64,
+
+    /// Fraction of a partition's cleanable log that must be dirty before
+    /// compaction rewrites it (`log.cleaner.min.cleanable.ratio`).
+    #[arg(long = "min-cleanable-dirty-ratio", default_value_t = 0.5)]
+    min_cleanable_dirty_ratio: f64,
+
+    /// How long a record is protected from being compacted away
+    /// (`log.cleaner.min.compaction.lag.ms`).
+    #[arg(long = "min-compaction-lag-ms", default_value_t = 0)]
+    min_compaction_lag_ms: u64,
+
+    /// How long a dirty record may wait before compaction runs regardless
+    /// of the dirty ratio (`log.cleaner.max.compaction.lag.ms`); unset
+    /// never forces a pass.
+    #[arg(long = "max-compaction-lag-ms")]
+    max_compaction_lag_ms: Option<u64>,
 
     /// fsync the active segment after this many records. Unset leaves
     /// durability to replication and the page cache (Kafka's default).
@@ -226,11 +283,65 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_OFFSETS_TOPIC_PARTITIONS)]
     offsets_topic_partitions: i32,
 
+    /// Replication factor for the internal `__consumer_offsets` and
+    /// `__transaction_state` topics
+    /// (`offsets.topic.replication.factor`). `0` derives it from the
+    /// cluster size, capped at 3.
+    ///
+    /// Worth setting explicitly on a cluster that grows: the internal
+    /// topics are created once, when the first nodes register, so a
+    /// three-node cluster whose second and third nodes had not started yet
+    /// would otherwise pin committed offsets to a single broker forever.
+    #[arg(long = "offsets-topic-replication-factor", default_value_t = 0)]
+    offsets_topic_replication_factor: i32,
+
     /// How long a group with no members keeps its committed offsets
     /// (`offsets.retention.ms`); 0 keeps them forever. The clock starts
     /// when the group empties, so a live consumer is never affected.
     #[arg(long = "offsets-retention-ms", default_value_t = 7 * 24 * 60 * 60 * 1000)]
     offsets_retention_ms: u64,
+
+    /// Largest `transaction.timeout.ms` a producer may ask for
+    /// (`transaction.max.timeout.ms`). A transaction that outlives its
+    /// timeout is aborted by the coordinator and its producer fenced,
+    /// which is what stops an abandoned transaction holding every
+    /// `read_committed` consumer of its partitions still.
+    #[arg(long = "transaction-max-timeout-ms", default_value_t = 15 * 60 * 1000)]
+    transaction_max_timeout_ms: u64,
+
+    /// How long an idle `transactional.id` is remembered before its
+    /// coordinator state is deleted (`transactional.id.expiration.ms`).
+    #[arg(long = "transactional-id-expiration-ms", default_value_t = 7 * 24 * 60 * 60 * 1000)]
+    transactional_id_expiration_ms: u64,
+
+    /// Host to publish in metadata, when it differs from `--host`.
+    ///
+    /// Kafka's `advertised.listeners`. A broker behind NAT, in a container
+    /// with a bridged network, or on a Kubernetes pod IP binds one address
+    /// and is reachable at another; without this it publishes the address
+    /// it bound and every client is routed somewhere it cannot reach.
+    #[arg(long = "advertised-host")]
+    advertised_host: Option<String>,
+
+    /// Port to publish in metadata, when it differs from the bound one.
+    #[arg(long = "advertised-port")]
+    advertised_port: Option<u16>,
+
+    /// Bind a second data-plane listener for broker-to-broker traffic
+    /// (Kafka's `inter.broker.listener.name`); `0` picks a port.
+    ///
+    /// Replication carries every record once per follower, so a cluster
+    /// required to present TLS to its clients would otherwise encrypt the
+    /// same bytes two or three more times to reach brokers on a private
+    /// network it already trusts. With this set, clients use `--port` and
+    /// its transport, and peers use this one and its.
+    #[arg(long = "internal-port")]
+    internal_port: Option<u16>,
+
+    /// Whether the inter-broker listener speaks TLS. Off means plaintext,
+    /// which is the point of having it.
+    #[arg(long = "internal-tls", default_value_t = false)]
+    internal_tls: bool,
 
     /// Data-plane transport: `tcp` (one multiplexed byte stream, plain),
     /// `tcp-tls` (the same, encrypted with TLS 1.3), or `quic` (TLS 1.3,
@@ -292,6 +403,8 @@ struct BrokerRegistration {
     host: String,
     data_port: u16,
     control_port: u16,
+    /// Where peers reach this broker, or 0 when that is `data_port`.
+    internal_port: u16,
     rack: Option<String>,
 }
 
@@ -336,11 +449,25 @@ async fn run_standalone(args: Args) -> Result<()> {
             retention_bytes: args.retention_bytes,
             flush_interval_messages: args.flush_interval_messages,
             flush_interval_ms: args.flush_interval_ms,
+            compact: args.cleanup_policy == "compact",
+            delete_retention_ms: args.delete_retention_ms,
+            min_cleanable_dirty_ratio: args.min_cleanable_dirty_ratio,
+            min_compaction_lag_ms: args.min_compaction_lag_ms,
+            max_compaction_lag_ms: args.max_compaction_lag_ms,
+            index_interval_bytes: args.index_interval_bytes.max(1),
             ..LogConfig::default()
         },
         retention_check_interval: Duration::from_millis(args.retention_check_interval_ms.max(1)),
+        max_frame_bytes: args.max_frame_bytes.max(1 << 16),
+        max_message_bytes: (args.max_message_bytes > 0).then_some(args.max_message_bytes as usize),
         offsets_retention: (args.offsets_retention_ms > 0)
             .then(|| Duration::from_millis(args.offsets_retention_ms)),
+        transaction_max_timeout: Duration::from_millis(args.transaction_max_timeout_ms),
+        transactional_id_expiration: Duration::from_millis(args.transactional_id_expiration_ms),
+        internal_listener: args.internal_port.map(|port| InternalListener {
+            port,
+            tls: args.internal_tls,
+        }),
         transport: args.transport,
         quota,
         require_auth: args.require_auth,
@@ -442,13 +569,28 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
                 retention_bytes: args.retention_bytes,
                 flush_interval_messages: args.flush_interval_messages,
                 flush_interval_ms: args.flush_interval_ms,
+                compact: args.cleanup_policy == "compact",
+                delete_retention_ms: args.delete_retention_ms,
+                min_cleanable_dirty_ratio: args.min_cleanable_dirty_ratio,
+                min_compaction_lag_ms: args.min_compaction_lag_ms,
+                max_compaction_lag_ms: args.max_compaction_lag_ms,
+                index_interval_bytes: args.index_interval_bytes.max(1),
                 ..LogConfig::default()
             },
             retention_check_interval: Duration::from_millis(
                 args.retention_check_interval_ms.max(1),
             ),
+            max_frame_bytes: args.max_frame_bytes.max(1 << 16),
+            max_message_bytes: (args.max_message_bytes > 0)
+                .then_some(args.max_message_bytes as usize),
             offsets_retention: (args.offsets_retention_ms > 0)
                 .then(|| Duration::from_millis(args.offsets_retention_ms)),
+            transaction_max_timeout: Duration::from_millis(args.transaction_max_timeout_ms),
+            transactional_id_expiration: Duration::from_millis(args.transactional_id_expiration_ms),
+            internal_listener: args.internal_port.map(|port| InternalListener {
+                port,
+                tls: args.internal_tls,
+            }),
             transport: args.transport,
             quota,
             require_auth: args.require_auth,
@@ -460,11 +602,26 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
         .await
         .context("failed to start broker")?,
     );
+    // What peers and clients are told, which is not necessarily what was
+    // bound: a broker behind NAT or on a pod IP is reachable at an
+    // address it never bound.
+    let internal_transport = if args.internal_port.is_some() {
+        if args.internal_tls {
+            Transport::TcpTls
+        } else {
+            Transport::Tcp
+        }
+    } else {
+        args.transport
+    };
     let registration = BrokerRegistration {
         broker_id: cluster.broker_id,
-        host: args.host,
-        data_port: broker.local_addr().port(),
+        host: args.advertised_host.clone().unwrap_or(args.host),
+        data_port: args
+            .advertised_port
+            .unwrap_or_else(|| broker.local_addr().port()),
         control_port: control_addr.port(),
+        internal_port: broker.internal_addr().map_or(0, |addr| addr.port()),
         rack: cluster.rack.clone(),
     };
 
@@ -567,7 +724,10 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
         Arc::clone(&broker),
         broker_epoch_rx.clone(),
         ReplicaManagerConfig {
-            transport: args.transport,
+            // The inter-broker listener's transport when there is one:
+            // replication has to speak whatever that socket speaks, not
+            // whatever the client listener does.
+            transport: internal_transport,
             ..ReplicaManagerConfig::default()
         },
     );
@@ -587,12 +747,14 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
     let offsets_epoch = broker_epoch_rx.clone();
     let offsets_shutdown = shutdown_rx.clone();
     let offsets_partitions = args.offsets_topic_partitions;
+    let offsets_replication_factor = args.offsets_topic_replication_factor;
     components.spawn(async move {
         ensure_internal_topics(
             offsets_controller,
             offsets_cache,
             offsets_epoch,
             offsets_partitions,
+            offsets_replication_factor,
             offsets_shutdown,
         )
         .await
@@ -679,6 +841,9 @@ fn cluster_settings(args: &Args) -> Result<Option<ClusterSettings>> {
     }
     if args.offsets_topic_partitions < 1 {
         bail!("--offsets-topic-partitions must be at least 1");
+    }
+    if args.offsets_topic_replication_factor < 0 {
+        bail!("--offsets-topic-replication-factor must be 0 (derive) or positive");
     }
 
     let mut peers = BTreeMap::new();
@@ -911,6 +1076,7 @@ async fn register_broker(
         host: registration.host.clone(),
         data_port: registration.data_port,
         control_port: registration.control_port,
+        internal_port: registration.internal_port,
         roles: vec![NodeRole::Broker, NodeRole::Controller],
         rack: registration.rack.clone(),
         now_ms: unix_time_ms(),
@@ -1563,9 +1729,10 @@ fn preferred_leader_commands(image: &ClusterMetadata) -> Vec<MetadataCommand> {
             // The ISR is only evidence of a caught-up *replica*; the broker
             // must also still be alive and serving as a broker, or the
             // handover would elect a node that cannot take the traffic.
-            let usable = image.brokers.get(&preferred).is_some_and(|broker| {
-                broker.alive && broker.roles.contains(&NodeRole::Broker)
-            });
+            let usable = image
+                .brokers
+                .get(&preferred)
+                .is_some_and(|broker| broker.alive && broker.roles.contains(&NodeRole::Broker));
             if !usable {
                 continue;
             }
@@ -1616,6 +1783,7 @@ async fn ensure_internal_topics(
     cache: MetadataCache,
     mut broker_epoch: watch::Receiver<BrokerEpoch>,
     partitions: i32,
+    replication_factor: i32,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
@@ -1640,7 +1808,15 @@ async fn ensure_internal_topics(
         (OFFSETS_TOPIC, partitions),
         (TRANSACTION_STATE_TOPIC, partitions.clamp(1, 50)),
     ] {
-        create_internal_topic(&controller, &cache, name, partitions, &mut shutdown).await?;
+        create_internal_topic(
+            &controller,
+            &cache,
+            name,
+            partitions,
+            replication_factor,
+            &mut shutdown,
+        )
+        .await?;
     }
     // The topics are ensured; park until shutdown. Returning early would
     // make supervise_components tear down the whole node (any completed
@@ -1659,6 +1835,7 @@ async fn create_internal_topic(
     cache: &MetadataCache,
     name: &str,
     partitions: i32,
+    replication_factor: i32,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let image = controller
@@ -1670,10 +1847,19 @@ async fn create_internal_topic(
         return Ok(());
     }
     let live = image.brokers.values().filter(|broker| broker.alive).count();
+    // An explicit factor is honoured as given, but never above the number
+    // of brokers that exist: a topic asking for more replicas than there
+    // are brokers cannot be created at all, and failing to create the
+    // offsets topic takes the whole cluster down with it.
+    let replication_factor = if replication_factor > 0 {
+        replication_factor.min(live.max(1) as i32)
+    } else {
+        (live as i32).clamp(1, 3)
+    };
     let command = MetadataCommand::CreateTopic {
         name: name.to_owned(),
         partitions,
-        replication_factor: (live as i32).clamp(1, 3),
+        replication_factor,
         configs: BTreeMap::new(),
     };
     let Some(result) = write_or_shutdown(controller, command, shutdown).await else {
@@ -1684,13 +1870,30 @@ async fn create_internal_topic(
             tracing::info!(?event, name, partitions, "internal topic created");
         }
         Err(error) => {
-            let image = controller
-                .local_metadata()
-                .await
-                .with_context(|| format!("failed to re-read metadata after creating {name}"))?;
-            publish_if_newer(cache, image.clone());
-            if !image.topics.contains_key(name) {
-                bail!("failed to create internal topic {name}: {error}")
+            // Losing the race is the expected outcome for all but one node,
+            // and the loser learns it did by finding the topic present.
+            //
+            // But "present" has to be given time to arrive. The create was
+            // refused by the *leader*, whose state this node's local Raft
+            // copy trails by however long replication takes — so a single
+            // look can miss a topic that certainly exists, and bailing on
+            // that look takes the node down at startup for a race it was
+            // designed to lose.
+            let deadline = Instant::now() + INTERNAL_TOPIC_SETTLE;
+            loop {
+                let image = controller
+                    .local_metadata()
+                    .await
+                    .with_context(|| format!("failed to re-read metadata after creating {name}"))?;
+                let present = image.topics.contains_key(name);
+                publish_if_newer(cache, image);
+                if present {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!("failed to create internal topic {name}: {error}")
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
     }
@@ -2233,6 +2436,7 @@ mod tests {
             host: "127.0.0.1".into(),
             data_port: 9_092,
             control_port: 19_092,
+            internal_port: 0,
             broker_epoch,
             roles: BTreeSet::from([NodeRole::Broker, NodeRole::Controller]),
             rack: None,

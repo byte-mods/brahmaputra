@@ -274,6 +274,11 @@ pub enum Cmd {
     Usage {
         reply: oneshot::Sender<PartitionUsage>,
     },
+    /// Who has written to this partition and what is still open, for
+    /// `DescribeProducers`.
+    Producers {
+        reply: oneshot::Sender<PartitionProducers>,
+    },
     /// Discard every record below an offset; reply with the resulting log
     /// start offset.
     DeleteRecordsBefore {
@@ -375,6 +380,26 @@ pub struct PartitionUsage {
     pub log_end_offset: i64,
     pub high_watermark: i64,
     pub segments: usize,
+}
+
+/// One producer's state on one partition, as `DescribeProducers` reports it.
+#[derive(Debug, Clone, Copy)]
+pub struct ProducerSnapshot {
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    /// Sequence of the last batch accepted, or -1 if none is remembered.
+    pub last_sequence: i32,
+    /// First offset of this producer's open transaction here, or -1.
+    pub current_txn_start_offset: i64,
+}
+
+/// What `DescribeProducers` needs from a partition: who has written, and
+/// the two offsets whose gap is the symptom an operator is chasing.
+#[derive(Debug, Default)]
+pub struct PartitionProducers {
+    pub producers: Vec<ProducerSnapshot>,
+    pub last_stable_offset: i64,
+    pub high_watermark: i64,
 }
 
 pub struct ReadOutcome {
@@ -647,6 +672,16 @@ impl PartitionHandle {
         rx.await.map_err(|_| actor_gone())
     }
 
+    /// Who has written to this partition, and what is still open.
+    pub async fn producers(&self) -> Result<PartitionProducers, StorageError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Producers { reply })
+            .await
+            .map_err(|_| actor_gone())?;
+        rx.await.map_err(|_| actor_gone())
+    }
+
     /// Discard every record below `offset`, returning the new log start.
     pub async fn delete_records_before(&self, offset: i64) -> Result<i64, StorageError> {
         let (reply, rx) = oneshot::channel();
@@ -826,8 +861,14 @@ async fn run(
                 // throw away offsets a group still depends on.
                 if current.is_compacted() {
                     match current.compact() {
-                        Ok(removed) if removed > 0 => {
-                            debug!(removed, "compaction removed superseded records");
+                        Ok(outcome) if outcome.records_removed > 0 => {
+                            debug!(
+                                removed = outcome.records_removed,
+                                tombstones = outcome.tombstones_removed,
+                                bytes_before = outcome.bytes_before,
+                                bytes_after = outcome.bytes_after,
+                                "compaction removed superseded records"
+                            );
                         }
                         Ok(_) => {}
                         Err(error) => warn!(%error, "compaction pass failed"),
@@ -981,14 +1022,14 @@ async fn run(
                 // aborted records — so the take_while below has nothing
                 // left to trim.
                 let stable = current.last_stable_offset();
-                let result = current.read_committed(offset, max_bytes).map(|batches| {
-                    ReadOutcome {
+                let result = current
+                    .read_committed(offset, max_bytes)
+                    .map(|batches| ReadOutcome {
                         batches,
                         high_watermark: stable,
                         log_start_offset: current.log_start_offset(),
                         log_end_offset: current.log_end_offset(),
-                    }
-                });
+                    });
                 let _ = reply.send(result);
             }
             Cmd::Read {
@@ -1173,6 +1214,43 @@ async fn run(
                     log_end_offset: current.log_end_offset(),
                     high_watermark: current.high_watermark(),
                     segments: current.segment_count(),
+                });
+            }
+            Cmd::Producers { reply } => {
+                let current = log.as_ref().expect("partition log");
+                let open: std::collections::HashMap<i64, i64> =
+                    current.open_transactions().into_iter().collect();
+                let mut producers: Vec<ProducerSnapshot> = producer_state
+                    .producers
+                    .iter()
+                    .map(|(producer_id, state)| ProducerSnapshot {
+                        producer_id: *producer_id,
+                        producer_epoch: state.epoch,
+                        last_sequence: state.next_sequence.saturating_sub(1),
+                        current_txn_start_offset: open.get(producer_id).copied().unwrap_or(-1),
+                    })
+                    .collect();
+                // A producer with an open transaction but no remembered
+                // batch — one whose state was rebuilt after retention —
+                // still has to appear: it is the one holding the LSO.
+                for (producer_id, first_offset) in open {
+                    if !producers
+                        .iter()
+                        .any(|snapshot| snapshot.producer_id == producer_id)
+                    {
+                        producers.push(ProducerSnapshot {
+                            producer_id,
+                            producer_epoch: -1,
+                            last_sequence: -1,
+                            current_txn_start_offset: first_offset,
+                        });
+                    }
+                }
+                producers.sort_by_key(|snapshot| snapshot.producer_id);
+                let _ = reply.send(PartitionProducers {
+                    producers,
+                    last_stable_offset: current.last_stable_offset(),
+                    high_watermark: current.high_watermark(),
                 });
             }
             Cmd::DeleteRecordsBefore { offset, reply } => {

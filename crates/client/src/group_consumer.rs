@@ -371,7 +371,8 @@ pub struct ConsumedRecord {
     pub partition: i32,
     pub offset: i64,
     pub key: Option<Bytes>,
-    pub value: Bytes,
+    /// `None` is a tombstone — the producer deleted this key.
+    pub value: Option<Bytes>,
     /// Absolute create time in unix milliseconds, already resolved against
     /// the batch base so a caller never has to know the batch existed.
     pub timestamp: i64,
@@ -629,6 +630,17 @@ pub struct GroupConsumer {
     coordinator: GroupCoordinator,
     consumer: Consumer,
     session_timeout_ms: i32,
+    /// How often a heartbeat goes out (`heartbeat.interval.ms`). `None`
+    /// derives it from the session timeout.
+    ///
+    /// Independently settable because the two answer different questions.
+    /// The session timeout is how long the coordinator waits before
+    /// declaring a member dead — a tolerance for GC pauses and network
+    /// hiccups. The heartbeat interval is how often the member proves it
+    /// is alive, which is a traffic decision. Deriving one from the other
+    /// forces a fleet that wants a generous 45-second tolerance to also
+    /// accept 15 seconds of blindness after a real failure.
+    heartbeat_interval_ms: Option<i32>,
     rebalance_timeout_ms: i32,
     assignor: Assignor,
     auto_commit: Option<Duration>,
@@ -691,6 +703,7 @@ impl GroupConsumer {
             },
             consumer,
             session_timeout_ms: 10_000,
+            heartbeat_interval_ms: None,
             rebalance_timeout_ms: 3_000,
             assignor: Assignor::Range,
             auto_commit: Some(Duration::from_secs(5)),
@@ -751,9 +764,21 @@ impl GroupConsumer {
         self
     }
 
-    /// Broker-side session timeout; heartbeats go out every timeout/3.
+    /// Broker-side session timeout. Heartbeats go out every timeout/3
+    /// unless [`with_heartbeat_interval`](Self::with_heartbeat_interval)
+    /// says otherwise.
     pub fn with_session_timeout(mut self, session_timeout_ms: i32) -> Self {
         self.session_timeout_ms = session_timeout_ms;
+        self
+    }
+
+    /// How often to heartbeat (`heartbeat.interval.ms`).
+    ///
+    /// Clamped below the session timeout: a member that heartbeats less
+    /// often than the coordinator waits is a member that will be evicted
+    /// while perfectly healthy.
+    pub fn with_heartbeat_interval(mut self, heartbeat_interval_ms: i32) -> Self {
+        self.heartbeat_interval_ms = Some(heartbeat_interval_ms);
         self
     }
 
@@ -795,6 +820,17 @@ impl GroupConsumer {
     /// Cap on response batch bytes per fetch.
     pub fn with_max_bytes(mut self, max_bytes: i32) -> Self {
         self.consumer = Consumer::from_router(self.coordinator.router.clone(), max_bytes);
+        self
+    }
+
+    /// Where this consumer is running (`client.rack`), so its fetches can
+    /// be served by a replica in the same failure domain.
+    pub fn with_rack(mut self, rack: impl Into<String>) -> Self {
+        let consumer = std::mem::replace(
+            &mut self.consumer,
+            Consumer::from_router(self.coordinator.router.clone(), 8 * 1024 * 1024),
+        );
+        self.consumer = consumer.with_rack(rack);
         self
     }
 
@@ -1241,9 +1277,19 @@ impl GroupConsumer {
         // session timeout alone means a consumer with a long session and a
         // short poll interval — a perfectly ordinary combination — would
         // not be checked for a stalled poll until long after it stalled.
-        let heartbeat_every = u64::try_from(self.session_timeout_ms / 3)
-            .unwrap_or(1)
-            .max(1);
+        // An explicit interval is clamped to strictly less than the session
+        // timeout: heartbeating no more often than the coordinator waits
+        // guarantees eviction rather than risking it.
+        let heartbeat_every = match self.heartbeat_interval_ms {
+            Some(interval) => {
+                u64::try_from(interval.clamp(1, (self.session_timeout_ms - 1).max(1)))
+                    .unwrap_or(1)
+                    .max(1)
+            }
+            None => u64::try_from(self.session_timeout_ms / 3)
+                .unwrap_or(1)
+                .max(1),
+        };
         let poll_check_every = (self.max_poll_interval.as_millis() as u64 / 3).max(1);
         let interval = Duration::from_millis(heartbeat_every.min(poll_check_every));
         self.heartbeat_task = Some(tokio::spawn(async move {

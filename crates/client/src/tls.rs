@@ -88,9 +88,7 @@ fn read_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ClientError> 
 }
 
 /// Build the rustls client configuration these settings describe.
-pub(crate) fn client_config(
-    settings: &TlsSettings,
-) -> Result<rustls::ClientConfig, ClientError> {
+pub(crate) fn client_config(settings: &TlsSettings) -> Result<rustls::ClientConfig, ClientError> {
     let builder = match &settings.ca_path {
         Some(ca_path) => {
             let mut roots = RootCertStore::empty();

@@ -55,6 +55,11 @@ class FetchRequest {
     // the last stable offset instead of the high watermark, and never sees
     // an aborted transaction's records or a control marker.
     int isolation_level;
+    // The consumer's own failure domain (`client.rack`), empty when it has
+    // none. Non-empty asks the leader to name a replica in that rack that
+    // this consumer could read from instead, which is what keeps a fetch
+    // inside one availability zone (KIP-392).
+    string rack;
 }
 
 class FetchResponse {
@@ -64,6 +69,11 @@ class FetchResponse {
     long high_watermark;
     long last_stable_offset;
     long batches_length;   // bytes of raw record-batch data trailing the struct
+    // Broker this consumer should fetch this partition from instead, or
+    // -1 to keep reading here. Named by the leader, which is the only
+    // node that knows the current ISR, so a consumer never has to guess
+    // which replica is caught up enough to serve it.
+    int preferred_read_replica;
 }
 
 // ---------- ListOffsets (api_key 2) ----------
@@ -88,6 +98,10 @@ class BrokerInfo {
     int broker_id;
     string host;
     int port;
+    // Failure domain this broker is in, empty when it was started without
+    // --rack. A consumer that knows its own rack uses this to ask for a
+    // replica it can read without crossing a zone boundary.
+    string rack;
 }
 
 class PartitionInfo {
@@ -312,11 +326,30 @@ class FetchMultiPartition {
     int max_bytes;
 }
 
+class ForgottenPartition {
+    string topic;
+    int partition;
+}
+
 class FetchMultiRequest {
     int max_wait_ms;          // long poll, applied across the whole request
     int min_bytes;            // return early once this many bytes are ready
     int isolation_level;      // 0 = read_uncommitted, 1 = read_committed
+    string rack;              // `client.rack`, empty when the consumer has none
+    // Incremental fetch session (KIP-227). A consumer holding a thousand
+    // partitions of which three are moving resends all thousand on every
+    // poll; with a session it resends the three. `session_id` is 0 until
+    // the broker issues one, `session_epoch` is 0 to open a session, a
+    // positive number to continue one, and -1 to close it.
+    int session_id;
+    int session_epoch;
+    // Every partition when opening a session or fetching without one;
+    // only the ones whose fetch offset changed when continuing.
     FetchMultiPartition[] partitions;
+    // Partitions to drop from the session — an assignment this consumer
+    // no longer holds. Without it a rebalance would leave the broker
+    // fetching partitions nobody is reading.
+    ForgottenPartition[] forgotten;
 }
 
 class FetchMultiResult {
@@ -326,9 +359,22 @@ class FetchMultiResult {
     long high_watermark;
     long last_stable_offset;
     long batches_length;      // bytes of this partition's trailing batches
+    int preferred_read_replica; // broker to read from instead, or -1
 }
 
 class FetchMultiResponse {
+    // The session this response belongs to, and the epoch the next request
+    // must carry. Zero means no session was established, which is a
+    // complete answer rather than a failure: the client simply keeps
+    // sending full fetches.
+    int session_id;
+    int session_epoch;
+    // Request-level failure, distinct from a per-partition one: an
+    // unknown session or an epoch that has gone out of step. The client
+    // answers both the same way — start again with a full fetch — which
+    // is why they are reported here rather than smeared across the
+    // partitions.
+    int error_code;
     FetchMultiResult[] results;
 }
 
@@ -403,15 +449,33 @@ class TombstoneRecord {
 // over `tcp-tls` or `quic`. That is the same trade SASL/PLAIN makes in
 // Kafka, and the broker refuses it on a plaintext listener.
 
+// Two shapes share one API key, distinguished by `mechanism`.
+//
+// PLAIN sends the password and is refused on a plaintext listener, because
+// a password in the clear is only meaningful under encryption.
+// SCRAM-SHA-256 never sends it: the client proves it knows the password by
+// answering a challenge, which is what makes authentication meaningful on
+// a listener that is not encrypted. Its exchange takes two round trips, so
+// `payload` carries an RFC 5802 message and `done` says whether the server
+// considers the exchange finished.
+
 class AuthenticateRequest {
     string username;
     string password;
+    // Empty means PLAIN, for a client that predates mechanisms.
+    string mechanism;
+    // The SCRAM message for this step; unused by PLAIN.
+    string payload;
 }
 
 class AuthenticateResponse {
     int error_code;
     string principal;
     string role;
+    // The server's SCRAM message for this step; unused by PLAIN.
+    string payload;
+    // False when the client must send another step.
+    bool done;
 }
 
 // ---------- LeaveGroup (api_key 18) ----------
@@ -709,4 +773,163 @@ class TxnMarkerResult {
 
 class WriteTxnMarkersResponse {
     TxnMarkerResult[] results;
+}
+
+// ---------- AlterConfigs (api_key 28) ----------
+// Change a topic's configuration from the data plane.
+//
+// Configuration could already be changed on a running cluster, but only
+// through the controller's HTTP API — which means an administrative client
+// had to know a second protocol, a second address and a second set of
+// credentials to do what DescribeConfigs (key 20) already let it read back
+// over this one. The broker forwards to the controller, so the durability
+// and ordering of the change are unchanged; what changes is that one
+// connection is enough to both read and write a topic's configuration.
+//
+// `incremental` distinguishes Kafka's two shapes: false replaces the whole
+// config map, true merges the entries given and leaves the rest alone. An
+// entry with an empty value in incremental mode removes that key, which is
+// how a topic is returned to the broker default rather than pinned to
+// whatever the default happened to be on the day.
+
+class AlterConfigEntry {
+    string name;
+    string value;
+}
+
+class AlterConfigsRequest {
+    string resource_type;   // "topic"
+    string resource_name;
+    bool incremental;
+    AlterConfigEntry[] configs;
+}
+
+class AlterConfigsResponse {
+    int error_code;
+    string resource_type;
+    string resource_name;
+    // Human-readable reason when error_code is not zero: an operator who
+    // mistyped a config name deserves to be told which one.
+    string error_message;
+}
+
+// ---------- DescribeProducers (api_key 29) ----------
+// Which producers have written to a partition, and what state each is in.
+//
+// This is the answer to "why is my read_committed consumer stuck?", which
+// before had no answer short of reading the log by hand. A partition whose
+// last stable offset will not advance has exactly one cause — an open
+// transaction — and this says which producer owns it and when it last did
+// anything.
+
+class ProducerState {
+    long producer_id;
+    int producer_epoch;
+    int last_sequence;
+    long last_timestamp_ms;
+    // First offset of this producer's open transaction on this partition,
+    // or -1 when it has none in flight.
+    long current_txn_start_offset;
+}
+
+class DescribeProducersRequest {
+    string topic;
+    int partition;
+}
+
+class DescribeProducersResponse {
+    int error_code;
+    string topic;
+    int partition;
+    // The offset a read_committed consumer stops at, and the high
+    // watermark it would stop at if nothing were open. Reported together
+    // because the gap between them *is* the symptom being diagnosed.
+    long last_stable_offset;
+    long high_watermark;
+    ProducerState[] producers;
+}
+
+// ---------- ListTransactions (api_key 30) ----------
+// Every transactional id this broker coordinates, and what state it is in.
+//
+// The cluster-wide view of the same question: a transaction that has been
+// Ongoing for longer than its timeout is one the coordinator is about to
+// abort, and one that has been PrepareCommit for a while is one whose
+// markers did not all land.
+
+class TransactionListing {
+    string transactional_id;
+    long producer_id;
+    string state;
+    long last_update_ms;
+    int timeout_ms;
+    int partition_count;
+}
+
+class ListTransactionsRequest {
+    // Only these states, empty for all.
+    string[] states;
+}
+
+class ListTransactionsResponse {
+    int error_code;
+    TransactionListing[] transactions;
+}
+
+// ---------- DescribeTransactions (api_key 31) ----------
+// One transaction in full, including the partitions it has announced.
+
+class DescribeTransactionsRequest {
+    string transactional_id;
+}
+
+class DescribeTransactionsResponse {
+    int error_code;
+    string transactional_id;
+    long producer_id;
+    int producer_epoch;
+    string state;
+    int timeout_ms;
+    long last_update_ms;
+    TxnPartition[] partitions;
+}
+
+// ---------- AlterReplicaLogDirs (api_key 32) ----------
+// Move a partition from one of a broker's disks to another.
+//
+// JBOD placed partitions across disks and isolated a disk failure to its
+// own partitions, but placement was decided once — when the partition was
+// created — and could never be revisited. So a disk added to a running
+// broker took only *new* partitions, and a disk filling up could only be
+// relieved by deleting a partition and letting it refetch from the leader,
+// which is a full re-replication to solve a local problem.
+//
+// The move is not free: the partition is closed for the duration of the
+// copy, so on this broker it is unavailable and, in a cluster, it stops
+// fetching and leaves the ISR until it catches up. That is the honest
+// trade — Kafka builds a second copy alongside and swaps, which avoids the
+// pause at the cost of needing both copies to fit and of a whole
+// catch-up-and-swap state machine. Move followers, or hand leadership away
+// first.
+
+class AlterLogDirPartition {
+    string topic;
+    int partition;
+    string log_dir;         // absolute path, one of the broker's --data-dir
+}
+
+class AlterReplicaLogDirsRequest {
+    AlterLogDirPartition[] partitions;
+}
+
+class AlterLogDirResult {
+    string topic;
+    int partition;
+    int error_code;
+    string log_dir;         // where the partition now lives
+    long bytes_moved;
+}
+
+class AlterReplicaLogDirsResponse {
+    AlterLogDirResult[] results;
 }

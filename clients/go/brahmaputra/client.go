@@ -1,12 +1,18 @@
 package brahmaputra
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -103,32 +109,166 @@ func (c *Conn) readFrame() ([]byte, error) {
 	return payload, nil
 }
 
-// Authenticate binds a principal to this connection.
+// Authenticate binds a principal to this connection using SCRAM-SHA-256.
 //
-// The password crosses the wire in the clear exactly as SASL/PLAIN does,
-// so the broker refuses this on a plaintext listener.
+// The password never crosses the wire: the broker sends a challenge and
+// this answers with a proof derived from the password, which is what makes
+// authentication meaningful on a plaintext listener. Use
+// AuthenticatePlain only where the connection is already encrypted and the
+// broker's user was created without a SCRAM credential.
 func (c *Conn) Authenticate(username, password string) (principal, role string, err error) {
-	w := NewBodyWriter()
-	w.String(username)
-	w.String(password)
-	body, err := c.Request(APIAuthenticate, w.Bytes())
+	clientNonce, err := scramNonce()
 	if err != nil {
 		return "", "", err
 	}
-	r, err := NewBodyReader(body)
+	bare := fmt.Sprintf("n=%s,r=%s", username, clientNonce)
+	code, _, _, serverFirst, done, err := c.authenticateStep(
+		username, "", scramMechanism, "n,,"+bare,
+	)
 	if err != nil {
 		return "", "", err
 	}
-	code := r.Int32()
-	principal = r.String()
-	role = r.String()
-	if r.Err() != nil {
-		return "", "", r.Err()
+	if code != ErrNone {
+		return "", "", serverError(code, "authenticate")
+	}
+	if done {
+		return "", "", errors.New("broker ended the SCRAM exchange before it began")
+	}
+	nonce, ok := scramField(serverFirst, "r")
+	if !ok {
+		return "", "", errors.New("malformed SCRAM server-first message")
+	}
+	salt, ok := scramField(serverFirst, "s")
+	if !ok {
+		return "", "", errors.New("malformed SCRAM server-first message")
+	}
+	iterationsField, ok := scramField(serverFirst, "i")
+	if !ok {
+		return "", "", errors.New("malformed SCRAM server-first message")
+	}
+	iterations, err := strconv.Atoi(iterationsField)
+	if err != nil || iterations <= 0 {
+		return "", "", errors.New("malformed SCRAM iteration count")
+	}
+	// The server must have kept this client's nonce, which is what makes
+	// the exchange this one rather than a replay of an earlier one.
+	if !strings.HasPrefix(nonce, clientNonce) {
+		return "", "", errors.New("SCRAM server nonce does not extend the client nonce")
+	}
+	// `biws` is base64 of the GS2 header "n,,", echoed so the server can
+	// see it was not altered in flight.
+	withoutProof := "c=biws,r=" + nonce
+	authMessage := strings.Join([]string{bare, serverFirst, withoutProof}, ",")
+	proof, err := scramClientProof(password, salt, iterations, authMessage)
+	if err != nil {
+		return "", "", err
+	}
+	code, principal, role, _, _, err = c.authenticateStep(
+		username, "", scramMechanism, withoutProof+",p="+proof,
+	)
+	if err != nil {
+		return "", "", err
 	}
 	if code != ErrNone {
 		return "", "", serverError(code, "authenticate")
 	}
 	return principal, role, nil
+}
+
+// AuthenticatePlain sends the password itself, exactly as SASL/PLAIN does.
+// The broker refuses it on a plaintext listener.
+func (c *Conn) AuthenticatePlain(username, password string) (principal, role string, err error) {
+	code, principal, role, _, _, err := c.authenticateStep(username, password, "PLAIN", "")
+	if err != nil {
+		return "", "", err
+	}
+	if code != ErrNone {
+		return "", "", serverError(code, "authenticate")
+	}
+	return principal, role, nil
+}
+
+func (c *Conn) authenticateStep(
+	username, password, mechanism, payload string,
+) (code int32, principal, role, responsePayload string, done bool, err error) {
+	w := NewBodyWriter()
+	w.String(username)
+	w.String(password)
+	w.String(mechanism)
+	w.String(payload)
+	body, err := c.Request(APIAuthenticate, w.Bytes())
+	if err != nil {
+		return 0, "", "", "", false, err
+	}
+	r, err := NewBodyReader(body)
+	if err != nil {
+		return 0, "", "", "", false, err
+	}
+	code = r.Int32()
+	principal = r.String()
+	role = r.String()
+	responsePayload = r.String()
+	done = r.Bool()
+	if r.Err() != nil {
+		return 0, "", "", "", false, r.Err()
+	}
+	return code, principal, role, responsePayload, done, nil
+}
+
+const scramMechanism = "SCRAM-SHA-256"
+
+func scramNonce() (string, error) {
+	raw := make([]byte, 18)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return strings.ReplaceAll(base64.StdEncoding.EncodeToString(raw), ",", "."), nil
+}
+
+func scramField(message, key string) (string, bool) {
+	for _, part := range strings.Split(message, ",") {
+		if strings.HasPrefix(part, key+"=") {
+			return part[len(key)+1:], true
+		}
+	}
+	return "", false
+}
+
+func scramHMAC(key, message []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(message)
+	return mac.Sum(nil)
+}
+
+// PBKDF2-HMAC-SHA256, one output block — all SCRAM-SHA-256 needs, since
+// its derived key is exactly the hash length.
+func scramPBKDF2(password, salt []byte, iterations int) []byte {
+	block := append(append([]byte{}, salt...), 0, 0, 0, 1)
+	u := scramHMAC(password, block)
+	result := append([]byte{}, u...)
+	for i := 1; i < iterations; i++ {
+		u = scramHMAC(password, u)
+		for j := range result {
+			result[j] ^= u[j]
+		}
+	}
+	return result
+}
+
+func scramClientProof(password, salt string, iterations int, authMessage string) (string, error) {
+	decodedSalt, err := base64.StdEncoding.DecodeString(salt)
+	if err != nil {
+		return "", errors.New("malformed SCRAM salt")
+	}
+	salted := scramPBKDF2([]byte(password), decodedSalt, iterations)
+	clientKey := scramHMAC(salted, []byte("Client Key"))
+	storedKey := sha256.Sum256(clientKey)
+	signature := scramHMAC(storedKey[:], []byte(authMessage))
+	proof := make([]byte, len(clientKey))
+	for i := range clientKey {
+		proof[i] = clientKey[i] ^ signature[i]
+	}
+	return base64.StdEncoding.EncodeToString(proof), nil
 }
 
 // APIVersionRange is one entry of an ApiVersions response.
@@ -174,6 +314,10 @@ type BrokerInfo struct {
 	NodeID int32
 	Host   string
 	Port   int32
+	// Failure domain this broker is in, empty when it was started without
+	// --rack. A consumer that sets ConsumerConfig.Rack can be redirected
+	// to a replica in its own rack.
+	Rack string
 }
 
 type PartitionInfo struct {
@@ -234,7 +378,10 @@ func decodeMetadata(r *Reader) (*ClusterMetadata, error) {
 		return nil, serverError(code, "metadata")
 	}
 	for count := int(r.Int32()); count > 0; count-- {
-		metadata.Brokers = append(metadata.Brokers, BrokerInfo{r.Int32(), r.String(), r.Int32()})
+		metadata.Brokers = append(
+			metadata.Brokers,
+			BrokerInfo{r.Int32(), r.String(), r.Int32(), r.String()},
+		)
 	}
 	r.SkipInt32() // controller_id
 	for count := int(r.Int32()); count > 0; count-- {
@@ -812,6 +959,9 @@ type ConsumerConfig struct {
 	FetchMinBytes int32
 	// FetchMaxWaitMs is the long-poll ceiling when caught up.
 	FetchMaxWaitMs int32
+	// Rack is this consumer's failure domain (`client.rack`), empty when
+	// it has none.
+	Rack string
 
 	// IsolationLevel is ReadUncommitted (the default) or ReadCommitted.
 	// A committed read stops at the last stable offset and never sees a
@@ -911,6 +1061,9 @@ func (c *Consumer) FetchVerbose(
 	w.Int32(maxWaitMs)
 	w.Int32(c.config.FetchMinBytes)
 	w.Int32(c.config.IsolationLevel)
+	// `client.rack`: with it set the leader names an in-sync replica in
+	// the same rack, and this client reads from that instead.
+	w.String(c.config.Rack)
 	body := w.Bytes()
 
 	conn, err := c.router.ConnFor(topic, partition)
@@ -977,6 +1130,10 @@ func (c *Consumer) fetchOnce(
 	highWatermark := r.Int64()
 	r.SkipInt64() // last_stable_offset
 	batchesLength := r.Int64()
+	// Read even though this client does not act on it: the batches trail
+	// the whole struct, so skipping a field would take them from the
+	// wrong offset and every batch after it would fail to decode.
+	r.SkipInt32() // preferred_read_replica
 	if r.Err() != nil {
 		return 0, 0, nil, r.Err()
 	}

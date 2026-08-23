@@ -146,7 +146,7 @@ async fn very_long_fetch_is_cancelled_and_acknowledged_produce_survives_restart(
         .expect("read acknowledged record after restart");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].offset, 0);
-    assert_eq!(records[0].value, Bytes::from_static(b"durable"));
+    assert_eq!(records[0].value, Some(Bytes::from_static(b"durable")));
     drop(consumer);
     stop_broker(reopened).await;
 }

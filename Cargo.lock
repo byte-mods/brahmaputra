@@ -291,8 +291,9 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-broker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "base64",
  "brahmaputra-client",
  "brahmaputra-metadata",
  "brahmaputra-metrics",
@@ -305,6 +306,7 @@ dependencies = [
  "libc",
  "quinn",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
@@ -322,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "brahmaputra-broker",
@@ -341,8 +343,9 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "brahmaputra-metadata",
  "brahmaputra-protocol",
  "bytes",
  "crc32c",
@@ -360,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-controller"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -378,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-dashboard"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "async-stream",
@@ -399,18 +402,21 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-metadata"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
+ "base64",
+ "hmac",
  "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "brahmaputra-metrics"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dashmap",
  "serde",
@@ -418,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "crc32c",
@@ -431,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -452,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-storage"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "brahmaputra-protocol",
  "bytes",
@@ -944,6 +950,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"
@@ -2076,6 +2091,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
 ]
 
 [[package]]

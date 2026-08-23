@@ -102,7 +102,9 @@ impl LogDirs {
     /// put anything.
     pub fn open(paths: &[PathBuf]) -> Result<Self, BrokerError> {
         if paths.is_empty() {
-            return Err(BrokerError::Meta("at least one data dir is required".into()));
+            return Err(BrokerError::Meta(
+                "at least one data dir is required".into(),
+            ));
         }
 
         let mut dirs = Vec::with_capacity(paths.len());
@@ -277,6 +279,23 @@ impl LogDirs {
             .get(&(topic.to_owned(), partition))
             .map(|entry| *entry)?;
         Some(partition_path(&self.dirs[index].path, topic, partition))
+    }
+
+    /// Record that a partition now lives on `destination`.
+    ///
+    /// Called after its files are there, never before: the placement
+    /// record is what the broker believes, and believing a partition is
+    /// somewhere its data is not would be worse than not knowing where it
+    /// is at all.
+    pub fn reassign(&self, topic: &str, partition: i32, destination: &Path) -> Result<(), String> {
+        let index = self
+            .dirs
+            .iter()
+            .position(|dir| dir.path == destination)
+            .ok_or_else(|| format!("{} is not a log directory", destination.display()))?;
+        self.assignment.insert((topic.to_owned(), partition), index);
+        self.record_placement();
+        Ok(())
     }
 
     /// Forget a partition this broker no longer holds, so a later

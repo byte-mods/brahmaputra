@@ -72,11 +72,28 @@ impl fmt::Display for Transport {
 pub struct TransportConfig {
     pub transport: Transport,
     pub tls: TlsSettings,
+    /// Credentials to present on every connection this configuration
+    /// opens.
+    ///
+    /// Carried with the transport rather than passed to one call, because
+    /// a client reconnects: a producer whose broker restarted opens a new
+    /// socket, and a socket that skipped authentication is anonymous no
+    /// matter what the first one did.
+    pub credentials: Option<Credentials>,
 }
 
 impl TransportConfig {
     pub fn new(transport: Transport, tls: TlsSettings) -> Self {
-        TransportConfig { transport, tls }
+        TransportConfig {
+            transport,
+            tls,
+            credentials: None,
+        }
+    }
+
+    pub fn with_credentials(mut self, credentials: Option<Credentials>) -> Self {
+        self.credentials = credentials;
+        self
     }
 }
 
@@ -85,6 +102,7 @@ impl From<Transport> for TransportConfig {
         TransportConfig {
             transport,
             tls: TlsSettings::default(),
+            credentials: None,
         }
     }
 }
@@ -167,25 +185,150 @@ mod tests {
     }
 }
 
+/// How a client proves who it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaslMechanism {
+    /// The password crosses the wire in the clear, exactly as SASL/PLAIN
+    /// does, so a broker refuses it on a plaintext listener.
+    Plain,
+    /// A challenge–response in which the password never travels at all
+    /// (RFC 5802). Two round trips instead of one, and safe on a plaintext
+    /// listener — which is the whole reason to prefer it.
+    #[default]
+    ScramSha256,
+}
+
+impl SaslMechanism {
+    fn name(self) -> &'static str {
+        match self {
+            SaslMechanism::Plain => "PLAIN",
+            SaslMechanism::ScramSha256 => brahmaputra_metadata::scram::MECHANISM,
+        }
+    }
+
+    /// Parse the spelling used on a command line.
+    pub fn parse(name: &str) -> Option<SaslMechanism> {
+        match name.to_ascii_uppercase().as_str() {
+            "PLAIN" => Some(SaslMechanism::Plain),
+            "SCRAM-SHA-256" | "SCRAM" => Some(SaslMechanism::ScramSha256),
+            _ => None,
+        }
+    }
+}
+
 /// Credentials a client presents when the broker requires authentication.
-///
-/// The password crosses the wire in the clear, exactly as SASL/PLAIN does,
-/// so a broker refuses this on a plaintext listener. Use `tcp-tls` or
-/// `quic`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
+    /// Which mechanism to use. SCRAM by default, because it is safe on
+    /// every listener and PLAIN is not.
+    pub mechanism: SaslMechanism,
+}
+
+impl Credentials {
+    /// Credentials using the default mechanism.
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Credentials {
+        Credentials {
+            username: username.into(),
+            password: password.into(),
+            mechanism: SaslMechanism::default(),
+        }
+    }
+
+    pub fn with_mechanism(mut self, mechanism: SaslMechanism) -> Credentials {
+        self.mechanism = mechanism;
+        self
+    }
 }
 
 impl Connection {
     /// Bind a principal to this connection. Every later request on it is
     /// authorized as that principal.
     pub async fn authenticate(&self, credentials: &Credentials) -> Result<String, ClientError> {
+        match credentials.mechanism {
+            SaslMechanism::Plain => self.authenticate_plain(credentials).await,
+            SaslMechanism::ScramSha256 => self.authenticate_scram(credentials).await,
+        }
+    }
+
+    async fn authenticate_plain(&self, credentials: &Credentials) -> Result<String, ClientError> {
         let request = AuthenticateRequest {
             username: credentials.username.clone(),
             password: credentials.password.clone(),
+            mechanism: SaslMechanism::Plain.name().to_owned(),
+            payload: String::new(),
         };
+        let response = self.authenticate_step(request).await?;
+        Ok(response.principal)
+    }
+
+    /// The SCRAM-SHA-256 exchange, client side.
+    ///
+    /// The server's final message is verified rather than ignored: without
+    /// that check a client would authenticate happily to anything that
+    /// could relay the first two messages, which is precisely the attack
+    /// mutual authentication exists to stop.
+    async fn authenticate_scram(&self, credentials: &Credentials) -> Result<String, ClientError> {
+        use brahmaputra_metadata::scram;
+
+        let client_nonce = scram::random_nonce();
+        let bare = format!("n={},r={}", credentials.username, client_nonce);
+        let first = self
+            .authenticate_step(AuthenticateRequest {
+                username: credentials.username.clone(),
+                password: String::new(),
+                mechanism: SaslMechanism::ScramSha256.name().to_owned(),
+                payload: format!("n,,{bare}"),
+            })
+            .await?;
+        if first.done {
+            return Err(ClientError::Configuration(
+                "broker ended the SCRAM exchange before it began".into(),
+            ));
+        }
+        let server_first = first.payload;
+        let (Some(nonce), Some(salt), Some(iterations)) = (
+            scram::field(&server_first, "r"),
+            scram::field(&server_first, "s"),
+            scram::field(&server_first, "i").and_then(|value| value.parse::<u32>().ok()),
+        ) else {
+            return Err(ClientError::Configuration(
+                "malformed SCRAM server-first message".into(),
+            ));
+        };
+        // The server must have kept the client's nonce, which is what makes
+        // this exchange this exchange rather than a replayed one.
+        if !nonce.starts_with(&client_nonce) {
+            return Err(ClientError::Configuration(
+                "SCRAM server nonce does not extend the client nonce".into(),
+            ));
+        }
+        // `biws` is base64 of "n,," — the GS2 header, echoed so the server
+        // can see it was not tampered with in flight.
+        let without_proof = format!("c=biws,r={nonce}");
+        let auth_message = format!("{bare},{server_first},{without_proof}");
+        let proof = scram::ScramCredential::client_proof(
+            &credentials.password,
+            salt,
+            iterations,
+            &auth_message,
+        );
+        let final_response = self
+            .authenticate_step(AuthenticateRequest {
+                username: credentials.username.clone(),
+                password: String::new(),
+                mechanism: SaslMechanism::ScramSha256.name().to_owned(),
+                payload: format!("{without_proof},p={proof}"),
+            })
+            .await?;
+        Ok(final_response.principal)
+    }
+
+    async fn authenticate_step(
+        &self,
+        request: AuthenticateRequest,
+    ) -> Result<AuthenticateResponse, ClientError> {
         let body = request
             .encode()
             .map_err(|error| ClientError::Configuration(error.to_string()))?;
@@ -193,6 +336,6 @@ impl Connection {
         let response = AuthenticateResponse::decode(&response)
             .map_err(|error| ClientError::Configuration(error.to_string()))?;
         ClientError::from_error_code(response.error_code)?;
-        Ok(response.principal)
+        Ok(response)
     }
 }

@@ -109,7 +109,8 @@ async fn drain(addr: SocketAddr, transport: Transport) -> Vec<(i32, i64, String)
                 out.push((
                     partition,
                     record.offset,
-                    String::from_utf8(record.value.to_vec()).expect("utf8 value"),
+                    String::from_utf8(record.value.clone().unwrap_or_default().to_vec())
+                        .expect("utf8 value"),
                 ));
                 next = record.offset + 1;
             }

@@ -18,10 +18,10 @@ use brahmaputra_protocol::gen::{
     AssignedPartition, DescribeGroupResponse, DescribedMember, GroupMemberInfo, GroupMemberRecord,
     GroupMetadataRecord, HeartbeatRequest, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest,
     ListedGroup, OffsetCommitEntry, OffsetCommitRecord, OffsetCommitRequest, OffsetFetchEntry,
-    OffsetFetchRequest,
-    OffsetFetchResponse, SyncGroupRequest, SyncGroupResponse, TombstoneRecord,
+    OffsetFetchRequest, OffsetFetchResponse, SyncGroupRequest, SyncGroupResponse, TombstoneRecord,
 };
 use brahmaputra_protocol::{Record, RecordBatch};
+use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
@@ -57,6 +57,14 @@ const INITIAL_REBALANCE_DELAY_MS: i64 = 1_000;
 /// Extra grace beyond the rebalance deadline before a blocked JoinGroup or
 /// SyncGroup gives up waiting for the group watch.
 const REBALANCE_WAIT_GRACE: Duration = Duration::from_millis(1_000);
+
+/// What a record key last wrote into coordinator state, so a tombstone
+/// under the same key can undo exactly that.
+#[derive(Debug, Clone)]
+enum KeyTarget {
+    Offset((String, String, i32)),
+    Group(String),
+}
 /// How long an offset commit waits for the appended batch to be committed.
 const COMMIT_WATERMARK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Session-expiry sweep cadence.
@@ -239,6 +247,13 @@ impl CoordinatorShard {
     async fn replay(&self) -> Result<(), BrokerError> {
         let (log_start, _, high_watermark) = self.handle.offsets().await?;
         let mut position = log_start;
+        // What each record key last wrote, so a tombstone under that key can
+        // undo it without parsing the key back apart — a group id may
+        // contain the separator, so parsing could delete the wrong entry.
+        // Local to one replay: a tombstone can only cancel something this
+        // same pass has seen, since anything earlier was compacted away
+        // together with the tombstone that removed it.
+        let mut written: HashMap<Bytes, KeyTarget> = HashMap::new();
         while position < high_watermark {
             let outcome = self.handle.read(position, REPLAY_MAX_BYTES).await?;
             if outcome.batches.is_empty() {
@@ -249,7 +264,7 @@ impl CoordinatorShard {
                 let mut buf = raw.clone();
                 let batch = RecordBatch::decode(&mut buf)?;
                 for record in &batch.records {
-                    self.apply_record(record);
+                    self.apply_record(record, &mut written);
                 }
                 position = position.max(batch.next_offset());
                 advanced = true;
@@ -267,22 +282,48 @@ impl CoordinatorShard {
         Ok(())
     }
 
-    fn apply_record(&self, record: &Record) {
-        let Some((&kind, payload)) = record.value.split_first() else {
+    fn apply_record(&self, record: &Record, written: &mut HashMap<Bytes, KeyTarget>) {
+        let Some(value) = record.value.as_ref() else {
+            // A null value deletes whatever this key last wrote. This is the
+            // form compaction understands, so the record it cancels stops
+            // occupying disk rather than merely being ignored on replay.
+            if let Some(key) = record.key.as_ref() {
+                match written.remove(key) {
+                    Some(KeyTarget::Offset(key)) => {
+                        self.offsets.remove(&key);
+                    }
+                    Some(KeyTarget::Group(group_id)) => {
+                        self.groups.remove(&group_id);
+                    }
+                    None => {}
+                }
+            }
+            return;
+        };
+        let Some((&kind, payload)) = value.split_first() else {
             return;
         };
         match kind {
             KIND_OFFSET_COMMIT => match OffsetCommitRecord::decode(payload) {
                 Ok(commit) => {
-                    self.offsets.insert(
-                        (commit.group_id, commit.topic, commit.partition),
-                        commit.offset,
-                    );
+                    let key = (commit.group_id, commit.topic, commit.partition);
+                    if let Some(record_key) = record.key.as_ref() {
+                        written.insert(record_key.clone(), KeyTarget::Offset(key.clone()));
+                    }
+                    self.offsets.insert(key, commit.offset);
                 }
                 Err(error) => warn!(%error, "skipping undecodable offset commit record"),
             },
             KIND_GROUP_METADATA => match GroupMetadataRecord::decode(payload) {
-                Ok(metadata) => self.apply_group_metadata(metadata),
+                Ok(metadata) => {
+                    if let Some(record_key) = record.key.as_ref() {
+                        written.insert(
+                            record_key.clone(),
+                            KeyTarget::Group(metadata.group_id.clone()),
+                        );
+                    }
+                    self.apply_group_metadata(metadata)
+                }
                 Err(error) => warn!(%error, "skipping undecodable group metadata record"),
             },
             KIND_TOMBSTONE => match TombstoneRecord::decode(payload) {
@@ -347,14 +388,24 @@ impl CoordinatorShard {
 
     /// Append one batch of keyed coordinator records; the actor stamps the
     /// real base offset, which is returned.
-    async fn append_records(&self, records: Vec<(String, Vec<u8>)>) -> Result<i64, BrokerError> {
+    /// Append keyed records; a `None` value is a tombstone, which deletes
+    /// the key both on replay and, once compaction runs, on disk.
+    async fn append_records(
+        &self,
+        records: Vec<(String, Option<Vec<u8>>)>,
+    ) -> Result<i64, BrokerError> {
         let batch = RecordBatch::new(
             0,
             self.leader_epoch,
             now_ms(),
             records
                 .into_iter()
-                .map(|(key, value)| Record::with_key(key.into_bytes(), value, 0))
+                .map(|(key, value)| Record {
+                    key: Some(key.into_bytes().into()),
+                    value: value.map(Into::into),
+                    timestamp_delta: 0,
+                    headers: Vec::new(),
+                })
                 .collect(),
         );
         Ok(self.handle.append(batch).await?)
@@ -462,7 +513,7 @@ impl GroupCoordinator {
         &self,
         broker: &Broker,
         shard: &CoordinatorShard,
-        records: Vec<(String, Vec<u8>)>,
+        records: Vec<(String, Option<Vec<u8>>)>,
     ) -> Result<i64, BrokerError> {
         let cluster_assignment = if let Some(cache) = broker.metadata_cache() {
             let image = cache.snapshot();
@@ -540,7 +591,7 @@ impl GroupCoordinator {
         };
         let mut value = vec![KIND_GROUP_METADATA];
         value.extend(record.encode()?);
-        self.append_and_commit(broker, shard, vec![(group_id.to_owned(), value)])
+        self.append_and_commit(broker, shard, vec![(group_id.to_owned(), Some(value))])
             .await?;
         Ok(())
     }
@@ -1003,7 +1054,7 @@ impl GroupCoordinator {
             value.extend(record.encode()?);
             records.push((
                 format!("{}/{}/{}", request.group_id, entry.topic, entry.partition),
-                value,
+                Some(value),
             ));
         }
         let record_count = records.len() as i64;
@@ -1312,28 +1363,31 @@ impl GroupCoordinator {
             "expiring the offsets of a group that has been empty past offsets.retention.ms"
         );
 
-        let tombstone = TombstoneRecord {
-            group_id: group_id.to_owned(),
-            // Empty topic means the whole group, matching what replay
-            // already understands.
-            topic: String::new(),
-            partition: -1,
-        };
-        let mut value = vec![KIND_TOMBSTONE];
-        value.extend_from_slice(
-            &tombstone
-                .encode()
-                .map_err(|error| BrokerError::Meta(format!("encoding group tombstone: {error}")))?,
-        );
+        // A tombstone per key that was written, not one record standing for
+        // all of them. The key is what compaction matches on, so a deletion
+        // filed under any other key would be understood on replay and
+        // ignored on disk — which is how an offsets topic ends up growing
+        // forever with groups that no longer exist.
+        let mut tombstones: Vec<(String, Option<Vec<u8>>)> = held
+            .iter()
+            .map(|(group, topic, partition)| (format!("{group}/{topic}/{partition}"), None))
+            .collect();
+        // And the group's own metadata record, under its own key.
+        tombstones.push((group_id.to_owned(), None));
+        let record_count = tombstones.len() as i64;
         let mut watermark = shard.handle.watermark_watch();
         watermark.borrow_and_update();
-        let base = self
-            .append_and_commit(broker, shard, vec![(group_id.to_owned(), value)])
-            .await?;
+        let base = self.append_and_commit(broker, shard, tombstones).await?;
         // Only forget the offsets once the deletion is committed. Dropping
         // them from memory first would make a coordinator that then failed
         // over resurrect every one of them.
-        if !wait_for_high_watermark(&mut watermark, base + 1, COMMIT_WATERMARK_TIMEOUT).await {
+        if !wait_for_high_watermark(
+            &mut watermark,
+            base + record_count,
+            COMMIT_WATERMARK_TIMEOUT,
+        )
+        .await
+        {
             return Err(BrokerError::NotEnoughReplicas {
                 required: 1,
                 available: 0,

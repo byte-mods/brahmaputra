@@ -21,7 +21,7 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
@@ -30,15 +30,15 @@ use tracing::{debug, info, warn};
 use crate::actor::{self, PartitionHandle};
 use crate::error::BrokerError;
 use crate::group::GroupCoordinator;
-use crate::transaction::TransactionCoordinator;
 use crate::handlers;
+use crate::logdirs::LogDirs;
 use crate::producer_id::ProducerIdManager;
 use crate::quic::QuicListener;
 use crate::quota::{QuotaConfig, QuotaKind, QuotaManager};
 use crate::replication::{ReplicationHealthSnapshot, ReplicationTracker};
-use crate::logdirs::LogDirs;
 use crate::state::BrokerState;
 use crate::tls::TlsIdentity;
+use crate::transaction::TransactionCoordinator;
 use tokio_rustls::TlsAcceptor;
 
 const TASK_DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -82,6 +82,10 @@ pub struct BrokerConfig {
     pub channel_capacity: usize,
     /// Largest accepted frame (post-length-prefix bytes).
     pub max_frame_bytes: usize,
+    /// Broker-wide `message.max.bytes`; a topic that sets
+    /// `max.message.bytes` overrides it. `None` leaves batches bounded
+    /// only by the frame limit.
+    pub max_message_bytes: Option<usize>,
     /// How often partition actors apply enabled time/size retention policies.
     pub retention_check_interval: Duration,
     /// How long a group with no members keeps its committed offsets
@@ -91,6 +95,25 @@ pub struct BrokerConfig {
     /// committed: a live group is still using its offsets however old they
     /// are, and expiring under it would silently rewind the consumer.
     pub offsets_retention: Option<Duration>,
+    /// A second data-plane listener for broker-to-broker traffic, with its
+    /// own transport. `None` puts everything on the client listener.
+    ///
+    /// Kafka's `inter.broker.listener.name`, and the reason to want it is
+    /// the same: replication carries every record once per follower, so a
+    /// cluster that must present TLS to its clients would otherwise be
+    /// encrypting the same bytes two or three more times to reach brokers
+    /// on a private network it already trusts.
+    pub internal_listener: Option<InternalListener>,
+    /// Largest `transaction.timeout.ms` a producer may ask for
+    /// (`transaction.max.timeout.ms`).
+    ///
+    /// The timeout is what bounds how long an abandoned transaction can
+    /// hold every `read_committed` consumer of the partitions it touched,
+    /// so a client is not allowed to set it arbitrarily high.
+    pub transaction_max_timeout: Duration,
+    /// How long an idle `transactional.id` is remembered before its
+    /// coordinator state is deleted (`transactional.id.expiration.ms`).
+    pub transactional_id_expiration: Duration,
     /// Shared controller-materialized metadata image. `None` preserves the
     /// standalone M1 topic map and implicit topic creation behavior.
     pub metadata_cache: Option<MetadataCache>,
@@ -128,9 +151,13 @@ impl Default for BrokerConfig {
             log_config: LogConfig::default(),
             channel_capacity: 1024,
             max_frame_bytes: 32 * 1024 * 1024,
+            max_message_bytes: None,
             retention_check_interval: Duration::from_secs(1),
             // Kafka's default: 7 days.
             offsets_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)),
+            internal_listener: None,
+            transaction_max_timeout: Duration::from_secs(15 * 60),
+            transactional_id_expiration: Duration::from_secs(7 * 24 * 60 * 60),
             metadata_cache: None,
             replication_enabled: false,
             transport: Transport::default(),
@@ -188,11 +215,30 @@ pub struct Broker {
     groups: GroupCoordinator,
     log_dirs: Arc<LogDirs>,
     transactions: TransactionCoordinator,
+    /// Incremental fetch sessions (KIP-227), one per consumer that asked
+    /// for one.
+    fetch_sessions: crate::fetchsession::FetchSessions,
     quotas: QuotaManager,
     listener: Mutex<Option<BoundListener>>,
+    /// The inter-broker listener, taken by `run` exactly as the client one
+    /// is.
+    internal_listener: Mutex<Option<(TcpListener, Option<TlsAcceptor>)>>,
+    internal_addr: Option<SocketAddr>,
     shutdown_tx: watch::Sender<bool>,
     local_broker_epoch: AtomicU64,
     addr: SocketAddr,
+}
+
+/// A second data-plane listener, for traffic between brokers.
+#[derive(Debug, Clone)]
+pub struct InternalListener {
+    /// Port to bind. `0` picks one, as everywhere else.
+    pub port: u16,
+    /// Transport for this listener alone. QUIC is deliberately not
+    /// offered here: the inter-broker path is a small number of long-lived
+    /// connections on a network the operator controls, which is exactly
+    /// where QUIC's advantages do not apply and its costs do.
+    pub tls: bool,
 }
 
 impl Broker {
@@ -223,7 +269,10 @@ impl Broker {
             Transport::TcpTls => {
                 let listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
                 let addr = listener.local_addr()?;
-                (BoundListener::TcpTls(listener, tls_acceptor(&config.tls)?), addr)
+                (
+                    BoundListener::TcpTls(listener, tls_acceptor(&config.tls)?),
+                    addr,
+                )
             }
             Transport::Quic => {
                 let bind = resolve_bind_addr(&config.host, config.port).await?;
@@ -232,6 +281,21 @@ impl Broker {
                 (BoundListener::Quic(listener), addr)
             }
         };
+        let internal = match &config.internal_listener {
+            Some(internal) => {
+                let listener = TcpListener::bind((config.host.as_str(), internal.port)).await?;
+                let addr = listener.local_addr()?;
+                let acceptor = if internal.tls {
+                    Some(tls_acceptor(&config.tls)?)
+                } else {
+                    None
+                };
+                Some((listener, acceptor, addr))
+            }
+            None => None,
+        };
+        let internal_addr = internal.as_ref().map(|(_, _, addr)| *addr);
+        let internal_listener = internal.map(|(listener, acceptor, _)| (listener, acceptor));
         let (shutdown_tx, _) = watch::channel(false);
         let initial_broker_epoch = config.broker_epoch.unwrap_or(0);
         let config_quota = config.quota;
@@ -247,8 +311,11 @@ impl Broker {
             groups: GroupCoordinator::default(),
             log_dirs,
             transactions: TransactionCoordinator::default(),
+            fetch_sessions: crate::fetchsession::FetchSessions::default(),
             quotas: QuotaManager::new(config_quota),
             listener: Mutex::new(Some(listener)),
+            internal_listener: Mutex::new(internal_listener),
+            internal_addr,
             shutdown_tx,
             local_broker_epoch: AtomicU64::new(initial_broker_epoch),
             addr,
@@ -305,6 +372,12 @@ impl Broker {
 
     /// The address actually bound (after port 0 resolution). This is what
     /// Metadata responses advertise.
+    /// The inter-broker address actually bound, when there is a second
+    /// listener. This is what peers are told to use.
+    pub fn internal_addr(&self) -> Option<SocketAddr> {
+        self.internal_addr
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
@@ -600,6 +673,11 @@ impl Broker {
         &self.transactions
     }
 
+    /// The incremental fetch sessions open on this broker.
+    pub(crate) fn fetch_sessions(&self) -> &crate::fetchsession::FetchSessions {
+        &self.fetch_sessions
+    }
+
     /// The broker's log directories and the partition placement over them.
     pub(crate) fn log_dirs(&self) -> &Arc<LogDirs> {
         &self.log_dirs
@@ -668,9 +746,29 @@ impl Broker {
     pub(crate) fn broker_address(&self, broker_id: i32) -> Option<SocketAddr> {
         let image = self.metadata_cache()?.snapshot();
         let registered = image.brokers.get(&broker_id)?;
-        format!("{}:{}", registered.host, registered.data_port)
-            .parse()
-            .ok()
+        // The inter-broker endpoint when the peer published one; its
+        // client endpoint otherwise. A peer that has an internal listener
+        // and is reached on its client port would work, but would be
+        // encrypted or not according to the wrong policy.
+        let port = if registered.internal_port != 0 {
+            registered.internal_port
+        } else {
+            registered.data_port
+        };
+        format!("{}:{}", registered.host, port).parse().ok()
+    }
+
+    /// The transport peers must use to reach this cluster's brokers.
+    ///
+    /// Every broker in a cluster is configured alike here — a follower that
+    /// guessed the leader's inter-broker transport wrongly would fail every
+    /// fetch with a handshake error rather than anything diagnosable.
+    pub(crate) fn internal_transport(&self) -> Transport {
+        match &self.config.internal_listener {
+            Some(internal) if internal.tls => Transport::TcpTls,
+            Some(_) => Transport::Tcp,
+            None => self.config.transport,
+        }
     }
 
     /// The shared metric registry (DESIGN.md §9.1).
@@ -970,6 +1068,46 @@ impl Broker {
         self.open_partition(topic, partition)
     }
 
+    /// A partition handle for a consumer fetch that may legitimately land
+    /// on a follower (KIP-392).
+    ///
+    /// The replica must be in the ISR: a follower that has fallen behind
+    /// would answer with stale data indefinitely, and a consumer has no way
+    /// to tell that apart from a quiet partition. Refusing sends it back to
+    /// the leader, which is always correct if sometimes further away.
+    pub fn replica_partition_for_read(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<PartitionHandle, BrokerError> {
+        let Some(cache) = self.metadata_cache() else {
+            // Standalone: there is only one replica and it is this one.
+            return self.partition(topic, partition);
+        };
+        let image = cache.snapshot();
+        self.validate_local_broker_epoch(&image)?;
+        let metadata = image
+            .topics
+            .get(topic)
+            .and_then(|topic| topic.partitions.get(&partition))
+            .ok_or_else(|| BrokerError::UnknownTopicOrPartition {
+                topic: topic.to_owned(),
+                partition,
+            })?;
+        if metadata.leader == self.config.broker_id {
+            return self.partition(topic, partition);
+        }
+        if !metadata.isr.contains(&self.config.broker_id) {
+            return Err(BrokerError::NotLeaderOrFollower {
+                topic: topic.to_owned(),
+                partition,
+                broker_id: self.config.broker_id,
+                leader: metadata.leader,
+            });
+        }
+        self.cluster_partition(topic, partition, false)
+    }
+
     /// A handle to a partition this broker has *already opened*, or `None`.
     ///
     /// Reporting on disk usage must not itself allocate disk: going through
@@ -1115,6 +1253,10 @@ impl Broker {
         let sweeper = tokio::spawn(async move {
             crate::group::run_expiry_sweeper(sweeper_broker).await;
         });
+        let txn_sweeper_broker = Arc::clone(&self);
+        let txn_sweeper = tokio::spawn(async move {
+            crate::transaction::run_expiry_sweeper(txn_sweeper_broker).await;
+        });
         let watcher_broker = Arc::clone(&self);
         let watcher = tokio::spawn(async move {
             crate::logdirs::run_health_watcher(watcher_broker).await;
@@ -1130,9 +1272,145 @@ impl Broker {
         }
         let _ = self.shutdown_tx.send(true);
         sweeper.abort();
+        txn_sweeper.abort();
         watcher.abort();
         self.graceful_shutdown_actors().await;
         Ok(())
+    }
+
+    /// Hand one accepted socket to a connection task.
+    ///
+    /// Extracted so the client listener and the inter-broker listener
+    /// share it exactly: two accept loops that handled connections
+    /// differently would be two protocols wearing one name.
+    fn spawn_connection(
+        self: &Arc<Self>,
+        socket: TcpStream,
+        peer: SocketAddr,
+        tls: Option<TlsAcceptor>,
+        connection_tasks: &mut JoinSet<()>,
+    ) {
+        debug!(%peer, "connection accepted");
+        // Responses are small and latency-critical; without
+        // this, Nagle holds a response until the previous
+        // segment is acknowledged, which pairs with the
+        // peer's delayed ACK to add tens of milliseconds per
+        // request on anything but loopback. The client sets
+        // it on its half already.
+        if let Err(error) = socket.set_nodelay(true) {
+            warn!(%peer, %error, "cannot disable Nagle on accepted socket");
+        }
+        let broker = Arc::clone(self);
+        let mut connection_shutdown = self.shutdown_tx.subscribe();
+        let tls = tls.clone();
+        connection_tasks.spawn(async move {
+            // The TLS handshake happens inside the
+            // connection task, so a slow or hostile peer
+            // stalls only itself, never the accept loop.
+            match tls {
+                // Plaintext keeps the socket concrete, so a
+                // fetch can be answered with `sendfile`.
+                None => {
+                    let (reader, writer) = socket.into_split();
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut connection_shutdown) => {
+                            debug!(%peer, "connection cancelled for broker shutdown");
+                        }
+                        result = handle_connection(
+                            broker,
+                            reader,
+                            ResponseSink::Plain(writer),
+                            peer,
+                            // Plaintext carries no certificate
+                            // and therefore no identity.
+                            None,
+                        ) => {
+                            if let Err(error) = result {
+                                debug!(%peer, %error, "connection closed");
+                            }
+                        }
+                    }
+                }
+                Some(acceptor) => {
+                    let (stream, principal): (Box<dyn BrokerStream>, Option<String>) =
+                        match acceptor.accept(socket).await {
+                            Ok(stream) => {
+                                // rustls has already verified the
+                                // chain against the configured CA
+                                // by this point; with no client CA
+                                // configured there is no peer
+                                // certificate and the connection
+                                // stays anonymous.
+                                let principal = stream
+                                    .get_ref()
+                                    .1
+                                    .peer_certificates()
+                                    .and_then(|chain| chain.first())
+                                    .and_then(crate::tls::common_name);
+                                (Box::new(stream), principal)
+                            }
+                            Err(error) => {
+                                debug!(%peer, %error, "tls handshake failed");
+                                return;
+                            }
+                        };
+                    let (reader, writer) = tokio::io::split(stream);
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut connection_shutdown) => {
+                            debug!(%peer, "connection cancelled for broker shutdown");
+                        }
+                        result = handle_connection(
+                            broker,
+                            reader,
+                            ResponseSink::Encrypted(writer),
+                            peer,
+                            principal,
+                        ) => {
+                            if let Err(error) = result {
+                                debug!(%peer, %error, "connection closed");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Serve the inter-broker listener, when the operator configured
+    /// one.
+    ///
+    /// Same protocol, same handlers, a different socket — which is
+    /// the whole point: replication traffic can then cross a private
+    /// network in plaintext while clients are required to use TLS,
+    /// without encrypting every record two extra times on the way to
+    /// the followers.
+    async fn run_internal_listener(
+        self: Arc<Self>,
+        listener: TcpListener,
+        tls: Option<TlsAcceptor>,
+    ) {
+        let mut broker_shutdown = self.shutdown_tx.subscribe();
+        let mut connection_tasks = JoinSet::new();
+        info!(addr = ?listener.local_addr().ok(), "broker serving (inter-broker)");
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut broker_shutdown) => break,
+                joined = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                    log_task_result(joined, "internal connection");
+                }
+                accepted = listener.accept() => match accepted {
+                    Ok((socket, peer)) => {
+                        self.spawn_connection(socket, peer, tls.clone(), &mut connection_tasks);
+                    }
+                    Err(error) => warn!(%error, "inter-broker accept failed"),
+                },
+            }
+        }
+        drop(listener);
+        drain_connection_tasks(&mut connection_tasks).await;
     }
 
     pub async fn run(
@@ -1166,6 +1444,32 @@ impl Broker {
                 crate::group::run_expiry_sweeper(sweeper_broker).await;
             });
         }
+        // The inter-broker listener, when there is one. Same handlers, its
+        // own socket and its own transport.
+        {
+            let internal = self
+                .internal_listener
+                .lock()
+                .expect("internal listener")
+                .take();
+            if let Some((listener, tls)) = internal {
+                let internal_broker = Arc::clone(&self);
+                connection_tasks.spawn(async move {
+                    internal_broker.run_internal_listener(listener, tls).await;
+                });
+            }
+        }
+        // Transaction expiry: aborts transactions that outlived
+        // `transaction.timeout.ms` and finishes those left half-marked.
+        // Without it a producer that never comes back holds every
+        // `read_committed` consumer of its partitions at the last stable
+        // offset, permanently.
+        {
+            let sweeper_broker = Arc::clone(&self);
+            connection_tasks.spawn(async move {
+                crate::transaction::run_expiry_sweeper(sweeper_broker).await;
+            });
+        }
         // Disk health: a directory that fails takes only its own partitions
         // offline. Probed on a timer as well as noticed on IO errors,
         // because a disk that dies under an idle topic would otherwise not
@@ -1192,91 +1496,7 @@ impl Broker {
                 }
                 accepted = listener.accept() => match accepted {
                     Ok((socket, peer)) => {
-                        debug!(%peer, "connection accepted");
-                        // Responses are small and latency-critical; without
-                        // this, Nagle holds a response until the previous
-                        // segment is acknowledged, which pairs with the
-                        // peer's delayed ACK to add tens of milliseconds per
-                        // request on anything but loopback. The client sets
-                        // it on its half already.
-                        if let Err(error) = socket.set_nodelay(true) {
-                            warn!(%peer, %error, "cannot disable Nagle on accepted socket");
-                        }
-                        let broker = Arc::clone(&self);
-                        let mut connection_shutdown = self.shutdown_tx.subscribe();
-                        let tls = tls.clone();
-                        connection_tasks.spawn(async move {
-                            // The TLS handshake happens inside the
-                            // connection task, so a slow or hostile peer
-                            // stalls only itself, never the accept loop.
-                            match tls {
-                                // Plaintext keeps the socket concrete, so a
-                                // fetch can be answered with `sendfile`.
-                                None => {
-                                    let (reader, writer) = socket.into_split();
-                                    tokio::select! {
-                                        biased;
-                                        _ = wait_for_shutdown(&mut connection_shutdown) => {
-                                            debug!(%peer, "connection cancelled for broker shutdown");
-                                        }
-                                        result = handle_connection(
-                                            broker,
-                                            reader,
-                                            ResponseSink::Plain(writer),
-                                            peer,
-                                            // Plaintext carries no certificate
-                                            // and therefore no identity.
-                                            None,
-                                        ) => {
-                                            if let Err(error) = result {
-                                                debug!(%peer, %error, "connection closed");
-                                            }
-                                        }
-                                    }
-                                }
-                                Some(acceptor) => {
-                                    let (stream, principal): (Box<dyn BrokerStream>, Option<String>) = match acceptor.accept(socket).await {
-                                        Ok(stream) => {
-                                            // rustls has already verified the
-                                            // chain against the configured CA
-                                            // by this point; with no client CA
-                                            // configured there is no peer
-                                            // certificate and the connection
-                                            // stays anonymous.
-                                            let principal = stream
-                                                .get_ref()
-                                                .1
-                                                .peer_certificates()
-                                                .and_then(|chain| chain.first())
-                                                .and_then(crate::tls::common_name);
-                                            (Box::new(stream), principal)
-                                        }
-                                        Err(error) => {
-                                            debug!(%peer, %error, "tls handshake failed");
-                                            return;
-                                        }
-                                    };
-                                    let (reader, writer) = tokio::io::split(stream);
-                                    tokio::select! {
-                                        biased;
-                                        _ = wait_for_shutdown(&mut connection_shutdown) => {
-                                            debug!(%peer, "connection cancelled for broker shutdown");
-                                        }
-                                        result = handle_connection(
-                                            broker,
-                                            reader,
-                                            ResponseSink::Encrypted(writer),
-                                            peer,
-                                            principal,
-                                        ) => {
-                                            if let Err(error) = result {
-                                                debug!(%peer, %error, "connection closed");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
+                        self.spawn_connection(socket, peer, tls.clone(), &mut connection_tasks);
                     }
                     Err(e) => warn!(error = %e, "accept failed"),
                 },
@@ -1690,14 +1910,40 @@ impl Broker {
     ///
     /// `None` means only the frame limit applies, which is the broker-wide
     /// ceiling every request is already bounded by.
-    pub(crate) fn max_message_bytes(&self, topic: &str) -> Option<usize> {
+    /// The codec this topic requires, if it names one.
+    ///
+    /// `producer` — Kafka's default and this broker's — means "whatever the
+    /// producer chose", and is represented by `None`.
+    pub(crate) fn required_compression(
+        &self,
+        topic: &str,
+    ) -> Option<brahmaputra_protocol::Compression> {
         let image = self.config.metadata_cache.as_ref()?.snapshot();
-        let configs = &image.topics.get(topic)?.configs;
-        configs
-            .get("max.message.bytes")?
-            .parse::<usize>()
-            .ok()
-            .filter(|limit| *limit > 0)
+        let value = image.topics.get(topic)?.configs.get("compression.type")?;
+        if value == "producer" {
+            return None;
+        }
+        brahmaputra_protocol::Compression::parse(value)
+    }
+
+    pub(crate) fn max_message_bytes(&self, topic: &str) -> Option<usize> {
+        // A topic that sets it wins; otherwise the broker default, which is
+        // what makes the limit reachable in standalone mode where there are
+        // no topic configs at all.
+        let per_topic = self
+            .config
+            .metadata_cache
+            .as_ref()
+            .and_then(|cache| {
+                cache
+                    .snapshot()
+                    .topics
+                    .get(topic)
+                    .and_then(|topic| topic.configs.get("max.message.bytes").cloned())
+            })
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|limit| *limit > 0);
+        per_topic.or(self.config.max_message_bytes)
     }
 }
 
@@ -1725,6 +1971,7 @@ mod live_topic_config_tests {
                 host: "127.0.0.1".into(),
                 data_port: 9092,
                 control_port: 19092,
+                internal_port: 0,
                 roles: vec![NodeRole::Broker],
                 rack: None,
                 now_ms: 1,

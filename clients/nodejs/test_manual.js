@@ -193,6 +193,36 @@ async function main() {
     consumer.close();
   }
 
+  section('tombstones');
+  {
+    const tombTopic = unique('node-tombstones');
+    const producer = await Producer.connect(HOST, PORT, { lingerMs: 0 });
+    await producer.send(tombTopic, Buffer.from('set'), {
+      partition: 0,
+      key: Buffer.from('k1'),
+    });
+    await producer.send(tombTopic, Buffer.alloc(0), {
+      partition: 0,
+      key: Buffer.from('k2'),
+    });
+    // A null value is a deletion, and must stay distinguishable from the
+    // empty value above all the way through the round trip.
+    await producer.send(tombTopic, null, { partition: 0, key: Buffer.from('k3') });
+    await producer.close();
+
+    const consumer = await Consumer.connect(HOST, PORT);
+    const got = await consumer.fetch(tombTopic, 0, 0n);
+    check('all three records arrive', got.length === 3, `got ${got.length}`);
+    if (got.length === 3) {
+      check('an ordinary value round-trips', got[0].value.equals(Buffer.from('set')));
+      check('an empty value is empty, not null',
+        got[1].value !== null && got[1].value.length === 0);
+      check('a tombstone arrives as a null value', got[2].value === null,
+        `${got[2].value}`);
+    }
+    await consumer.close();
+  }
+
   section('offsets');
   {
     const consumer = await Consumer.connect(HOST, PORT);

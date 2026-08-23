@@ -294,6 +294,7 @@ async fn metadata_converges_and_writes_continue_after_leader_shutdown() -> Resul
             host: "127.0.0.1".to_owned(),
             data_port: 9_092,
             control_port: 19_092,
+            internal_port: 0,
             roles: vec![NodeRole::Broker, NodeRole::Controller],
             rack: Some("rack-a".to_owned()),
             now_ms: 1_000,
@@ -358,6 +359,7 @@ async fn metadata_converges_and_writes_continue_after_leader_shutdown() -> Resul
                 password_hash: "test-only-hash".to_owned(),
                 role: Role::Operator,
                 force_password_change: true,
+                scram: None,
             },
         },
     )
@@ -437,6 +439,7 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
             host: "127.0.0.1".to_owned(),
             data_port: 9_092,
             control_port: 19_092,
+            internal_port: 0,
             roles: vec![NodeRole::Broker, NodeRole::Controller],
             rack: Some("rack-a".to_owned()),
             now_ms: 1_000,
@@ -527,6 +530,7 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
                 password_hash: "test-only-hash".to_owned(),
                 role: Role::Admin,
                 force_password_change: false,
+                scram: None,
             },
         },
     )

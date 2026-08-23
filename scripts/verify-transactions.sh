@@ -191,4 +191,74 @@ assert_eq "$(committed orders)" "2" "aborted records stay aborted across a resta
 assert_eq "$(values orders --isolation-level read_committed)" "order-A,order-AFTER" \
   "and the surviving records are the same two, unchanged"
 
+
+# ------------------------------------------------------------- expiry
+
+stage "a transaction that outlives its timeout is aborted by the coordinator"
+
+# A short ceiling, so the wait is observable. Everything above ran with the
+# default and is unaffected.
+kill -9 "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+"$SERVER_EXE" --port "$PORT" --data-dir "$WORK_DIR/data" --default-partitions 1 \
+  --transaction-max-timeout-ms 2000 \
+  >>"$WORK_DIR/broker.out" 2>>"$WORK_DIR/broker.err" &
+SERVER_PID=$!
+DEADLINE=$((SECONDS + 40))
+until "$CLI_EXE" --broker "$BROKER" metadata >/dev/null 2>&1; do
+  (( SECONDS < DEADLINE )) || die "broker never restarted: $(tail -3 "$WORK_DIR/broker.err")"
+  sleep 0.3
+done
+
+BEFORE_ABANDON="$(committed orders)"
+# Abandoned, with a timeout the broker will police. This is the shape of a
+# producer that was scaled down or redeployed under a different id: nothing
+# will ever claim this transactional id again.
+cli transaction --id doomed-etl --timeout-ms 1000 --abandon \
+  --send "orders:0=order-TIMEDOUT" >/dev/null
+assert_eq "$(committed orders)" "$BEFORE_ABANDON" \
+  "while it is open, a committed reader is held where it was"
+
+# The coordinator resolves it on its own, with nobody asking.
+DEADLINE=$((SECONDS + 30))
+RELEASED=0
+while (( SECONDS < DEADLINE )); do
+  STATE="$(cli describe-transaction --id doomed-etl 2>/dev/null \
+    | sed -n 's/.*state=\([A-Za-z]*\).*/\1/p')"
+  if [[ "$STATE" == "CompleteAbort" ]]; then
+    RELEASED=1
+    break
+  fi
+  sleep 0.5
+done
+[[ "$RELEASED" == "1" ]] \
+  || die "the coordinator never aborted a transaction past its timeout (state=$STATE)"
+pass "the coordinator aborts it without anyone asking (state=CompleteAbort)"
+
+# And the partition is usable again: a later transaction's records become
+# visible, which they could not while the abandoned one held the LSO.
+cli transaction --id later-etl --send "orders:0=order-AFTER-TIMEOUT" >/dev/null
+assert_eq "$(committed orders)" "$((BEFORE_ABANDON + 1))" \
+  "records written after it become visible, so the partition is usable again"
+VALUES="$(values orders --isolation-level read_committed)"
+grep -q "order-TIMEDOUT" <<<"$VALUES" \
+  && die "the aborted transaction's records must never be delivered: $VALUES"
+pass "and the timed-out transaction's own records are never delivered"
+
+# ------------------------------------------------------- observability
+
+stage "an operator can see which producer is holding a partition"
+
+PRODUCERS="$(cli describe-producers --topic orders --partition 0)"
+grep -q "last_stable_offset=" <<<"$PRODUCERS" \
+  || die "describe-producers does not report the last stable offset"
+pass "describe-producers reports the last stable offset and the high watermark"
+grep -q "PRODUCER_ID" <<<"$PRODUCERS" \
+  || die "describe-producers does not list producers"
+pass "and the producers that have written to the partition"
+
+LISTED="$(cli list-transactions)"
+grep -q "doomed-etl" <<<"$LISTED" \
+  || die "list-transactions does not name a transaction the broker coordinates: $LISTED"
+pass "list-transactions names every transactional id the cluster coordinates"
 printf '\n\033[32mAll %d checks passed.\033[0m\n' "$CHECKS"

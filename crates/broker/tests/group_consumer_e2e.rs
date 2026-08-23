@@ -317,7 +317,7 @@ async fn reconnect_resumes_from_committed_offsets() {
     // Only the five uncommitted records are delivered after the reconnect.
     let mut values: Vec<String> = records
         .iter()
-        .map(|record| String::from_utf8(record.value.to_vec()).unwrap())
+        .map(|record| String::from_utf8(record.value.clone().unwrap_or_default().to_vec()).unwrap())
         .collect();
     values.sort();
     assert_eq!(

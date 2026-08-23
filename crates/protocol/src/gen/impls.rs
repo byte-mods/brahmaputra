@@ -426,6 +426,10 @@ impl FetchRequest {
 		buf.put_i32(*&self.isolation_level);
 		
 		
+		
+		buf.put_str(&self.rack);
+		
+		
         Ok(())
     }
 
@@ -473,6 +477,10 @@ impl FetchRequest {
 		obj.isolation_level = buf.get_i32();
 		
 		
+		
+		obj.rack = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
 		Ok(obj)
 	}
 }
@@ -513,6 +521,10 @@ impl FetchResponse {
 		
 		
 		buf.put_i64(*&self.batches_length);
+		
+		
+		
+		buf.put_i32(*&self.preferred_read_replica);
 		
 		
         Ok(())
@@ -556,6 +568,10 @@ impl FetchResponse {
 		
 		
 		obj.batches_length = buf.get_i64();
+		
+		
+		
+		obj.preferred_read_replica = buf.get_i32();
 		
 		
 		Ok(obj)
@@ -726,6 +742,10 @@ impl BrokerInfo {
 		buf.put_i32(*&self.port);
 		
 		
+		
+		buf.put_str(&self.rack);
+		
+		
         Ok(())
     }
 
@@ -755,6 +775,10 @@ impl BrokerInfo {
 		
 		
 		obj.port = buf.get_i32();
+		
+		
+		
+		obj.rack = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
 		Ok(obj)
@@ -2775,6 +2799,59 @@ impl FetchMultiPartition {
 	}
 }
 
+impl ForgottenPartition {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_str(&self.topic);
+		
+		
+		
+		buf.put_i32(*&self.partition);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = ForgottenPartition::default();
+		
+		
+		obj.topic = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.partition = buf.get_i32();
+		
+		
+		Ok(obj)
+	}
+}
+
 impl FetchMultiRequest {
 	pub fn encode(&self) -> Result<Vec<u8>, Error> {
 		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
@@ -2802,8 +2879,27 @@ impl FetchMultiRequest {
 		
 		
 		
+		buf.put_str(&self.rack);
+		
+		
+		
+		buf.put_i32(*&self.session_id);
+		
+		
+		
+		buf.put_i32(*&self.session_epoch);
+		
+		
+		
 		buf.put_i32(self.partitions.len() as i32);
 		for item in &self.partitions {
+			item.encode_to(buf)?;
+		}
+		
+		
+		
+		buf.put_i32(self.forgotten.len() as i32);
+		for item in &self.forgotten {
 			item.encode_to(buf)?;
 		}
 		
@@ -2840,10 +2936,30 @@ impl FetchMultiRequest {
 		
 		
 		
+		obj.rack = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.session_id = buf.get_i32();
+		
+		
+		
+		obj.session_epoch = buf.get_i32();
+		
+		
+		
 		let partitions_len = buf.get_i32();
 		for _ in 0..partitions_len {
 			let val = FetchMultiPartition::decode_from(buf)?;
 			obj.partitions.push(val);
+		}
+		
+		
+		
+		let forgotten_len = buf.get_i32();
+		for _ in 0..forgotten_len {
+			let val = ForgottenPartition::decode_from(buf)?;
+			obj.forgotten.push(val);
 		}
 		
 		
@@ -2889,6 +3005,10 @@ impl FetchMultiResult {
 		buf.put_i64(*&self.batches_length);
 		
 		
+		
+		buf.put_i32(*&self.preferred_read_replica);
+		
+		
         Ok(())
     }
 
@@ -2932,6 +3052,10 @@ impl FetchMultiResult {
 		obj.batches_length = buf.get_i64();
 		
 		
+		
+		obj.preferred_read_replica = buf.get_i32();
+		
+		
 		Ok(obj)
 	}
 }
@@ -2949,6 +3073,18 @@ impl FetchMultiResponse {
 	}
 
     pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_i32(*&self.session_id);
+		
+		
+		
+		buf.put_i32(*&self.session_epoch);
+		
+		
+		
+		buf.put_i32(*&self.error_code);
+		
 		
 		
 		buf.put_i32(self.results.len() as i32);
@@ -2975,6 +3111,18 @@ impl FetchMultiResponse {
 
     pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
 		let mut obj = FetchMultiResponse::default();
+		
+		
+		obj.session_id = buf.get_i32();
+		
+		
+		
+		obj.session_epoch = buf.get_i32();
+		
+		
+		
+		obj.error_code = buf.get_i32();
+		
 		
 		
 		let results_len = buf.get_i32();
@@ -3497,6 +3645,14 @@ impl AuthenticateRequest {
 		buf.put_str(&self.password);
 		
 		
+		
+		buf.put_str(&self.mechanism);
+		
+		
+		
+		buf.put_str(&self.payload);
+		
+		
         Ok(())
     }
 
@@ -3522,6 +3678,14 @@ impl AuthenticateRequest {
 		
 		
 		obj.password = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.mechanism = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.payload = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
 		Ok(obj)
@@ -3554,6 +3718,14 @@ impl AuthenticateResponse {
 		buf.put_str(&self.role);
 		
 		
+		
+		buf.put_str(&self.payload);
+		
+		
+		
+		buf.put_bool(*&self.done);
+		
+		
         Ok(())
     }
 
@@ -3583,6 +3755,14 @@ impl AuthenticateResponse {
 		
 		
 		obj.role = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.payload = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.done = buf.get_bool();
 		
 		
 		Ok(obj)
@@ -5469,6 +5649,1018 @@ impl WriteTxnMarkersResponse {
 		let results_len = buf.get_i32();
 		for _ in 0..results_len {
 			let val = TxnMarkerResult::decode_from(buf)?;
+			obj.results.push(val);
+		}
+		
+		
+		Ok(obj)
+	}
+}
+
+impl AlterConfigEntry {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_str(&self.name);
+		
+		
+		
+		buf.put_str(&self.value);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = AlterConfigEntry::default();
+		
+		
+		obj.name = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.value = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		Ok(obj)
+	}
+}
+
+impl AlterConfigsRequest {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_str(&self.resource_type);
+		
+		
+		
+		buf.put_str(&self.resource_name);
+		
+		
+		
+		buf.put_bool(*&self.incremental);
+		
+		
+		
+		buf.put_i32(self.configs.len() as i32);
+		for item in &self.configs {
+			item.encode_to(buf)?;
+		}
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = AlterConfigsRequest::default();
+		
+		
+		obj.resource_type = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.resource_name = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.incremental = buf.get_bool();
+		
+		
+		
+		let configs_len = buf.get_i32();
+		for _ in 0..configs_len {
+			let val = AlterConfigEntry::decode_from(buf)?;
+			obj.configs.push(val);
+		}
+		
+		
+		Ok(obj)
+	}
+}
+
+impl AlterConfigsResponse {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_i32(*&self.error_code);
+		
+		
+		
+		buf.put_str(&self.resource_type);
+		
+		
+		
+		buf.put_str(&self.resource_name);
+		
+		
+		
+		buf.put_str(&self.error_message);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = AlterConfigsResponse::default();
+		
+		
+		obj.error_code = buf.get_i32();
+		
+		
+		
+		obj.resource_type = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.resource_name = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.error_message = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		Ok(obj)
+	}
+}
+
+impl ProducerState {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_i64(*&self.producer_id);
+		
+		
+		
+		buf.put_i32(*&self.producer_epoch);
+		
+		
+		
+		buf.put_i32(*&self.last_sequence);
+		
+		
+		
+		buf.put_i64(*&self.last_timestamp_ms);
+		
+		
+		
+		buf.put_i64(*&self.current_txn_start_offset);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = ProducerState::default();
+		
+		
+		obj.producer_id = buf.get_i64();
+		
+		
+		
+		obj.producer_epoch = buf.get_i32();
+		
+		
+		
+		obj.last_sequence = buf.get_i32();
+		
+		
+		
+		obj.last_timestamp_ms = buf.get_i64();
+		
+		
+		
+		obj.current_txn_start_offset = buf.get_i64();
+		
+		
+		Ok(obj)
+	}
+}
+
+impl DescribeProducersRequest {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_str(&self.topic);
+		
+		
+		
+		buf.put_i32(*&self.partition);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = DescribeProducersRequest::default();
+		
+		
+		obj.topic = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.partition = buf.get_i32();
+		
+		
+		Ok(obj)
+	}
+}
+
+impl DescribeProducersResponse {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_i32(*&self.error_code);
+		
+		
+		
+		buf.put_str(&self.topic);
+		
+		
+		
+		buf.put_i32(*&self.partition);
+		
+		
+		
+		buf.put_i64(*&self.last_stable_offset);
+		
+		
+		
+		buf.put_i64(*&self.high_watermark);
+		
+		
+		
+		buf.put_i32(self.producers.len() as i32);
+		for item in &self.producers {
+			item.encode_to(buf)?;
+		}
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = DescribeProducersResponse::default();
+		
+		
+		obj.error_code = buf.get_i32();
+		
+		
+		
+		obj.topic = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.partition = buf.get_i32();
+		
+		
+		
+		obj.last_stable_offset = buf.get_i64();
+		
+		
+		
+		obj.high_watermark = buf.get_i64();
+		
+		
+		
+		let producers_len = buf.get_i32();
+		for _ in 0..producers_len {
+			let val = ProducerState::decode_from(buf)?;
+			obj.producers.push(val);
+		}
+		
+		
+		Ok(obj)
+	}
+}
+
+impl TransactionListing {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_str(&self.transactional_id);
+		
+		
+		
+		buf.put_i64(*&self.producer_id);
+		
+		
+		
+		buf.put_str(&self.state);
+		
+		
+		
+		buf.put_i64(*&self.last_update_ms);
+		
+		
+		
+		buf.put_i32(*&self.timeout_ms);
+		
+		
+		
+		buf.put_i32(*&self.partition_count);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = TransactionListing::default();
+		
+		
+		obj.transactional_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.producer_id = buf.get_i64();
+		
+		
+		
+		obj.state = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.last_update_ms = buf.get_i64();
+		
+		
+		
+		obj.timeout_ms = buf.get_i32();
+		
+		
+		
+		obj.partition_count = buf.get_i32();
+		
+		
+		Ok(obj)
+	}
+}
+
+impl ListTransactionsRequest {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_i32(self.states.len() as i32);
+		for item in &self.states {
+			buf.put_str(item);
+		}
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = ListTransactionsRequest::default();
+		
+		
+		let states_len = buf.get_i32();
+		for _ in 0..states_len {
+			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+			obj.states.push(val);
+		}
+		
+		
+		Ok(obj)
+	}
+}
+
+impl ListTransactionsResponse {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_i32(*&self.error_code);
+		
+		
+		
+		buf.put_i32(self.transactions.len() as i32);
+		for item in &self.transactions {
+			item.encode_to(buf)?;
+		}
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = ListTransactionsResponse::default();
+		
+		
+		obj.error_code = buf.get_i32();
+		
+		
+		
+		let transactions_len = buf.get_i32();
+		for _ in 0..transactions_len {
+			let val = TransactionListing::decode_from(buf)?;
+			obj.transactions.push(val);
+		}
+		
+		
+		Ok(obj)
+	}
+}
+
+impl DescribeTransactionsRequest {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_str(&self.transactional_id);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = DescribeTransactionsRequest::default();
+		
+		
+		obj.transactional_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		Ok(obj)
+	}
+}
+
+impl DescribeTransactionsResponse {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_i32(*&self.error_code);
+		
+		
+		
+		buf.put_str(&self.transactional_id);
+		
+		
+		
+		buf.put_i64(*&self.producer_id);
+		
+		
+		
+		buf.put_i32(*&self.producer_epoch);
+		
+		
+		
+		buf.put_str(&self.state);
+		
+		
+		
+		buf.put_i32(*&self.timeout_ms);
+		
+		
+		
+		buf.put_i64(*&self.last_update_ms);
+		
+		
+		
+		buf.put_i32(self.partitions.len() as i32);
+		for item in &self.partitions {
+			item.encode_to(buf)?;
+		}
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = DescribeTransactionsResponse::default();
+		
+		
+		obj.error_code = buf.get_i32();
+		
+		
+		
+		obj.transactional_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.producer_id = buf.get_i64();
+		
+		
+		
+		obj.producer_epoch = buf.get_i32();
+		
+		
+		
+		obj.state = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.timeout_ms = buf.get_i32();
+		
+		
+		
+		obj.last_update_ms = buf.get_i64();
+		
+		
+		
+		let partitions_len = buf.get_i32();
+		for _ in 0..partitions_len {
+			let val = TxnPartition::decode_from(buf)?;
+			obj.partitions.push(val);
+		}
+		
+		
+		Ok(obj)
+	}
+}
+
+impl AlterLogDirPartition {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_str(&self.topic);
+		
+		
+		
+		buf.put_i32(*&self.partition);
+		
+		
+		
+		buf.put_str(&self.log_dir);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = AlterLogDirPartition::default();
+		
+		
+		obj.topic = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.partition = buf.get_i32();
+		
+		
+		
+		obj.log_dir = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		Ok(obj)
+	}
+}
+
+impl AlterReplicaLogDirsRequest {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_i32(self.partitions.len() as i32);
+		for item in &self.partitions {
+			item.encode_to(buf)?;
+		}
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = AlterReplicaLogDirsRequest::default();
+		
+		
+		let partitions_len = buf.get_i32();
+		for _ in 0..partitions_len {
+			let val = AlterLogDirPartition::decode_from(buf)?;
+			obj.partitions.push(val);
+		}
+		
+		
+		Ok(obj)
+	}
+}
+
+impl AlterLogDirResult {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_str(&self.topic);
+		
+		
+		
+		buf.put_i32(*&self.partition);
+		
+		
+		
+		buf.put_i32(*&self.error_code);
+		
+		
+		
+		buf.put_str(&self.log_dir);
+		
+		
+		
+		buf.put_i64(*&self.bytes_moved);
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = AlterLogDirResult::default();
+		
+		
+		obj.topic = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.partition = buf.get_i32();
+		
+		
+		
+		obj.error_code = buf.get_i32();
+		
+		
+		
+		obj.log_dir = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
+		
+		
+		
+		obj.bytes_moved = buf.get_i64();
+		
+		
+		Ok(obj)
+	}
+}
+
+impl AlterReplicaLogDirsResponse {
+	pub fn encode(&self) -> Result<Vec<u8>, Error> {
+		let mut buf = ZeroCopyByteBuff::new_writer(65536, Endian::Big);
+        buf.put_str(VERSION);
+        self.encode_to(&mut buf)?;
+		let wtr = buf.finish();
+		
+		
+		Ok(wtr)
+		
+	}
+
+    pub fn encode_to(&self, buf: &mut ZeroCopyByteBuff) -> Result<(), Error> {
+		
+		
+		buf.put_i32(self.results.len() as i32);
+		for item in &self.results {
+			item.encode_to(buf)?;
+		}
+		
+		
+        Ok(())
+    }
+
+	pub fn decode(data: &[u8]) -> Result<Self, Error> {
+		
+		let mut buf = ZeroCopyByteBuff::from_slice(data, Endian::Big);
+		
+
+        let v_str = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if v_str != VERSION {
+			return Err(Error::new(ErrorKind::InvalidData, format!("Version Mismatch: Expected {}, got {}", VERSION, v_str)));
+		}
+
+        Self::decode_from(&mut buf)
+    }
+
+    pub fn decode_from(buf: &mut ZeroCopyByteBuff) -> Result<Self, Error> {
+		let mut obj = AlterReplicaLogDirsResponse::default();
+		
+		
+		let results_len = buf.get_i32();
+		for _ in 0..results_len {
+			let val = AlterLogDirResult::decode_from(buf)?;
 			obj.results.push(val);
 		}
 		

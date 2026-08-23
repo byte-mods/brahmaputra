@@ -398,7 +398,14 @@ impl ReplicaManager {
                         leader_id: leader.broker_id,
                         leader_epoch: partition.leader_epoch,
                         leader_host: leader.host.clone(),
-                        leader_port: leader.data_port,
+                        // The leader's inter-broker endpoint when it has one:
+                        // replication is exactly the traffic that listener
+                        // exists to carry.
+                        leader_port: if leader.internal_port != 0 {
+                            leader.internal_port
+                        } else {
+                            leader.data_port
+                        },
                         follower_id: local_id,
                         follower_broker_epoch: broker_epoch,
                     },

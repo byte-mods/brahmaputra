@@ -122,6 +122,41 @@ pub struct UserRecord {
     pub role: Role,
     #[serde(default)]
     pub force_password_change: bool,
+    /// SCRAM-SHA-256 credential, derived when the password was set.
+    ///
+    /// `None` for a user created before SCRAM existed, or by a path that
+    /// only had the Argon2 hash to work from. Such a user simply cannot
+    /// authenticate with SCRAM until their password is set again — the
+    /// credential cannot be back-derived from a hash, which is the point
+    /// of a hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scram: Option<crate::scram::ScramCredential>,
+}
+
+impl UserRecord {
+    /// Build a user from a plaintext password, deriving both credentials.
+    ///
+    /// One constructor, so a new way of creating users cannot quietly
+    /// produce an account that works in the dashboard and not on the data
+    /// plane.
+    pub fn new(
+        username: impl Into<String>,
+        password: &str,
+        role: Role,
+        force_password_change: bool,
+    ) -> Result<UserRecord, &'static str> {
+        Ok(UserRecord {
+            username: username.into(),
+            password_hash: crate::password::hash(password)?,
+            role,
+            force_password_change,
+            scram: Some(crate::scram::ScramCredential::derive(
+                password,
+                &crate::scram::random_salt(),
+                crate::scram::DEFAULT_ITERATIONS,
+            )),
+        })
+    }
 }
 
 /// Who a byte-rate limit applies to.
@@ -198,6 +233,15 @@ pub struct BrokerMetadata {
     pub host: String,
     pub data_port: u16,
     pub control_port: u16,
+    /// Where other brokers reach this one. Zero means they use
+    /// `data_port`, which is what a single-listener broker publishes.
+    ///
+    /// Separating the two is what lets a cluster speak plaintext to
+    /// itself on a private network and TLS to its clients, without
+    /// paying for encryption on the replication path that carries every
+    /// record a second and third time.
+    #[serde(default)]
+    pub internal_port: u16,
     pub broker_epoch: BrokerEpoch,
     pub roles: BTreeSet<NodeRole>,
     pub rack: Option<String>,
@@ -490,6 +534,7 @@ impl ClusterMetadata {
                 host,
                 data_port,
                 control_port,
+                internal_port,
                 roles,
                 rack,
                 now_ms,
@@ -503,6 +548,7 @@ impl ClusterMetadata {
                         host,
                         data_port,
                         control_port,
+                        internal_port,
                         broker_epoch,
                         roles,
                         rack,
@@ -927,6 +973,14 @@ pub enum MetadataCommand {
         host: String,
         data_port: u16,
         control_port: u16,
+        /// Where other brokers reach this one, when that is not where
+        /// clients do. Zero means the two are the same endpoint.
+        ///
+        /// Defaulted so a registration written before this field existed
+        /// still applies: an existing cluster's Raft log must keep
+        /// meaning what it meant.
+        #[serde(default)]
+        internal_port: u16,
         roles: Vec<NodeRole>,
         rack: Option<String>,
         now_ms: i64,
@@ -1163,6 +1217,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 data_port: 9_092 + broker_id as u16,
                 control_port: 19_092 + broker_id as u16,
+                internal_port: 0,
                 roles: vec![NodeRole::Broker, NodeRole::Controller],
                 rack: None,
                 now_ms,
@@ -1258,6 +1313,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 data_port: 9_092,
                 control_port: 19_092,
+                internal_port: 0,
                 roles: vec![NodeRole::Broker],
                 rack: None,
                 now_ms: 0,
@@ -1506,6 +1562,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 data_port: 9092,
                 control_port: 19092,
+                internal_port: 0,
                 roles: vec![NodeRole::Broker],
                 rack: None,
                 now_ms: 100,
@@ -1574,8 +1631,7 @@ impl ClusterMetadata {
                 continue;
             }
             let rank = entity.specificity();
-            if limits.produce_bytes_per_sec.is_some()
-                && produce_rank.is_none_or(|best| rank > best)
+            if limits.produce_bytes_per_sec.is_some() && produce_rank.is_none_or(|best| rank > best)
             {
                 produce = limits.produce_bytes_per_sec;
                 produce_rank = Some(rank);
@@ -1596,7 +1652,13 @@ impl ClusterMetadata {
 mod quota_tests {
     use super::*;
 
-    fn put(state: &mut ClusterMetadata, user: Option<&str>, client: Option<&str>, produce: Option<u64>, fetch: Option<u64>) {
+    fn put(
+        state: &mut ClusterMetadata,
+        user: Option<&str>,
+        client: Option<&str>,
+        produce: Option<u64>,
+        fetch: Option<u64>,
+    ) {
         state
             .apply(MetadataCommand::PutQuota {
                 entity: QuotaEntity::new(user.map(str::to_owned), client.map(str::to_owned)),
@@ -1686,9 +1748,7 @@ mod quota_tests {
         );
 
         let key = QuotaEntity::new(Some("alice".into()), Some("app".into())).key();
-        state
-            .apply(MetadataCommand::DeleteQuota { key })
-            .unwrap();
+        state.apply(MetadataCommand::DeleteQuota { key }).unwrap();
         assert!(state.quotas.is_empty());
     }
 }
@@ -1805,6 +1865,7 @@ mod acl_tests {
                 password_hash: "x".to_string(),
                 role: Role::Admin,
                 force_password_change: false,
+                scram: None,
             },
         );
         put(
@@ -1830,6 +1891,8 @@ mod acl_tests {
 /// This lives beside [`UserRecord`] rather than in the dashboard because
 /// the data plane authenticates against the same users, and a broker must
 /// not have to depend on the HTTP layer to check a password.
+pub mod scram;
+
 pub mod password {
     use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
     use argon2::Argon2;
@@ -1892,6 +1955,7 @@ mod partition_and_config_tests {
                     host: format!("host-{broker_id}"),
                     data_port: 9092,
                     control_port: 19092,
+                    internal_port: 0,
                     roles: vec![NodeRole::Broker],
                     rack: None,
                     now_ms: 1_000,
@@ -2091,6 +2155,7 @@ mod placement_and_reassignment_tests {
                     host: "127.0.0.1".into(),
                     data_port: 9092 + *id as u16,
                     control_port: 19092 + *id as u16,
+                    internal_port: 0,
                     roles: vec![NodeRole::Broker, NodeRole::Controller],
                     rack: Some((*rack).to_string()),
                     now_ms: 1,

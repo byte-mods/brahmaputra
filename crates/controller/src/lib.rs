@@ -943,6 +943,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 data_port: 9092,
                 control_port: 19092,
+                internal_port: 0,
                 roles: vec![],
                 rack: None,
                 now_ms: 1_000,

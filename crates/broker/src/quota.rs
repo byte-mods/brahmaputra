@@ -310,7 +310,13 @@ mod replication_quota_tests {
         for _ in 0..100 {
             assert!(
                 manager
-                    .throttle_for(None, Some("replica-9"), QuotaKind::Replication, 1_000_000, None)
+                    .throttle_for(
+                        None,
+                        Some("replica-9"),
+                        QuotaKind::Replication,
+                        1_000_000,
+                        None
+                    )
                     .is_zero(),
                 "no replication ceiling means no replication throttling"
             );

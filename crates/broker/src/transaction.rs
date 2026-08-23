@@ -282,7 +282,19 @@ impl TransactionShard {
     }
 
     fn apply_record(&self, record: &Record) {
-        let Some((&kind, payload)) = record.value.split_first() else {
+        let Some(value) = record.value.as_ref() else {
+            // A null value under a `transactional.id` retires it: the
+            // producer has been idle past `transactional.id.expiration.ms`
+            // and its state is gone, here and, once compaction runs, on
+            // disk too.
+            if let Some(key) = record.key.as_ref() {
+                if let Ok(id) = std::str::from_utf8(key) {
+                    self.transactions.remove(id);
+                }
+            }
+            return;
+        };
+        let Some((&kind, payload)) = value.split_first() else {
             return;
         };
         if kind != KIND_TRANSACTION_STATE {
@@ -317,6 +329,20 @@ impl TransactionShard {
             vec![Record::with_key(
                 metadata.transactional_id.clone().into_bytes(),
                 value,
+                0,
+            )],
+        );
+        Ok(self.handle.append(batch).await?)
+    }
+
+    /// Append a null value under `transactional_id`, deleting it.
+    async fn persist_tombstone(&self, transactional_id: &str) -> Result<i64, BrokerError> {
+        let batch = RecordBatch::new(
+            0,
+            self.leader_epoch,
+            now_ms(),
+            vec![Record::tombstone(
+                transactional_id.to_owned().into_bytes(),
                 0,
             )],
         );
@@ -392,9 +418,7 @@ pub(crate) async fn shard_for(
         let handle = broker.partition_auto_create(TRANSACTION_STATE_TOPIC, partition)?;
         (partition, 0, handle)
     };
-    let shard = broker
-        .transactions()
-        .shard(partition, handle, leader_epoch);
+    let shard = broker.transactions().shard(partition, handle, leader_epoch);
     shard.ensure_loaded().await?;
     Ok(shard)
 }
@@ -448,8 +472,8 @@ pub(crate) async fn init_transactional_producer(
     // never reached a decision, so it aborts. One already `Prepare*` did:
     // that record is durable, and finishing it is the whole reason it is
     // written before any marker is sent.
-    let abandoned = matches!(metadata.state, TransactionState::Ongoing)
-        || metadata.state.is_prepared();
+    let abandoned =
+        matches!(metadata.state, TransactionState::Ongoing) || metadata.state.is_prepared();
     if abandoned && !metadata.partitions.is_empty() {
         let committed = metadata.state.committed();
         let partitions = metadata.partitions.clone();
@@ -478,6 +502,325 @@ pub(crate) async fn init_transactional_producer(
     let identity = (metadata.producer_id, metadata.producer_epoch);
     shard.put(metadata);
     Ok(identity)
+}
+
+/// How often the coordinator looks for transactions that have outlived
+/// their timeout.
+///
+/// Kafka checks every 10 s. This is faster because the cost is walking an
+/// in-memory map of the ids this broker coordinates, and because the thing
+/// being waited on — an abandoned transaction — is holding every
+/// `read_committed` consumer of its partitions still while it waits.
+const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a transaction may sit in `Prepare*` before its markers are
+/// re-sent.
+///
+/// A marker write that failed leaves the decision durable and the
+/// partitions unmarked, which is safe but not finished: a committed reader
+/// stays held at the LSO until someone completes it. Before this existed
+/// the only thing that would was the next `InitProducerId` for that id,
+/// which for a producer that never came back is never.
+const MARKER_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Smallest `transaction.timeout.ms` a producer may ask for.
+///
+/// Below this the coordinator would abort transactions out from under a
+/// producer that is merely slow, which turns a latency spike into a
+/// correctness-looking failure.
+const MIN_TRANSACTION_TIMEOUT_MS: i32 = 1_000;
+
+/// Clamp a client's requested transaction timeout to what this broker will
+/// police.
+pub(crate) fn clamp_transaction_timeout(broker: &Broker, requested: i32) -> i32 {
+    let max = broker
+        .config()
+        .transaction_max_timeout
+        .as_millis()
+        .min(i32::MAX as u128) as i32;
+    requested.clamp(
+        MIN_TRANSACTION_TIMEOUT_MS,
+        max.max(MIN_TRANSACTION_TIMEOUT_MS),
+    )
+}
+
+/// Every `__transaction_state` partition this broker coordinates *and has
+/// already opened*.
+///
+/// In cluster mode that is the partitions it leads; in standalone mode
+/// every local one. Empty when the topic does not exist yet, which is the
+/// normal state of a broker nothing transactional has ever talked to.
+///
+/// **Already opened** is the important half. This runs on a timer on every
+/// broker, and `Broker::partition` *creates* a partition actor if one is
+/// not open — so asking it here would let a background sweep spawn an
+/// actor, with its own maintenance tick and checkpoint fsync, for every
+/// one of the fifty `__transaction_state` partitions a broker leads and
+/// nothing has ever used. A timer should observe state, not conjure it.
+///
+/// Nothing is lost by waiting. A broker opens every partition it hosts at
+/// startup, so after the restart or failover that recovery actually cares
+/// about, the shards are open and this sees them. Before that, a partition
+/// nobody has touched holds no transaction that could need resolving.
+fn local_coordinator_partitions(broker: &Broker) -> Vec<(i32, crate::actor::PartitionHandle, i32)> {
+    let mut out = Vec::new();
+    match broker.metadata_cache() {
+        Some(cache) => {
+            let image = cache.snapshot();
+            let Some(topic) = image.topics.get(TRANSACTION_STATE_TOPIC) else {
+                return out;
+            };
+            for (partition, assignment) in &topic.partitions {
+                if assignment.leader != broker.config().broker_id {
+                    continue;
+                }
+                if let Some(handle) = broker.hosted_partition(TRANSACTION_STATE_TOPIC, *partition) {
+                    out.push((*partition, handle, assignment.leader_epoch));
+                }
+            }
+        }
+        None => {
+            let Some(count) = broker.state().partitions(TRANSACTION_STATE_TOPIC) else {
+                return out;
+            };
+            for partition in 0..count {
+                if let Some(handle) = broker.hosted_partition(TRANSACTION_STATE_TOPIC, partition) {
+                    out.push((partition, handle, 0));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Abort transactions that have outlived their timeout, finish the ones
+/// left half-marked, and forget producers nobody has used in a long time.
+///
+/// This is the half of the coordinator that does not need a client. Without
+/// it, `transaction.timeout.ms` is a number the client sends and nothing
+/// enforces: a producer that dies mid-transaction — scaled down, redeployed
+/// under a different id, crashed for good — leaves records in doubt on
+/// every partition it wrote to, and the last stable offset on those
+/// partitions never advances past them. Every `read_committed` consumer
+/// stops there, permanently.
+pub(crate) async fn sweep_expired(broker: &Broker) {
+    for (partition, handle, leader_epoch) in local_coordinator_partitions(broker) {
+        let shard = broker.transactions().shard(partition, handle, leader_epoch);
+        // Loading is what makes this work after a failover: the new
+        // coordinator has to know what the old one left open before it can
+        // finish it, and nothing else would make it read the log until a
+        // client happened to ask.
+        if let Err(error) = shard.ensure_loaded().await {
+            debug!(partition, %error, "transaction shard not ready to sweep");
+            continue;
+        }
+        let now = now_ms();
+        let candidates: Vec<TransactionMetadata> = shard
+            .transactions
+            .iter()
+            .filter(|entry| {
+                let age = now.saturating_sub(entry.last_update_ms);
+                match entry.state {
+                    TransactionState::Ongoing => age > entry.timeout_ms.max(0) as i64,
+                    state if state.is_prepared() => age > MARKER_RETRY_INTERVAL.as_millis() as i64,
+                    _ => age > broker.config().transactional_id_expiration.as_millis() as i64,
+                }
+            })
+            .map(|entry| entry.clone())
+            .collect();
+
+        for metadata in candidates {
+            let result = match metadata.state {
+                TransactionState::Ongoing => abort_timed_out(broker, &shard, metadata).await,
+                state if state.is_prepared() => finish_prepared(broker, &shard, metadata).await,
+                _ => expire_transactional_id(&shard, metadata).await,
+            };
+            if let Err(error) = result {
+                warn!(%error, partition, "transaction expiry sweep failed");
+            }
+        }
+    }
+}
+
+/// Abort a transaction whose producer stopped talking, fencing it first.
+///
+/// The epoch bump is not bookkeeping: without it a producer that is merely
+/// slow would carry on writing records into a transaction the coordinator
+/// has already marked aborted, and those records would be in doubt with no
+/// marker ever coming for them. Fencing turns that into a
+/// `FENCED_PRODUCER_EPOCH` the producer must re-initialise after, which is
+/// exactly what Kafka does.
+async fn abort_timed_out(
+    broker: &Broker,
+    shard: &Arc<TransactionShard>,
+    mut metadata: TransactionMetadata,
+) -> Result<(), BrokerError> {
+    let abandoned_epoch = metadata.producer_epoch;
+    metadata.producer_epoch = metadata.producer_epoch.wrapping_add(1);
+    metadata.state = TransactionState::PrepareAbort;
+    metadata.last_update_ms = now_ms();
+    debug!(
+        transactional_id = %metadata.transactional_id,
+        partitions = metadata.partitions.len(),
+        "aborting a transaction that outlived transaction.timeout.ms"
+    );
+    // Durable before any marker, for the same reason `EndTxn` is: a
+    // coordinator that dies here comes back knowing the decision rather
+    // than guessing it.
+    shard.persist(&metadata).await?;
+    shard.put(metadata.clone());
+
+    // The records were written under the epoch before the bump, so that is
+    // the epoch their markers carry.
+    write_markers(
+        broker,
+        metadata.producer_id,
+        abandoned_epoch,
+        false,
+        &metadata.partitions,
+    )
+    .await;
+
+    metadata.state = TransactionState::CompleteAbort;
+    metadata.partitions.clear();
+    metadata.last_update_ms = now_ms();
+    shard.persist(&metadata).await?;
+    shard.put(metadata);
+    Ok(())
+}
+
+/// Re-send the markers of a transaction whose decision is durable but whose
+/// partitions never heard about it.
+async fn finish_prepared(
+    broker: &Broker,
+    shard: &Arc<TransactionShard>,
+    mut metadata: TransactionMetadata,
+) -> Result<(), BrokerError> {
+    let committed = metadata.state.committed();
+    debug!(
+        transactional_id = %metadata.transactional_id,
+        committed,
+        partitions = metadata.partitions.len(),
+        "re-sending the markers of a transaction left half-finished"
+    );
+    // A duplicate marker is harmless: a partition that already closed this
+    // transaction has nothing open to close, and says so by doing nothing.
+    write_markers(
+        broker,
+        metadata.producer_id,
+        metadata.producer_epoch,
+        committed,
+        &metadata.partitions,
+    )
+    .await;
+    metadata.state = if committed {
+        TransactionState::CompleteCommit
+    } else {
+        TransactionState::CompleteAbort
+    };
+    metadata.partitions.clear();
+    metadata.last_update_ms = now_ms();
+    shard.persist(&metadata).await?;
+    shard.put(metadata);
+    Ok(())
+}
+
+/// Forget a `transactional.id` nobody has used in a very long time.
+///
+/// Written as a tombstone rather than only dropped from memory: the state
+/// log is compacted, so a null value is what makes the record stop
+/// occupying disk. Without it the coordinator's log grows with every
+/// transactional id that ever existed, and its replay after a failover
+/// grows with it.
+async fn expire_transactional_id(
+    shard: &Arc<TransactionShard>,
+    metadata: TransactionMetadata,
+) -> Result<(), BrokerError> {
+    debug!(
+        transactional_id = %metadata.transactional_id,
+        "expiring an idle transactional id"
+    );
+    shard.persist_tombstone(&metadata.transactional_id).await?;
+    shard.transactions.remove(&metadata.transactional_id);
+    Ok(())
+}
+
+/// Every transaction this broker coordinates, for `ListTransactions`.
+///
+/// Reads the loaded shards rather than the log: a coordinator's in-memory
+/// state *is* the replay of that log, and asking it costs nothing where
+/// re-reading the log would cost a scan per query.
+pub(crate) async fn list_local_transactions(
+    broker: &Broker,
+) -> Vec<brahmaputra_protocol::gen::TransactionListing> {
+    let mut out = Vec::new();
+    for (partition, handle, leader_epoch) in local_coordinator_partitions(broker) {
+        let shard = broker.transactions().shard(partition, handle, leader_epoch);
+        if shard.ensure_loaded().await.is_err() {
+            continue;
+        }
+        for entry in shard.transactions.iter() {
+            out.push(brahmaputra_protocol::gen::TransactionListing {
+                transactional_id: entry.transactional_id.clone(),
+                producer_id: entry.producer_id,
+                state: entry.state.as_str().to_owned(),
+                last_update_ms: entry.last_update_ms,
+                timeout_ms: entry.timeout_ms,
+                partition_count: entry.partitions.len() as i32,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.transactional_id.cmp(&b.transactional_id));
+    out
+}
+
+/// One transaction in full, or `None` when this broker does not coordinate
+/// that id.
+pub(crate) async fn describe_local_transaction(
+    broker: &Broker,
+    transactional_id: &str,
+) -> Result<Option<brahmaputra_protocol::gen::DescribeTransactionsResponse>, BrokerError> {
+    let shard = shard_for(broker, transactional_id).await?;
+    let Some(metadata) = shard.get(transactional_id) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        brahmaputra_protocol::gen::DescribeTransactionsResponse {
+            error_code: ec::NONE,
+            transactional_id: metadata.transactional_id,
+            producer_id: metadata.producer_id,
+            producer_epoch: i32::from(metadata.producer_epoch),
+            state: metadata.state.as_str().to_owned(),
+            timeout_ms: metadata.timeout_ms,
+            last_update_ms: metadata.last_update_ms,
+            partitions: metadata
+                .partitions
+                .into_iter()
+                .map(|(topic, partition)| TxnPartition { topic, partition })
+                .collect(),
+        },
+    ))
+}
+
+/// Transaction-expiry sweeper. Spawned from [`Broker::run`]; stops on the
+/// broker shutdown watch.
+pub(crate) async fn run_expiry_sweeper(broker: Arc<Broker>) {
+    let mut shutdown = broker.shutdown_receiver();
+    let mut interval = tokio::time::interval(EXPIRY_SWEEP_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = async {
+                while !*shutdown.borrow_and_update() {
+                    if shutdown.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => break,
+            _ = interval.tick() => sweep_expired(&broker).await,
+        }
+    }
 }
 
 /// Check that a request comes from the current producer instance.
@@ -541,10 +884,8 @@ pub(crate) async fn add_offsets(
     producer_epoch: i16,
     group_id: &str,
 ) -> Result<(), i32> {
-    let offsets_partition = crate::group::coordinator_partition(
-        group_id,
-        offsets_topic_partition_count(broker).await,
-    );
+    let offsets_partition =
+        crate::group::coordinator_partition(group_id, offsets_topic_partition_count(broker).await);
     add_partitions(
         broker,
         transactional_id,
@@ -667,8 +1008,15 @@ async fn write_markers(
     }
 
     for (topic, partition) in local {
-        if let Err(error) =
-            append_marker(broker, &topic, partition, producer_id, producer_epoch, committed).await
+        if let Err(error) = append_marker(
+            broker,
+            &topic,
+            partition,
+            producer_id,
+            producer_epoch,
+            committed,
+        )
+        .await
         {
             warn!(%topic, partition, %error, "could not write a transaction marker locally");
         }
@@ -781,7 +1129,7 @@ async fn send_markers(
         .map_err(|error| BrokerError::Meta(error.to_string()))?;
 
     let client = brahmaputra_client::ReplicaClient::connect_with(
-        broker.config().transport,
+        broker.internal_transport(),
         address,
         format!("txn-coordinator-{}", broker.config().broker_id),
         4,
@@ -789,10 +1137,13 @@ async fn send_markers(
     .await
     .map_err(|error| BrokerError::Meta(error.to_string()))?;
 
-    let response = tokio::time::timeout(MARKER_TIMEOUT, client.connection().request(ApiKey::WriteTxnMarkers, &body))
-        .await
-        .map_err(|_| BrokerError::Meta("timed out writing transaction markers".into()))?
-        .map_err(|error| BrokerError::Meta(error.to_string()))?;
+    let response = tokio::time::timeout(
+        MARKER_TIMEOUT,
+        client.connection().request(ApiKey::WriteTxnMarkers, &body),
+    )
+    .await
+    .map_err(|_| BrokerError::Meta("timed out writing transaction markers".into()))?
+    .map_err(|error| BrokerError::Meta(error.to_string()))?;
     let decoded = WriteTxnMarkersResponse::decode(&response)
         .map_err(|error| BrokerError::Meta(error.to_string()))?;
     for result in decoded.results {
