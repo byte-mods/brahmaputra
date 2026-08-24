@@ -14,6 +14,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use brahmaputra_broker::Broker;
+use brahmaputra_client::{Admin, GroupAdmin};
 use brahmaputra_metadata::{ClusterMetadata, MetadataCache, Role, UserRecord};
 use brahmaputra_metrics::{names, Metrics};
 use brahmaputra_protocol::RecordBatch;
@@ -282,6 +283,149 @@ async fn topics(State(state): State<DashboardState>, headers: HeaderMap) -> Resp
     Json(json!({ "topics": topics })).into_response()
 }
 
+/// An admin client aimed at one broker's data port.
+///
+/// The dashboard is served by every node, but disk usage and broker
+/// configuration are per-broker facts: asking only the local one would
+/// answer a different question than the operator is asking. So these views
+/// go over the data plane, exactly as the CLI does.
+async fn admin_for(state: &DashboardState, host: &str, port: u16) -> Result<Admin, String> {
+    let addr = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| error.to_string())?
+        .next()
+        .ok_or_else(|| format!("{host}:{port} did not resolve"))?;
+    Admin::connect_with(state.broker.config().transport, addr, "dashboard")
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The configuration in force on every broker.
+///
+/// Read-only, and not an oversight: `AlterConfigs` accepts topic resources
+/// only, and a broker's settings come from the flags it was started with,
+/// so there is nothing here a write could move. `is_default` is the useful
+/// column — it marks the values a restart with a different flag would
+/// change.
+async fn broker_configs(State(state): State<DashboardState>, headers: HeaderMap) -> Response {
+    if let Err(error) = state.authorize(&headers, Role::Viewer) {
+        return auth_error(error);
+    }
+    let image = state.image();
+    let mut brokers = Vec::new();
+    for broker in image.brokers.values() {
+        let described = match admin_for(&state, &broker.host, broker.data_port).await {
+            Ok(admin) => admin
+                .describe_configs("broker", &broker.broker_id.to_string(), &[])
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        brokers.push(match described {
+            Ok(configs) => json!({
+                "broker_id": broker.broker_id,
+                "address": format!("{}:{}", broker.host, broker.data_port),
+                "configs": configs
+                    .into_iter()
+                    .map(|entry| json!({
+                        "name": entry.name,
+                        "value": entry.value,
+                        "is_default": entry.is_default,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            // A broker that cannot be reached is reported in place rather
+            // than failing the sweep: one node being down is often exactly
+            // why someone opened this page.
+            Err(error) => json!({
+                "broker_id": broker.broker_id,
+                "address": format!("{}:{}", broker.host, broker.data_port),
+                "error": error,
+            }),
+        });
+    }
+    Json(json!({ "brokers": brokers, "mutable": false })).into_response()
+}
+
+/// Per-broker disk usage, optionally narrowed to one topic.
+///
+/// Without `?topic=`, every topic in the cluster is asked for, because the
+/// per-broker totals are the sum over topics and a partial list would
+/// under-report a disk. One connection is enough: the client fans the
+/// request out to every broker itself.
+async fn log_dirs(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(query): Query<LogDirQuery>,
+) -> Response {
+    if let Err(error) = state.authorize(&headers, Role::Viewer) {
+        return auth_error(error);
+    }
+    let image = state.image();
+    let topics: Vec<String> = match &query.topic {
+        Some(topic) => vec![topic.clone()],
+        None => image.topics.keys().cloned().collect(),
+    };
+
+    let config = state.broker.config();
+    let admin = match admin_for(&state, &config.host, config.port).await {
+        Ok(admin) => admin,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    let (dirs, unreachable) = match admin.describe_log_dirs(&topics).await {
+        Ok(result) => result,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    };
+
+    let dirs: Vec<_> = dirs
+        .into_iter()
+        .map(|dir| {
+            json!({
+                "broker_id": dir.broker_id,
+                "log_dir": dir.log_dir,
+                "online": dir.error_code == 0,
+                "offline_reason": dir.offline_reason,
+                "total_bytes": dir.total_bytes,
+                "usable_bytes": dir.usable_bytes,
+                "size_bytes": dir.partitions.iter().map(|p| p.size_bytes.max(0)).sum::<i64>(),
+                "partitions": dir
+                    .partitions
+                    .into_iter()
+                    .map(|partition| json!({
+                        "topic": partition.topic,
+                        "partition": partition.partition,
+                        "size_bytes": partition.size_bytes,
+                        "offset_lag": partition.offset_lag,
+                        "is_leader": partition.is_leader,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let unreachable: Vec<_> = unreachable
+        .into_iter()
+        .map(|(broker_id, error)| json!({ "broker_id": broker_id, "error": error }))
+        .collect();
+    Json(json!({ "dirs": dirs, "unreachable": unreachable })).into_response()
+}
+
+#[derive(Deserialize)]
+struct LogDirQuery {
+    topic: Option<String>,
+}
+
 async fn topic_detail(
     State(state): State<DashboardState>,
     headers: HeaderMap,
@@ -388,11 +532,51 @@ async fn groups(State(state): State<DashboardState>, headers: HeaderMap) -> Resp
     if let Err(error) = state.authorize(&headers, Role::Viewer) {
         return auth_error(error);
     }
-    match state.broker.list_groups().await {
-        Ok(groups) => Json(json!({ "groups": groups })).into_response(),
+    // Deliberately not `broker.list_groups`: a group lives on whichever
+    // broker leads its __consumer_offsets partition, so the local view
+    // shows only the groups this node happens to coordinate and silently
+    // omits the rest. On a three-broker cluster that hides roughly two
+    // thirds of them. GroupAdmin asks every broker and returns the union.
+    let config = state.broker.config();
+    let admin = match group_admin_for(&state, &config.host, config.port).await {
+        Ok(admin) => admin,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    match admin.list_groups(&[]).await {
+        Ok(report) => {
+            let groups: Vec<_> = report
+                .groups
+                .into_iter()
+                .map(|group| {
+                    json!({
+                        "group_id": group.group_id,
+                        "state": group.state,
+                        "generation": group.generation,
+                        "member_count": group.member_count,
+                        "coordinator_partition": group.coordinator_partition,
+                        "coordinator_broker": group.coordinator_broker,
+                    })
+                })
+                .collect();
+            // A broker that did not answer is named rather than dropped:
+            // otherwise its groups are simply absent from the list, which
+            // looks the same as their not existing.
+            let unreachable: Vec<_> = report
+                .unreachable
+                .into_iter()
+                .map(|(broker_id, error)| json!({ "broker_id": broker_id, "error": error }))
+                .collect();
+            Json(json!({ "groups": groups, "unreachable": unreachable })).into_response()
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error })),
+            Json(json!({ "error": error.to_string() })),
         )
             .into_response(),
     }
@@ -406,10 +590,65 @@ async fn group_lag(
     if let Err(error) = state.authorize(&headers, Role::Viewer) {
         return auth_error(error);
     }
-    match state.broker.group_lag(&group).await {
-        Ok(lag) => Json(json!({ "group": group, "partitions": lag })).into_response(),
-        Err(error) => (StatusCode::NOT_FOUND, Json(json!({ "error": error }))).into_response(),
+    // Deliberately not `broker.group_lag`: that reads log ends from the
+    // partitions *this* node leads and reports -1 for the rest, so on any
+    // multi-broker cluster most of the table would be blank. The client's
+    // GroupAdmin asks each partition's leader instead, which is the only
+    // way the number is right.
+    let config = state.broker.config();
+    let admin = match group_admin_for(&state, &config.host, config.port).await {
+        Ok(admin) => admin,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    match admin.group_lag(&group).await {
+        Ok(lag) => {
+            let partitions: Vec<_> = lag
+                .into_iter()
+                .map(|entry| {
+                    json!({
+                        "topic": entry.topic,
+                        "partition": entry.partition,
+                        // A partition the group never committed is not the
+                        // same as one committed at offset 0, so an absent
+                        // commit stays null rather than becoming a number.
+                        "committed_offset": entry.committed_offset,
+                        "log_end_offset": entry.log_end_offset,
+                        "lag": entry.lag,
+                        "member_id": entry.member_id,
+                    })
+                })
+                .collect();
+            Json(json!({ "group": group, "partitions": partitions })).into_response()
+        }
+        Err(error) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response(),
     }
+}
+
+/// A group-admin client aimed at one broker, for the cluster-wide views
+/// that need to reach partition leaders rather than only local state.
+async fn group_admin_for(
+    state: &DashboardState,
+    host: &str,
+    port: u16,
+) -> Result<GroupAdmin, String> {
+    let addr = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| error.to_string())?
+        .next()
+        .ok_or_else(|| format!("{host}:{port} did not resolve"))?;
+    GroupAdmin::connect_with(state.broker.config().transport, addr, "dashboard")
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn metrics_snapshot(State(state): State<DashboardState>, headers: HeaderMap) -> Response {
@@ -543,8 +782,23 @@ async fn delete_user(
     }
 }
 
-async fn dashboard_page() -> Html<&'static str> {
-    Html(ui::INDEX_HTML)
+/// The dashboard page, explicitly uncacheable.
+///
+/// The UI is compiled into the broker, so it changes with every upgrade
+/// while its URL never does. Without this header a browser is entitled to
+/// reuse a heuristically cached copy, and an operator who upgrades the
+/// cluster keeps looking at the previous version's page with no hint that
+/// anything is stale — the failure mode is silent and looks like the
+/// upgrade simply did nothing.
+async fn dashboard_page() -> Response {
+    (
+        [(
+            header::CACHE_CONTROL,
+            "no-store, no-cache, must-revalidate",
+        )],
+        Html(ui::INDEX_HTML),
+    )
+        .into_response()
 }
 
 /// Build the router. Every route except `/metrics` and the login endpoint
@@ -555,6 +809,8 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/brokers", get(brokers))
+        .route("/api/v1/brokers/config", get(broker_configs))
+        .route("/api/v1/logdirs", get(log_dirs))
         .route("/api/v1/topics", get(topics).post(create_topic))
         .route(
             "/api/v1/topics/{name}",

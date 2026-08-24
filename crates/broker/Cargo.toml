@@ -36,7 +36,8 @@ base64 = "0.22"
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# Only for Linux `sendfile` on the plaintext fetch path. Other platforms use
-# the portable buffered fallback because their sendfile APIs differ.
+[target.'cfg(unix)'.dependencies]
+# `statvfs` for DescribeLogDirs on every unix, and Linux-only `sendfile` on
+# the plaintext fetch path. Other platforms use the portable buffered
+# fallback for the latter, because their sendfile APIs differ.
 libc = "0.2"

@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-broker"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64",
  "brahmaputra-client",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "brahmaputra-broker",
@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-client"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "brahmaputra-metadata",
  "brahmaputra-protocol",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-controller"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -381,13 +381,14 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-dashboard"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "argon2",
  "async-stream",
  "async-trait",
  "axum",
  "brahmaputra-broker",
+ "brahmaputra-client",
  "brahmaputra-metadata",
  "brahmaputra-metrics",
  "brahmaputra-protocol",
@@ -402,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-metadata"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "argon2",
  "base64",
@@ -416,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-metrics"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dashmap",
  "serde",
@@ -424,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-protocol"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "crc32c",
@@ -437,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -458,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "brahmaputra-storage"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "brahmaputra-protocol",
  "bytes",

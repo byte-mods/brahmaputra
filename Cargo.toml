@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -67,11 +67,11 @@ rustls-pemfile = "2"
 # dev-dependencies
 tempfile = "3"
 
-brahmaputra-protocol = { path = "crates/protocol", version = "0.4.0" }
-brahmaputra-storage = { path = "crates/storage", version = "0.4.0" }
-brahmaputra-metadata = { path = "crates/metadata", version = "0.4.0" }
-brahmaputra-metrics = { path = "crates/metrics", version = "0.4.0" }
-brahmaputra-dashboard = { path = "crates/dashboard", version = "0.4.0" }
-brahmaputra-controller = { path = "crates/controller", version = "0.4.0" }
-brahmaputra-broker = { path = "crates/broker", version = "0.4.0" }
-brahmaputra-client = { path = "crates/client", version = "0.4.0" }
+brahmaputra-protocol = { path = "crates/protocol", version = "0.5.0" }
+brahmaputra-storage = { path = "crates/storage", version = "0.5.0" }
+brahmaputra-metadata = { path = "crates/metadata", version = "0.5.0" }
+brahmaputra-metrics = { path = "crates/metrics", version = "0.5.0" }
+brahmaputra-dashboard = { path = "crates/dashboard", version = "0.5.0" }
+brahmaputra-controller = { path = "crates/controller", version = "0.5.0" }
+brahmaputra-broker = { path = "crates/broker", version = "0.5.0" }
+brahmaputra-client = { path = "crates/client", version = "0.5.0" }

@@ -83,10 +83,43 @@ open http://localhost:8080                              # dashboard
 | M10 | Transactions and `read_committed` isolation | ✅ complete |
 | M11 | JBOD: several disks per broker, failure isolated per disk | ✅ complete |
 | M12 | Tombstones and real compaction, transaction expiry, follower fetching, fetch sessions, SCRAM | ✅ complete |
+| M13 | Cluster-wide dashboard views, local hosting scripts, sole-replica recovery | ✅ complete |
 
 Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
+
+### Upgrading to 0.5.0
+
+**No wire change and no on-disk change**: the protocol stays at version 4,
+logs and checkpoints are read unchanged, and a 0.4.0 client talks to a
+0.5.0 broker. Upgrading is a restart.
+
+That restart is worth doing, because 0.5.0 fixes a partition that could
+never come back. Fencing a broker empties the ISR and clears the leader.
+With several replicas another one takes over and the returning broker
+rejoins through it; with **one** replica there was no leader to rejoin
+through, and the two rules that keep ISR membership safe deadlocked —
+`ChangePartition` will not make a broker leader unless it is already in the
+ISR, and only a leader can widen the ISR. The partition stayed offline
+permanently even though its only replica was back holding the whole log.
+
+`__consumer_offsets` is created with one replica per partition, so this
+took out consumer groups: a group is coordinated by
+`crc32c(group) % partitions`, and any group whose coordinator partition sat
+on a broker that had once restarted could never start again. It failed as
+`unknown topic-partition "__consumer_offsets"-N`.
+
+Registration now restores leadership for partitions where the returning
+broker is the **only** replica. That is a clean election, not an unclean
+one: with one replica that log *is* the partition, so there is no more
+recent data anywhere to lose. Partitions with several replicas and an empty
+ISR are deliberately left alone — there, choosing which returning replica
+to believe can genuinely discard writes, and that belongs to an explicit
+unclean-election policy rather than to whichever broker registers first.
+
+Affected clusters heal on the next broker restart; nothing has to be
+recreated and no data is touched.
 
 ### Upgrading to 0.4.0
 
@@ -179,6 +212,52 @@ brahmaputra-cli --controller http://10.0.0.1:19092 \
 Clients connect to **any** broker and are routed to partition leaders
 automatically; there is no bootstrap-server list to maintain beyond one
 reachable address.
+
+### A three-node cluster on one machine
+
+For development, [scripts/run-cluster.sh](scripts/run-cluster.sh) runs the
+same shape locally — three combined broker/controller nodes separated by
+port rather than by address, dashboard included:
+
+```bash
+scripts/run-cluster.sh start     # build if needed, start, form the quorum
+scripts/run-cluster.sh status    # brokers, controller view, topics
+scripts/run-cluster.sh logs 2    # tail node 2
+scripts/run-cluster.sh stop      # stop all three, keep the data
+scripts/run-cluster.sh destroy   # stop and delete the data directories
+```
+
+Ports are `base + node - 1`: data 9092–9094, controller 19092–19094,
+dashboard 8080–8082. Shift a base when something else holds it — a Kafka
+container on 9092 is the usual collision:
+
+```bash
+DATA_PORT_BASE=9192 HTTP_PORT_BASE=8090 scripts/run-cluster.sh start
+```
+
+The resolved ports land in `data/cluster/cluster.env`, which the other
+scripts read, so a shifted cluster stays usable without repeating the
+variables. State lives under `data/cluster`, and `stop` leaves it in place
+so a restart rejoins the same cluster with the same logs.
+
+Two scripts drive it:
+
+```bash
+scripts/load-100k.sh        # push 100,000 records at acks=1, then verify them
+scripts/consume-follow.sh   # tail the topic, printing each record
+```
+
+`load-100k.sh` does not trust the producer's own count: it sums partition
+offsets before and after and fails unless the total moved by exactly the
+number requested, then checks the ISR — `acks=1` is precisely the setting
+where "the client thinks it sent it" and "the replicas hold it" can differ.
+`COUNT`, `VALUE_SIZE`, `TOPIC`, `PARTITIONS` and `RATE` are all
+overridable; offering below saturation with `RATE` is what makes the
+latency percentiles mean what a caller waits for.
+
+`consume-follow.sh` tails from `latest` by default, so it prints records as
+they arrive rather than opening with the whole backlog. `FROM=earliest`
+replays, `GROUP=""` reads standalone without committing.
 
 ## Transports
 
@@ -603,17 +682,39 @@ Every broker serves an operations surface on `--http-port` (default 8080):
 | `POST /api/v1/auth/login` | — | exchange credentials for a 12-hour token |
 | `GET /api/v1/overview` | viewer | cluster summary, under-replicated and offline counts |
 | `GET /api/v1/brokers` | viewer | broker list, liveness, roles |
+| `GET /api/v1/brokers/config` | viewer | each broker's configuration, asked of each in turn |
+| `GET /api/v1/logdirs` | viewer | per-broker disk usage, optionally `?topic=` |
 | `GET /api/v1/topics`, `/topics/{name}` | viewer | topics, per-partition leader/ISR/offsets |
 | `POST /api/v1/topics`, `DELETE /topics/{name}` | operator | topic administration |
 | `GET /api/v1/topics/{name}/messages` | viewer | browse records, with `search`, `order`, `partition`, `limit` |
 | `GET /api/v1/topics/{name}/stream` | viewer | live tail as server-sent events |
 | `POST /api/v1/topics/{name}/partitions` | operator | increase the partition count |
 | `POST /api/v1/topics/{name}/config` | operator | change topic configuration |
-| `GET /api/v1/groups`, `/groups/{id}/lag` | viewer | consumer groups and lag |
+| `GET /api/v1/groups`, `/groups/{id}/lag` | viewer | consumer groups and lag, cluster-wide |
 | `GET /api/v1/metrics/snapshot`, `/timeseries` | viewer | current values, chart history |
 | `GET /api/v1/users`, `POST`, `DELETE` | admin | user administration |
 | ACL rules | admin | via the controller, `put_acl` / `delete_acl` |
 | `GET /metrics` | none | Prometheus text format |
+
+Every row in the dashboard's broker, topic and group tables expands:
+
+- **A broker** shows its configuration and its data directories with logs,
+  free space and capacity. Configuration is **read-only**, and that is a
+  design fact rather than a missing button: `AlterConfigs` accepts topic
+  resources only, and a broker's settings come from the flags it was
+  started with, so there is nothing here a write could move.
+- **A topic** shows per-partition leader, replicas, ISR, leader epoch,
+  start and end offsets, high watermark and on-disk size, plus the
+  configuration actually in force rather than only a box to set one.
+- **A group** shows per-partition committed offset, log end offset and lag,
+  with the group's total lag on the row itself.
+
+These are cluster-wide, not local. Disk usage, broker configuration, the
+group list and lag each go over the data plane to the brokers that own the
+answer — a group lives on whichever broker leads its `__consumer_offsets`
+partition, and a partition's disk usage is a fact only its own broker
+knows, so a node answering from its local state alone would quietly omit
+most of both.
 
 On first boot the cluster creates an `admin` user and a signing secret,
 both stored in the Raft metadata so any broker can authenticate a session:
@@ -1244,6 +1345,9 @@ docs/kafka-parity.md        config-by-config audit against Kafka
 docs/benchmarks.md          method, machine, results, and the fixes they drove
 schemas/protocol.buff       BitPacker wire schemas (data plane)
 scripts/                    live verification and benchmark harnesses
+scripts/run-cluster.sh      a three-node cluster on one machine, dashboard included
+scripts/load-100k.sh        push 100,000 records at acks=1 and verify they landed
+scripts/consume-follow.sh   tail a topic, printing each record
 bench/                      Dockerfile and results for the Kafka comparison
 .github/workflows/ci.yml    tests plus the live suites on every PR
 crates/

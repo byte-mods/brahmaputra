@@ -556,6 +556,11 @@ impl ClusterMetadata {
                         last_heartbeat_ms: now_ms,
                     },
                 );
+                // A returning broker normally rejoins the ISR through the
+                // partition's leader. Partitions it is the *only* replica of
+                // have no leader to rejoin through, so they are restored
+                // here or not at all.
+                self.restore_sole_replica_leadership(broker_id);
                 MetadataEvent::BrokerRegistered {
                     broker_id,
                     broker_epoch,
@@ -938,6 +943,49 @@ impl ClusterMetadata {
                 topic: topic.to_owned(),
                 partition,
             })
+    }
+
+    /// Give a re-registering broker back the partitions it is the sole
+    /// replica of.
+    ///
+    /// Fencing empties the ISR and leaves the leader as -1. With several
+    /// replicas that is recoverable: another one leads, the returning
+    /// broker catches up as a follower, and the leader admits it back to
+    /// the ISR. With a single replica there is no such path, and the two
+    /// rules that make ISR membership safe deadlock against each other —
+    /// `ChangePartition` will not make a broker leader unless it is already
+    /// in the ISR, and only a leader can widen the ISR. An empty ISR
+    /// becomes a state the partition can never leave, and it stays offline
+    /// permanently even though its one replica is back holding the whole
+    /// log. `__consumer_offsets` is created with one replica per partition,
+    /// so in practice this took out half the consumer groups in the
+    /// cluster: a group whose coordinator partition landed on a broker that
+    /// had once restarted could never start again.
+    ///
+    /// Trusting that single replica is a clean election, not an unclean
+    /// one. It is the only copy that ever existed, so its log *is* the
+    /// partition and there is no more recent data anywhere to lose.
+    /// Partitions with several replicas and an empty ISR are deliberately
+    /// left alone: there, choosing which returning replica to believe
+    /// really can discard writes another replica had, and that decision
+    /// belongs to an explicit unclean-leader-election policy rather than to
+    /// whichever broker happens to register first.
+    fn restore_sole_replica_leadership(&mut self, broker_id: BrokerId) {
+        for topic in self.topics.values_mut() {
+            for partition in topic.partitions.values_mut() {
+                if partition.leader < 0
+                    && partition.isr.is_empty()
+                    && partition.replicas == [broker_id]
+                {
+                    partition.leader = broker_id;
+                    partition.isr = vec![broker_id];
+                    // Bumped like any other leadership change, so a client
+                    // or follower holding the old epoch is fenced rather
+                    // than silently accepted.
+                    partition.leader_epoch += 1;
+                }
+            }
+        }
     }
 
     fn remove_from_isr_and_elect(&mut self, broker_id: BrokerId) {
@@ -1344,6 +1392,79 @@ mod tests {
                 .unwrap_err(),
             MetadataError::InvalidController(2)
         );
+    }
+
+    #[test]
+    fn a_sole_replica_gets_its_partition_back_when_it_returns() {
+        // The shape of __consumer_offsets: one replica per partition. Its
+        // fencing empties the ISR and leaves no leader, and with no second
+        // replica there is no leader to rejoin through — so without
+        // recovery on registration the partition is offline for good.
+        let mut state = ClusterMetadata::default();
+        let epoch = register(&mut state, 1, 0);
+        state
+            .apply(MetadataCommand::CreateTopic {
+                name: "__consumer_offsets".into(),
+                partitions: 1,
+                replication_factor: 1,
+                configs: BTreeMap::new(),
+            })
+            .unwrap();
+        assert_eq!(state.topics["__consumer_offsets"].partitions[&0].leader, 1);
+
+        state
+            .apply(MetadataCommand::FenceBroker {
+                broker_id: 1,
+                broker_epoch: epoch,
+            })
+            .unwrap();
+        let fenced = &state.topics["__consumer_offsets"].partitions[&0];
+        assert_eq!(fenced.leader, -1, "fencing leaves the partition leaderless");
+        assert!(fenced.isr.is_empty());
+        let fenced_epoch = fenced.leader_epoch;
+
+        register(&mut state, 1, 100);
+        let restored = &state.topics["__consumer_offsets"].partitions[&0];
+        assert_eq!(restored.leader, 1, "the only replica leads again");
+        assert_eq!(restored.isr, vec![1]);
+        assert!(
+            restored.leader_epoch > fenced_epoch,
+            "a leadership change fences the previous epoch"
+        );
+    }
+
+    #[test]
+    fn a_returning_replica_does_not_seize_a_partition_it_shares() {
+        // The same empty ISR with several replicas is a different
+        // situation: another copy may hold writes this one never saw, so
+        // believing whichever broker registers first would discard them.
+        // That is unclean leader election, and it is not what registration
+        // is allowed to do.
+        let mut state = ClusterMetadata::default();
+        let mut epochs = BTreeMap::new();
+        for broker_id in 1..=3 {
+            epochs.insert(broker_id, register(&mut state, broker_id, 0));
+        }
+        create_topic(&mut state, "orders");
+        for broker_id in 1..=3 {
+            state
+                .apply(MetadataCommand::FenceBroker {
+                    broker_id,
+                    broker_epoch: epochs[&broker_id],
+                })
+                .unwrap();
+        }
+        let partition = &state.topics["orders"].partitions[&0];
+        assert_eq!(partition.leader, -1);
+        assert!(partition.isr.is_empty());
+
+        register(&mut state, 1, 100);
+        let partition = &state.topics["orders"].partitions[&0];
+        assert_eq!(
+            partition.leader, -1,
+            "a shared partition stays offline until an explicit election"
+        );
+        assert!(partition.isr.is_empty());
     }
 
     #[test]

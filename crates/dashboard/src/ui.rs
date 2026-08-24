@@ -56,6 +56,15 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
   .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px; }
   .toolbar input { min-width:160px; }
   .bad { color:var(--bad); }
+  tr.pick { cursor:pointer; }
+  tr.pick:hover td { background:rgba(77,163,255,.07); }
+  tr.on td { background:rgba(77,163,255,.12); }
+  .detail { margin-top:10px; }
+  .detail h4 { margin:0 0 8px; font-size:12px; font-weight:600; color:var(--muted);
+               text-transform:uppercase; letter-spacing:.6px; }
+  .detail table { margin-bottom:12px; }
+  .detail table:last-child { margin-bottom:0; }
+  .kv td:first-child { color:var(--muted); width:280px; }
   #messages td { vertical-align:top; word-break:break-word; }
   #messages td:nth-child(5) { max-width:640px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
   #login { max-width:340px; margin:14vh auto; }
@@ -96,9 +105,18 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
       </div>
     </section>
 
-    <section><h2>Brokers</h2><table id="brokers"></table></section>
-    <section><h2>Topics</h2><table id="topics"></table></section>
-    <section><h2>Consumer groups</h2><table id="groups"></table></section>
+    <section>
+      <h2>Brokers</h2><table id="brokers"></table>
+      <div id="brokerdetail"></div>
+    </section>
+    <section>
+      <h2>Topics</h2><table id="topics"></table>
+      <div id="topicdetail"></div>
+    </section>
+    <section>
+      <h2>Consumer groups</h2><table id="groups"></table>
+      <div id="groupdetail"></div>
+    </section>
     <section>
       <h2>Messages</h2>
       <div class="card">
@@ -187,8 +205,165 @@ const fmt = n => n === undefined || n === null ? "—"
   : n >= 1e9 ? (n/1e9).toFixed(1)+"G" : n >= 1e6 ? (n/1e6).toFixed(1)+"M"
   : n >= 1e3 ? (n/1e3).toFixed(1)+"k" : String(Math.round(n));
 
+// Disk figures arrive as bytes and as -1 where the platform could not be
+// asked. That is not zero and must not render as "0 B": a full disk and an
+// unanswerable question are different operational situations.
+const fmtBytes = n => {
+  if (n === undefined || n === null || n < 0) return "\u2014";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let value = n, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return (unit === 0 ? value : value.toFixed(1)) + " " + units[unit];
+};
+
 function tile(label, value, cls) {
   return `<div class="card"><h3>${label}</h3><div class="v ${cls||""}">${value}</div></div>`;
+}
+
+// What is expanded right now. Kept out of the tables themselves so the
+// three-second refresh can redraw them without collapsing a panel the
+// operator is reading.
+let picked = { broker: null, topic: null, group: null };
+
+// A string argument inside an onclick attribute has to survive two
+// parsers: JSON.stringify quotes it for JavaScript, escapeHtml then makes
+// those quotes safe inside the attribute.
+const arg = value => escapeHtml(JSON.stringify(value));
+
+function pick(kind, id) {
+  picked[kind] = picked[kind] === id ? null : id;
+  renderDetail(kind);
+  refresh();
+}
+
+function renderDetail(kind) {
+  if (kind === "broker") return renderBrokerDetail();
+  if (kind === "topic") return renderTopicDetail();
+  if (kind === "group") return renderGroupDetail();
+}
+
+function detailBox(id, html) {
+  document.getElementById(id).innerHTML = html ? `<div class="card detail">${html}</div>` : "";
+}
+
+// ---- broker detail: configuration and disk ----------------------------
+
+async function renderBrokerDetail() {
+  const id = picked.broker;
+  if (id === null) { detailBox("brokerdetail", ""); return; }
+  try {
+    const [cfg, usage] = await Promise.all([
+      api("/api/v1/brokers/config"),
+      api("/api/v1/logdirs")
+    ]);
+    const entry = (cfg.brokers || []).find(b => b.broker_id === id);
+    const dirs = (usage.dirs || []).filter(d => d.broker_id === id);
+
+    let html = `<h4>Broker ${id} \u00b7 configuration</h4>`;
+    if (!entry) {
+      html += '<div class="muted">not in the cluster metadata</div>';
+    } else if (entry.error) {
+      html += `<div class="bad">${escapeHtml(entry.error)}</div>`;
+    } else {
+      html += '<table class="kv"><tr><th>Setting</th><th>Value</th><th>Source</th></tr>' +
+        entry.configs.map(c => `<tr><td>${escapeHtml(c.name)}</td>
+          <td>${escapeHtml(c.value)}</td>
+          <td><span class="pill ${c.is_default ? "" : "ok"}">${c.is_default ? "default" : "set"}</span></td></tr>`).join("") +
+        "</table>";
+      // Stated in the UI because the absence of an edit control is a
+      // design fact, not a missing feature: AlterConfigs takes topic
+      // resources only, and these values come from the broker's flags.
+      html += '<div class="muted">Read-only: broker settings come from the flags the node was ' +
+        'started with. Only topic configuration can be altered at runtime.</div>';
+    }
+
+    html += "<h4>Data directories</h4>";
+    html += dirs.length
+      ? '<table><tr><th>Directory</th><th>Status</th><th>Logs</th><th>Free</th><th>Capacity</th></tr>' +
+        dirs.map(d => `<tr><td>${escapeHtml(d.log_dir)}</td>
+          <td><span class="pill ${d.online ? "ok" : "no"}">${d.online ? "online" : escapeHtml(d.offline_reason || "offline")}</span></td>
+          <td>${fmtBytes(d.size_bytes)}</td>
+          <td>${fmtBytes(d.usable_bytes)}</td>
+          <td>${fmtBytes(d.total_bytes)}</td></tr>`).join("") +
+        "</table>"
+      : '<div class="muted">no directories reported</div>';
+    detailBox("brokerdetail", html);
+  } catch (error) {
+    detailBox("brokerdetail", `<div class="bad">${escapeHtml(String(error.message || error))}</div>`);
+  }
+}
+
+// ---- topic detail: partitions and configuration -----------------------
+
+async function renderTopicDetail() {
+  const name = picked.topic;
+  if (!name) { detailBox("topicdetail", ""); return; }
+  try {
+    const [detail, usage] = await Promise.all([
+      api(`/api/v1/topics/${encodeURIComponent(name)}`),
+      api(`/api/v1/logdirs?topic=${encodeURIComponent(name)}`)
+    ]);
+    // Size is per broker per partition; the leader's copy is the one an
+    // operator means by "how big is this partition".
+    const size = new Map();
+    for (const dir of usage.dirs || []) {
+      for (const p of dir.partitions || []) {
+        if (p.topic === name && p.is_leader) size.set(p.partition, p.size_bytes);
+      }
+    }
+
+    let html = `<h4>${escapeHtml(name)} \u00b7 partitions</h4>`;
+    html += '<table><tr><th>Partition</th><th>Leader</th><th>Replicas</th><th>ISR</th>' +
+      '<th>Epoch</th><th>Start</th><th>End</th><th>High watermark</th><th>Size</th></tr>' +
+      detail.partitions.map(p => `<tr>
+        <td>${p.partition}</td><td>${p.leader}</td>
+        <td class="muted">${(p.replicas || []).join(", ")}</td>
+        <td><span class="pill ${p.under_replicated ? "no" : "ok"}">${(p.isr || []).join(", ")}</span></td>
+        <td class="muted">${p.leader_epoch}</td>
+        <td>${offset(p.log_start_offset)}</td>
+        <td>${offset(p.log_end_offset)}</td>
+        <td>${offset(p.high_watermark)}</td>
+        <td>${fmtBytes(size.has(p.partition) ? size.get(p.partition) : -1)}</td>
+      </tr>`).join("") + "</table>";
+
+    const configs = Object.entries(detail.configs || {});
+    html += "<h4>Configuration in force</h4>";
+    html += configs.length
+      ? '<table class="kv"><tr><th>Setting</th><th>Value</th></tr>' +
+        configs.map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(String(v))}</td></tr>`).join("") +
+        "</table>"
+      : '<div class="muted">nothing set on the topic; every value is the broker default</div>';
+    detailBox("topicdetail", html);
+  } catch (error) {
+    detailBox("topicdetail", `<div class="bad">${escapeHtml(String(error.message || error))}</div>`);
+  }
+}
+
+// A gauge that was never sampled reads -1, which is not offset -1.
+const offset = n => (n === undefined || n === null || n < 0) ? "\u2014" : fmt(n);
+
+// ---- consumer group detail: per-partition lag -------------------------
+
+async function renderGroupDetail() {
+  const group = picked.group;
+  if (!group) { detailBox("groupdetail", ""); return; }
+  try {
+    const lag = await api(`/api/v1/groups/${encodeURIComponent(group)}/lag`);
+    const rows = lag.partitions || [];
+    const total = rows.reduce((sum, p) => sum + (p.lag > 0 ? p.lag : 0), 0);
+    let html = `<h4>${escapeHtml(group)} \u00b7 lag (${fmt(total)} records behind)</h4>`;
+    html += rows.length
+      ? '<table><tr><th>Topic</th><th>Partition</th><th>Committed</th><th>Log end</th><th>Lag</th></tr>' +
+        rows.map(p => `<tr><td>${escapeHtml(p.topic)}</td><td>${p.partition}</td>
+          <td>${offset(p.committed_offset)}</td>
+          <td>${offset(p.log_end_offset)}</td>
+          <td><span class="pill ${p.lag < 0 ? "" : p.lag > 0 ? "warn" : "ok"}">${p.lag < 0 ? "\u2014" : fmt(p.lag)}</span></td>
+        </tr>`).join("") + "</table>"
+      : '<div class="muted">the group has committed no offsets yet</div>';
+    detailBox("groupdetail", html);
+  } catch (error) {
+    detailBox("groupdetail", `<div class="bad">${escapeHtml(String(error.message || error))}</div>`);
+  }
 }
 
 async function refresh() {
@@ -206,30 +381,66 @@ async function refresh() {
       tile("Bytes out", fmt(o.fetch_bytes_total));
 
     const b = await api("/api/v1/brokers");
+    // Disk is a per-broker fact and needs its own sweep; a failure here
+    // must not blank the broker list, so it degrades to an empty map.
+    const usage = await api("/api/v1/logdirs").catch(() => ({ dirs: [] }));
+    const byBroker = new Map();
+    for (const dir of usage.dirs || []) {
+      const acc = byBroker.get(dir.broker_id) || { logs: 0, usable: -1 };
+      acc.logs += Math.max(dir.size_bytes, 0);
+      // Two directories on one disk would double-count free space, so the
+      // smallest is reported: that is the one that fills first.
+      if (dir.usable_bytes >= 0) {
+        acc.usable = acc.usable < 0 ? dir.usable_bytes : Math.min(acc.usable, dir.usable_bytes);
+      }
+      byBroker.set(dir.broker_id, acc);
+    }
     document.getElementById("brokers").innerHTML =
-      "<tr><th>ID</th><th>Address</th><th>Roles</th><th>Status</th></tr>" +
-      b.brokers.map(x => `<tr><td>${x.broker_id}${x.is_controller ? ' <span class="pill warn">controller</span>' : ""}</td>
+      "<tr><th>ID</th><th>Address</th><th>Roles</th><th>Logs</th><th>Free</th><th>Status</th></tr>" +
+      b.brokers.map(x => {
+        const disk = byBroker.get(x.broker_id) || { logs: -1, usable: -1 };
+        return `<tr class="pick ${picked.broker === x.broker_id ? "on" : ""}" onclick="pick('broker', ${x.broker_id})">
+        <td>${x.broker_id}${x.is_controller ? ' <span class="pill warn">controller</span>' : ""}</td>
         <td>${x.host}:${x.data_port}</td><td class="muted">${(x.roles||[]).join(", ")}</td>
-        <td><span class="pill ${x.alive ? "ok" : "no"}">${x.alive ? "alive" : "down"}</span></td></tr>`).join("");
+        <td>${fmtBytes(disk.logs)}</td><td>${fmtBytes(disk.usable)}</td>
+        <td><span class="pill ${x.alive ? "ok" : "no"}">${x.alive ? "alive" : "down"}</span></td></tr>`;
+      }).join("");
 
     const t = await api("/api/v1/topics");
     fillTopicPicker(t.topics || []);
     document.getElementById("topics").innerHTML =
       "<tr><th>Topic</th><th>Partitions</th><th>RF</th><th>Under-replicated</th></tr>" +
-      (t.topics.length ? t.topics.map(x => `<tr><td>${x.name}</td><td>${x.partitions}</td>
+      (t.topics.length ? t.topics.map(x => `<tr class="pick ${picked.topic === x.name ? "on" : ""}"
+        onclick="pick('topic', ${arg(x.name)})">
+        <td>${escapeHtml(x.name)}</td><td>${x.partitions}</td>
         <td>${x.replication_factor}</td>
         <td><span class="pill ${x.under_replicated ? "no" : "ok"}">${x.under_replicated}</span></td></tr>`).join("")
         : '<tr><td class="muted" colspan="4">no topics</td></tr>');
 
     const g = await api("/api/v1/groups");
+    // Total lag per group, fetched alongside the list so the headline
+    // number an operator looks for is on the row rather than a click away.
+    const lags = await Promise.all((g.groups || []).map(x =>
+      api(`/api/v1/groups/${encodeURIComponent(x.group_id)}/lag`)
+        .then(l => (l.partitions || []).reduce((sum, p) => sum + (p.lag > 0 ? p.lag : 0), 0))
+        .catch(() => -1)));
     document.getElementById("groups").innerHTML =
-      "<tr><th>Group</th><th>State</th><th>Members</th><th>Generation</th></tr>" +
-      (g.groups.length ? g.groups.map(x => `<tr><td>${x.group_id}</td>
+      "<tr><th>Group</th><th>State</th><th>Members</th><th>Generation</th><th>Lag</th></tr>" +
+      (g.groups.length ? g.groups.map((x, i) => `<tr class="pick ${picked.group === x.group_id ? "on" : ""}"
+        onclick="pick('group', ${arg(x.group_id)})">
+        <td>${escapeHtml(x.group_id)}</td>
         <td><span class="pill ${x.state === "Stable" ? "ok" : "warn"}">${x.state}</span></td>
-        <td>${x.member_count}</td><td>${x.generation}</td></tr>`).join("")
-        : '<tr><td class="muted" colspan="4">no groups</td></tr>');
+        <td>${x.member_count}</td><td>${x.generation}</td>
+        <td><span class="pill ${lags[i] < 0 ? "" : lags[i] > 0 ? "warn" : "ok"}">${lags[i] < 0 ? "\u2014" : fmt(lags[i])}</span></td></tr>`).join("")
+        : '<tr><td class="muted" colspan="5">no groups</td></tr>');
 
     document.getElementById("clock").textContent = new Date().toLocaleTimeString();
+    // Whatever is expanded follows the same three-second cadence as the
+    // tables above it; lag that only moved when clicked would be worse
+    // than no lag column at all.
+    if (picked.broker !== null) renderBrokerDetail();
+    if (picked.topic) renderTopicDetail();
+    if (picked.group) renderGroupDetail();
   } catch (e) { /* a transient failure should not blank the page */ }
 }
 
