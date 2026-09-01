@@ -304,7 +304,7 @@ impl ReplicaManager {
                     if let Some(cache) = self.broker.metadata_cache() {
                         let image = cache.snapshot();
                         self.broker.apply_topic_config_changes(&image).await;
-                        self.broker.drain_unowned_partitions(&image);
+                        self.broker.drain_unowned_partitions(&image).await;
                     }
                 }
             }

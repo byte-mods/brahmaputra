@@ -359,6 +359,10 @@ pub enum Cmd {
     Offsets {
         reply: oneshot::Sender<(i64, i64, i64)>,
     },
+    /// Stop accepting work, persist the final watermark, and close every
+    /// log file before acknowledging. Topic deletion uses this before it
+    /// removes the partition directory.
+    Shutdown { reply: oneshot::Sender<()> },
 }
 
 /// Result of a partition read.
@@ -425,6 +429,13 @@ pub struct PartitionHandle {
 }
 
 impl PartitionHandle {
+    pub(crate) async fn shutdown(&self) {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Cmd::Shutdown { reply }).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
+
     pub async fn append(&self, batch: RecordBatch) -> Result<i64, StorageError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -910,6 +921,16 @@ async fn run(
             }
         };
         match cmd {
+            Cmd::Shutdown { reply } => {
+                if let Some(current) = log.as_mut() {
+                    if let Err(error) = current.checkpoint_high_watermark() {
+                        warn!(%error, "high-watermark checkpoint before partition shutdown failed");
+                    }
+                }
+                drop(log.take());
+                let _ = reply.send(());
+                break;
+            }
             Cmd::Append { batch, reply } => {
                 let current = log.as_mut().expect("partition log");
                 let result = current.append(batch).and_then(|base| {

@@ -548,6 +548,7 @@ pub struct ZeroCopyByteBuff<'a> {
     data: &'a [u8],       
     write_buf: Vec<u8>,   
     cursor: usize,
+    decode_error: bool,
     multiplier: f64,
     endian: Endian,
 }
@@ -558,6 +559,7 @@ impl<'a> ZeroCopyByteBuff<'a> {
             data: slice,
             write_buf: Vec::new(),
             cursor: 0,
+            decode_error: false,
             multiplier: 10000.0,
             endian,
         }
@@ -568,6 +570,7 @@ impl<'a> ZeroCopyByteBuff<'a> {
             data: &[],
             write_buf: Vec::with_capacity(capacity),
             cursor: 0,
+            decode_error: false,
             multiplier: 10000.0,
             endian,
         }
@@ -597,19 +600,23 @@ impl<'a> ZeroCopyByteBuff<'a> {
 	#[inline(always)]
 	fn get_varint32(&mut self) -> u32 {
 		let mut result: u32 = 0;
-		let mut shift = 0;
-        // Optimization: Unrolled loop for common case (1-5 bytes)
-		loop {
-            // SAFETY: We trust the data source. Unchecked access is faster.
-			let byte = unsafe { *self.data.get_unchecked(self.cursor) };
-			self.cursor += 1;
-			result |= ((byte & 0x7F) as u32) << shift;
+		for index in 0..5 {
+            let Some(&byte) = self.data.get(self.cursor) else {
+                self.decode_error = true;
+                return 0;
+            };
+            self.cursor += 1;
+            if index == 4 && byte & 0xf0 != 0 {
+                self.decode_error = true;
+                return 0;
+            }
+			result |= ((byte & 0x7F) as u32) << (index * 7);
 			if byte & 0x80 == 0 {
-				break;
+				return result;
 			}
-			shift += 7;
 		}
-		result
+		self.decode_error = true;
+        0
 	}
 
 	#[inline(always)]
@@ -642,18 +649,23 @@ impl<'a> ZeroCopyByteBuff<'a> {
 	#[inline(always)]
 	fn get_varint64(&mut self) -> u64 {
 		let mut result: u64 = 0;
-		let mut shift = 0;
-		loop {
-            // SAFETY: Unchecked access
-			let byte = unsafe { *self.data.get_unchecked(self.cursor) };
-			self.cursor += 1;
-			result |= ((byte & 0x7F) as u64) << shift;
+		for index in 0..10 {
+            let Some(&byte) = self.data.get(self.cursor) else {
+                self.decode_error = true;
+                return 0;
+            };
+            self.cursor += 1;
+            if index == 9 && byte & 0xfe != 0 {
+                self.decode_error = true;
+                return 0;
+            }
+			result |= ((byte & 0x7F) as u64) << (index * 7);
 			if byte & 0x80 == 0 {
-				break;
+				return result;
 			}
-			shift += 7;
 		}
-		result
+		self.decode_error = true;
+        0
 	}
 
 	#[inline(always)]
@@ -691,21 +703,46 @@ impl<'a> ZeroCopyByteBuff<'a> {
 
 	#[inline(always)]
     pub fn get_bool(&mut self) -> bool {
-        // SAFETY: Unchecked access
-        let b = unsafe { *self.data.get_unchecked(self.cursor) };
-        self.cursor += 1;
-		b != 0
+        match self.data.get(self.cursor) {
+            Some(&byte) => {
+                self.cursor += 1;
+                byte != 0
+            }
+            None => {
+                self.decode_error = true;
+                false
+            }
+        }
     }
 
     #[inline(always)]
     pub fn get_str(&mut self) -> Result<&'a str, &'static str> {
-		let len = self.get_i32() as usize;
+		let raw_len = self.get_i32();
+        self.ensure_valid()?;
+        let len = usize::try_from(raw_len).map_err(|_| "negative string length")?;
         if len == 0 { return Ok(""); }
-        // SAFETY: We assume valid UTF-8 and sufficient length for speed.
-        let s_bytes = unsafe { self.data.get_unchecked(self.cursor..self.cursor + len) };
-        self.cursor += len;
-        // SAFETY: Skipping UTF-8 check
-        Ok(unsafe { str::from_utf8_unchecked(s_bytes) })
+        let end = self.cursor.checked_add(len).ok_or("string length overflow")?;
+        let s_bytes = self.data.get(self.cursor..end).ok_or("truncated string")?;
+        self.cursor = end;
+        str::from_utf8(s_bytes).map_err(|_| "invalid UTF-8 string")
+    }
+
+    pub fn get_collection_len(&mut self) -> Result<usize, &'static str> {
+        let raw_len = self.get_i32();
+        self.ensure_valid()?;
+        let len = usize::try_from(raw_len).map_err(|_| "negative collection length")?;
+        if len > self.data.len().saturating_sub(self.cursor) {
+            return Err("collection length exceeds remaining input");
+        }
+        Ok(len)
+    }
+
+    pub fn ensure_valid(&self) -> Result<(), &'static str> {
+        if self.decode_error {
+            Err("truncated or invalid varint")
+        } else {
+            Ok(())
+        }
     }
 
     #[inline(always)]
@@ -819,7 +856,7 @@ impl {{.Name}} {
 		let mut obj = {{.Name}}::default();
 		{{range .Fields}}
 		{{if .IsArray}}
-		let {{.Name}}_len = buf.get_i32();
+		let {{.Name}}_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..{{.Name}}_len {
 			{{decodeFieldRust "let val" .Type}}
 			obj.{{.Name}}.push(val);
@@ -828,6 +865,7 @@ impl {{.Name}} {
 		{{decodeFieldRust (printf "obj.%s" .Name) .Type}}
 		{{end}}
 		{{end}}
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -863,6 +901,7 @@ pub struct ZeroCopyByteBuff<'a> {
     data: &'a [u8],       
     write_buf: Vec<u8>,   
     cursor: usize,
+    decode_error: bool,
     multiplier: f64,
     endian: Endian,
 }
@@ -873,6 +912,7 @@ impl<'a> ZeroCopyByteBuff<'a> {
             data: slice,
             write_buf: Vec::new(),
             cursor: 0,
+            decode_error: false,
             multiplier: 10000.0,
             endian,
         }
@@ -883,6 +923,7 @@ impl<'a> ZeroCopyByteBuff<'a> {
             data: &[],
             write_buf: Vec::with_capacity(capacity),
             cursor: 0,
+            decode_error: false,
             multiplier: 10000.0,
             endian,
         }
@@ -912,19 +953,23 @@ impl<'a> ZeroCopyByteBuff<'a> {
 	#[inline(always)]
 	fn get_varint32(&mut self) -> u32 {
 		let mut result: u32 = 0;
-		let mut shift = 0;
-        // Optimization: Unrolled loop for common case (1-5 bytes)
-		loop {
-            // SAFETY: We trust the data source. Unchecked access is faster.
-			let byte = unsafe { *self.data.get_unchecked(self.cursor) };
-			self.cursor += 1;
-			result |= ((byte & 0x7F) as u32) << shift;
+		for index in 0..5 {
+            let Some(&byte) = self.data.get(self.cursor) else {
+                self.decode_error = true;
+                return 0;
+            };
+            self.cursor += 1;
+            if index == 4 && byte & 0xf0 != 0 {
+                self.decode_error = true;
+                return 0;
+            }
+			result |= ((byte & 0x7F) as u32) << (index * 7);
 			if byte & 0x80 == 0 {
-				break;
+				return result;
 			}
-			shift += 7;
 		}
-		result
+		self.decode_error = true;
+        0
 	}
 
 	#[inline(always)]
@@ -957,18 +1002,23 @@ impl<'a> ZeroCopyByteBuff<'a> {
 	#[inline(always)]
 	fn get_varint64(&mut self) -> u64 {
 		let mut result: u64 = 0;
-		let mut shift = 0;
-		loop {
-            // SAFETY: Unchecked access
-			let byte = unsafe { *self.data.get_unchecked(self.cursor) };
-			self.cursor += 1;
-			result |= ((byte & 0x7F) as u64) << shift;
+		for index in 0..10 {
+            let Some(&byte) = self.data.get(self.cursor) else {
+                self.decode_error = true;
+                return 0;
+            };
+            self.cursor += 1;
+            if index == 9 && byte & 0xfe != 0 {
+                self.decode_error = true;
+                return 0;
+            }
+			result |= ((byte & 0x7F) as u64) << (index * 7);
 			if byte & 0x80 == 0 {
-				break;
+				return result;
 			}
-			shift += 7;
 		}
-		result
+		self.decode_error = true;
+        0
 	}
 
 	#[inline(always)]
@@ -1006,21 +1056,46 @@ impl<'a> ZeroCopyByteBuff<'a> {
 
 	#[inline(always)]
     pub fn get_bool(&mut self) -> bool {
-        // SAFETY: Unchecked access
-        let b = unsafe { *self.data.get_unchecked(self.cursor) };
-        self.cursor += 1;
-		b != 0
+        match self.data.get(self.cursor) {
+            Some(&byte) => {
+                self.cursor += 1;
+                byte != 0
+            }
+            None => {
+                self.decode_error = true;
+                false
+            }
+        }
     }
 
     #[inline(always)]
     pub fn get_str(&mut self) -> Result<&'a str, &'static str> {
-		let len = self.get_i32() as usize;
+		let raw_len = self.get_i32();
+        self.ensure_valid()?;
+        let len = usize::try_from(raw_len).map_err(|_| "negative string length")?;
         if len == 0 { return Ok(""); }
-        // SAFETY: We assume valid UTF-8 and sufficient length for speed.
-        let s_bytes = unsafe { self.data.get_unchecked(self.cursor..self.cursor + len) };
-        self.cursor += len;
-        // SAFETY: Skipping UTF-8 check
-        Ok(unsafe { str::from_utf8_unchecked(s_bytes) })
+        let end = self.cursor.checked_add(len).ok_or("string length overflow")?;
+        let s_bytes = self.data.get(self.cursor..end).ok_or("truncated string")?;
+        self.cursor = end;
+        str::from_utf8(s_bytes).map_err(|_| "invalid UTF-8 string")
+    }
+
+    pub fn get_collection_len(&mut self) -> Result<usize, &'static str> {
+        let raw_len = self.get_i32();
+        self.ensure_valid()?;
+        let len = usize::try_from(raw_len).map_err(|_| "negative collection length")?;
+        if len > self.data.len().saturating_sub(self.cursor) {
+            return Err("collection length exceeds remaining input");
+        }
+        Ok(len)
+    }
+
+    pub fn ensure_valid(&self) -> Result<(), &'static str> {
+        if self.decode_error {
+            Err("truncated or invalid varint")
+        } else {
+            Ok(())
+        }
     }
 
     #[inline(always)]
@@ -1128,7 +1203,7 @@ impl {{.Name}} {
 		let mut obj = {{.Name}}::default();
 		{{range .Fields}}
 		{{if .IsArray}}
-		let {{.Name}}_len = buf.get_i32();
+		let {{.Name}}_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..{{.Name}}_len {
 			{{decodeFieldRust "let val" .Type}}
 			obj.{{.Name}}.push(val);
@@ -1137,6 +1212,7 @@ impl {{.Name}} {
 		{{decodeFieldRust (printf "obj.%s" .Name) .Type}}
 		{{end}}
 		{{end}}
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }

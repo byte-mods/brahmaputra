@@ -84,10 +84,84 @@ open http://localhost:8080                              # dashboard
 | M11 | JBOD: several disks per broker, failure isolated per disk | ✅ complete |
 | M12 | Tombstones and real compaction, transaction expiry, follower fetching, fetch sessions, SCRAM | ✅ complete |
 | M13 | Cluster-wide dashboard views, local hosting scripts, sole-replica recovery | ✅ complete |
+| M14 | Surviving a controller outage, topic incarnations, hostile-input decoding | ✅ complete |
 
 Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
+
+### Upgrading to 0.6.0
+
+**No wire change and no on-disk format change**: the protocol stays at
+version 4, and a 0.5.0 client talks to a 0.6.0 broker. Each partition
+directory gains one 8-byte `.topic-epoch` marker the first time the broker
+opens it; a directory that has none is adopted in place, so existing logs,
+indexes and checkpoints are read unchanged. Upgrading is a restart.
+
+That restart is worth doing for three reasons.
+
+**A controller outage no longer kills the brokers that survived it.** A
+broker that could not renew its lease used to treat that as proof it had
+been superseded, and exited. It is not proof: a broker that cannot reach a
+controller at all learns nothing about whether another incarnation of
+itself exists. Losing the Raft leader for longer than
+`--session-timeout-ms` therefore took down the *whole* cluster — the two
+nodes that were still healthy self-terminated. Five things changed, because
+the same assumption sat at five layers:
+
+- An expired lease **suspends** the data plane instead of ending the
+  process: the broker stops serving, keeps its listeners and actors, and
+  re-registers with `expected_epoch` set to the epoch it held. The
+  controller accepts that only if no newer incarnation has taken over, so a
+  current process resumes and a zombie is refused. `fence()` remains
+  irreversible for the case that *is* proof — an epoch change seen while
+  the lease is live.
+- A **controller fence of the epoch this broker holds** is treated the same
+  way: the controller fences whatever it has not heard from, and silence
+  during an election is not evidence of a replacement.
+- A **new controller leader fences nobody for one session timeout.**
+  Renewing a lease is a quorum write, so an election is a window in which
+  no broker can renew and every timestamp the new leader inherits is
+  already stale. This is the grace Kafka's controller gives after a
+  failover.
+- `RegisterBroker` and `Heartbeat` are **stamped when they are proposed**,
+  not when they are built. A registration that waited seconds for a quorum
+  used to commit already looking overdue, and the next maintenance pass
+  fenced the broker that had just come back.
+- A partition whose **whole ISR was fenced** is recovered by any replica
+  that was in that ISR (`last_isr`), not only by a sole replica as in
+  0.5.0. In-sync means it holds every committed record, so this is a clean
+  election. A replica that had already fallen out is still not eligible —
+  that is unclean election, and it stays an explicit decision.
+
+**A deleted topic's data can no longer come back under its name.** Topic
+names are reusable, and a partition directory had no durable link to the
+topic incarnation that created it, so recreating `orders` reopened the
+deleted `orders-0` log and served records the operator had deleted.
+`CreateTopic` now stamps a monotonic `topic_epoch` into the metadata,
+brokers persist it in `.topic-epoch` beside each replica, and a mismatch
+discards the stale directory before the log can be opened. Deleting a
+partition now also shuts its actor down cleanly and retries a removal that
+failed, rather than dropping the handle and leaking the directory.
+
+**Malformed frames are rejected instead of read out of bounds.** The
+generated BitPacker decoder read varints, booleans and lengths through
+`get_unchecked` on the theory that the data source was trusted. The data
+source is the network. Every read is now bounds-checked and raises a
+decode-error flag that each generated `decode` checks before returning;
+overlong varints, negative and impossible lengths, and invalid UTF-8 are
+refused as errors rather than followed. The generator in `tools/bit-packer`
+emits the checked form, so regenerating the protocol reproduces the
+checked-in files byte for byte. Quota accounting
+was the same shape of problem one layer up: it keyed live buckets by the
+peer-supplied `client.id`, so rotating that string grew broker memory
+without bound. Buckets are now keyed by a seeded hash and capped at 4,096.
+
+One client-side change comes with them: a producer **retries
+`UNKNOWN_TOPIC_OR_PARTITION`**, refreshing its route first. Topic creation
+reaches brokers asynchronously, so a send issued immediately after
+`topic create` used to fail outright; a topic that really does not exist
+still fails, once the retry budget is spent.
 
 ### Upgrading to 0.5.0
 

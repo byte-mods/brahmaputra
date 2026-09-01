@@ -345,48 +345,26 @@ equally, which is what preserves the ratios.
    and offset monotonicity — but the longest run to date is measured in
    minutes. A soak that would actually move this is measured in weeks.
    Nothing in this document can close this one.
-3. **A controller node that stays down takes the surviving brokers with
-   it.** With three combined nodes and `--session-timeout-ms 3000`, killing
-   the node holding Raft leadership and *leaving it down* leaves the other
-   two unable to renew their broker lease before it expires; they
-   self-terminate, and a cluster that should have survived one failure
-   loses all three.
-
-   The distinction matters, and it is what makes this survivable in
-   practice: killing that node and restarting it within a couple of seconds
-   — a rolling restart, a crash with a supervisor — is handled cleanly, and
-   `scripts/soak.sh` does exactly that repeatedly without a single failed
-   write. It is the sustained outage of the leader that is not.
-
-   Reproduced identically on 0.3.0, so this is not new. Both halves are
-   individually deliberate: a broker that cannot renew its lease must stop
-   serving rather than risk split brain, and the controller must fence a
-   broker it has not heard from. What is missing is the distinction between
-   "a controller told me I am fenced" and "I could not reach a controller
-   at all" — the second is a re-registration, not a death sentence. Setting
-   `--session-timeout-ms` above the worst-case election time avoids it
-   today.
-
-4. `sendfile` is Linux-plus-plaintext only; elsewhere the fallback reads
+3. `sendfile` is Linux-plus-plaintext only; elsewhere the fallback reads
    the range and writes it — correct, just not free. This is a property of
    the platform rather than a thing left undone: macOS, BSD and Windows
    have no equivalent that covers this case, and TLS and QUIC must see the
    bytes to encrypt them. Kafka draws the same line for SSL.
-5. **No general listener map.** There are now two listeners — a client one
+4. **No general listener map.** There are now two listeners — a client one
    and an optional inter-broker one, each with its own transport — and an
    advertised address distinct from the bound one. What is still missing is
    Kafka's arbitrary `listeners` / `advertised.listeners` map with named
    endpoints and a security-protocol per name. The common shape it exists
    for, plaintext between brokers and TLS to clients, is covered; three or
    more listeners with different protocols is not.
-6. **A log-directory move takes the partition offline while it copies.**
+5. **A log-directory move takes the partition offline while it copies.**
    `AlterReplicaLogDirs` (key 32) moves a partition between a broker's
    disks, which is the gap that mattered — a disk added to a running broker
    used to take only new partitions forever. But Kafka builds the second
    copy alongside, lets it catch up, and swaps; this closes the partition,
    copies, and reopens. The pause is bounded by the partition's size and is
    the reason to move followers, or to hand leadership away first.
-7. **SASL is SCRAM-SHA-256 and PLAIN only.** No SCRAM-SHA-512, GSSAPI,
+6. **SASL is SCRAM-SHA-256 and PLAIN only.** No SCRAM-SHA-512, GSSAPI,
    OAUTHBEARER, and no delegation tokens. SCRAM covers the case that
    actually blocked deployments — authentication that is meaningful on a
    listener that is not encrypted — and certificate authentication remains
@@ -394,15 +372,15 @@ equally, which is what preserves the ratios.
 
 **Efficiency at scale**
 
-8. No tiered storage: retention is bounded by local disk. A v1 non-goal,
+7. No tiered storage: retention is bounded by local disk. A v1 non-goal,
    and the one item on this list that is a deliberate scope decision rather
    than something not yet built.
-9. A `read_committed` fetch cannot use the zero-copy path: choosing which
+8. A `read_committed` fetch cannot use the zero-copy path: choosing which
    batches to withhold means reading their headers, and the point of
    handing the kernel a file range is that nobody reads them. Filtering is
    per batch rather than per record, so this costs a copy and never a
    decompression.
-10. **`compression.type` is enforced by refusal, not conversion.** A topic
+9. **`compression.type` is enforced by refusal, not conversion.** A topic
    that names a codec rejects a batch in any other one; Kafka would
    recompress it. Converting means decompressing and recompressing every
    batch on the way in, which is exactly the cost that byte-identical
@@ -410,7 +388,7 @@ equally, which is what preserves the ratios.
    an operator gets ("every batch on this topic is zstd") is the same, and
    the producer is told what to send rather than having its data silently
    rewritten.
-11. **`message.timestamp.type=LogAppendTime` keeps per-record deltas.**
+10. **`message.timestamp.type=LogAppendTime` keeps per-record deltas.**
     Kafka flattens every record in a batch to the same instant; here the
     batch timestamp becomes the broker's clock and the per-record deltas
     survive, so records inside one batch keep their relative spacing. What
@@ -420,12 +398,12 @@ equally, which is what preserves the ratios.
 
 **Newer Kafka**
 
-12. **KIP-848**, the broker-side consumer group protocol and the default in
+11. **KIP-848**, the broker-side consumer group protocol and the default in
     Kafka 4.0. The client-side JoinGroup/SyncGroup rebalance implemented
     here is the older protocol, which Kafka still supports. Moving the
     assignment into the coordinator is a re-architecture of the group
     machinery rather than a feature to add to it.
-13. **KIP-932 share groups** (queue semantics) and **KIP-890 transaction
+12. **KIP-932 share groups** (queue semantics) and **KIP-890 transaction
     fencing v2**. Both are Kafka 4.x work; neither is a gap against the
     Kafka most deployments are running.
 
@@ -433,6 +411,70 @@ equally, which is what preserves the ratios.
 
 Recorded because this document has drifted before, and a gap list that
 only ever grows is not being read against the code.
+
+### Closed in 0.6.0
+
+- **A controller node that stays down no longer takes the surviving
+  brokers with it** — gap 3 on the previous list, and the one that turned a
+  single failure into a total one. A broker that could not renew its lease
+  treated that as proof it had been superseded and exited; it is not proof,
+  because a broker that cannot reach a controller at all learns nothing
+  about whether a newer incarnation of itself exists.
+
+  An expired lease now **suspends** the data plane instead: the broker
+  stops serving, keeps its process, listeners and actors alive, and
+  re-registers with `expected_epoch` set to the epoch it held. The
+  controller accepts that only if no newer incarnation registered
+  meanwhile, so a still-current process resumes and a zombie is rejected.
+  `fence()` remains irreversible for the case that *is* proof — an epoch
+  change observed while the lease is live. This is the distinction the
+  previous audit named as missing.
+
+  Surviving the outage took four more changes at other layers, each of
+  which could take the cluster down on its own:
+
+  - a controller fence of the epoch a broker holds is recoverable, not
+    fatal — the controller fences whatever it has not heard from, and an
+    election is silence, not replacement;
+  - a **new controller leader fences nobody for one session timeout**,
+    because renewing a lease is a quorum write and every timestamp it
+    inherits predates its own election. Kafka's controller gives the same
+    grace after a failover;
+  - `RegisterBroker` and `Heartbeat` are stamped when proposed rather than
+    when built, so a registration that waited for a quorum does not commit
+    already looking overdue;
+  - a partition whose whole ISR was fenced is recovered by any replica
+    that was in that ISR (`last_isr`), which is Kafka's clean-election
+    rule. 0.5.0 could recover only a sole replica, so a replicated
+    partition could still be permanently offline after this outage.
+
+  Verified by `scripts/verify-bugfixes.ps1`: three combined nodes, the Raft
+  leader hard-killed and left down, survivors asserted alive, electing,
+  renewing and accepting `acks=all` writes; then a second node killed, the
+  last one asserted to suspend rather than exit *and* to refuse to serve
+  without a lease, and to resume once a peer returns.
+
+- **A deleted topic's data can no longer be served under a recreated
+  topic's name.** This was not on the gap list — it was found by reading
+  the code, and it is the third instance of the same mistake the two items
+  below are: assuming an absence of evidence is evidence. A partition
+  directory had no durable link to the topic incarnation that created it,
+  so recreating `orders` reopened the deleted `orders-0` log with its
+  offsets, records and watermark intact. `CreateTopic` now stamps a
+  monotonic `topic_epoch` into the metadata, brokers persist it in
+  `.topic-epoch` beside each replica, and a mismatch discards the stale
+  directory before the log can be opened.
+
+- **A malformed frame can no longer read out of bounds.** The generated
+  BitPacker decoder read varints, booleans and lengths through
+  `get_unchecked` because "we trust the data source"; the data source is
+  the network. Every read is now bounds-checked behind a decode-error flag
+  each generated `decode` inspects, and the generator in `tools/bit-packer`
+  emits the checked form. Quota accounting had the same shape one layer up
+  — buckets keyed by the peer-supplied `client.id` and kept forever — and
+  is now keyed by a seeded hash and capped.
+
+### Closed in 0.4.0
 
 The first two were not on the previous gap list at all. They were found by
 reading the code against this document's own claims, and both are worse
@@ -651,7 +693,7 @@ half-present one is not.
 ## 10. Verification
 
 ```bash
-cargo test --workspace                    # 389
+cargo test --workspace                    # 399
 bash scripts/verify-m1.sh                 # 31  storage, protocol, SIGKILL recovery
 bash scripts/verify-m4.sh                 # 30  consumer groups across 5 nodes
 bash scripts/verify-m5.sh                 # 15  fsync, quotas, version negotiation
@@ -666,6 +708,7 @@ bash scripts/verify-admin-and-security.sh # 29  admin APIs, quotas, mTLS, SCRAM,
 bash scripts/verify-transactions.sh       # 24  commit, abort, in doubt, expiry
 bash scripts/verify-compaction.sh         # 17  tombstones, superseding, delete horizons
 bash scripts/verify-jbod.sh               # 26  multi-disk placement, failure, moves between disks
+pwsh scripts/verify-bugfixes.ps1          # 5   controller outage survival, topic recreation
 SOAK_MINUTES=20 bash scripts/soak.sh      # 5   sustained load through repeated kills
 bash scripts/bench-replicated.sh          #     RF=3 acks=all vs RF=1 acks=1
 ```

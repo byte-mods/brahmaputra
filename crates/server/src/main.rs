@@ -926,6 +926,7 @@ async fn broker_lifecycle(
     let mut heartbeat = interval(settings.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut epoch: Option<BrokerEpoch> = None;
+    let mut expected_epoch: Option<BrokerEpoch> = None;
     let mut last_renewal = None;
     let mut prefer_remote_heartbeat = false;
 
@@ -943,13 +944,17 @@ async fn broker_lifecycle(
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                broker.fence();
+                let expired_epoch = epoch.take().unwrap_or(0);
+                broker.suspend_broker_lease();
                 broker_epoch.send_replace(0);
-                bail!(
-                    "broker {} could not renew epoch {} within its {:?} session timeout",
-                    registration.broker_id,
-                    epoch.unwrap_or(0),
-                    settings.session_timeout,
+                expected_epoch = (expired_epoch != 0).then_some(expired_epoch);
+                last_renewal = None;
+                prefer_remote_heartbeat = false;
+                tracing::warn!(
+                    broker_id = registration.broker_id,
+                    broker_epoch = expired_epoch,
+                    timeout = ?settings.session_timeout,
+                    "broker lease expired locally; data plane suspended until conditional re-registration"
                 );
             }
             _ = heartbeat.tick() => {
@@ -969,19 +974,37 @@ async fn broker_lifecycle(
                             current_epoch,
                             prefer_remote_heartbeat,
                             &mut shutdown,
-                        ) => result,
+                        ) => Some(result),
                         _ = sleep_until(deadline) => {
-                            broker.fence();
-                            broker_epoch.send_replace(0);
-                            bail!(
-                                "broker {} epoch {} heartbeat exceeded its session timeout",
-                                registration.broker_id,
-                                current_epoch,
-                            );
+                            None
                         }
                     };
+                    let Some(outcome) = outcome else {
+                        epoch = None;
+                        expected_epoch = Some(current_epoch);
+                        last_renewal = None;
+                        prefer_remote_heartbeat = false;
+                        broker.suspend_broker_lease();
+                        broker_epoch.send_replace(0);
+                        tracing::warn!(
+                            broker_id = registration.broker_id,
+                            broker_epoch = current_epoch,
+                            timeout = ?settings.session_timeout,
+                            "broker heartbeat exceeded its lease; data plane suspended until conditional re-registration"
+                        );
+                        continue;
+                    };
                     match outcome {
-                        Ok(Some(true)) => {
+                        Ok(HeartbeatOutcome::Reregister) => {
+                            epoch = None;
+                            expected_epoch = Some(current_epoch);
+                            last_renewal = None;
+                            prefer_remote_heartbeat = false;
+                            broker.suspend_broker_lease();
+                            broker_epoch.send_replace(0);
+                            continue;
+                        }
+                        Ok(HeartbeatOutcome::Renewed) => {
                             last_renewal = Some(Instant::now());
                             if prefer_remote_heartbeat {
                                 let visibility = tokio::time::timeout(
@@ -1000,8 +1023,8 @@ async fn broker_lifecycle(
                                 }
                             }
                         }
-                        Ok(Some(false)) => {}
-                        Ok(None) => return Ok(()),
+                        Ok(HeartbeatOutcome::Retry) => {}
+                        Ok(HeartbeatOutcome::Shutdown) => return Ok(()),
                         Err(error) => {
                             broker.fence();
                             broker_epoch.send_replace(0);
@@ -1009,11 +1032,17 @@ async fn broker_lifecycle(
                         }
                     }
                 } else {
-                    let registered =
-                        register_broker(&controller, &registration, &mut shutdown).await?;
+                    let registered = register_broker(
+                        &controller,
+                        &registration,
+                        expected_epoch,
+                        &mut shutdown,
+                    )
+                    .await?;
                     if let Some(registered_epoch) = registered {
                         broker.activate_broker_epoch(registered_epoch)?;
                         epoch = Some(registered_epoch);
+                        expected_epoch = None;
                         last_renewal = Some(Instant::now());
                         prefer_remote_heartbeat = true;
                     }
@@ -1037,6 +1066,11 @@ async fn controller_maintenance(
     // a second timer so a node that only just became Raft leader does not
     // immediately reshuffle a cluster it has barely observed.
     let mut last_rebalance = Instant::now();
+    // When this node became the Raft leader. Fencing decisions are made
+    // against heartbeats that could only be written to a quorum, so a
+    // leader younger than one session timeout has no evidence yet — every
+    // timestamp it inherited predates its own election.
+    let mut leader_since: Option<Instant> = None;
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -1045,6 +1079,11 @@ async fn controller_maintenance(
                 }
             }
             _ = maintenance.tick() => {
+                if controller.raft_metrics().current_leader == Some(settings.node_id) {
+                    leader_since.get_or_insert_with(Instant::now);
+                } else {
+                    leader_since = None;
+                }
                 if *broker_epoch.borrow_and_update() != 0 {
                     let rebalance_due = match settings.auto_leader_rebalance_interval {
                         Some(every) => last_rebalance.elapsed() >= every,
@@ -1053,9 +1092,12 @@ async fn controller_maintenance(
                     if rebalance_due {
                         last_rebalance = Instant::now();
                     }
+                    let fencing_open = leader_since
+                        .is_some_and(|since| since.elapsed() >= settings.session_timeout);
                     run_leader_maintenance(
                         &controller,
                         &settings,
+                        fencing_open,
                         rebalance_due,
                         &mut shutdown,
                     )
@@ -1069,6 +1111,7 @@ async fn controller_maintenance(
 async fn register_broker(
     controller: &ControllerNode,
     registration: &BrokerRegistration,
+    expected_epoch: Option<BrokerEpoch>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Option<BrokerEpoch>> {
     let command = MetadataCommand::RegisterBroker {
@@ -1077,11 +1120,18 @@ async fn register_broker(
         data_port: registration.data_port,
         control_port: registration.control_port,
         internal_port: registration.internal_port,
+        expected_epoch,
         roles: vec![NodeRole::Broker, NodeRole::Controller],
         rack: registration.rack.clone(),
         now_ms: unix_time_ms(),
     };
-    let Some(result) = write_or_shutdown(controller, command, shutdown).await else {
+    // Stamped on the attempt that commits: this write may wait for a quorum
+    // to exist at all, and a registration that lands looking older than the
+    // session timeout is fenced by the next maintenance pass.
+    let Some(result) = (tokio::select! {
+        result = controller.write_metadata_stamped(command) => Some(result),
+        _ = wait_for_shutdown(shutdown.clone()) => None,
+    }) else {
         return Ok(None);
     };
     match result {
@@ -1093,11 +1143,28 @@ async fn register_broker(
             Ok(Some(broker_epoch))
         }
         Ok(event) => Err(anyhow!("unexpected broker registration result: {event:?}")),
-        Err(error) => {
+        Err(error) if error.retryable => {
             tracing::warn!(%error, "broker registration failed; retrying after next tick");
             Ok(None)
         }
+        Err(error) => Err(anyhow!("broker registration was rejected: {error}")),
     }
+}
+
+/// What one heartbeat attempt established about this broker's lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatOutcome {
+    /// The controller acknowledged the epoch; the lease is renewed.
+    Renewed,
+    /// Nothing was established. Try again on the next tick, within the
+    /// independently enforced lease deadline.
+    Retry,
+    /// The controller has fenced this epoch, but nothing newer holds this
+    /// broker id. Being fenced for lateness is not proof of replacement:
+    /// suspend and let a conditional registration decide.
+    Reregister,
+    /// The process is shutting down.
+    Shutdown,
 }
 
 async fn heartbeat_broker(
@@ -1106,7 +1173,7 @@ async fn heartbeat_broker(
     broker_epoch: BrokerEpoch,
     prefer_remote_leader: bool,
     shutdown: &mut watch::Receiver<bool>,
-) -> Result<Option<bool>> {
+) -> Result<HeartbeatOutcome> {
     let command = MetadataCommand::Heartbeat {
         broker_id,
         broker_epoch,
@@ -1127,32 +1194,36 @@ async fn heartbeat_broker(
         result = write => Some(result),
         _ = wait_for_shutdown(shutdown.clone()) => None,
     }) else {
-        return Ok(None);
+        return Ok(HeartbeatOutcome::Shutdown);
     };
     match result {
         Ok(MetadataEvent::BrokerHeartbeat {
             broker_id: acknowledged_id,
             broker_epoch: acknowledged_epoch,
-        }) if acknowledged_id == broker_id && acknowledged_epoch == broker_epoch => Ok(Some(true)),
+        }) if acknowledged_id == broker_id && acknowledged_epoch == broker_epoch => {
+            Ok(HeartbeatOutcome::Renewed)
+        }
         Ok(event) => Err(anyhow!("unexpected broker heartbeat result: {event:?}")),
         Err(error) if error.retryable => {
             tracing::warn!(%error, "broker heartbeat could not reach the active controller");
-            Ok(Some(false))
+            Ok(HeartbeatOutcome::Retry)
         }
         Err(error) => {
+            // Classify against the metadata rather than against the message
+            // text: what matters is whether anything newer holds this broker
+            // id, and only the image can say.
+            let image = controller
+                .local_metadata()
+                .await
+                .context("failed to inspect local metadata after heartbeat rejection")?;
+            let registered = image.brokers.get(&broker_id);
             // A follower may still believe it is the leader immediately after
             // restart and pre-validate this heartbeat against its stale local
             // broker epoch. The registration itself already committed on the
             // active leader, so let the lifecycle retry until the local image
             // catches up or the independently enforced lease deadline expires.
-            let image = controller
-                .local_metadata()
-                .await
-                .context("failed to inspect local metadata after heartbeat rejection")?;
-            let locally_older = image
-                .brokers
-                .get(&broker_id)
-                .is_none_or(|registered| registered.broker_epoch < broker_epoch);
+            let locally_older =
+                registered.is_none_or(|registered| registered.broker_epoch < broker_epoch);
             if locally_older {
                 tracing::warn!(
                     %error,
@@ -1160,10 +1231,25 @@ async fn heartbeat_broker(
                     broker_epoch,
                     "broker heartbeat was rejected by a stale local controller image; retrying"
                 );
-                Ok(Some(false))
-            } else {
-                Err(anyhow!("broker heartbeat was rejected: {error}"))
+                return Ok(HeartbeatOutcome::Retry);
             }
+            // The controller fenced this exact epoch and nothing newer has
+            // claimed the id. That happens whenever an election outlasts the
+            // session timeout: the writes that would have renewed the lease
+            // had nowhere to commit. Re-registering conditionally is the
+            // correct answer, and it is refused if a zombie is what this is.
+            if registered.is_some_and(|registered| {
+                registered.broker_epoch == broker_epoch && !registered.alive
+            }) {
+                tracing::warn!(
+                    %error,
+                    broker_id,
+                    broker_epoch,
+                    "broker was fenced by the controller; re-registering conditionally"
+                );
+                return Ok(HeartbeatOutcome::Reregister);
+            }
+            Err(anyhow!("broker heartbeat was rejected: {error}"))
         }
     }
 }
@@ -1171,6 +1257,7 @@ async fn heartbeat_broker(
 async fn run_leader_maintenance(
     controller: &ControllerNode,
     settings: &ClusterSettings,
+    fencing_open: bool,
     rebalance_leadership: bool,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
@@ -1183,8 +1270,11 @@ async fn run_leader_maintenance(
         settings.node_id,
         settings.broker_id,
         controller.raft_metrics().current_leader,
-        unix_time_ms(),
-        duration_millis_i64(settings.session_timeout),
+        FencingWindow {
+            now_ms: unix_time_ms(),
+            session_timeout_ms: duration_millis_i64(settings.session_timeout),
+            open: fencing_open,
+        },
         rebalance_leadership,
     );
     for command in commands {
@@ -1668,13 +1758,30 @@ fn replication_maintenance_commands(
     commands
 }
 
+/// When a controller may fence brokers it has not heard from lately.
+///
+/// `open` is false for the first session timeout after this node becomes
+/// the Raft leader. A broker renews its lease by writing to the quorum, so
+/// an election is a window in which no broker *can* renew: the timestamps a
+/// new leader inherits are all stale, and fencing on them fences the whole
+/// cluster the moment it recovers — including the brokers that stayed up
+/// the entire time. Every broker gets a full session timeout to check in
+/// with the new leader first, which is the same grace Kafka's controller
+/// gives after a failover. A broker that is genuinely gone is fenced one
+/// session timeout later than it otherwise would have been.
+#[derive(Debug, Clone, Copy)]
+struct FencingWindow {
+    now_ms: i64,
+    session_timeout_ms: i64,
+    open: bool,
+}
+
 fn leader_maintenance_commands(
     image: &ClusterMetadata,
     node_id: NodeId,
     broker_id: i32,
     current_leader: Option<NodeId>,
-    now_ms: i64,
-    session_timeout_ms: i64,
+    fencing: FencingWindow,
     rebalance_leadership: bool,
 ) -> Vec<MetadataCommand> {
     if current_leader != Some(node_id) {
@@ -1688,15 +1795,17 @@ fn leader_maintenance_commands(
     if image.controller_id != Some(broker_id) && local_is_live_controller {
         commands.push(MetadataCommand::SetController { broker_id });
     }
-    commands.extend(
-        image
-            .expired_brokers(now_ms, session_timeout_ms)
-            .into_iter()
-            .map(|(broker_id, broker_epoch)| MetadataCommand::FenceBroker {
-                broker_id,
-                broker_epoch,
-            }),
-    );
+    if fencing.open {
+        commands.extend(
+            image
+                .expired_brokers(fencing.now_ms, fencing.session_timeout_ms)
+                .into_iter()
+                .map(|(broker_id, broker_epoch)| MetadataCommand::FenceBroker {
+                    broker_id,
+                    broker_epoch,
+                }),
+        );
+    }
     if rebalance_leadership {
         commands.extend(preferred_leader_commands(image));
     }
@@ -2141,14 +2250,71 @@ mod tests {
         assert!(parse_error.to_string().contains("i32 broker ID"));
     }
 
+    /// A controller that has been leading for longer than one session
+    /// timeout, which is when expiry decisions become evidence-based.
+    fn open_window(now_ms: i64, session_timeout_ms: i64) -> FencingWindow {
+        FencingWindow {
+            now_ms,
+            session_timeout_ms,
+            open: true,
+        }
+    }
+
+    #[test]
+    fn a_new_controller_leader_fences_nobody_until_its_grace_has_passed() {
+        // Every heartbeat is a quorum write, so an election is a window in
+        // which no broker can renew. A leader that fenced on the timestamps
+        // it inherits would fence the brokers that survived the election —
+        // the whole cluster, at the moment it recovers.
+        let mut image = ClusterMetadata::new("test");
+        image.brokers.insert(1, broker(1, 7, 1_800));
+        image.brokers.insert(2, broker(2, 9, 10));
+
+        let commands = leader_maintenance_commands(
+            &image,
+            1,
+            1,
+            Some(1),
+            FencingWindow {
+                now_ms: 2_000,
+                session_timeout_ms: 500,
+                open: false,
+            },
+            false,
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, MetadataCommand::FenceBroker { .. })),
+            "a leader inside its grace window must fence nobody"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, MetadataCommand::SetController { .. })),
+            "the rest of maintenance still runs"
+        );
+
+        // Once the grace has passed, the same image expires broker 2.
+        let commands =
+            leader_maintenance_commands(&image, 1, 1, Some(1), open_window(2_000, 500), false);
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, MetadataCommand::FenceBroker { broker_id: 2, .. })));
+    }
+
     #[test]
     fn only_leader_generates_controller_and_expiry_commands() {
         let mut image = ClusterMetadata::new("test");
         image.brokers.insert(1, broker(1, 7, 1_800));
         image.brokers.insert(2, broker(2, 9, 10));
 
-        assert!(leader_maintenance_commands(&image, 1, 1, Some(2), 2_000, 500, false).is_empty());
-        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, false);
+        assert!(
+            leader_maintenance_commands(&image, 1, 1, Some(2), open_window(2_000, 500), false)
+                .is_empty()
+        );
+        let commands =
+            leader_maintenance_commands(&image, 1, 1, Some(1), open_window(2_000, 500), false);
         assert_eq!(commands.len(), 2);
         assert!(matches!(
             commands[0],
@@ -2168,7 +2334,8 @@ mod tests {
             .unwrap()
             .roles
             .remove(&NodeRole::Controller);
-        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, false);
+        let commands =
+            leader_maintenance_commands(&image, 1, 1, Some(1), open_window(2_000, 500), false);
         assert!(!commands
             .iter()
             .any(|command| matches!(command, MetadataCommand::SetController { .. })));
@@ -2186,6 +2353,7 @@ mod tests {
             "orders".into(),
             TopicMetadata {
                 name: "orders".into(),
+                topic_epoch: 1,
                 replication_factor: 3,
                 partitions: BTreeMap::from([(
                     0,
@@ -2196,6 +2364,7 @@ mod tests {
                         isr: vec![1, 3],
                         leader_epoch: 4,
                         target_replicas: None,
+                        last_isr: Vec::new(),
                     },
                 )]),
                 configs: BTreeMap::new(),
@@ -2204,7 +2373,8 @@ mod tests {
 
         // Still catching up: leadership must not move to a replica that
         // does not hold every committed record.
-        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, true);
+        let commands =
+            leader_maintenance_commands(&image, 1, 1, Some(1), open_window(2_000, 500), true);
         assert!(!commands
             .iter()
             .any(|command| matches!(command, MetadataCommand::ChangePartition { .. })));
@@ -2219,12 +2389,14 @@ mod tests {
         partition.isr = vec![1, 2, 3];
 
         // Rejoined the ISR — but nothing moves until the rebalance is due.
-        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, false);
+        let commands =
+            leader_maintenance_commands(&image, 1, 1, Some(1), open_window(2_000, 500), false);
         assert!(!commands
             .iter()
             .any(|command| matches!(command, MetadataCommand::ChangePartition { .. })));
 
-        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, true);
+        let commands =
+            leader_maintenance_commands(&image, 1, 1, Some(1), open_window(2_000, 500), true);
         let change = commands
             .iter()
             .find_map(|command| match command {
@@ -2250,7 +2422,8 @@ mod tests {
             .get_mut(&0)
             .unwrap()
             .target_replicas = Some(vec![1, 3]);
-        let commands = leader_maintenance_commands(&image, 1, 1, Some(1), 2_000, 500, true);
+        let commands =
+            leader_maintenance_commands(&image, 1, 1, Some(1), open_window(2_000, 500), true);
         assert!(!commands
             .iter()
             .any(|command| matches!(command, MetadataCommand::ChangePartition { .. })));
@@ -2289,6 +2462,7 @@ mod tests {
             "orders".into(),
             TopicMetadata {
                 name: "orders".into(),
+                topic_epoch: 1,
                 replication_factor: 3,
                 partitions: BTreeMap::from([(
                     0,
@@ -2299,6 +2473,7 @@ mod tests {
                         isr: vec![1, 2, 3],
                         leader_epoch: 4,
                         target_replicas: None,
+                        last_isr: Vec::new(),
                     },
                 )]),
                 configs: BTreeMap::new(),

@@ -17,6 +17,7 @@ pub struct ZeroCopyByteBuff<'a> {
     data: &'a [u8],       
     write_buf: Vec<u8>,   
     cursor: usize,
+    decode_error: bool,
     multiplier: f64,
     endian: Endian,
 }
@@ -27,6 +28,7 @@ impl<'a> ZeroCopyByteBuff<'a> {
             data: slice,
             write_buf: Vec::new(),
             cursor: 0,
+            decode_error: false,
             multiplier: 10000.0,
             endian,
         }
@@ -37,6 +39,7 @@ impl<'a> ZeroCopyByteBuff<'a> {
             data: &[],
             write_buf: Vec::with_capacity(capacity),
             cursor: 0,
+            decode_error: false,
             multiplier: 10000.0,
             endian,
         }
@@ -66,19 +69,23 @@ impl<'a> ZeroCopyByteBuff<'a> {
 	#[inline(always)]
 	fn get_varint32(&mut self) -> u32 {
 		let mut result: u32 = 0;
-		let mut shift = 0;
-        // Optimization: Unrolled loop for common case (1-5 bytes)
-		loop {
-            // SAFETY: We trust the data source. Unchecked access is faster.
-			let byte = unsafe { *self.data.get_unchecked(self.cursor) };
-			self.cursor += 1;
-			result |= ((byte & 0x7F) as u32) << shift;
+		for index in 0..5 {
+            let Some(&byte) = self.data.get(self.cursor) else {
+                self.decode_error = true;
+                return 0;
+            };
+            self.cursor += 1;
+            if index == 4 && byte & 0xf0 != 0 {
+                self.decode_error = true;
+                return 0;
+            }
+			result |= ((byte & 0x7F) as u32) << (index * 7);
 			if byte & 0x80 == 0 {
-				break;
+				return result;
 			}
-			shift += 7;
 		}
-		result
+		self.decode_error = true;
+        0
 	}
 
 	#[inline(always)]
@@ -111,18 +118,23 @@ impl<'a> ZeroCopyByteBuff<'a> {
 	#[inline(always)]
 	fn get_varint64(&mut self) -> u64 {
 		let mut result: u64 = 0;
-		let mut shift = 0;
-		loop {
-            // SAFETY: Unchecked access
-			let byte = unsafe { *self.data.get_unchecked(self.cursor) };
-			self.cursor += 1;
-			result |= ((byte & 0x7F) as u64) << shift;
+		for index in 0..10 {
+            let Some(&byte) = self.data.get(self.cursor) else {
+                self.decode_error = true;
+                return 0;
+            };
+            self.cursor += 1;
+            if index == 9 && byte & 0xfe != 0 {
+                self.decode_error = true;
+                return 0;
+            }
+			result |= ((byte & 0x7F) as u64) << (index * 7);
 			if byte & 0x80 == 0 {
-				break;
+				return result;
 			}
-			shift += 7;
 		}
-		result
+		self.decode_error = true;
+        0
 	}
 
 	#[inline(always)]
@@ -160,21 +172,46 @@ impl<'a> ZeroCopyByteBuff<'a> {
 
 	#[inline(always)]
     pub fn get_bool(&mut self) -> bool {
-        // SAFETY: Unchecked access
-        let b = unsafe { *self.data.get_unchecked(self.cursor) };
-        self.cursor += 1;
-		b != 0
+        match self.data.get(self.cursor) {
+            Some(&byte) => {
+                self.cursor += 1;
+                byte != 0
+            }
+            None => {
+                self.decode_error = true;
+                false
+            }
+        }
     }
 
     #[inline(always)]
     pub fn get_str(&mut self) -> Result<&'a str, &'static str> {
-		let len = self.get_i32() as usize;
+		let raw_len = self.get_i32();
+        self.ensure_valid()?;
+        let len = usize::try_from(raw_len).map_err(|_| "negative string length")?;
         if len == 0 { return Ok(""); }
-        // SAFETY: We assume valid UTF-8 and sufficient length for speed.
-        let s_bytes = unsafe { self.data.get_unchecked(self.cursor..self.cursor + len) };
-        self.cursor += len;
-        // SAFETY: Skipping UTF-8 check
-        Ok(unsafe { str::from_utf8_unchecked(s_bytes) })
+        let end = self.cursor.checked_add(len).ok_or("string length overflow")?;
+        let s_bytes = self.data.get(self.cursor..end).ok_or("truncated string")?;
+        self.cursor = end;
+        str::from_utf8(s_bytes).map_err(|_| "invalid UTF-8 string")
+    }
+
+    pub fn get_collection_len(&mut self) -> Result<usize, &'static str> {
+        let raw_len = self.get_i32();
+        self.ensure_valid()?;
+        let len = usize::try_from(raw_len).map_err(|_| "negative collection length")?;
+        if len > self.data.len().saturating_sub(self.cursor) {
+            return Err("collection length exceeds remaining input");
+        }
+        Ok(len)
+    }
+
+    pub fn ensure_valid(&self) -> Result<(), &'static str> {
+        if self.decode_error {
+            Err("truncated or invalid varint")
+        } else {
+            Ok(())
+        }
     }
 
     #[inline(always)]
@@ -303,6 +340,7 @@ impl ProduceRequest {
 		obj.batches_length = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -380,6 +418,7 @@ impl ProduceResponse {
 		obj.log_append_time_ms = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -481,6 +520,7 @@ impl FetchRequest {
 		obj.rack = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -574,6 +614,7 @@ impl FetchResponse {
 		obj.preferred_read_replica = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -635,6 +676,7 @@ impl ListOffsetsRequest {
 		obj.timestamp = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -712,6 +754,7 @@ impl ListOffsetsResponse {
 		obj.timestamp = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -781,6 +824,7 @@ impl BrokerInfo {
 		obj.rack = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -853,7 +897,7 @@ impl PartitionInfo {
 		
 		
 		
-		let replicas_len = buf.get_i32();
+		let replicas_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..replicas_len {
 			let val = buf.get_i32();
 			obj.replicas.push(val);
@@ -861,7 +905,7 @@ impl PartitionInfo {
 		
 		
 		
-		let isr_len = buf.get_i32();
+		let isr_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..isr_len {
 			let val = buf.get_i32();
 			obj.isr.push(val);
@@ -872,6 +916,7 @@ impl PartitionInfo {
 		obj.leader_epoch = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -933,13 +978,14 @@ impl TopicInfo {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = PartitionInfo::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -985,13 +1031,14 @@ impl MetadataRequest {
 		let mut obj = MetadataRequest::default();
 		
 		
-		let topics_len = buf.get_i32();
+		let topics_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..topics_len {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.topics.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1056,7 +1103,7 @@ impl MetadataResponse {
 		
 		
 		
-		let brokers_len = buf.get_i32();
+		let brokers_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..brokers_len {
 			let val = BrokerInfo::decode_from(buf)?;
 			obj.brokers.push(val);
@@ -1068,13 +1115,14 @@ impl MetadataResponse {
 		
 		
 		
-		let topics_len = buf.get_i32();
+		let topics_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..topics_len {
 			let val = TopicInfo::decode_from(buf)?;
 			obj.topics.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1135,7 +1183,7 @@ impl GroupMemberInfo {
 		
 		
 		
-		let subscription_topics_len = buf.get_i32();
+		let subscription_topics_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..subscription_topics_len {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.subscription_topics.push(val);
@@ -1143,13 +1191,14 @@ impl GroupMemberInfo {
 		
 		
 		
-		let assignment_len = buf.get_i32();
+		let assignment_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..assignment_len {
 			let val = AssignedPartition::decode_from(buf)?;
 			obj.assignment.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1231,7 +1280,7 @@ impl JoinGroupRequest {
 		
 		
 		
-		let subscription_topics_len = buf.get_i32();
+		let subscription_topics_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..subscription_topics_len {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.subscription_topics.push(val);
@@ -1242,6 +1291,7 @@ impl JoinGroupRequest {
 		obj.group_instance_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1319,13 +1369,14 @@ impl JoinGroupResponse {
 		
 		
 		
-		let members_len = buf.get_i32();
+		let members_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..members_len {
 			let val = GroupMemberInfo::decode_from(buf)?;
 			obj.members.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1379,6 +1430,7 @@ impl AssignedPartition {
 		obj.partition = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1432,13 +1484,14 @@ impl MemberAssignment {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = AssignedPartition::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1508,13 +1561,14 @@ impl SyncGroupRequest {
 		
 		
 		
-		let assignments_len = buf.get_i32();
+		let assignments_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..assignments_len {
 			let val = MemberAssignment::decode_from(buf)?;
 			obj.assignments.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1568,13 +1622,14 @@ impl SyncGroupResponse {
 		
 		
 		
-		let assignment_len = buf.get_i32();
+		let assignment_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..assignment_len {
 			let val = AssignedPartition::decode_from(buf)?;
 			obj.assignment.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1636,6 +1691,7 @@ impl HeartbeatRequest {
 		obj.member_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1681,6 +1737,7 @@ impl HeartbeatResponse {
 		obj.error_code = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1742,6 +1799,7 @@ impl OffsetCommitEntry {
 		obj.offset = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1811,13 +1869,14 @@ impl OffsetCommitRequest {
 		
 		
 		
-		let offsets_len = buf.get_i32();
+		let offsets_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..offsets_len {
 			let val = OffsetCommitEntry::decode_from(buf)?;
 			obj.offsets.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1863,6 +1922,7 @@ impl OffsetCommitResponse {
 		obj.error_code = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1916,13 +1976,14 @@ impl OffsetFetchRequest {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = AssignedPartition::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -1984,6 +2045,7 @@ impl OffsetFetchEntry {
 		obj.offset = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2037,13 +2099,14 @@ impl OffsetFetchResponse {
 		
 		
 		
-		let offsets_len = buf.get_i32();
+		let offsets_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..offsets_len {
 			let val = OffsetFetchEntry::decode_from(buf)?;
 			obj.offsets.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2121,6 +2184,7 @@ impl ListedGroup {
 		obj.coordinator_partition = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2166,13 +2230,14 @@ impl ListGroupsRequest {
 		let mut obj = ListGroupsRequest::default();
 		
 		
-		let states_len = buf.get_i32();
+		let states_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..states_len {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.states.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2226,13 +2291,14 @@ impl ListGroupsResponse {
 		
 		
 		
-		let groups_len = buf.get_i32();
+		let groups_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..groups_len {
 			let val = ListedGroup::decode_from(buf)?;
 			obj.groups.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2293,7 +2359,7 @@ impl DescribedMember {
 		
 		
 		
-		let subscription_topics_len = buf.get_i32();
+		let subscription_topics_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..subscription_topics_len {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.subscription_topics.push(val);
@@ -2301,13 +2367,14 @@ impl DescribedMember {
 		
 		
 		
-		let assignment_len = buf.get_i32();
+		let assignment_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..assignment_len {
 			let val = AssignedPartition::decode_from(buf)?;
 			obj.assignment.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2353,6 +2420,7 @@ impl DescribeGroupRequest {
 		obj.group_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2453,7 +2521,7 @@ impl DescribeGroupResponse {
 		
 		
 		
-		let members_len = buf.get_i32();
+		let members_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..members_len {
 			let val = DescribedMember::decode_from(buf)?;
 			obj.members.push(val);
@@ -2461,13 +2529,14 @@ impl DescribeGroupResponse {
 		
 		
 		
-		let offsets_len = buf.get_i32();
+		let offsets_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..offsets_len {
 			let val = OffsetFetchEntry::decode_from(buf)?;
 			obj.offsets.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2529,6 +2598,7 @@ impl ProduceMultiPartition {
 		obj.batches_length = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2590,13 +2660,14 @@ impl ProduceMultiRequest {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = ProduceMultiPartition::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2674,6 +2745,7 @@ impl ProduceMultiResult {
 		obj.log_append_time_ms = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2719,13 +2791,14 @@ impl ProduceMultiResponse {
 		let mut obj = ProduceMultiResponse::default();
 		
 		
-		let results_len = buf.get_i32();
+		let results_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..results_len {
 			let val = ProduceMultiResult::decode_from(buf)?;
 			obj.results.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2795,6 +2868,7 @@ impl FetchMultiPartition {
 		obj.max_bytes = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2848,6 +2922,7 @@ impl ForgottenPartition {
 		obj.partition = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -2948,7 +3023,7 @@ impl FetchMultiRequest {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = FetchMultiPartition::decode_from(buf)?;
 			obj.partitions.push(val);
@@ -2956,13 +3031,14 @@ impl FetchMultiRequest {
 		
 		
 		
-		let forgotten_len = buf.get_i32();
+		let forgotten_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..forgotten_len {
 			let val = ForgottenPartition::decode_from(buf)?;
 			obj.forgotten.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3056,6 +3132,7 @@ impl FetchMultiResult {
 		obj.preferred_read_replica = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3125,13 +3202,14 @@ impl FetchMultiResponse {
 		
 		
 		
-		let results_len = buf.get_i32();
+		let results_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..results_len {
 			let val = FetchMultiResult::decode_from(buf)?;
 			obj.results.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3193,6 +3271,7 @@ impl ApiVersionRange {
 		obj.max_version = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3246,6 +3325,7 @@ impl ApiVersionsRequest {
 		obj.client_software_version = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3307,7 +3387,7 @@ impl ApiVersionsResponse {
 		
 		
 		
-		let api_versions_len = buf.get_i32();
+		let api_versions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..api_versions_len {
 			let val = ApiVersionRange::decode_from(buf)?;
 			obj.api_versions.push(val);
@@ -3322,6 +3402,7 @@ impl ApiVersionsResponse {
 		obj.throttle_time_ms = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3399,6 +3480,7 @@ impl OffsetCommitRecord {
 		obj.commit_timestamp_ms = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3463,7 +3545,7 @@ impl GroupMemberRecord {
 		
 		
 		
-		let subscription_topics_len = buf.get_i32();
+		let subscription_topics_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..subscription_topics_len {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.subscription_topics.push(val);
@@ -3471,7 +3553,7 @@ impl GroupMemberRecord {
 		
 		
 		
-		let assignment_len = buf.get_i32();
+		let assignment_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..assignment_len {
 			let val = AssignedPartition::decode_from(buf)?;
 			obj.assignment.push(val);
@@ -3482,6 +3564,7 @@ impl GroupMemberRecord {
 		obj.group_instance_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3551,13 +3634,14 @@ impl GroupMetadataRecord {
 		
 		
 		
-		let members_len = buf.get_i32();
+		let members_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..members_len {
 			let val = GroupMemberRecord::decode_from(buf)?;
 			obj.members.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3619,6 +3703,7 @@ impl TombstoneRecord {
 		obj.partition = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3688,6 +3773,7 @@ impl AuthenticateRequest {
 		obj.payload = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3765,6 +3851,7 @@ impl AuthenticateResponse {
 		obj.done = buf.get_bool();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3818,6 +3905,7 @@ impl LeaveGroupRequest {
 		obj.member_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3863,6 +3951,7 @@ impl LeaveGroupResponse {
 		obj.error_code = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3932,6 +4021,7 @@ impl DescribeClusterBroker {
 		obj.rack = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -3977,6 +4067,7 @@ impl DescribeClusterRequest {
 		obj.include_cluster_authorized_operations = buf.get_bool();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4046,13 +4137,14 @@ impl DescribeClusterResponse {
 		
 		
 		
-		let brokers_len = buf.get_i32();
+		let brokers_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..brokers_len {
 			let val = DescribeClusterBroker::decode_from(buf)?;
 			obj.brokers.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4114,6 +4206,7 @@ impl ConfigEntry {
 		obj.is_default = buf.get_bool();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4175,13 +4268,14 @@ impl DescribeConfigsRequest {
 		
 		
 		
-		let config_names_len = buf.get_i32();
+		let config_names_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..config_names_len {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.config_names.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4251,13 +4345,14 @@ impl DescribeConfigsResponse {
 		
 		
 		
-		let configs_len = buf.get_i32();
+		let configs_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..configs_len {
 			let val = ConfigEntry::decode_from(buf)?;
 			obj.configs.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4335,6 +4430,7 @@ impl LogDirPartition {
 		obj.is_leader = buf.get_bool();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4420,13 +4516,14 @@ impl LogDirInfo {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = LogDirPartition::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4472,13 +4569,14 @@ impl DescribeLogDirsRequest {
 		let mut obj = DescribeLogDirsRequest::default();
 		
 		
-		let topics_len = buf.get_i32();
+		let topics_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..topics_len {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.topics.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4532,13 +4630,14 @@ impl DescribeLogDirsResponse {
 		
 		
 		
-		let log_dirs_len = buf.get_i32();
+		let log_dirs_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..log_dirs_len {
 			let val = LogDirInfo::decode_from(buf)?;
 			obj.log_dirs.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4600,6 +4699,7 @@ impl DeleteRecordsPartition {
 		obj.offset = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4653,13 +4753,14 @@ impl DeleteRecordsRequest {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = DeleteRecordsPartition::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4729,6 +4830,7 @@ impl DeleteRecordsResult {
 		obj.low_watermark = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4774,13 +4876,14 @@ impl DeleteRecordsResponse {
 		let mut obj = DeleteRecordsResponse::default();
 		
 		
-		let results_len = buf.get_i32();
+		let results_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..results_len {
 			let val = DeleteRecordsResult::decode_from(buf)?;
 			obj.results.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4834,6 +4937,7 @@ impl TxnPartition {
 		obj.partition = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4903,13 +5007,14 @@ impl AddPartitionsToTxnRequest {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = TxnPartition::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -4955,6 +5060,7 @@ impl AddPartitionsToTxnResponse {
 		obj.error_code = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5024,6 +5130,7 @@ impl AddOffsetsToTxnRequest {
 		obj.group_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5069,6 +5176,7 @@ impl AddOffsetsToTxnResponse {
 		obj.error_code = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5138,6 +5246,7 @@ impl EndTxnRequest {
 		obj.committed = buf.get_bool();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5183,6 +5292,7 @@ impl EndTxnResponse {
 		obj.error_code = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5260,13 +5370,14 @@ impl TxnOffsetCommitRequest {
 		
 		
 		
-		let offsets_len = buf.get_i32();
+		let offsets_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..offsets_len {
 			let val = OffsetCommitEntry::decode_from(buf)?;
 			obj.offsets.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5312,6 +5423,7 @@ impl TxnOffsetCommitResponse {
 		obj.error_code = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5405,13 +5517,14 @@ impl TransactionStateRecord {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = TxnPartition::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5481,13 +5594,14 @@ impl TxnMarker {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = TxnPartition::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5533,13 +5647,14 @@ impl WriteTxnMarkersRequest {
 		let mut obj = WriteTxnMarkersRequest::default();
 		
 		
-		let markers_len = buf.get_i32();
+		let markers_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..markers_len {
 			let val = TxnMarker::decode_from(buf)?;
 			obj.markers.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5601,6 +5716,7 @@ impl TxnMarkerResult {
 		obj.error_code = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5646,13 +5762,14 @@ impl WriteTxnMarkersResponse {
 		let mut obj = WriteTxnMarkersResponse::default();
 		
 		
-		let results_len = buf.get_i32();
+		let results_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..results_len {
 			let val = TxnMarkerResult::decode_from(buf)?;
 			obj.results.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5706,6 +5823,7 @@ impl AlterConfigEntry {
 		obj.value = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5775,13 +5893,14 @@ impl AlterConfigsRequest {
 		
 		
 		
-		let configs_len = buf.get_i32();
+		let configs_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..configs_len {
 			let val = AlterConfigEntry::decode_from(buf)?;
 			obj.configs.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5851,6 +5970,7 @@ impl AlterConfigsResponse {
 		obj.error_message = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5928,6 +6048,7 @@ impl ProducerState {
 		obj.current_txn_start_offset = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -5981,6 +6102,7 @@ impl DescribeProducersRequest {
 		obj.partition = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -6066,13 +6188,14 @@ impl DescribeProducersResponse {
 		
 		
 		
-		let producers_len = buf.get_i32();
+		let producers_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..producers_len {
 			let val = ProducerState::decode_from(buf)?;
 			obj.producers.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -6158,6 +6281,7 @@ impl TransactionListing {
 		obj.partition_count = buf.get_i32();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -6203,13 +6327,14 @@ impl ListTransactionsRequest {
 		let mut obj = ListTransactionsRequest::default();
 		
 		
-		let states_len = buf.get_i32();
+		let states_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..states_len {
 			let val = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 			obj.states.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -6263,13 +6388,14 @@ impl ListTransactionsResponse {
 		
 		
 		
-		let transactions_len = buf.get_i32();
+		let transactions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..transactions_len {
 			let val = TransactionListing::decode_from(buf)?;
 			obj.transactions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -6315,6 +6441,7 @@ impl DescribeTransactionsRequest {
 		obj.transactional_id = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -6416,13 +6543,14 @@ impl DescribeTransactionsResponse {
 		
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = TxnPartition::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -6484,6 +6612,7 @@ impl AlterLogDirPartition {
 		obj.log_dir = buf.get_str().map_err(|e| Error::new(ErrorKind::InvalidData, e))?.to_string();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -6529,13 +6658,14 @@ impl AlterReplicaLogDirsRequest {
 		let mut obj = AlterReplicaLogDirsRequest::default();
 		
 		
-		let partitions_len = buf.get_i32();
+		let partitions_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..partitions_len {
 			let val = AlterLogDirPartition::decode_from(buf)?;
 			obj.partitions.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -6613,6 +6743,7 @@ impl AlterLogDirResult {
 		obj.bytes_moved = buf.get_i64();
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }
@@ -6658,13 +6789,14 @@ impl AlterReplicaLogDirsResponse {
 		let mut obj = AlterReplicaLogDirsResponse::default();
 		
 		
-		let results_len = buf.get_i32();
+		let results_len = buf.get_collection_len().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		for _ in 0..results_len {
 			let val = AlterLogDirResult::decode_from(buf)?;
 			obj.results.push(val);
 		}
 		
 		
+		buf.ensure_valid().map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 		Ok(obj)
 	}
 }

@@ -136,6 +136,7 @@ fn cluster_image() -> ClusterMetadata {
         isr: vec![leader],
         leader_epoch: 1,
         target_replicas: None,
+        last_isr: Vec::new(),
     };
     ClusterMetadata {
         cluster_id: "group-coordinator-test".into(),
@@ -146,6 +147,7 @@ fn cluster_image() -> ClusterMetadata {
             OFFSETS_TOPIC.into(),
             TopicMetadata {
                 name: OFFSETS_TOPIC.into(),
+                topic_epoch: 1,
                 replication_factor: 1,
                 partitions: BTreeMap::from([(0, partition(0, 1)), (1, partition(1, 2))]),
                 configs: BTreeMap::new(),

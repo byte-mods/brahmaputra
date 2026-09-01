@@ -240,6 +240,7 @@ fn proxy_cluster_image(proxy_port: u16) -> ClusterMetadata {
             TOPIC.into(),
             TopicMetadata {
                 name: TOPIC.into(),
+                topic_epoch: 1,
                 replication_factor: 1,
                 partitions: BTreeMap::from([(
                     0,
@@ -250,6 +251,7 @@ fn proxy_cluster_image(proxy_port: u16) -> ClusterMetadata {
                         isr: vec![1],
                         leader_epoch: 0,
                         target_replicas: None,
+                        last_isr: Vec::new(),
                     },
                 )]),
                 configs: BTreeMap::new(),

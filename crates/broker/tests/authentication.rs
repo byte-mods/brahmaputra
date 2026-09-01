@@ -87,6 +87,7 @@ fn image_with_users() -> ClusterMetadata {
             data_port: 19_099,
             control_port: 29_099,
             internal_port: 0,
+            expected_epoch: None,
             roles: vec![NodeRole::Broker, NodeRole::Controller],
             rack: None,
             now_ms: 1_000,

@@ -321,6 +321,31 @@ impl ControllerNode {
     /// observed leader, and both forwarding and direct writes retry across a
     /// leader election until `command_timeout` expires.
     pub async fn write_metadata(&self, command: MetadataCommand) -> ControllerCommandResult {
+        self.write_metadata_inner(command, false).await
+    }
+
+    /// Write a command whose wall clock must describe the attempt that
+    /// commits, rather than the moment the caller built it.
+    ///
+    /// A write can wait a long time for a quorum to exist at all. A broker
+    /// registration proposed with a timestamp from before an outage commits
+    /// as one that already looks older than the session timeout, and the
+    /// next leader maintenance pass fences the broker that has just come
+    /// back. Callers that mean the timestamp they wrote — an operator
+    /// posting a command, a test replaying a fixed sequence — use
+    /// [`ControllerNode::write_metadata`] and keep it.
+    pub async fn write_metadata_stamped(
+        &self,
+        command: MetadataCommand,
+    ) -> ControllerCommandResult {
+        self.write_metadata_inner(command, true).await
+    }
+
+    async fn write_metadata_inner(
+        &self,
+        mut command: MetadataCommand,
+        restamp: bool,
+    ) -> ControllerCommandResult {
         let deadline = Instant::now() + self.config.command_timeout;
         let mut leader_hint = self.raft_metrics().current_leader;
         if leader_hint == Some(self.config.node_id)
@@ -338,6 +363,10 @@ impl ControllerNode {
         let mut preserve_discovered_leader_once = false;
 
         loop {
+            // Stamp the attempt, not the intention.
+            if restamp {
+                refresh_command_clock(&mut command);
+            }
             if let Some(leader_id) = leader_hint {
                 if leader_id != self.config.node_id {
                     match self.forward_command(leader_id, &command).await {
@@ -847,6 +876,29 @@ enum HeartbeatPreflight {
     },
 }
 
+/// Re-stamp the wall clock a broker registration carries.
+///
+/// The state machine cannot read a clock — every replica must apply the
+/// same command to the same state — so the caller stamps the time. That is
+/// correct only if the stamp is close to the commit. A registration made
+/// while no quorum exists can wait seconds for one to form, and it commits
+/// recording a broker whose last contact already looks older than the
+/// session timeout. The next leader maintenance pass then fences the broker
+/// that has just come back, which is how a recovered cluster loses the node
+/// that recovered it.
+fn refresh_command_clock(command: &mut MetadataCommand) {
+    if let MetadataCommand::RegisterBroker { now_ms, .. } = command {
+        *now_ms = unix_time_ms();
+    }
+}
+
+fn unix_time_ms() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+}
+
 fn heartbeat_epoch_is_live(metadata: &ClusterMetadata, broker_id: i32, broker_epoch: u64) -> bool {
     metadata
         .brokers
@@ -944,6 +996,7 @@ mod tests {
                 data_port: 9092,
                 control_port: 19092,
                 internal_port: 0,
+                expected_epoch: None,
                 roles: vec![],
                 rack: None,
                 now_ms: 1_000,

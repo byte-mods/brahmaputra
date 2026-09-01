@@ -57,6 +57,7 @@ fn cluster_image(
             TOPIC.into(),
             TopicMetadata {
                 name: TOPIC.into(),
+                topic_epoch: 1,
                 replication_factor: replicas.len() as i32,
                 partitions: BTreeMap::from([(
                     0,
@@ -67,6 +68,7 @@ fn cluster_image(
                         isr,
                         leader_epoch,
                         target_replicas: None,
+                        last_isr: Vec::new(),
                     },
                 )]),
                 configs,

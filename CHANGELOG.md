@@ -1,5 +1,151 @@
 # Changelog
 
+## 0.6.0 — 2026-09-01
+
+The release that stops a controller outage from taking the cluster with it,
+stops a deleted topic's records from reappearing under its name, and stops
+the wire decoder from reading out of bounds on a malformed frame.
+
+All three were the same kind of mistake in three places: treating an
+absence of evidence as evidence. A broker that could not reach a controller
+concluded it had been replaced. A partition directory with the right name
+was assumed to belong to the topic that now has that name. A decoder that
+had bytes assumed it had enough of them.
+
+**No wire change and no on-disk format change.** The protocol stays at
+version 4 and a 0.5.0 client talks to a 0.6.0 broker. Each partition
+directory gains one 8-byte `.topic-epoch` marker on first open; a directory
+without one is adopted in place, so existing logs, indexes and checkpoints
+are read unchanged.
+
+### Fixed
+
+- **A controller outage no longer terminates the brokers that survived
+  it.** Losing the Raft leader for longer than `--session-timeout-ms` used
+  to take down every remaining node: each surviving broker failed to renew
+  its lease, treated that as proof it had been superseded, and exited. A
+  cluster that should have survived one failure lost all three. This was
+  gap 3 in [docs/kafka-parity.md](docs/kafka-parity.md) and reproduced
+  identically on 0.3.0.
+
+  Failure to renew is not proof of anything. A broker that cannot reach a
+  controller at all learns nothing about whether a newer incarnation of
+  itself exists, and the two cases need different answers. Closing this
+  took five changes, because the outage exposed the same assumption at
+  five layers:
+
+  - An expired lease now **suspends** the data plane: the broker stops
+    serving, keeps its listeners, actors and process alive, and retries.
+    `validate_local_broker_lease` fails while suspended, so a broker
+    without a lease still refuses to serve — the guarantee that made
+    self-termination look correct is kept without the exit.
+  - `RegisterBroker` takes an optional `expected_epoch`. A suspended
+    process re-registers with the epoch it held, and the controller
+    refuses the registration if any newer incarnation registered in the
+    meantime. A process that is still current resumes; a zombie is
+    rejected, and now fails loudly instead of retrying forever. `fence()`
+    stays irreversible for the case that *is* proof: an epoch change
+    observed while the lease is live.
+  - **A controller fence of the current epoch is recoverable, not fatal.**
+    Both the heartbeat rejection and the metadata image now distinguish
+    "the controller fenced the epoch I hold" — for lateness, with nothing
+    newer registered — from "something newer holds my id". The first
+    suspends and re-registers; only the second stops the process.
+  - **A new controller leader fences nobody for one session timeout.**
+    Renewing a lease is a quorum write, so an election is a window in
+    which no broker *can* renew, and every timestamp the new leader
+    inherits is already stale. Fencing on them fenced the survivors at the
+    moment the cluster recovered. Each broker now gets a full session
+    timeout to check in first, which is the grace Kafka's controller gives
+    after a failover.
+  - **Time-bearing commands are stamped when they are proposed, not when
+    they are built.** The state machine cannot read a clock, so the caller
+    supplies `now_ms` — and a registration that waits seconds for a quorum
+    to exist committed with a timestamp already older than the session
+    timeout, so the next maintenance pass fenced the broker that had just
+    come back. `RegisterBroker` and `Heartbeat` are re-stamped on each
+    attempt.
+  - **A partition whose whole ISR was fenced can be recovered by any
+    replica that was in it.** `PartitionMetadata::last_isr` records the
+    in-sync set as it stood when the partition lost the last member of it,
+    and a returning replica from that set is elected on registration.
+    In-sync means it holds every committed record, so this is a clean
+    election on the same terms Kafka uses — 0.5.0 could only recover the
+    single-replica case. A replica that had already fallen out of the ISR
+    is still not eligible: believing that one can discard acknowledged
+    writes, which is what unclean election means, and it stays an explicit
+    decision.
+
+- **A deleted topic's data can no longer be served under a recreated
+  topic's name.** Topic names are reusable and a partition directory had no
+  durable link to the incarnation that created it, so recreating `orders`
+  reopened the deleted `orders-0` log — with its offsets, its records and
+  its watermark — and served an operator's deleted data back to consumers.
+
+  - `CreateTopic` stamps a monotonic `topic_epoch` (the metadata offset
+    that created it) into `TopicMetadata`. It is `#[serde(default)]`, so an
+    existing Raft log still means what it meant.
+  - Brokers persist that epoch in `.topic-epoch` beside each replica and
+    sync it before the log can be opened. A mismatch discards the stale
+    directory; an unmarked directory predates the marker and is adopted in
+    place; an epoch-zero image is never allowed to replace a marked
+    directory.
+  - `open_partition` refuses a partition whose open incarnation no longer
+    matches the metadata, so a recreated topic waits for the stale data to
+    be removed rather than briefly serving it.
+  - Partition deletion now shuts the actor down cleanly — checkpointing the
+    high watermark and closing every file — before removing the directory,
+    and a removal that fails is retried instead of leaking the directory
+    forever. That also stops a transient Windows sharing violation from
+    surfacing as a whole-disk failure.
+
+- **Malformed frames are rejected instead of read out of bounds.** The
+  generated BitPacker decoder read varints, booleans and lengths through
+  `get_unchecked`, on a comment that said the data source was trusted. The
+  data source is the network, which made every unauthenticated frame a
+  potential out-of-bounds read.
+
+  - Every read is bounds-checked and raises a decode-error flag that each
+    generated `decode` checks before it returns. Overlong varints, negative
+    and impossible collection lengths, and invalid UTF-8 are errors rather
+    than things to follow.
+  - The generator in `tools/bit-packer` emits the checked form:
+    `scripts/gen-protocol.sh` reproduces the checked-in
+    `crates/protocol/src/gen/*` byte for byte.
+  - Tests assert that every truncated prefix of a response, every
+    single-byte payload, and every hostile length is an error and not a
+    panic.
+
+- **A producer no longer gives up on a topic the broker has not heard of
+  yet.** Topic creation is a controller write that reaches brokers
+  asynchronously, so a send that closely follows `CreateTopic` could fail
+  outright with `UNKNOWN_TOPIC_OR_PARTITION`; leadership moves produced the
+  same answer briefly. That code is now retriable — like every other
+  metadata-staleness code, and like Kafka classifies it — and a retry
+  refreshes the route first. It is also honoured when the staleness is the
+  client's own: a topic missing from the client's metadata is retried
+  rather than raised immediately. A topic that genuinely does not exist
+  still fails, after the retry budget, with the broker's own code.
+
+- **A peer can no longer grow broker memory by rotating `client.id`.**
+  Quota buckets were keyed by the client-supplied string and kept for the
+  life of the process. They are now keyed by a per-broker seeded hash — no
+  attacker-controlled string is retained, and collisions cannot be
+  manufactured — and the table is capped at 4,096 identities. Eviction can
+  grant a churned identity a fresh one-second burst; it can never lose or
+  corrupt a request.
+
+### Verification
+
+`scripts/verify-bugfixes.ps1` starts three combined nodes, hard-kills the
+Raft leader and leaves it down, and asserts that the survivors stay alive,
+elect a leader, renew their leases and accept `acks=all` writes. It then
+kills a second node and asserts the last one suspends rather than exits and
+refuses to serve without a lease, and that restoring a peer lets it
+re-register and resume. It also deletes and immediately recreates a
+replicated topic and asserts every replica discarded its old incarnation
+marker and that only the fresh record is readable.
+
 ## 0.4.0 — 2026-08-23
 
 The release that finishes log compaction and makes `transaction.timeout.ms`

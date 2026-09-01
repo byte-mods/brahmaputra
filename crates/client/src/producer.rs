@@ -113,12 +113,14 @@ impl Default for ProducerConfig {
     }
 }
 
+type BufferedRecord = (Record, i64, oneshot::Sender<Result<i64, ClientError>>);
+
 struct Buffer {
     /// Each record is buffered with the wall-clock time it was *sent*, not
     /// the time its batch happens to flush. Those differ by up to
     /// `linger.ms`, and it is the send time that a consumer filtering by
     /// timestamp is asking about.
-    records: Vec<(Record, i64, oneshot::Sender<Result<i64, ClientError>>)>,
+    records: Vec<BufferedRecord>,
     size: usize,
 }
 
@@ -896,7 +898,33 @@ impl Inner {
         let mut retried_ambiguous = false;
         let mut attempts_left = self.config.retries;
         loop {
-            match self.produce_once(topic, partition, body).await {
+            let attempt = self.produce_once(topic, partition, body).await;
+            // A retriable condition can arrive two ways: as a code in a
+            // response the broker sent, or as a client-side error raised
+            // while routing — the topic is missing from *this client's*
+            // metadata, which is the same staleness seen one step earlier.
+            let routing_code = match &attempt {
+                Err(ClientError::Server { code, .. }) if is_retriable_error_code(*code) => {
+                    Some(*code)
+                }
+                _ => None,
+            };
+            match attempt {
+                Err(error) if routing_code.is_some() => {
+                    let code = routing_code.expect("checked");
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if attempts_left == 0 || remaining.is_zero() {
+                        return Err(error);
+                    }
+                    attempts_left -= 1;
+                    let _ = self.router.refresh_topic(topic).await;
+                    debug!(
+                        topic,
+                        partition, code, attempts_left, "retriable routing error; backing off"
+                    );
+                    let backoff = Duration::from_millis(self.config.retry_backoff_ms);
+                    tokio::time::sleep(backoff.min(remaining)).await;
+                }
                 Ok(response) if is_retriable_error_code(response.error_code) => {
                     let code = response.error_code;
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -911,7 +939,8 @@ impl Inner {
                     // resending to the same broker would just repeat it.
                     if matches!(
                         code,
-                        ec::NOT_LEADER_OR_FOLLOWER
+                        ec::UNKNOWN_TOPIC_OR_PARTITION
+                            | ec::NOT_LEADER_OR_FOLLOWER
                             | ec::FENCED_LEADER_EPOCH
                             | ec::UNKNOWN_LEADER_EPOCH
                     ) {
@@ -970,6 +999,12 @@ impl Inner {
 /// The distinction that matters is *durability*, not severity. Each code
 /// here is one the broker returns strictly before it appends anything:
 ///
+/// - `UNKNOWN_TOPIC_OR_PARTITION`: the broker has not seen the topic *yet*.
+///   Creation is a controller write that reaches brokers asynchronously, so
+///   a send that follows a `CreateTopic` closely enough races the metadata,
+///   and leadership moves produce the same answer briefly. A topic that
+///   truly does not exist still fails — after the retry budget, with the
+///   broker's own code — which is what Kafka does with this code too.
 /// - `NOT_LEADER_OR_FOLLOWER` / `FENCED_LEADER_EPOCH` /
 ///   `UNKNOWN_LEADER_EPOCH`: the request reached a broker that does not
 ///   lead the partition, so it appended nothing and the client's routing
@@ -989,7 +1024,8 @@ impl Inner {
 fn is_retriable_error_code(code: i32) -> bool {
     matches!(
         code,
-        ec::NOT_LEADER_OR_FOLLOWER
+        ec::UNKNOWN_TOPIC_OR_PARTITION
+            | ec::NOT_LEADER_OR_FOLLOWER
             | ec::FENCED_LEADER_EPOCH
             | ec::UNKNOWN_LEADER_EPOCH
             | ec::NOT_ENOUGH_REPLICAS
@@ -1131,6 +1167,9 @@ mod retry_classification_tests {
     #[test]
     fn only_codes_that_prove_no_append_are_retried() {
         for code in [
+            // Metadata staleness, not a verdict: the topic may exist and
+            // this broker may simply not have been told yet.
+            ec::UNKNOWN_TOPIC_OR_PARTITION,
             ec::NOT_LEADER_OR_FOLLOWER,
             ec::FENCED_LEADER_EPOCH,
             ec::UNKNOWN_LEADER_EPOCH,
@@ -1150,7 +1189,6 @@ mod retry_classification_tests {
             ec::UNSUPPORTED_VERSION,
             ec::AUTHORIZATION_FAILED,
             ec::SASL_AUTHENTICATION_FAILED,
-            ec::UNKNOWN_TOPIC_OR_PARTITION,
             ec::OFFSET_OUT_OF_RANGE,
             // These two mean the producer's sequence state is already
             // broken; a blind retry makes it worse, not better.

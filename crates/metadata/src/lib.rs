@@ -268,6 +268,25 @@ pub struct PartitionMetadata {
     /// the target only once the target replicas are all in the ISR.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_replicas: Option<Vec<BrokerId>>,
+    /// The in-sync set as it stood when this partition last lost every
+    /// member of it.
+    ///
+    /// Fencing removes a broker from the ISR, and fencing the last one
+    /// empties it. An empty ISR is a state the partition cannot leave on
+    /// its own: `ChangePartition` will not make a broker leader unless it
+    /// is already in the ISR, and only a leader can widen the ISR. Without
+    /// this field the only recoverable case is a partition with a single
+    /// replica, where the one log that exists *is* the partition.
+    ///
+    /// Remembering the final ISR makes the general case recoverable on the
+    /// same terms Kafka uses: a replica that was in sync when the partition
+    /// went dark holds every committed record, so electing it is a clean
+    /// election. A replica that had already fallen out of the ISR is not
+    /// here, and is not eligible — believing that one could discard writes
+    /// the others had, which is what unclean election means and why it
+    /// stays a separate, explicit decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_isr: Vec<BrokerId>,
 }
 
 impl PartitionMetadata {
@@ -383,6 +402,13 @@ pub fn place_replicas(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicMetadata {
     pub name: String,
+    /// Monotonic identity of this topic incarnation.
+    ///
+    /// Names may be deleted and recreated. Brokers persist this value next
+    /// to each local replica so a new topic never adopts the deleted topic's
+    /// log merely because both use the same name and partition number.
+    #[serde(default)]
+    pub topic_epoch: MetadataOffset,
     pub replication_factor: i32,
     pub partitions: BTreeMap<i32, PartitionMetadata>,
     #[serde(default)]
@@ -535,10 +561,25 @@ impl ClusterMetadata {
                 data_port,
                 control_port,
                 internal_port,
+                expected_epoch,
                 roles,
                 rack,
                 now_ms,
             } => {
+                if let Some(expected) = expected_epoch {
+                    let current = self
+                        .brokers
+                        .get(&broker_id)
+                        .ok_or(MetadataError::UnknownBroker(broker_id))?
+                        .broker_epoch;
+                    if current != expected {
+                        return Err(MetadataError::StaleBrokerEpoch {
+                            broker_id,
+                            expected: current,
+                            actual: expected,
+                        });
+                    }
+                }
                 let broker_epoch = self.next_broker_epoch(broker_id);
                 let roles = roles.into_iter().collect();
                 self.brokers.insert(
@@ -557,10 +598,10 @@ impl ClusterMetadata {
                     },
                 );
                 // A returning broker normally rejoins the ISR through the
-                // partition's leader. Partitions it is the *only* replica of
-                // have no leader to rejoin through, so they are restored
-                // here or not at all.
-                self.restore_sole_replica_leadership(broker_id);
+                // partition's leader. Partitions with no ISR left have no
+                // leader to rejoin through, so they are restored here or
+                // not at all.
+                self.restore_returning_replica_leadership(broker_id);
                 MetadataEvent::BrokerRegistered {
                     broker_id,
                     broker_epoch,
@@ -660,6 +701,7 @@ impl ClusterMetadata {
                             replicas,
                             leader_epoch: 0,
                             target_replicas: None,
+                            last_isr: Vec::new(),
                         },
                     );
                 }
@@ -667,6 +709,7 @@ impl ClusterMetadata {
                     name.clone(),
                     TopicMetadata {
                         name: name.clone(),
+                        topic_epoch: self.offset.saturating_add(1),
                         replication_factor,
                         partitions: placed,
                         configs,
@@ -762,6 +805,7 @@ impl ClusterMetadata {
                             replicas,
                             leader_epoch: 0,
                             target_replicas: None,
+                            last_isr: Vec::new(),
                         },
                     );
                 }
@@ -945,37 +989,47 @@ impl ClusterMetadata {
             })
     }
 
-    /// Give a re-registering broker back the partitions it is the sole
-    /// replica of.
+    /// Give a re-registering broker back the partitions it is entitled to
+    /// lead again.
     ///
-    /// Fencing empties the ISR and leaves the leader as -1. With several
-    /// replicas that is recoverable: another one leads, the returning
-    /// broker catches up as a follower, and the leader admits it back to
-    /// the ISR. With a single replica there is no such path, and the two
-    /// rules that make ISR membership safe deadlock against each other —
-    /// `ChangePartition` will not make a broker leader unless it is already
-    /// in the ISR, and only a leader can widen the ISR. An empty ISR
-    /// becomes a state the partition can never leave, and it stays offline
-    /// permanently even though its one replica is back holding the whole
-    /// log. `__consumer_offsets` is created with one replica per partition,
-    /// so in practice this took out half the consumer groups in the
-    /// cluster: a group whose coordinator partition landed on a broker that
-    /// had once restarted could never start again.
+    /// Fencing empties the ISR and leaves the leader as -1. While at least
+    /// one replica is left in the ISR that is recoverable on its own:
+    /// another replica leads, the returning broker catches up as a
+    /// follower, and the leader admits it back. Once the ISR is empty there
+    /// is no such path, and the two rules that make ISR membership safe
+    /// deadlock against each other — `ChangePartition` will not make a
+    /// broker leader unless it is already in the ISR, and only a leader can
+    /// widen the ISR. An empty ISR becomes a state the partition can never
+    /// leave, and it stays offline even though a replica is back holding
+    /// the whole log. `__consumer_offsets` is created with one replica per
+    /// partition, so in practice this took out half the consumer groups in
+    /// the cluster.
     ///
-    /// Trusting that single replica is a clean election, not an unclean
-    /// one. It is the only copy that ever existed, so its log *is* the
-    /// partition and there is no more recent data anywhere to lose.
-    /// Partitions with several replicas and an empty ISR are deliberately
-    /// left alone: there, choosing which returning replica to believe
-    /// really can discard writes another replica had, and that decision
-    /// belongs to an explicit unclean-leader-election policy rather than to
-    /// whichever broker happens to register first.
-    fn restore_sole_replica_leadership(&mut self, broker_id: BrokerId) {
+    /// Two returning replicas are trusted, and both are clean elections:
+    ///
+    /// - the **sole replica** of a partition. Its log *is* the partition,
+    ///   so there is no more recent data anywhere to lose.
+    /// - a replica in [`PartitionMetadata::last_isr`], the in-sync set as
+    ///   it stood when the partition lost the last member of it. In-sync
+    ///   means it held every committed record, so electing it discards
+    ///   nothing that was ever acknowledged. This is the rule Kafka elects
+    ///   by.
+    ///
+    /// A replica that had already fallen out of the ISR is not eligible.
+    /// Believing that one can genuinely discard writes the others had,
+    /// which is what unclean leader election means, and it stays an
+    /// explicit decision rather than a consequence of which broker happens
+    /// to register first.
+    fn restore_returning_replica_leadership(&mut self, broker_id: BrokerId) {
         for topic in self.topics.values_mut() {
             for partition in topic.partitions.values_mut() {
-                if partition.leader < 0
-                    && partition.isr.is_empty()
-                    && partition.replicas == [broker_id]
+                // Eligible on either of two grounds, both clean: this is
+                // the only replica that ever existed, or it was in the
+                // in-sync set at the moment the partition lost the last of
+                // it — so it holds every record that was ever committed.
+                let sole_replica = partition.replicas == [broker_id];
+                let was_in_sync = partition.last_isr.contains(&broker_id);
+                if partition.leader < 0 && partition.isr.is_empty() && (sole_replica || was_in_sync)
                 {
                     partition.leader = broker_id;
                     partition.isr = vec![broker_id];
@@ -992,9 +1046,16 @@ impl ClusterMetadata {
         let alive: BTreeSet<_> = self.live_broker_ids().into_iter().collect();
         for topic in self.topics.values_mut() {
             for partition in topic.partitions.values_mut() {
+                let was_in_sync = partition.isr.clone();
                 partition
                     .isr
                     .retain(|id| *id != broker_id && alive.contains(id));
+                // Losing the last in-sync replica is the moment worth
+                // remembering: it is the only one after which nothing in
+                // the ISR can say who held the committed records.
+                if partition.isr.is_empty() && !was_in_sync.is_empty() {
+                    partition.last_isr = was_in_sync;
+                }
                 if partition.leader == broker_id || !partition.isr.contains(&partition.leader) {
                     partition.leader = elect_from_isr(partition);
                     partition.leader_epoch += 1;
@@ -1029,6 +1090,12 @@ pub enum MetadataCommand {
         /// meaning what it meant.
         #[serde(default)]
         internal_port: u16,
+        /// For a process renewing after a locally expired lease, require
+        /// that no newer incarnation registered in the meantime. Initial
+        /// process starts leave this unset and intentionally supersede an
+        /// older incarnation with the same configured broker ID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_epoch: Option<BrokerEpoch>,
         roles: Vec<NodeRole>,
         rack: Option<String>,
         now_ms: i64,
@@ -1266,6 +1333,7 @@ mod tests {
                 data_port: 9_092 + broker_id as u16,
                 control_port: 19_092 + broker_id as u16,
                 internal_port: 0,
+                expected_epoch: None,
                 roles: vec![NodeRole::Broker, NodeRole::Controller],
                 rack: None,
                 now_ms,
@@ -1301,6 +1369,39 @@ mod tests {
         assert_eq!(topic.partitions[&1].replicas, vec![2, 3, 1]);
         assert_eq!(topic.partitions[&2].replicas, vec![3, 1, 2]);
         assert_eq!(topic.partitions[&3].replicas, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn recreating_a_topic_assigns_a_new_incarnation() {
+        let mut state = ClusterMetadata::new("cluster-a");
+        register(&mut state, 1, 1_000);
+        state
+            .apply(MetadataCommand::CreateTopic {
+                name: "orders".into(),
+                partitions: 1,
+                replication_factor: 1,
+                configs: BTreeMap::new(),
+            })
+            .unwrap();
+        let first = state.topics["orders"].topic_epoch;
+
+        state
+            .apply(MetadataCommand::DeleteTopic {
+                name: "orders".into(),
+            })
+            .unwrap();
+        state
+            .apply(MetadataCommand::CreateTopic {
+                name: "orders".into(),
+                partitions: 1,
+                replication_factor: 1,
+                configs: BTreeMap::new(),
+            })
+            .unwrap();
+
+        let second = state.topics["orders"].topic_epoch;
+        assert_ne!(first, second);
+        assert!(second > first);
     }
 
     #[test]
@@ -1353,6 +1454,41 @@ mod tests {
     }
 
     #[test]
+    fn conditional_reregistration_cannot_supersede_a_newer_process() {
+        let mut state = ClusterMetadata::default();
+        let first = register(&mut state, 7, 10);
+        let command = |expected_epoch| MetadataCommand::RegisterBroker {
+            broker_id: 7,
+            host: "127.0.0.1".into(),
+            data_port: 9_099,
+            control_port: 19_099,
+            internal_port: 0,
+            expected_epoch: Some(expected_epoch),
+            roles: vec![NodeRole::Broker, NodeRole::Controller],
+            rack: None,
+            now_ms: 20,
+        };
+
+        let event = state.apply(command(first)).expect("same process may renew");
+        assert!(matches!(
+            event,
+            MetadataEvent::BrokerRegistered {
+                broker_epoch: 2,
+                ..
+            }
+        ));
+        assert_eq!(
+            state.apply(command(first)).unwrap_err(),
+            MetadataError::StaleBrokerEpoch {
+                broker_id: 7,
+                expected: 2,
+                actual: 1,
+            }
+        );
+        assert_eq!(state.brokers[&7].broker_epoch, 2);
+    }
+
+    #[test]
     fn controller_must_be_live_and_have_the_controller_role() {
         let mut state = ClusterMetadata::default();
         state
@@ -1362,6 +1498,7 @@ mod tests {
                 data_port: 9_092,
                 control_port: 19_092,
                 internal_port: 0,
+                expected_epoch: None,
                 roles: vec![NodeRole::Broker],
                 rack: None,
                 now_ms: 0,
@@ -1465,6 +1602,81 @@ mod tests {
             "a shared partition stays offline until an explicit election"
         );
         assert!(partition.isr.is_empty());
+    }
+
+    #[test]
+    fn the_last_in_sync_replica_gets_a_shared_partition_back_when_it_returns() {
+        // Losing every broker — an election that outlasts the session
+        // timeout does exactly this — empties the ISR of partitions that
+        // have several replicas too. Whoever was in sync when that happened
+        // holds every committed record, so electing it when it comes back
+        // discards nothing: it is the same election the controller would
+        // have made a moment earlier, just later.
+        let mut state = ClusterMetadata::default();
+        let mut epochs = BTreeMap::new();
+        for broker_id in 1..=3 {
+            epochs.insert(broker_id, register(&mut state, broker_id, 0));
+        }
+        create_topic(&mut state, "orders");
+        for broker_id in 1..=3 {
+            state
+                .apply(MetadataCommand::FenceBroker {
+                    broker_id,
+                    broker_epoch: epochs[&broker_id],
+                })
+                .unwrap();
+        }
+        let partition = &state.topics["orders"].partitions[&0];
+        assert_eq!(partition.leader, -1);
+        assert!(partition.isr.is_empty());
+        assert_eq!(
+            partition.last_isr,
+            vec![3],
+            "the ISR shrank one fence at a time, so broker 3 was the last in sync"
+        );
+        let offline_epoch = partition.leader_epoch;
+
+        // Broker 2 fell out of the ISR before it emptied: not eligible.
+        register(&mut state, 2, 100);
+        assert_eq!(state.topics["orders"].partitions[&0].leader, -1);
+
+        register(&mut state, 3, 110);
+        let restored = &state.topics["orders"].partitions[&0];
+        assert_eq!(restored.leader, 3, "the last in-sync replica leads again");
+        assert_eq!(restored.isr, vec![3]);
+        assert!(restored.leader_epoch > offline_epoch);
+    }
+
+    #[test]
+    fn losing_every_broker_at_once_keeps_all_of_them_eligible() {
+        // When the whole ISR is fenced in one pass, every member of it was
+        // in sync at the same instant, so any of them may be elected.
+        let mut state = ClusterMetadata::default();
+        let mut epochs = BTreeMap::new();
+        for broker_id in 1..=3 {
+            epochs.insert(broker_id, register(&mut state, broker_id, 0));
+        }
+        create_topic(&mut state, "orders");
+        // Mark two brokers dead without fencing their partitions, which is
+        // what a controller that never got to run maintenance leaves
+        // behind; the next fence then empties the ISR in one step.
+        for broker_id in [2, 3] {
+            state.brokers.get_mut(&broker_id).expect("broker").alive = false;
+        }
+        state
+            .apply(MetadataCommand::FenceBroker {
+                broker_id: 1,
+                broker_epoch: epochs[&1],
+            })
+            .unwrap();
+        let partition = &state.topics["orders"].partitions[&0];
+        assert!(partition.isr.is_empty());
+        assert_eq!(partition.last_isr, vec![1, 2, 3]);
+
+        register(&mut state, 2, 100);
+        let restored = &state.topics["orders"].partitions[&0];
+        assert_eq!(restored.leader, 2);
+        assert_eq!(restored.isr, vec![2]);
     }
 
     #[test]
@@ -1684,6 +1896,7 @@ mod tests {
                 data_port: 9092,
                 control_port: 19092,
                 internal_port: 0,
+                expected_epoch: None,
                 roles: vec![NodeRole::Broker],
                 rack: None,
                 now_ms: 100,
@@ -2077,6 +2290,7 @@ mod partition_and_config_tests {
                     data_port: 9092,
                     control_port: 19092,
                     internal_port: 0,
+                    expected_epoch: None,
                     roles: vec![NodeRole::Broker],
                     rack: None,
                     now_ms: 1_000,
@@ -2277,6 +2491,7 @@ mod placement_and_reassignment_tests {
                     data_port: 9092 + *id as u16,
                     control_port: 19092 + *id as u16,
                     internal_port: 0,
+                    expected_epoch: None,
                     roles: vec![NodeRole::Broker, NodeRole::Controller],
                     rack: Some((*rack).to_string()),
                     now_ms: 1,

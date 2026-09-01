@@ -2604,6 +2604,7 @@ mod tests {
                 "orders".into(),
                 TopicMetadata {
                     name: "orders".into(),
+                    topic_epoch: 1,
                     replication_factor: 3,
                     partitions: BTreeMap::from([(
                         0,
@@ -2614,6 +2615,7 @@ mod tests {
                             isr,
                             leader_epoch: 1,
                             target_replicas: None,
+                            last_isr: Vec::new(),
                         },
                     )]),
                     configs: BTreeMap::new(),

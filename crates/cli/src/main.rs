@@ -2021,6 +2021,11 @@ async fn consume(broker: SocketAddr, topic: String, options: ConsumeOptions<'_>)
     }
 
     let mut printed = 0u64;
+    let emit_options = EmitOptions {
+        max,
+        quiet,
+        show_timestamp,
+    };
     let mut cursors = Vec::with_capacity(partitions.len());
     for p in partitions {
         let next = match offset {
@@ -2043,16 +2048,7 @@ async fn consume(broker: SocketAddr, topic: String, options: ConsumeOptions<'_>)
             for (p, next) in &mut cursors {
                 let records = consumer.fetch(&topic, *p, *next, max_wait_ms).await?;
                 made_progress |= !records.is_empty();
-                if emit_records(
-                    *p,
-                    next,
-                    &mut printed,
-                    max,
-                    records,
-                    quiet,
-                    show_timestamp,
-                    &mut bytes,
-                ) {
+                if emit_records(*p, next, &mut printed, records, emit_options, &mut bytes) {
                     report_consume_rate(quiet, printed, bytes, started);
                     return Ok(());
                 }
@@ -2086,10 +2082,8 @@ async fn consume(broker: SocketAddr, topic: String, options: ConsumeOptions<'_>)
                 partition,
                 &mut cursor.1,
                 &mut printed,
-                max,
                 records,
-                quiet,
-                show_timestamp,
+                emit_options,
                 &mut bytes,
             ) {
                 report_consume_rate(quiet, printed, bytes, started);
@@ -2273,20 +2267,25 @@ fn render_value(value: &Option<Bytes>) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+struct EmitOptions {
+    max: Option<u64>,
+    quiet: bool,
+    show_timestamp: bool,
+}
+
 fn emit_records(
     partition: i32,
     next: &mut i64,
     printed: &mut u64,
-    max: Option<u64>,
     records: Vec<FetchedRecord>,
-    quiet: bool,
-    show_timestamp: bool,
+    options: EmitOptions,
     bytes: &mut u64,
 ) -> bool {
     for record in records {
         *bytes += (record.value.as_ref().map_or(0, |value| value.len())
             + record.key.as_ref().map_or(0, |key| key.len())) as u64;
-        if !quiet {
+        if !options.quiet {
             let key = record
                 .key
                 .map(|key| String::from_utf8_lossy(&key).into_owned())
@@ -2315,7 +2314,7 @@ fn emit_records(
             // verification scripts parse it positionally, and so does
             // anything a user has piped it into. Widening it by default
             // breaks every one of those silently.
-            let timestamp = if show_timestamp {
+            let timestamp = if options.show_timestamp {
                 format!(" timestamp={}", record.timestamp)
             } else {
                 String::new()
@@ -2328,7 +2327,7 @@ fn emit_records(
         }
         *printed += 1;
         *next = record.offset + 1;
-        if max.is_some_and(|max| *printed >= max) {
+        if options.max.is_some_and(|max| *printed >= max) {
             return true;
         }
     }

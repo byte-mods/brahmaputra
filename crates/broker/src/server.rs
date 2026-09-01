@@ -1,17 +1,18 @@
 //! The broker: TCP listener, per-connection tasks, and the partition-actor
 //! supervisor (Blueprint 02 §2).
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::io::IoSlice;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use brahmaputra_client::Transport;
 use brahmaputra_metadata::{
-    BrokerEpoch, ClusterMetadata, MetadataCache, NodeRole, PartitionMetadata,
+    BrokerEpoch, ClusterMetadata, MetadataCache, MetadataOffset, NodeRole, PartitionMetadata,
 };
 use brahmaputra_metrics::{names, MetricKey, Metrics};
 use brahmaputra_protocol::{decode_payload, encode_frame_prefix, FrameHeader};
@@ -46,6 +47,7 @@ const TASK_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// keep a batching client busy, bounded so one client cannot spawn
 /// unbounded work.
 const MAX_IN_FLIGHT_PER_CONNECTION: usize = 64;
+const TOPIC_EPOCH_FILE: &str = ".topic-epoch";
 
 #[derive(Default)]
 struct BrokerLifecycle {
@@ -193,6 +195,62 @@ fn is_disk_failure(error: &brahmaputra_storage::StorageError) -> bool {
     matches!(error, brahmaputra_storage::StorageError::Io(_))
 }
 
+/// Bind a local partition directory to one controller topic incarnation.
+///
+/// A topic name is reusable after deletion. Without a durable identity,
+/// recreating `orders-0` opens the old `orders-0` log and makes records the
+/// operator deleted visible again. The marker is synced before the log can
+/// be opened; a mismatch is resolved by discarding the stale incarnation.
+fn prepare_topic_incarnation(
+    dir: &std::path::Path,
+    expected: MetadataOffset,
+) -> Result<(), BrokerError> {
+    let marker = dir.join(TOPIC_EPOCH_FILE);
+    let current = match std::fs::read(&marker) {
+        Ok(bytes) if bytes.len() == 8 => Some(u64::from_be_bytes(
+            bytes.as_slice().try_into().expect("checked marker length"),
+        )),
+        Ok(_) => Some(u64::MAX),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if current == Some(expected) {
+        return Ok(());
+    }
+
+    // An unmarked directory predates topic-incarnation markers, so adopt it
+    // in place. Once a marker exists, however, every mismatch is decisive:
+    // the name now refers to different topic data. Never let a legacy
+    // (epoch-zero) metadata image replace a directory carrying a newer ID.
+    if expected == 0 && current.is_some() {
+        return Err(BrokerError::Meta(format!(
+            "topic epoch regressed for {}: marker={current:?}, metadata=0",
+            dir.display()
+        )));
+    }
+    if expected != 0 && current.is_some() {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::create_dir_all(dir)?;
+    }
+
+    // New assignments have no directory yet; legacy assignments already
+    // do. Creating it here is harmless for the latter and ensures the
+    // marker is always the first partition file written for the former.
+    std::fs::create_dir_all(dir)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&marker)?;
+    std::io::Write::write_all(&mut file, &expected.to_be_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn tls_acceptor(identity: &TlsIdentity) -> Result<TlsAcceptor, BrokerError> {
     Ok(TlsAcceptor::from(Arc::new(crate::tls::server_config(
         identity,
@@ -208,6 +266,14 @@ pub struct Broker {
     /// The log configuration each open partition was last told to use, so
     /// the maintenance tick can tell a real change from a no-op.
     applied_topic_configs: DashMap<(String, i32), LogConfig>,
+    /// Controller identity of each open topic-partition plus the metadata
+    /// offset that proved it existed. This distinguishes a deleted topic
+    /// from a later topic that happens to reuse its name.
+    topic_incarnations: DashMap<(String, i32), TopicIncarnation>,
+    /// Partitions whose actor is closing and directory is being removed.
+    /// Openers must wait: deleting a directory underneath the old actor can
+    /// turn a topic deletion into a false whole-disk failure.
+    draining_partitions: DashMap<(String, i32), ()>,
     partition_mutations: DashMap<(String, i32), Arc<AsyncMutex<()>>>,
     lifecycle: Mutex<BrokerLifecycle>,
     replication: ReplicationTracker,
@@ -226,7 +292,18 @@ pub struct Broker {
     internal_addr: Option<SocketAddr>,
     shutdown_tx: watch::Sender<bool>,
     local_broker_epoch: AtomicU64,
+    /// Whether the current epoch has a locally valid controller lease.
+    /// This is deliberately reversible: losing contact suspends the data
+    /// plane until conditional re-registration succeeds, while `fence()`
+    /// remains the irreversible response to a proven newer incarnation.
+    lease_active: AtomicBool,
     addr: SocketAddr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopicIncarnation {
+    topic_epoch: MetadataOffset,
+    observed_at: MetadataOffset,
 }
 
 /// A second data-plane listener, for traffic between brokers.
@@ -298,12 +375,15 @@ impl Broker {
         let internal_listener = internal.map(|(listener, acceptor, _)| (listener, acceptor));
         let (shutdown_tx, _) = watch::channel(false);
         let initial_broker_epoch = config.broker_epoch.unwrap_or(0);
+        let initial_lease_active = config.metadata_cache.is_none() || initial_broker_epoch != 0;
         let config_quota = config.quota;
         let broker = Broker {
             config,
             state,
             handles: DashMap::new(),
             applied_topic_configs: DashMap::new(),
+            topic_incarnations: DashMap::new(),
+            draining_partitions: DashMap::new(),
             partition_mutations: DashMap::new(),
             lifecycle: Mutex::new(BrokerLifecycle::default()),
             replication: ReplicationTracker::default(),
@@ -318,6 +398,7 @@ impl Broker {
             internal_addr,
             shutdown_tx,
             local_broker_epoch: AtomicU64::new(initial_broker_epoch),
+            lease_active: AtomicBool::new(initial_lease_active),
             addr,
         };
         let local_partitions = if let Some(cache) = broker.metadata_cache() {
@@ -395,6 +476,7 @@ impl Broker {
     /// immediately; [`Broker::run`] observes the signal, closes all tracked
     /// connections, and then drains partition actors before returning.
     pub fn fence(&self) {
+        self.lease_active.store(false, Ordering::Release);
         self.lifecycle.lock().expect("broker lifecycle").closing = true;
         self.shutdown_tx.send_replace(true);
         // If `run` has not claimed the listener yet, close it here. Otherwise
@@ -407,9 +489,12 @@ impl Broker {
         *self.shutdown_tx.borrow()
     }
 
-    /// Activate the controller-issued epoch for this process exactly once.
-    /// A different epoch means another incarnation has superseded this one;
-    /// this process fences itself instead of participating in epoch ping-pong.
+    /// Activate a controller-issued epoch.
+    ///
+    /// An active process may never change epochs: that proves a different
+    /// incarnation superseded it and is an irreversible fence. A process
+    /// that first suspended its expired local lease may accept the next
+    /// epoch returned by a *conditional* registration and resume safely.
     pub fn activate_broker_epoch(&self, broker_epoch: BrokerEpoch) -> Result<(), BrokerError> {
         if broker_epoch == 0 {
             return Err(BrokerError::Meta(
@@ -423,23 +508,32 @@ impl Broker {
                 current: broker_epoch,
             });
         }
-        match self.local_broker_epoch.compare_exchange(
-            0,
-            broker_epoch,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(()),
-            Err(current) if current == broker_epoch => Ok(()),
-            Err(current) => {
-                self.fence();
-                Err(BrokerError::FencedBrokerEpoch {
-                    broker_id: self.config.broker_id,
-                    requested: current,
-                    current: broker_epoch,
-                })
-            }
+        let current = self.local_broker_epoch.load(Ordering::Acquire);
+        if current != 0 && current != broker_epoch && self.lease_active.load(Ordering::Acquire) {
+            self.fence();
+            return Err(BrokerError::FencedBrokerEpoch {
+                broker_id: self.config.broker_id,
+                requested: current,
+                current: broker_epoch,
+            });
         }
+        self.local_broker_epoch
+            .store(broker_epoch, Ordering::Release);
+        self.lease_active.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Stop serving under an epoch whose lease could not be renewed, but
+    /// keep listeners and actors alive so this same process can
+    /// conditionally re-register after the controller quorum recovers.
+    pub fn suspend_broker_lease(&self) {
+        if self.metadata_cache().is_some() && !self.is_fenced() {
+            self.lease_active.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn is_lease_active(&self) -> bool {
+        self.lease_active.load(Ordering::Acquire)
     }
 
     pub fn local_broker_epoch(&self) -> BrokerEpoch {
@@ -447,9 +541,12 @@ impl Broker {
     }
 
     /// Validate the exact local broker incarnation against one immutable
-    /// controller image. Higher epochs and an explicit same-epoch controller
-    /// fence irreversibly stop this process. A missing/lower image merely
-    /// rejects traffic while local metadata catches up.
+    /// controller image. A *higher* epoch irreversibly stops this process:
+    /// something else holds this broker id. A same-epoch controller fence
+    /// suspends it instead — the controller fences whatever it has not heard
+    /// from, and silence during an election is not evidence of a
+    /// replacement. A missing/lower image merely rejects traffic while local
+    /// metadata catches up.
     pub fn validate_local_broker_epoch(&self, image: &ClusterMetadata) -> Result<(), BrokerError> {
         if self.metadata_cache().is_none() {
             return Ok(());
@@ -457,7 +554,9 @@ impl Broker {
         let requested = self.local_broker_epoch();
         let registered = image.brokers.get(&self.config.broker_id);
         let current = registered.map_or(0, |broker| broker.broker_epoch);
+        let lease_active = self.is_lease_active();
         let eligible = !self.is_fenced()
+            && lease_active
             && requested != 0
             && registered.is_some_and(|broker| {
                 broker.broker_epoch == requested
@@ -468,14 +567,21 @@ impl Broker {
             return Ok(());
         }
 
-        if requested != 0
-            && registered.is_some_and(|broker| {
-                broker.broker_epoch > requested
-                    || (broker.broker_epoch == requested
-                        && (!broker.alive || !broker.roles.contains(&NodeRole::Broker)))
-            })
-        {
-            self.fence();
+        if requested != 0 {
+            let superseded = registered.is_some_and(|broker| broker.broker_epoch > requested);
+            let fenced_in_place = lease_active
+                && registered.is_some_and(|broker| {
+                    broker.broker_epoch == requested
+                        && (!broker.alive || !broker.roles.contains(&NodeRole::Broker))
+                });
+            if superseded {
+                self.fence();
+            } else if fenced_in_place {
+                // Stop serving, but stay alive: the lifecycle re-registers
+                // conditionally, and the controller refuses that if this
+                // really has been replaced.
+                self.suspend_broker_lease();
+            }
         }
         Err(BrokerError::FencedBrokerEpoch {
             broker_id: self.config.broker_id,
@@ -589,7 +695,7 @@ impl Broker {
         }
     }
 
-    pub(crate) fn drain_unowned_partitions(&self, image: &ClusterMetadata) {
+    pub(crate) async fn drain_unowned_partitions(&self, image: &ClusterMetadata) {
         let local_id = self.config.broker_id;
         let registered = image
             .brokers
@@ -599,11 +705,20 @@ impl Broker {
             return;
         }
 
-        let owned: Vec<(String, i32)> = self
+        // Include incarnations whose actor was already stopped but whose
+        // directory could not be removed. That makes transient Windows
+        // sharing violations and filesystem failures retryable instead of
+        // leaking stale topic data forever.
+        let mut owned: BTreeSet<(String, i32)> = self
             .handles
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
+        owned.extend(
+            self.topic_incarnations
+                .iter()
+                .map(|entry| entry.key().clone()),
+        );
 
         for (topic_name, partition) in owned {
             // The offsets topic is coordinator state, not a reassignable
@@ -611,39 +726,81 @@ impl Broker {
             if topic_name == crate::group::OFFSETS_TOPIC {
                 continue;
             }
-            let Some(topic) = image.topics.get(&topic_name) else {
-                continue; // topic unknown to this image: not evidence
+            let opened = self
+                .topic_incarnations
+                .get(&(topic_name.clone(), partition))
+                .map(|entry| *entry.value());
+            let should_drain = match image.topics.get(&topic_name) {
+                Some(topic) => {
+                    let replaced = opened.is_some_and(|opened| {
+                        opened.topic_epoch != topic.topic_epoch
+                            && image.offset >= opened.observed_at
+                    });
+                    let no_longer_owned =
+                        topic.partitions.get(&partition).is_some_and(|assignment| {
+                            !assignment.is_reassigning() && !assignment.replicas.contains(&local_id)
+                        });
+                    replaced || no_longer_owned
+                }
+                None => opened.is_some_and(|opened| image.offset > opened.observed_at),
             };
-            let Some(assignment) = topic.partitions.get(&partition) else {
-                continue;
-            };
-            if assignment.is_reassigning() || assignment.replicas.contains(&local_id) {
+            if !should_drain {
                 continue;
             }
 
             // Close the actor before touching the directory: deleting files
             // out from under a running log would surface as corruption
             // rather than as a clean removal.
-            let Some((_, handle)) = self.handles.remove(&(topic_name.clone(), partition)) else {
-                continue;
+            let key = (topic_name.clone(), partition);
+            // `open_partition` holds the same short lifecycle mutex. Mark
+            // the key and remove its handle while holding it so an opener
+            // can be neither just-before nor halfway-through this handoff.
+            let handle = {
+                let _lifecycle = self.lifecycle.lock().expect("broker lifecycle");
+                self.draining_partitions.insert(key.clone(), ());
+                self.handles.remove(&key).map(|(_, handle)| handle)
             };
-            drop(handle);
-            let Some(dir) = self.log_dirs.existing(&topic_name, partition) else {
-                continue;
+            if let Some(handle) = handle {
+                handle.shutdown().await;
+            }
+            let removed = match self.log_dirs.existing(&topic_name, partition) {
+                Some(dir) => {
+                    tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir)).await
+                }
+                None => Ok(Ok(())),
             };
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => tracing::info!(
-                    topic = %topic_name,
-                    partition,
-                    "dropped local data for a partition this broker no longer replicates"
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => tracing::warn!(
-                    %error,
-                    topic = %topic_name,
-                    partition,
-                    "could not remove drained partition data"
-                ),
+            let deletion_succeeded = match removed {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        topic = %topic_name,
+                        partition,
+                        "dropped local data for a deleted, replaced, or unowned partition"
+                    );
+                    true
+                }
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        %error,
+                        topic = %topic_name,
+                        partition,
+                        "could not remove drained partition data; will retry"
+                    );
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        topic = %topic_name,
+                        partition,
+                        "partition deletion task failed; will retry"
+                    );
+                    false
+                }
+            };
+            if !deletion_succeeded {
+                self.draining_partitions.remove(&key);
+                continue;
             }
             // Release the placement too. If this partition is ever assigned
             // back to this broker it should be placed afresh — most likely
@@ -652,6 +809,24 @@ impl Broker {
             self.log_dirs.forget(&topic_name, partition);
             self.applied_topic_configs
                 .remove(&(topic_name.clone(), partition));
+            self.topic_incarnations
+                .remove(&(topic_name.clone(), partition));
+            self.partition_mutations
+                .remove(&(topic_name.clone(), partition));
+            self.draining_partitions.remove(&key);
+            let partition_label = partition.to_string();
+            let labels = [
+                ("topic", topic_name.as_str()),
+                ("partition", partition_label.as_str()),
+            ];
+            for name in [
+                names::LOG_START_OFFSET,
+                names::LOG_END_OFFSET,
+                names::HIGH_WATERMARK,
+                names::ISR_SIZE,
+            ] {
+                self.metrics().remove_matching(name, &labels);
+            }
         }
     }
     pub(crate) fn replication_tracker(&self) -> &ReplicationTracker {
@@ -1148,15 +1323,46 @@ impl Broker {
             ));
         }
         let key = (topic.to_owned(), partition);
+        if self.draining_partitions.contains_key(&key) {
+            return Err(BrokerError::ActorUnavailable(format!(
+                "topic {topic} partition {partition} is being replaced or removed"
+            )));
+        }
+        let image = self
+            .config
+            .metadata_cache
+            .as_ref()
+            .map(MetadataCache::snapshot);
+        let incarnation = image.as_ref().and_then(|image| {
+            image.topics.get(topic).map(|metadata| TopicIncarnation {
+                topic_epoch: metadata.topic_epoch,
+                observed_at: image.offset,
+            })
+        });
         match self.handles.entry(key) {
-            Entry::Occupied(e) => Ok(e.get().clone()),
+            Entry::Occupied(e) => {
+                if let Some(expected) = incarnation {
+                    let matches = self
+                        .topic_incarnations
+                        .get(&(topic.to_owned(), partition))
+                        .is_some_and(|opened| opened.topic_epoch == expected.topic_epoch);
+                    if !matches {
+                        return Err(BrokerError::ActorUnavailable(format!(
+                            "topic {topic} was deleted and recreated; waiting for stale local data to be removed"
+                        )));
+                    }
+                }
+                Ok(e.get().clone())
+            }
             Entry::Vacant(e) => {
                 let dir = self.log_dirs.resolve(topic, partition)?;
+                if let Some(expected) = incarnation {
+                    prepare_topic_incarnation(&dir, expected.topic_epoch)?;
+                }
                 actor::complete_pending_replica_reset(&dir)?;
                 // Broker defaults, overridden by whatever this topic sets.
                 // Reading them here is what makes `retention.ms` on a topic
                 // mean something rather than being stored and ignored.
-                let image = self.config.metadata_cache.as_ref().map(|c| c.snapshot());
                 let topic_configs = image
                     .as_ref()
                     .and_then(|image| image.topics.get(topic))
@@ -1228,6 +1434,10 @@ impl Broker {
                     (false, false) => actor::spawn(log, self.config.channel_capacity),
                 };
                 lifecycle.actor_tasks.push(task);
+                if let Some(incarnation) = incarnation {
+                    self.topic_incarnations
+                        .insert((topic.to_owned(), partition), incarnation);
+                }
                 debug!(topic, partition, "partition actor spawned");
                 Ok(e.insert(handle).clone())
             }
@@ -1951,6 +2161,7 @@ impl Broker {
 mod live_topic_config_tests {
     use super::*;
     use brahmaputra_metadata::MetadataCommand;
+    use brahmaputra_protocol::{Record, RecordBatch};
     use std::collections::BTreeMap;
 
     /// A topic config change has to reach a *running* partition.
@@ -1972,6 +2183,7 @@ mod live_topic_config_tests {
                 data_port: 9092,
                 control_port: 19092,
                 internal_port: 0,
+                expected_epoch: None,
                 roles: vec![NodeRole::Broker],
                 rack: None,
                 now_ms: 1,
@@ -2032,5 +2244,175 @@ mod live_topic_config_tests {
             .map(|entry| entry.value().clone())
             .expect("still tracked");
         assert_eq!(applied, again);
+    }
+
+    #[tokio::test]
+    async fn delete_and_recreate_never_reopens_the_deleted_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut image = ClusterMetadata::default();
+        image
+            .apply(MetadataCommand::RegisterBroker {
+                broker_id: 0,
+                host: "127.0.0.1".into(),
+                data_port: 9092,
+                control_port: 19092,
+                internal_port: 0,
+                expected_epoch: None,
+                roles: vec![NodeRole::Broker],
+                rack: None,
+                now_ms: 1,
+            })
+            .expect("register");
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "reused".into(),
+                partitions: 1,
+                replication_factor: 1,
+                configs: BTreeMap::new(),
+            })
+            .expect("create first incarnation");
+        let first_epoch = image.topics["reused"].topic_epoch;
+        let cache = MetadataCache::new(image.clone());
+        let broker = Broker::bind(BrokerConfig {
+            port: 0,
+            data_dirs: vec![dir.path().to_path_buf()],
+            default_partitions: 1,
+            metadata_cache: Some(cache.clone()),
+            ..BrokerConfig::default()
+        })
+        .await
+        .expect("bind");
+
+        let old = broker.open_partition("reused", 0).expect("open old log");
+        old.append(RecordBatch::new(
+            0,
+            0,
+            1_000,
+            vec![Record::new("must-disappear")],
+        ))
+        .await
+        .expect("append old record");
+        assert_eq!(old.offsets().await.unwrap(), (0, 1, 1));
+        let old_dir = broker
+            .log_dirs
+            .existing("reused", 0)
+            .expect("old directory");
+        let mutation_guard = broker.partition_mutation_guard("reused", 0).await;
+        drop(mutation_guard);
+
+        // Publish only the final image. Real caches can coalesce updates,
+        // so the broker may never observe the intermediate absent topic.
+        image
+            .apply(MetadataCommand::DeleteTopic {
+                name: "reused".into(),
+            })
+            .expect("delete");
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "reused".into(),
+                partitions: 1,
+                replication_factor: 1,
+                configs: BTreeMap::new(),
+            })
+            .expect("recreate");
+        assert_ne!(image.topics["reused"].topic_epoch, first_epoch);
+        cache.replace(image.clone());
+
+        assert!(matches!(
+            broker.open_partition("reused", 0),
+            Err(BrokerError::ActorUnavailable(_))
+        ));
+        broker.drain_unowned_partitions(&image).await;
+
+        assert!(!old_dir.exists(), "deleted incarnation remained on disk");
+        assert!(!broker.handles.contains_key(&("reused".into(), 0)));
+        assert!(!broker
+            .partition_mutations
+            .contains_key(&("reused".into(), 0)));
+
+        let fresh = broker
+            .open_partition("reused", 0)
+            .expect("open recreated log");
+        assert_eq!(
+            fresh.offsets().await.unwrap(),
+            (0, 0, 0),
+            "the recreated topic exposed offsets from its deleted incarnation"
+        );
+        assert!(fresh.read(0, usize::MAX).await.unwrap().batches.is_empty());
+        fresh.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_local_lease_can_resume_without_reviving_a_zombie() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut image = ClusterMetadata::default();
+        let first_epoch = match image
+            .apply(MetadataCommand::RegisterBroker {
+                broker_id: 0,
+                host: "127.0.0.1".into(),
+                data_port: 9092,
+                control_port: 19092,
+                internal_port: 0,
+                expected_epoch: None,
+                roles: vec![NodeRole::Broker, NodeRole::Controller],
+                rack: None,
+                now_ms: 1,
+            })
+            .unwrap()
+        {
+            brahmaputra_metadata::MetadataEvent::BrokerRegistered { broker_epoch, .. } => {
+                broker_epoch
+            }
+            event => panic!("unexpected event: {event:?}"),
+        };
+        let cache = MetadataCache::new(image.clone());
+        let broker = Broker::bind(BrokerConfig {
+            broker_id: 0,
+            broker_epoch: Some(first_epoch),
+            port: 0,
+            data_dirs: vec![dir.path().to_path_buf()],
+            metadata_cache: Some(cache.clone()),
+            ..BrokerConfig::default()
+        })
+        .await
+        .unwrap();
+        broker.validate_local_broker_lease().unwrap();
+
+        broker.suspend_broker_lease();
+        assert!(!broker.is_lease_active());
+        assert!(broker.validate_local_broker_lease().is_err());
+        assert!(!broker.is_fenced(), "contact loss must be reversible");
+
+        let second_epoch = match image
+            .apply(MetadataCommand::RegisterBroker {
+                broker_id: 0,
+                host: "127.0.0.1".into(),
+                data_port: 9092,
+                control_port: 19092,
+                internal_port: 0,
+                expected_epoch: Some(first_epoch),
+                roles: vec![NodeRole::Broker, NodeRole::Controller],
+                rack: None,
+                now_ms: 2,
+            })
+            .unwrap()
+        {
+            brahmaputra_metadata::MetadataEvent::BrokerRegistered { broker_epoch, .. } => {
+                broker_epoch
+            }
+            event => panic!("unexpected event: {event:?}"),
+        };
+        cache.replace(image);
+        broker.activate_broker_epoch(second_epoch).unwrap();
+        assert!(broker.is_lease_active());
+        broker.validate_local_broker_lease().unwrap();
+
+        assert!(broker
+            .activate_broker_epoch(second_epoch.saturating_add(1))
+            .is_err());
+        assert!(
+            broker.is_fenced(),
+            "an active epoch change still proves this is a zombie"
+        );
     }
 }

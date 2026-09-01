@@ -13,7 +13,9 @@
 //! the work is done, a quota can never corrupt or drop a record — it only
 //! ever costs latency.
 
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -71,6 +73,14 @@ impl QuotaConfig {
 /// The default ceiling on a single throttle, matching Kafka's
 /// `quota.window.size.seconds` order of magnitude.
 const DEFAULT_MAX_THROTTLE: Duration = Duration::from_secs(30);
+/// Hard ceiling on live accounting identities.
+///
+/// `client.id` is supplied by the peer, so an unbounded map lets one
+/// connection grow broker memory forever merely by rotating IDs. Keys are
+/// fixed-size hashes and the table is capped; eviction may grant a fresh
+/// one-second burst to a churned identity, but can never lose or corrupt a
+/// request.
+const MAX_QUOTA_BUCKETS: usize = 4_096;
 
 #[derive(Debug)]
 struct Bucket {
@@ -84,10 +94,9 @@ struct Bucket {
 /// Both halves of the identity, not just the client id: two tenants that
 /// happen to ship the same `client.id` — the default one their library
 /// picked, most likely — must not draw down each other's budget.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct BucketKey {
-    user: Option<String>,
-    client_id: String,
+    identity: u64,
     kind: QuotaKind,
 }
 
@@ -96,6 +105,7 @@ struct BucketKey {
 pub struct QuotaManager {
     config: QuotaConfig,
     buckets: Mutex<HashMap<BucketKey, Bucket>>,
+    identity_hasher: RandomState,
 }
 
 impl QuotaManager {
@@ -103,6 +113,7 @@ impl QuotaManager {
         QuotaManager {
             config,
             buckets: Mutex::new(HashMap::new()),
+            identity_hasher: RandomState::new(),
         }
     }
 
@@ -136,14 +147,28 @@ impl QuotaManager {
         if rate == 0 || bytes == 0 {
             return Duration::ZERO;
         }
+        // Store no attacker-controlled strings in this process-lifetime
+        // table. RandomState gives every broker a secret hash seed, so a
+        // peer cannot cheaply manufacture collisions between tenants.
         let key = BucketKey {
-            user: user.map(str::to_owned),
-            client_id: client_id.unwrap_or("").to_owned(),
+            identity: self
+                .identity_hasher
+                .hash_one((user, client_id.unwrap_or(""))),
             kind,
         };
         let now = Instant::now();
 
         let mut buckets = self.buckets.lock().expect("quota buckets");
+        if !buckets.contains_key(&key) && buckets.len() >= MAX_QUOTA_BUCKETS {
+            // An arbitrary victim keeps insertion O(1) under hostile ID
+            // churn. Exact LRU ordering would itself need unbounded or
+            // attacker-amplified bookkeeping; all buckets are equivalent
+            // for correctness and a re-created one merely regains its
+            // normal initial burst.
+            if let Some(victim) = buckets.keys().next().copied() {
+                buckets.remove(&victim);
+            }
+        }
         let bucket = buckets.entry(key).or_insert_with(|| Bucket {
             // Start with one second of credit so a first request is not
             // throttled for having arrived first.
@@ -251,6 +276,21 @@ mod tests {
         let manager = manager(1);
         let throttle = manager.throttle_for(None, Some("c"), QuotaKind::Produce, 1_000_000, None);
         assert_eq!(throttle, Duration::from_secs(5), "capped by max_throttle");
+    }
+
+    #[test]
+    fn rotating_untrusted_client_ids_cannot_grow_the_bucket_table_forever() {
+        let manager = manager(1_000);
+        for id in 0..(MAX_QUOTA_BUCKETS + 512) {
+            manager.throttle_for(
+                Some("tenant"),
+                Some(&format!("attacker-{id}")),
+                QuotaKind::Produce,
+                1,
+                None,
+            );
+        }
+        assert_eq!(manager.buckets.lock().unwrap().len(), MAX_QUOTA_BUCKETS);
     }
 }
 

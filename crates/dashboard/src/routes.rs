@@ -792,10 +792,7 @@ async fn delete_user(
 /// upgrade simply did nothing.
 async fn dashboard_page() -> Response {
     (
-        [(
-            header::CACHE_CONTROL,
-            "no-store, no-cache, must-revalidate",
-        )],
+        [(header::CACHE_CONTROL, "no-store, no-cache, must-revalidate")],
         Html(ui::INDEX_HTML),
     )
         .into_response()
