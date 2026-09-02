@@ -924,9 +924,14 @@ async fn read_partition_messages(
         if outcome.batches.is_empty() {
             break;
         }
+        let mut undecodable = false;
         for raw in outcome.batches {
             let mut bytes = raw;
             let Ok(batch) = RecordBatch::decode(&mut bytes) else {
+                // Nothing here can say how many records the batch held, so
+                // `offset` cannot move past it — and re-reading the same
+                // range would spin forever. Stop at what was readable.
+                undecodable = true;
                 break;
             };
             let base = batch.base_offset;
@@ -957,6 +962,9 @@ async fn read_partition_messages(
                     size_bytes,
                 });
             }
+        }
+        if undecodable {
+            break;
         }
     }
     out

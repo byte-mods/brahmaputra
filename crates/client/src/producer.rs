@@ -207,6 +207,16 @@ impl BufferBudget {
     }
 
     /// Release space a flush has taken ownership of, waking any waiters.
+    /// Take space back for records being returned to a buffer. Unlike
+    /// `reserve` this never waits: the records already passed admission
+    /// once, and blocking a flush on the budget it is trying to refill
+    /// would deadlock.
+    fn reclaim(&self, bytes: usize) {
+        if bytes != 0 {
+            self.used.fetch_add(bytes, Ordering::AcqRel);
+        }
+    }
+
     fn release(&self, bytes: usize) {
         if bytes == 0 {
             return;
@@ -390,14 +400,7 @@ impl Producer {
             timestamp_delta: 0,
             headers,
         };
-        let approx_size = record.value_len()
-            + record.key.as_ref().map_or(0, |k| k.len())
-            + record
-                .headers
-                .iter()
-                .map(|h| h.key.len() + h.value.as_ref().map_or(0, |v| v.len()) + 4)
-                .sum::<usize>()
-            + 16;
+        let approx_size = approx_record_size(&record);
         let created_ms = now_ms();
         // Admission control before the record enters a buffer: past this
         // point the producer owns it and the caller cannot take it back, so
@@ -585,9 +588,17 @@ impl Inner {
             guards.push(self.send_lock(topic, *partition).lock_owned().await);
         }
 
+        // Each partition's records stay with their waiters until the broker
+        // has answered for them: a retriable answer puts them back in the
+        // buffer rather than failing the caller, which is what the
+        // unbatched path's retry budget already does for a single batch.
+        struct Unit {
+            topic: String,
+            partition: i32,
+            records: Vec<BufferedRecord>,
+        }
         let mut payload: Vec<(ProduceMultiPartition, Vec<Bytes>)> = Vec::new();
-        let mut waiters: Vec<Vec<oneshot::Sender<Result<i64, ClientError>>>> = Vec::new();
-        let mut counts: Vec<Vec<usize>> = Vec::new();
+        let mut units: Vec<Unit> = Vec::new();
         {
             let mut buffers = self.buffers.lock().expect("buffers");
             for (topic, partition) in &partitions {
@@ -601,13 +612,11 @@ impl Inner {
                 // The records belong to this flush now, so the buffer space
                 // they occupied is free for new sends.
                 self.budget.release(taken.size);
-                let mut timestamped = Vec::with_capacity(taken.records.len());
-                let mut senders = Vec::with_capacity(taken.records.len());
-                for (record, created_ms, sender) in taken.records {
-                    timestamped.push((record, created_ms));
-                    senders.push(sender);
-                }
-                let count = timestamped.len();
+                let timestamped: Vec<(Record, i64)> = taken
+                    .records
+                    .iter()
+                    .map(|(record, created_ms, _)| (record.clone(), *created_ms))
+                    .collect();
                 let batch = RecordBatch::from_timestamped(0, 0, timestamped, now_ms())
                     .with_compression(self.config.compression);
                 payload.push((
@@ -618,19 +627,30 @@ impl Inner {
                     },
                     vec![batch.encode()],
                 ));
-                waiters.push(senders);
-                counts.push(vec![count]);
+                units.push(Unit {
+                    topic: topic.clone(),
+                    partition: *partition,
+                    records: taken.records,
+                });
             }
         }
         if payload.is_empty() {
             return;
         }
 
+        let fail_units = |units: Vec<Unit>, error: ClientError| {
+            for unit in units {
+                for (_, _, sender) in unit.records {
+                    let _ = sender.send(Err(clone_error(&error)));
+                }
+            }
+        };
+
         let body =
             match codec::encode_produce_multi(self.config.acks, self.config.timeout_ms, &payload) {
                 Ok(body) => body,
                 Err(error) => {
-                    fail_all(waiters, ClientError::Protocol(error));
+                    fail_units(units, ClientError::Protocol(error));
                     return;
                 }
             };
@@ -640,8 +660,8 @@ impl Inner {
                 .router
                 .send_address(address, ApiKey::ProduceMulti, &body)
                 .await;
-            for senders in waiters {
-                for sender in senders {
+            for unit in units {
+                for (_, _, sender) in unit.records {
                     let _ = sender.send(Ok(-1));
                 }
             }
@@ -656,7 +676,14 @@ impl Inner {
         {
             Ok(response) => response,
             Err(error) => {
-                fail_all(waiters, error);
+                // The broker may be gone or leadership may have moved; the
+                // send itself is unacknowledged either way. Refresh the
+                // route and let the next tick try again, until each
+                // record's delivery timeout says otherwise.
+                for unit in units {
+                    self.requeue_or_fail(unit.topic, unit.partition, unit.records, &error)
+                        .await;
+                }
                 drop(guards);
                 return;
             }
@@ -664,19 +691,19 @@ impl Inner {
         let decoded = match ProduceMultiResponse::decode(&response) {
             Ok(decoded) => decoded,
             Err(error) => {
-                fail_all(waiters, ClientError::Io(error));
+                fail_units(units, ClientError::Io(error));
                 drop(guards);
                 return;
             }
         };
 
         // Results come back in request order, so they line up with the
-        // waiters collected above.
-        for (index, senders) in waiters.into_iter().enumerate() {
+        // units collected above.
+        for (index, unit) in units.into_iter().enumerate() {
             let result = decoded.results.get(index);
             match result {
                 Some(result) if result.error_code == ec::NONE => {
-                    for (position, sender) in senders.into_iter().enumerate() {
+                    for (position, (_, _, sender)) in unit.records.into_iter().enumerate() {
                         let offset = if result.base_offset < 0 {
                             -1
                         } else {
@@ -689,19 +716,74 @@ impl Inner {
                     let error = ClientError::from_error_code(result.error_code)
                         .err()
                         .unwrap_or(ClientError::ConnectionClosed);
-                    for sender in senders {
-                        let _ = sender.send(Err(clone_error(&error)));
+                    if is_retriable_error_code(result.error_code) {
+                        self.requeue_or_fail(unit.topic, unit.partition, unit.records, &error)
+                            .await;
+                    } else {
+                        for (_, _, sender) in unit.records {
+                            let _ = sender.send(Err(clone_error(&error)));
+                        }
                     }
                 }
                 None => {
-                    for sender in senders {
-                        let _ = sender.send(Err(ClientError::ConnectionClosed));
-                    }
+                    self.requeue_or_fail(
+                        unit.topic,
+                        unit.partition,
+                        unit.records,
+                        &ClientError::ConnectionClosed,
+                    )
+                    .await;
                 }
             }
-            let _ = &counts;
         }
         drop(guards);
+    }
+
+    /// Put a partition's records back at the head of its buffer after a
+    /// retriable failure, failing only those whose delivery timeout has
+    /// passed. The route is refreshed first, because a stale leader is the
+    /// usual reason, and the retry backoff is paid here — while this
+    /// partition's send lock is still held, so nothing reorders around it.
+    async fn requeue_or_fail(
+        &self,
+        topic: String,
+        partition: i32,
+        records: Vec<BufferedRecord>,
+        error: &ClientError,
+    ) {
+        let _ = self.router.refresh_topic(&topic).await;
+        let now = now_ms();
+        let timeout = i64::try_from(self.config.delivery_timeout_ms).unwrap_or(i64::MAX);
+        let mut kept: Vec<BufferedRecord> = Vec::with_capacity(records.len());
+        let mut kept_size = 0;
+        for (record, created_ms, sender) in records {
+            if now.saturating_sub(created_ms) < timeout {
+                kept_size += approx_record_size(&record);
+                kept.push((record, created_ms, sender));
+            } else {
+                let _ = sender.send(Err(clone_error(error)));
+            }
+        }
+        if kept.is_empty() {
+            return;
+        }
+        debug!(
+            %topic,
+            partition,
+            requeued = kept.len(),
+            %error,
+            "retriable batched produce error; requeued for the next flush"
+        );
+        tokio::time::sleep(Duration::from_millis(self.config.retry_backoff_ms)).await;
+        self.budget.reclaim(kept_size);
+        let mut buffers = self.buffers.lock().expect("buffers");
+        let buffer = buffers
+            .entry((topic, partition))
+            .or_insert_with(Buffer::new);
+        // Ahead of anything sent since: these records were accepted first.
+        kept.append(&mut buffer.records);
+        buffer.records = kept;
+        buffer.size += kept_size;
     }
 
     fn send_lock(&self, topic: &str, partition: i32) -> PartitionSendLock {
@@ -1073,15 +1155,6 @@ mod tests {
     }
 }
 
-/// Fail every waiter of a batched flush with the same error.
-fn fail_all(waiters: Vec<Vec<oneshot::Sender<Result<i64, ClientError>>>>, error: ClientError) {
-    for senders in waiters {
-        for sender in senders {
-            let _ = sender.send(Err(clone_error(&error)));
-        }
-    }
-}
-
 /// `ClientError` is not `Clone` (it wraps `io::Error`), but every waiter of
 /// a failed batch needs the same failure. Reconstructing preserves the
 /// error code, which is what callers actually branch on.
@@ -1097,6 +1170,19 @@ fn clone_error(error: &ClientError) -> ClientError {
             message: other.to_string(),
         },
     }
+}
+
+/// What a record costs against `buffer.memory`: its bytes plus a small
+/// fixed overhead for the bookkeeping around it.
+fn approx_record_size(record: &Record) -> usize {
+    record.value_len()
+        + record.key.as_ref().map_or(0, |k| k.len())
+        + record
+            .headers
+            .iter()
+            .map(|h| h.key.len() + h.value.as_ref().map_or(0, |v| v.len()) + 4)
+            .sum::<usize>()
+        + 16
 }
 
 fn now_ms() -> i64 {

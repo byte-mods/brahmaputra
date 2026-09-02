@@ -85,10 +85,51 @@ open http://localhost:8080                              # dashboard
 | M12 | Tombstones and real compaction, transaction expiry, follower fetching, fetch sessions, SCRAM | ✅ complete |
 | M13 | Cluster-wide dashboard views, local hosting scripts, sole-replica recovery | ✅ complete |
 | M14 | Surviving a controller outage, topic incarnations, hostile-input decoding | ✅ complete |
+| M15 | Review release: transactions and groups under leader change, fetch-path race, hot-path costs | ✅ complete |
 
 Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
+
+### Upgrading to 0.7.0
+
+**No wire change and no on-disk format change**: the protocol stays at
+version 4 and a 0.6.0 client talks to a 0.7.0 broker. The high-watermark
+checkpoint file is folded back to its 8-byte prefix once it passes 64 KiB;
+either version reads the other's file. Upgrading is a restart.
+
+This is a review release: the code was read against the guarantees it
+claims, and what follows is what that found. Full detail is in the
+[changelog](CHANGELOG.md).
+
+**Transactions and consumer groups now survive a leader change.** Four
+separate holes closed: a transaction marker carried leader epoch 0 and was
+rejected by every follower after the partition's first failover, which
+knocked the follower out of the ISR for good; the group and transaction
+coordinators cached their state for the life of the process, so a broker
+that lost and regained a `__consumer_offsets` partition served offsets from
+before and rewound consumers; a transactional offset commit never reached
+live coordinator state and replay read it uncommitted, so an aborted commit
+could become a group's position; and compaction let a record from an
+aborted transaction supersede the committed value under the same key.
+Alongside them, a 0.6.0 regression: a deleted-and-recreated
+`__consumer_offsets` was never drained, so every group request on a broker
+that had opened it failed forever.
+
+**The fetch fallback no longer races on a shared file position.** On
+Windows, macOS and every buffered path, two concurrent readers of one
+segment could each get the other's bytes. Segment reads are positional now.
+
+**Client contracts.** A batched producer retries a moved leader instead of
+failing the caller until restart, and auto-commit no longer acknowledges
+the batch the application is still processing — it commits what stood at
+the previous `poll`, which is when that batch is known to be done.
+
+**Costs that scaled with the wrong thing.** A partition lookup no longer
+takes the broker-wide lifecycle mutex that was held across `Log::open`; a
+64 KiB fetch no longer reads and zero-fills a megabyte; `FetchMulti` waits
+on watermarks instead of re-reading every partition every 5 ms; and the
+high-watermark checkpoint stops growing forever.
 
 ### Upgrading to 0.6.0
 

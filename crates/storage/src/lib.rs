@@ -28,4 +28,5 @@ mod txn;
 pub use epoch::{LeaderEpochCheckpoint, LeaderEpochEntry};
 pub use error::StorageError;
 pub use log::{Log, LogConfig, LogRegion};
+pub use segment::read_exact_at;
 pub use txn::{AbortedTransaction, TransactionIndex};

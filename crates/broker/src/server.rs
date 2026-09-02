@@ -251,6 +251,35 @@ fn prepare_topic_incarnation(
     Ok(())
 }
 
+/// Bind an already-open partition directory to `expected` without touching
+/// its data: a matching or absent marker is adopted (and written), any
+/// other marker means the directory belongs to a different incarnation.
+fn adopt_topic_incarnation(
+    dir: &std::path::Path,
+    expected: MetadataOffset,
+) -> Result<bool, BrokerError> {
+    let marker = dir.join(TOPIC_EPOCH_FILE);
+    match std::fs::read(&marker) {
+        Ok(bytes) if bytes.len() == 8 => {
+            let current = u64::from_be_bytes(bytes.as_slice().try_into().expect("checked"));
+            Ok(current == expected)
+        }
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&marker)?;
+            std::io::Write::write_all(&mut file, &expected.to_be_bytes())?;
+            file.sync_all()?;
+            Ok(true)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn tls_acceptor(identity: &TlsIdentity) -> Result<TlsAcceptor, BrokerError> {
     Ok(TlsAcceptor::from(Arc::new(crate::tls::server_config(
         identity,
@@ -721,23 +750,53 @@ impl Broker {
         );
 
         for (topic_name, partition) in owned {
-            // The offsets topic is coordinator state, not a reassignable
-            // user partition; leave it alone.
-            if topic_name == crate::group::OFFSETS_TOPIC {
-                continue;
-            }
             let opened = self
                 .topic_incarnations
                 .get(&(topic_name.clone(), partition))
                 .map(|entry| *entry.value());
             let should_drain = match image.topics.get(&topic_name) {
                 Some(topic) => {
-                    let replaced = opened.is_some_and(|opened| {
-                        opened.topic_epoch != topic.topic_epoch
-                            && image.offset >= opened.observed_at
-                    });
-                    let no_longer_owned =
-                        topic.partitions.get(&partition).is_some_and(|assignment| {
+                    // An actor opened before the image named its topic —
+                    // the node that creates an internal topic opens it
+                    // straight away — has no incarnation on record, so a
+                    // later delete-and-recreate could never mark it
+                    // replaced and it stayed unusable for good. Settle it
+                    // now against the directory marker: a stranger is
+                    // drained, anything else is adopted as this incarnation.
+                    let unverified = opened.is_none();
+                    let stranger = unverified
+                        && match self.log_dirs.existing(&topic_name, partition) {
+                            Some(dir) => match adopt_topic_incarnation(&dir, topic.topic_epoch) {
+                                Ok(true) => {
+                                    self.topic_incarnations.insert(
+                                        (topic_name.clone(), partition),
+                                        TopicIncarnation {
+                                            topic_epoch: topic.topic_epoch,
+                                            observed_at: image.offset,
+                                        },
+                                    );
+                                    false
+                                }
+                                Ok(false) => true,
+                                Err(error) => {
+                                    tracing::warn!(%error, topic = %topic_name, partition, "could not verify a partition's topic incarnation");
+                                    false
+                                }
+                            },
+                            None => false,
+                        };
+                    let replaced = stranger
+                        || opened.is_some_and(|opened| {
+                            opened.topic_epoch != topic.topic_epoch
+                                && image.offset >= opened.observed_at
+                        });
+                    // The offsets topic is coordinator state, not a
+                    // reassignable user partition, so ownership never
+                    // drains it. A replaced incarnation still does: a
+                    // deleted-and-recreated `__consumer_offsets` that was
+                    // never drained refused every group request forever.
+                    let no_longer_owned = topic_name != crate::group::OFFSETS_TOPIC
+                        && topic.partitions.get(&partition).is_some_and(|assignment| {
                             !assignment.is_reassigning() && !assignment.replicas.contains(&local_id)
                         });
                     replaced || no_longer_owned
@@ -1316,6 +1375,33 @@ impl Broker {
     /// shutdown; the `DashMap` entry lock makes concurrent spawns for the
     /// same partition impossible.
     fn open_partition(&self, topic: &str, partition: i32) -> Result<PartitionHandle, BrokerError> {
+        // The common case is an actor that is already running, and it
+        // must not pay for the lifecycle mutex: that lock is held across
+        // `Log::open` — a recovery scan of the active segment — so one
+        // cold partition would otherwise stall every request on the
+        // broker. A read-only lookup is enough as long as the incarnation
+        // still matches the metadata and nothing is draining it.
+        let key = (topic.to_owned(), partition);
+        if let Some(handle) = self.handles.get(&key) {
+            if !self.draining_partitions.contains_key(&key) {
+                let current_epoch = self
+                    .config
+                    .metadata_cache
+                    .as_ref()
+                    .map(MetadataCache::snapshot)
+                    .and_then(|image| image.topics.get(topic).map(|meta| meta.topic_epoch));
+                let matches = match current_epoch {
+                    None => true,
+                    Some(expected) => self
+                        .topic_incarnations
+                        .get(&key)
+                        .is_some_and(|opened| opened.topic_epoch == expected),
+                };
+                if matches {
+                    return Ok(handle.clone());
+                }
+            }
+        }
         let mut lifecycle = self.lifecycle.lock().expect("broker lifecycle");
         if lifecycle.closing {
             return Err(BrokerError::ActorUnavailable(
@@ -1342,13 +1428,36 @@ impl Broker {
         match self.handles.entry(key) {
             Entry::Occupied(e) => {
                 if let Some(expected) = incarnation {
-                    let matches = self
+                    let recorded = self
                         .topic_incarnations
                         .get(&(topic.to_owned(), partition))
-                        .is_some_and(|opened| opened.topic_epoch == expected.topic_epoch);
+                        .map(|opened| opened.topic_epoch);
+                    let matches = match recorded {
+                        Some(epoch) => epoch == expected.topic_epoch,
+                        // Opened before the metadata named this topic — an
+                        // internal topic created on first use, or a replica
+                        // spawned from a lagging image. Nothing was recorded
+                        // to compare against, so ask the directory: its
+                        // marker is the durable answer, and an unmarked
+                        // directory is adopted exactly as it is on open.
+                        // Refusing here instead left the actor unusable
+                        // forever, since nothing would ever drain it.
+                        None => {
+                            let adopted = match self.log_dirs.existing(topic, partition) {
+                                Some(dir) => adopt_topic_incarnation(&dir, expected.topic_epoch)?,
+                                None => true,
+                            };
+                            if adopted {
+                                self.topic_incarnations
+                                    .insert((topic.to_owned(), partition), expected);
+                            }
+                            adopted
+                        }
+                    };
                     if !matches {
                         return Err(BrokerError::ActorUnavailable(format!(
-                            "topic {topic} was deleted and recreated; waiting for stale local data to be removed"
+                            "topic {topic} was deleted and recreated; waiting for stale local data to be removed (recorded={recorded:?}, expected={})",
+                            expected.topic_epoch
                         )));
                     }
                 }
@@ -1926,12 +2035,19 @@ async fn send_region_buffered<W>(writer: &mut W, region: &LogRegion) -> std::io:
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file: &std::fs::File = &region.file;
-    let mut buffer = vec![0u8; region.len];
-    file.seek(SeekFrom::Start(region.position))?;
-    file.read_exact(&mut buffer)?;
+    // Positional, and off the runtime: the segment handle is shared with
+    // the partition actor, so a seek here would race its reads (see
+    // `read_exact_at`), and a multi-megabyte read from a cold page cache
+    // would otherwise stall every connection on this worker thread.
+    let file = Arc::clone(&region.file);
+    let (position, len) = (region.position, region.len);
+    let buffer = tokio::task::spawn_blocking(move || {
+        let mut buffer = vec![0u8; len];
+        brahmaputra_storage::read_exact_at(&file, position, &mut buffer)?;
+        std::io::Result::Ok(buffer)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(error.to_string()))??;
     writer.write_all(&buffer).await
 }
 

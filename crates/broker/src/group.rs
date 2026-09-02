@@ -10,6 +10,7 @@
 //! leadership failover.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -193,23 +194,110 @@ enum LoadState {
 pub(crate) struct CoordinatorShard {
     partition: i32,
     handle: PartitionHandle,
-    leader_epoch: i32,
+    /// The partition's current leader epoch, stamped on every batch this
+    /// shard writes. Refreshed whenever the coordinator is looked up, since
+    /// an ISR change bumps the epoch without moving leadership.
+    leader_epoch: AtomicI32,
+    /// The handle's disruption count when this shard was created. If it
+    /// has moved since, the log changed underneath the shard — this broker
+    /// was a follower for a while, or truncated — and the in-memory state
+    /// is from before that. The shard is then discarded and rebuilt.
+    loaded_at_disruption: u64,
     groups: DashMap<String, Group>,
     /// (group, topic, partition) -> committed offset.
     offsets: DashMap<(String, String, i32), i64>,
+    /// Offsets written inside a transaction that has not been decided yet,
+    /// by producer id. They become committed offsets only when that
+    /// producer's commit marker lands on this partition, and are dropped
+    /// on its abort marker — which is the whole of exactly-once for a
+    /// read-process-write pipeline: the offsets advance if and only if the
+    /// output records do. Both replay and the live path go through here,
+    /// so an aborted commit can never become the group's position.
+    pending_transactional: Mutex<HashMap<i64, Vec<PendingOffset>>>,
     load: Mutex<LoadState>,
+}
+
+/// One transactional offset commit awaiting its marker.
+struct PendingOffset {
+    record_key: Option<Bytes>,
+    key: (String, String, i32),
+    offset: i64,
 }
 
 impl CoordinatorShard {
     fn new(partition: i32, handle: PartitionHandle, leader_epoch: i32) -> Self {
         CoordinatorShard {
             partition,
+            loaded_at_disruption: handle.disruptions(),
             handle,
-            leader_epoch,
+            leader_epoch: AtomicI32::new(leader_epoch),
             groups: DashMap::new(),
             offsets: DashMap::new(),
+            pending_transactional: Mutex::new(HashMap::new()),
             load: Mutex::new(LoadState::Unloaded),
         }
+    }
+
+    /// Park a transactional offset commit until its marker arrives.
+    fn stash_transactional(&self, producer_id: i64, pending: Vec<PendingOffset>) {
+        self.pending_transactional
+            .lock()
+            .expect("pending transactional offsets")
+            .entry(producer_id)
+            .or_default()
+            .extend(pending);
+    }
+
+    /// A marker for `producer_id` landed on this partition: apply what it
+    /// committed, or forget what it aborted.
+    fn resolve_transactional(
+        &self,
+        producer_id: i64,
+        committed: bool,
+        written: Option<&mut HashMap<Bytes, KeyTarget>>,
+    ) {
+        let pending = self
+            .pending_transactional
+            .lock()
+            .expect("pending transactional offsets")
+            .remove(&producer_id)
+            .unwrap_or_default();
+        if !committed {
+            return;
+        }
+        let mut written = written;
+        for entry in pending {
+            if let (Some(written), Some(record_key)) = (written.as_deref_mut(), entry.record_key) {
+                written.insert(record_key, KeyTarget::Offset(entry.key.clone()));
+            }
+            self.offsets.insert(entry.key, entry.offset);
+        }
+    }
+
+    /// Decode the offset commits in one transactional batch without
+    /// applying them.
+    fn pending_from_batch(batch: &RecordBatch) -> Vec<PendingOffset> {
+        let mut pending = Vec::new();
+        for record in &batch.records {
+            let Some(value) = record.value.as_ref() else {
+                continue;
+            };
+            let Some((&kind, payload)) = value.split_first() else {
+                continue;
+            };
+            if kind != KIND_OFFSET_COMMIT {
+                continue;
+            }
+            match OffsetCommitRecord::decode(payload) {
+                Ok(commit) => pending.push(PendingOffset {
+                    record_key: record.key.clone(),
+                    key: (commit.group_id, commit.topic, commit.partition),
+                    offset: commit.offset,
+                }),
+                Err(error) => warn!(%error, "skipping undecodable transactional offset commit"),
+            }
+        }
+        pending
     }
 
     fn is_loaded(&self) -> bool {
@@ -263,8 +351,34 @@ impl CoordinatorShard {
             for raw in &outcome.batches {
                 let mut buf = raw.clone();
                 let batch = RecordBatch::decode(&mut buf)?;
-                for record in &batch.records {
-                    self.apply_record(record, &mut written);
+                // Replay is a committed reader in all but name: a
+                // transactional commit counts only once its marker is seen,
+                // and an aborted one never counts. Reading uncommitted and
+                // resolving here — rather than asking the log for
+                // `read_committed` — is what lets a transaction still open
+                // at the end of replay be finished by its marker later.
+                if batch.control {
+                    if let (Some(producer), Some(marker)) = (
+                        batch.producer.as_ref(),
+                        brahmaputra_protocol::read_control_marker(&batch),
+                    ) {
+                        self.resolve_transactional(
+                            producer.producer_id,
+                            matches!(marker, brahmaputra_protocol::ControlMarker::Commit),
+                            Some(&mut written),
+                        );
+                    }
+                } else if batch.transactional {
+                    if let Some(producer) = batch.producer.as_ref() {
+                        self.stash_transactional(
+                            producer.producer_id,
+                            Self::pending_from_batch(&batch),
+                        );
+                    }
+                } else {
+                    for record in &batch.records {
+                        self.apply_record(record, &mut written);
+                    }
                 }
                 position = position.max(batch.next_offset());
                 advanced = true;
@@ -396,7 +510,7 @@ impl CoordinatorShard {
     ) -> Result<i64, BrokerError> {
         let batch = RecordBatch::new(
             0,
-            self.leader_epoch,
+            self.leader_epoch.load(Ordering::Acquire),
             now_ms(),
             records
                 .into_iter()
@@ -462,7 +576,19 @@ pub(crate) async fn commit_transactional_offsets(
         ));
     }
 
-    let mut batch = RecordBatch::new(0, shard.leader_epoch, now, records);
+    let pending = offsets
+        .iter()
+        .map(|entry| PendingOffset {
+            record_key: Some(
+                format!("{group_id}/{}/{}", entry.topic, entry.partition)
+                    .into_bytes()
+                    .into(),
+            ),
+            key: (group_id.to_owned(), entry.topic.clone(), entry.partition),
+            offset: entry.offset,
+        })
+        .collect();
+    let mut batch = RecordBatch::new(0, shard.leader_epoch.load(Ordering::Acquire), now, records);
     batch.producer = Some(brahmaputra_protocol::ProducerMetadata {
         producer_id,
         producer_epoch,
@@ -477,6 +603,9 @@ pub(crate) async fn commit_transactional_offsets(
         .append(batch)
         .await
         .map_err(|error| crate::handlers::code_of(&BrokerError::Storage(error)))?;
+    // Parked, not applied: `OffsetFetch` must keep answering the previous
+    // committed position until the transaction's marker decides this one.
+    shard.stash_transactional(producer_id, pending);
     Ok(())
 }
 
@@ -496,10 +625,49 @@ impl GroupCoordinator {
         handle: PartitionHandle,
         leader_epoch: i32,
     ) -> Arc<CoordinatorShard> {
-        self.shards
-            .entry(partition)
-            .or_insert_with(|| Arc::new(CoordinatorShard::new(partition, handle, leader_epoch)))
-            .clone()
+        // Serve the cached shard only while it is still the shard *for
+        // this log*: same actor, and no replicated append or truncation
+        // since it loaded. Otherwise this broker lost leadership in
+        // between, the log holds writes the cache never saw — offsets
+        // committed through another coordinator — and answering from it
+        // would rewind consumers. Rebuilding replays the log.
+        let mut entry = self.shards.entry(partition);
+        if let dashmap::mapref::entry::Entry::Occupied(ref mut occupied) = entry {
+            let existing = occupied.get();
+            if existing.handle.same_actor(&handle)
+                && existing.loaded_at_disruption == handle.disruptions()
+            {
+                existing.leader_epoch.store(leader_epoch, Ordering::Release);
+                return Arc::clone(existing);
+            }
+            debug!(
+                partition,
+                "coordinator shard is stale after a leadership change; rebuilding"
+            );
+        }
+        let fresh = Arc::new(CoordinatorShard::new(partition, handle, leader_epoch));
+        match entry {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                occupied.insert(Arc::clone(&fresh));
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(Arc::clone(&fresh));
+            }
+        }
+        fresh
+    }
+
+    /// A transaction marker was written to `__consumer_offsets-{partition}`
+    /// on this broker. Called by the marker writer after the append, so a
+    /// shard that has already loaded applies or drops the offsets it parked
+    /// for that producer; a shard that has not loaded yet will meet the
+    /// marker during replay instead.
+    pub(crate) fn resolve_transaction(&self, partition: i32, producer_id: i64, committed: bool) {
+        if let Some(shard) = self.shards.get(&partition) {
+            if shard.is_loaded() {
+                shard.resolve_transactional(producer_id, committed, None);
+            }
+        }
     }
 
     /// Ensure a shard has replayed its log before serving group traffic.

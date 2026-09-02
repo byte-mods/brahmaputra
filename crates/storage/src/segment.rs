@@ -1,7 +1,7 @@
 //! A single log segment: one `.log` file plus its `.index` / `.timeindex`.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,6 +40,46 @@ fn index_path(dir: &Path, base_offset: i64) -> PathBuf {
     dir.join(format!("{base_offset:020}.index"))
 }
 
+/// Fill `buf` from `position` without touching the file's cursor.
+///
+/// The segment's handle is shared: the partition actor reads through it,
+/// and every fetch that is answered from the file rather than by
+/// `sendfile` reads through a clone of the same `Arc<File>` on another
+/// task. A seek followed by a read is two syscalls with a shared cursor
+/// in between, so two readers interleave and each gets the other's bytes
+/// — a batch from the wrong offset, or an end-of-file in the middle of a
+/// segment. A positional read is one syscall with no cursor at all.
+pub fn read_exact_at(file: &File, position: u64, buf: &mut [u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, position)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut filled = 0;
+        while filled < buf.len() {
+            let read = file.seek_read(&mut buf[filled..], position + filled as u64)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            filled += read;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file: &File = file;
+        file.seek(SeekFrom::Start(position))?;
+        file.read_exact(buf)
+    }
+}
+
 fn timeindex_path(dir: &Path, base_offset: i64) -> PathBuf {
     dir.join(format!("{base_offset:020}.timeindex"))
 }
@@ -68,9 +108,7 @@ impl Segment {
     }
 
     pub fn read_at(&self, position: u64, buf: &mut [u8]) -> io::Result<()> {
-        let mut file: &File = &self.log_file;
-        file.seek(SeekFrom::Start(position))?;
-        file.read_exact(buf)
+        read_exact_at(&self.log_file, position, buf)
     }
 
     /// Append one already-encoded batch whose first record sits at
@@ -208,7 +246,13 @@ impl Segment {
     pub fn scan_max_timestamp(&self) -> Result<Option<i64>, StorageError> {
         let file_len = self.size;
         let mut position = self.index.entries().last().map_or(0, |e| e.position as u64);
-        let mut max_timestamp: Option<i64> = None;
+        // Timestamps are producer-assigned and need not be monotonic, so
+        // the segment's maximum can sit anywhere in it — not only in the
+        // tail past the last index entry. The time index already records
+        // the maximum seen at each of its entries; start from that, and
+        // scan only the stretch it does not cover.
+        let mut max_timestamp: Option<i64> =
+            self.timeindex.entries().iter().map(|e| e.timestamp).max();
         while let Some((header, batch_len)) = self.read_valid_batch(position, file_len)? {
             max_timestamp = Some(
                 max_timestamp.map_or(header.max_timestamp, |t: i64| t.max(header.max_timestamp)),

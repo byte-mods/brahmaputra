@@ -640,52 +640,69 @@ async fn read_all_partitions(
 }
 
 /// Wait until any requested partition has data or the deadline passes, then
-/// re-read. Polling rather than waking per partition keeps this simple; the
-/// wait is bounded by `max_wait_ms` either way.
+/// re-read everything through the same budgeted path as the first read.
+///
+/// The wait is on each partition's high-watermark watch rather than a
+/// timer: a thousand idle partitions cost nothing until one of them moves.
+/// Re-reading through `read_all_partitions` matters as much as the wait —
+/// it is what applies the per-partition allowance and the frame budget, so
+/// a burst arriving during the poll cannot produce a response larger than
+/// the client's decoder accepts.
 async fn long_poll(
     broker: &Broker,
     request: &FetchMultiRequest,
-    results: &mut [(FetchMultiResult, Vec<Bytes>)],
+    results: &mut Vec<(FetchMultiResult, Vec<Bytes>)>,
 ) -> u64 {
-    let isolation = IsolationLevel::from_wire(request.isolation_level);
     let deadline = tokio::time::Instant::now() + Duration::from_millis(request.max_wait_ms as u64);
-    let poll_interval = Duration::from_millis(5);
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(
-            poll_interval.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
-        )
-        .await;
-        let mut served = 0_u64;
-        for (index, descriptor) in request.partitions.iter().enumerate() {
-            let Ok(handle) = broker.partition(&descriptor.topic, descriptor.partition) else {
-                continue;
-            };
-            let Ok(outcome) = handle
-                .read_at(
-                    descriptor.fetch_offset,
-                    descriptor.max_bytes.max(0) as usize,
-                    isolation,
-                )
-                .await
-            else {
-                continue;
-            };
-            if outcome.batches.is_empty() {
-                continue;
+    // The rack-aware resolution, so a consumer redirected to a follower
+    // waits on that follower's watermark instead of never waking.
+    let mut watches: Vec<(usize, tokio::sync::watch::Receiver<i64>, i64)> = request
+        .partitions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, descriptor)| {
+            let handle = crate::handlers::consumer_partition(
+                broker,
+                &descriptor.topic,
+                descriptor.partition,
+                &request.rack,
+            )
+            .ok()?;
+            let watch = handle.watermark_watch();
+            Some((index, watch, descriptor.fetch_offset))
+        })
+        .collect();
+    if watches.is_empty() {
+        return 0;
+    }
+    loop {
+        // Anything already past its fetch offset was written between the
+        // first read and now; serve immediately rather than sleeping.
+        let ready = watches
+            .iter()
+            .any(|(_, watch, fetch_offset)| *watch.borrow() > *fetch_offset);
+        if !ready {
+            let wakeups = watches
+                .iter_mut()
+                .map(|(_, watch, _)| Box::pin(watch.changed()));
+            let woke =
+                tokio::time::timeout_at(deadline, futures::future::select_all(wakeups)).await;
+            match woke {
+                Ok((Ok(()), _, _)) => {}
+                // A closed watch means the partition actor went away;
+                // stop waiting and let the re-read report it.
+                Ok((Err(_), _, _)) => {}
+                Err(_) => return 0,
             }
-            served += outcome
-                .batches
-                .iter()
-                .map(|batch| batch.len() as u64)
-                .sum::<u64>();
-            results[index].0.error_code = ec::NONE;
-            results[index].0.high_watermark = outcome.high_watermark;
-            results[index].0.last_stable_offset = outcome.high_watermark;
-            results[index].1 = outcome.batches;
         }
+        let mut reread = Vec::with_capacity(results.len());
+        let served = read_all_partitions(broker, request, &mut reread).await;
         if served > 0 {
+            *results = reread;
             return served;
         }
+        if tokio::time::Instant::now() >= deadline {
+            return 0;
+        }
     }
-    0
 }

@@ -1025,7 +1025,12 @@ pub(crate) fn code_of(err: &BrokerError) -> i32 {
         BrokerError::RebalanceInProgress { .. } => ec::REBALANCE_IN_PROGRESS,
         BrokerError::CoordinatorLoadInProgress { .. } => ec::COORDINATOR_LOAD_IN_PROGRESS,
         BrokerError::LogDirOffline { .. } => ec::LOG_DIR_OFFLINE,
-        _ => ec::INTERNAL,
+        other => {
+            // Everything else reaches the client as a bare INTERNAL, which
+            // says nothing about the cause; the cause belongs in the log.
+            tracing::warn!(error = %other, "request failed with an internal error");
+            ec::INTERNAL
+        }
     }
 }
 

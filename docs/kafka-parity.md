@@ -412,6 +412,31 @@ equally, which is what preserves the ratios.
 Recorded because this document has drifted before, and a gap list that
 only ever grows is not being read against the code.
 
+### Closed in 0.7.0
+
+None of these were on the gap list. They were found by reading the code
+against §7's claims, and each is a claim that was not true under a leader
+change or on a platform without `sendfile`:
+
+- **Transactions at RF>1 did not survive a failover.** A control batch was
+  written with leader epoch 0; a follower that had seen epoch 1 rejected it
+  as non-monotonic and retried the same offset forever. §7's "leader-epoch
+  truncation" row was true for data batches only.
+- **A returning coordinator served state from before it left.** Group and
+  transaction shards were cached for the process lifetime; regaining a
+  `__consumer_offsets` partition rewound every consumer past the commits
+  the other coordinator had taken. Shards are now tied to the partition
+  actor's disruption count and rebuilt when the log moved without them.
+- **`read_committed` did not extend to the coordinator or the cleaner.**
+  Transactional offset commits were never applied live and were replayed
+  uncommitted; compaction let aborted records supersede committed values.
+  Both now resolve by marker, and the cleaner stops at the last stable
+  offset.
+- **The buffered fetch path raced on a shared file cursor** everywhere
+  `sendfile` is not used. Reads are positional now.
+- **Client:** a batched producer never refreshed a moved leader; auto-commit
+  was at-most-once for the batch in flight.
+
 ### Closed in 0.6.0
 
 - **A controller node that stays down no longer takes the surviving
@@ -693,7 +718,7 @@ half-present one is not.
 ## 10. Verification
 
 ```bash
-cargo test --workspace                    # 399
+cargo test --workspace                    # 405
 bash scripts/verify-m1.sh                 # 31  storage, protocol, SIGKILL recovery
 bash scripts/verify-m4.sh                 # 30  consumer groups across 5 nodes
 bash scripts/verify-m5.sh                 # 15  fsync, quotas, version negotiation

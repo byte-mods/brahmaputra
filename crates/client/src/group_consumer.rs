@@ -665,6 +665,13 @@ pub struct GroupConsumer {
     /// Next offset to *deliver* per partition — what gets committed. Only
     /// advances over records handed to the caller.
     positions: Positions,
+    /// The positions as they stood when the application last called
+    /// `poll`. Records handed out by a poll are only known to be processed
+    /// once the application comes back for more, so this — not
+    /// `positions` — is what the timer commits. Committing `positions`
+    /// would acknowledge the batch the application is still working on,
+    /// and a crash mid-batch would then never redeliver the rest of it.
+    committable: Positions,
     /// Next offset to *fetch* per partition. Runs ahead of `positions` by
     /// exactly the records sitting in `buffered`.
     fetch_positions: BTreeMap<TopicPartition, i64>,
@@ -718,6 +725,7 @@ impl GroupConsumer {
             subscribed: Vec::new(),
             membership: Arc::new(Mutex::new(Membership::default())),
             positions: Arc::new(Mutex::new(BTreeMap::new())),
+            committable: Arc::new(Mutex::new(BTreeMap::new())),
             fetch_positions: BTreeMap::new(),
             buffered: VecDeque::new(),
             rejoin: Arc::new(AtomicBool::new(false)),
@@ -889,6 +897,12 @@ impl GroupConsumer {
         if !self.is_joined() || self.rejoin.load(Ordering::Relaxed) {
             tracing::debug!(member = %self.membership.lock().expect("membership").member_id, "poll triggers (re)join");
             self.join().await?;
+        }
+        // Everything handed out before this call is now the application's
+        // acknowledged past; the auto-commit timer may commit up to here.
+        {
+            let positions = self.positions.lock().expect("positions");
+            *self.committable.lock().expect("committable positions") = positions.clone();
         }
 
         let deadline = Instant::now() + max_wait;
@@ -1360,7 +1374,7 @@ impl GroupConsumer {
         };
         let coordinator = self.coordinator.clone();
         let membership = Arc::clone(&self.membership);
-        let positions = Arc::clone(&self.positions);
+        let positions = Arc::clone(&self.committable);
         let rejoin = Arc::clone(&self.rejoin);
         self.auto_commit_task = Some(tokio::spawn(async move {
             loop {

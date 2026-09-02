@@ -1,5 +1,140 @@
 # Changelog
 
+## 0.7.0 — 2026-09-02
+
+A review release. The code was read against the guarantees it claims, and
+what follows is what that turned up: four ways a transaction or a consumer
+group could lose its state under a leader change, a file-position race on
+every platform without `sendfile`, two client contract breaks, and a set of
+hot-path costs that scaled with the wrong thing.
+
+**No wire change and no on-disk format change.** The protocol stays at
+version 4 and a 0.6.0 client talks to a 0.7.0 broker. The high-watermark
+checkpoint file is folded back to its 8-byte prefix once it grows past
+64 KiB; a file written by an older broker is read unchanged, and an older
+broker reads a folded one unchanged too.
+
+### Fixed
+
+- **Transaction markers no longer break replication after a leader
+  change.** A commit or abort control batch was encoded with leader epoch
+  0 while every other batch carried the partition's real epoch. A follower
+  that had recorded epoch 1 rejected the marker as non-monotonic, retried
+  the same offset forever, and fell out of the ISR — so every transactional
+  topic at RF>1 lost durability after its first failover. The marker now
+  carries the epoch of the assignment it was written under.
+
+- **Coordinator state is rebuilt when the log moved underneath it.** The
+  group and transaction coordinators cached a shard per partition for the
+  life of the process. A broker that lost and later regained a
+  `__consumer_offsets` partition served the offsets it remembered from
+  before — rewinding every consumer of those groups past everything
+  committed through the other coordinator in between — and stamped its
+  writes with the old leader epoch. Each partition actor now counts its
+  *disruptions* (batches replicated from a leader, truncations, resets); a
+  shard remembers the count it loaded at and is discarded and replayed
+  when it has moved. The stamped epoch is refreshed on every lookup.
+
+- **Transactional offset commits are decided by their marker, on both the
+  live path and replay.** `TxnOffsetCommit` appended the records and never
+  touched the shard, so `OffsetFetch` kept answering the previous position
+  until a restart; replay then read *uncommitted*, so an aborted commit
+  became the group's position after a failover. Commits are now parked per
+  producer and applied when that producer's commit marker lands on the
+  partition, or dropped on its abort marker — the marker writer tells the
+  coordinator directly, and replay resolves them the same way as it meets
+  the markers.
+
+- **Compaction no longer lets an aborted transaction win.** Pass one took
+  the newest record per key regardless of whether its transaction had
+  aborted, and the cleanable range was bounded by the high watermark rather
+  than the last stable offset. On `__consumer_offsets` an aborted
+  transactional commit could supersede — and delete — the committed one.
+  Aborted batches are now dropped by both passes, and nothing at or past
+  the last stable offset is cleaned. Pinned by tests.
+
+- **The fetch fallback no longer races on a shared file position.**
+  Everywhere `sendfile` is not used — Windows, macOS, and the buffered
+  paths — the response was produced by *seeking* a segment handle shared
+  with the partition actor and then reading it. Two readers interleaved,
+  and each got the other's bytes: a batch from the wrong offset, or an
+  end-of-file in the middle of a segment. Reproduced with eight threads in
+  under a millisecond. Every segment read is now positional, and the
+  fallback read runs off the runtime instead of stalling a worker thread.
+
+- **A batched producer retries a moved leader instead of failing the
+  caller.** The linger-driven multi-partition flush failed its waiters on
+  `NOT_LEADER_OR_FOLLOWER` or a transport error and never refreshed the
+  route, so a low-rate producer stayed broken after any leadership move
+  until it was restarted. Retriable failures now refresh the route, pay
+  the retry backoff, and put the records back at the head of their buffer;
+  only records past `delivery.timeout.ms` are failed.
+
+- **Auto-commit no longer acknowledges the batch still being processed.**
+  The timer committed the positions advanced when records were *handed
+  out*; a crash mid-batch left the unprocessed remainder never redelivered
+  — a gap, which this project asserts never happens. The timer now commits
+  the positions as they stood at the application's last `poll`, which is
+  when the previous batch is known to be done. Explicit `commit_sync`
+  still commits everything handed out.
+
+- **A deleted-and-recreated `__consumer_offsets` no longer refuses every
+  group request forever.** 0.6.0's topic incarnations refused an actor
+  whose recorded incarnation no longer matched the metadata and relied on
+  the drain pass to replace it — but the drain pass skipped the offsets
+  topic entirely, because coordinator state is not reassignable. The two
+  rules together made a recreated offsets topic permanently unusable on
+  every broker that had opened it, which is exactly what the consumer-group
+  suite does before its first group. Ownership still never drains the
+  offsets topic; a replaced incarnation now does. An actor opened before
+  the metadata named its topic — the creating node opens an internal topic
+  straight away — is settled against the directory marker instead of
+  being refused with nothing on record to compare against.
+
+- **The dashboard's message browser cannot spin forever.** An undecodable
+  batch broke the inner loop but not the outer one, and the offset never
+  advanced past it, so one bad batch turned a browse or a live tail into
+  a request that never returned and never stopped reading.
+
+- **A sealed segment's maximum timestamp is right after a restart.** Only
+  the tail past the last index entry was scanned, so a segment whose
+  newest timestamp sat earlier looked older than it was — and retention
+  could delete it early. The time index is consulted first.
+
+### Performance
+
+- **A partition lookup no longer takes the broker-wide lifecycle mutex.**
+  Every produce and fetch serialized on one `std::Mutex` that was also
+  held across `Log::open`, so one cold partition's recovery scan stalled
+  every request on the broker. A running actor is now found with a
+  read-only lookup and the same incarnation check.
+- **A fetch reads what it asked for.** The storage read loop treated its
+  1 MiB chunk size as a floor, so a 64 KiB fetch zero-filled and read a
+  megabyte; with a hundred partitions per poll that was a sixteen-fold
+  read and memory amplification. The chunk is now a cap.
+- **`FetchMulti` waits on watermarks instead of polling.** The long poll
+  re-read every partition every 5 ms (200,000 reads per second per idle
+  thousand-partition consumer), used the leader-only lookup so a
+  rack-redirected consumer never woke, and bypassed the frame budget so a
+  burst during the poll could exceed `max_frame_bytes` and kill the
+  connection. It now waits on each partition's high-watermark watch and
+  re-reads through the budgeted path.
+- **The high-watermark checkpoint no longer grows forever.** Every
+  advance appended 36 bytes and nothing ever removed one, so an active
+  partition added hundreds of kilobytes a day and read all of it on open.
+
+### Known, not yet fixed
+
+Recorded so the list does not only shrink: non-atomic checkpoint writes in
+`write_log_start` and the leader-epoch rewrite (truncate-then-write,
+remove-then-rename); no timeout on client requests or connects; transaction
+coordinator state updated read-modify-write without per-id serialization;
+`reconcile_metadata` scanning every follower entry per produce; the
+producer-state table re-reading the whole retained log on every retention
+tick; the controller persisting the full image JSON per write; the
+aborted-transaction index scanned linearly per `read_committed` fetch and
+never pruned on compacted topics.
+
 ## 0.6.0 — 2026-09-01
 
 The release that stops a controller outage from taking the cluster with it,

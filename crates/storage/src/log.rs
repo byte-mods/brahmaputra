@@ -252,12 +252,45 @@ impl HighWatermarkCheckpoint {
         self.pending.unwrap_or(self.high_watermark)
     }
 
+    /// Fold the journal back into its 8-byte prefix once it has grown
+    /// past this. Every record is 36 bytes and nothing ever removed one,
+    /// so an active partition grew this file by hundreds of kilobytes a
+    /// day and re-read all of it on every open.
+    const COMPACT_ABOVE_BYTES: usize = 64 * 1024;
+
+    /// Rewrite the file as a legacy prefix carrying the current high
+    /// watermark, atomically: written beside, synced, renamed over.
+    fn compact(&mut self) -> Result<(), StorageError> {
+        let temp = self.path.with_extension("hwm.tmp");
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temp)?;
+            file.write_all(&self.high_watermark.to_be_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&temp, &self.path)?;
+        if let Some(dir) = self.path.parent() {
+            sync_dir(dir)?;
+        }
+        // The chain restarts: the prefix is generation zero, and the next
+        // record is generation one on top of the prefix's watermark.
+        self.generation = 0;
+        self.valid_len = size_of::<i64>();
+        Ok(())
+    }
+
     fn append(
         &mut self,
         kind: HighWatermarkRecordKind,
         high_watermark: i64,
     ) -> Result<(), StorageError> {
         self.ensure_legacy_prefix()?;
+        if self.valid_len >= Self::COMPACT_ABOVE_BYTES {
+            self.compact()?;
+        }
         let generation = self
             .generation
             .checked_add(1)
@@ -844,7 +877,12 @@ impl Log {
                 // copying it again.
                 let want = (seg.size - position) as usize;
                 let budget = max_bytes.saturating_sub(total).max(BATCH_HEADER_LEN);
-                let want = want.min(budget.max(READ_CHUNK_BYTES.min(want)));
+                // Read up to the remaining budget, one chunk at a time. The
+                // chunk is a cap, not a floor: a 64 KiB fetch must not
+                // zero-fill and read a megabyte to satisfy it. A batch that
+                // runs past the chunk is read on its own below, so a batch
+                // larger than the budget still gets served.
+                let want = want.min(budget.min(READ_CHUNK_BYTES));
                 let mut buf = BytesMut::zeroed(want);
                 seg.read_at(position, &mut buf)?;
                 let mut chunk = buf.freeze();
@@ -862,25 +900,26 @@ impl Log {
                         break 'segments;
                     }
                     if total_len > chunk.len() {
-                        // The batch runs past what this chunk covers. A
-                        // fetch must return at least one batch even when it
-                        // exceeds the byte budget, or a consumer whose
-                        // records are larger than its `max_bytes` can never
-                        // advance — so read that one directly and stop.
-                        if out.is_empty() {
-                            let mut single = BytesMut::zeroed(total_len);
-                            seg.read_at(position, &mut single)?;
-                            let batch = single.freeze();
-                            let Ok(header) = brahmaputra_protocol::validate_batch_header(&batch)
-                            else {
-                                break 'segments;
-                            };
-                            position += total_len as u64;
-                            if base_offset + header.last_offset_delta as i64 >= offset {
-                                out.push(batch);
+                        // The batch runs past what this chunk covers. Read
+                        // it on its own: a fetch stops *after* the batch
+                        // that crosses its budget, and must return at least
+                        // one batch even when that batch alone exceeds the
+                        // budget, or a consumer whose records are larger
+                        // than its `max_bytes` could never advance.
+                        let mut single = BytesMut::zeroed(total_len);
+                        seg.read_at(position, &mut single)?;
+                        let batch = single.freeze();
+                        let Ok(header) = brahmaputra_protocol::validate_batch_header(&batch) else {
+                            break 'segments;
+                        };
+                        position += total_len as u64;
+                        advanced = true;
+                        if base_offset + header.last_offset_delta as i64 >= offset {
+                            total += total_len;
+                            out.push(batch);
+                            if total >= max_bytes {
                                 break 'segments;
                             }
-                            advanced = true;
                         }
                         break;
                     }
@@ -2358,6 +2397,31 @@ mod hwm_checkpoint_cadence_tests {
         assert_eq!(log.high_watermark(), 5);
     }
 
+    /// The journal is append-only, so without folding it back it grew by
+    /// 36 bytes per checkpoint for the life of the partition and was read
+    /// whole on every open. Past the threshold it collapses to its prefix,
+    /// and what it says survives a reopen.
+    #[test]
+    fn the_checkpoint_journal_is_folded_once_it_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join(HWM_FILE);
+        let advances = 2 * HighWatermarkCheckpoint::COMPACT_ABOVE_BYTES / HWM_RECORD_LEN;
+        {
+            let mut log = Log::open(dir.path(), config(0)).unwrap();
+            for value in 0..advances {
+                log.append(one_batch(value)).unwrap();
+                log.set_high_watermark(log.log_end_offset()).unwrap();
+            }
+            let written = fs::metadata(&checkpoint).unwrap().len() as usize;
+            assert!(
+                written < HighWatermarkCheckpoint::COMPACT_ABOVE_BYTES + HWM_RECORD_LEN,
+                "checkpoint grew to {written} bytes without being folded"
+            );
+        }
+        let log = Log::open(dir.path(), config(0)).unwrap();
+        assert_eq!(log.high_watermark(), advances as i64);
+    }
+
     /// A flush carries the watermark with it: once the data is durable
     /// there is no reason to leave the pointer to it behind.
     #[test]
@@ -2843,9 +2907,27 @@ impl Log {
         // it was deduplicated by an earlier pass — which is what keeps this
         // map proportional to what has arrived since, not to the log.
         let mut latest: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
+        // A batch from a transaction that aborted holds records a committed
+        // reader never saw and never will. They are neither the latest
+        // value for their key nor worth keeping, so both passes drop them
+        // — the same rule Kafka's cleaner applies.
+        let aborted = self
+            .transactions
+            .aborted_in_range(self.segments[0].base_offset, cleanable_end);
+        let is_aborted = |batch: &RecordBatch| -> bool {
+            let Some(producer) = batch.producer.as_ref() else {
+                return false;
+            };
+            batch.transactional
+                && aborted.iter().any(|txn| {
+                    txn.producer_id == producer.producer_id
+                        && txn.first_offset <= batch.base_offset
+                        && batch.base_offset <= txn.last_offset
+                })
+        };
         for index in 0..cleanable_segments {
             Self::for_each_batch(&self.segments[index], |_, batch| {
-                if batch.control {
+                if batch.control || is_aborted(&batch) {
                     return Ok(());
                 }
                 for (offset, record) in batch.iter() {
@@ -2892,6 +2974,13 @@ impl Log {
                     if let Err(e) = writer.push(batch.base_offset, &raw, batch.max_timestamp) {
                         error = Some(e);
                     }
+                    return Ok(());
+                }
+                if is_aborted(&batch) {
+                    // Counted as removed, or a pass that dropped nothing
+                    // else would be treated as a no-op and its output
+                    // discarded — with the aborted records still in place.
+                    outcome.records_removed += batch.records.len();
                     return Ok(());
                 }
                 let shape = BatchShape {
@@ -3034,7 +3123,12 @@ impl Log {
                 }
             }
         }
-        while count > 0 && self.segments[count].base_offset > self.high_watermark {
+        // Bounded by the last stable offset, not the high watermark: a
+        // record inside an open transaction is not yet a value at all, and
+        // letting it supersede the committed one would delete the value
+        // that is real for one that may be retracted.
+        let stable = self.last_stable_offset();
+        while count > 0 && self.segments[count].base_offset > stable {
             count -= 1;
         }
         if count == 0 {
@@ -3405,6 +3499,104 @@ mod compaction_tests {
             }
         }
         out
+    }
+
+    fn transactional_keyed(producer_id: i64, key: &str, value: &str) -> RecordBatch {
+        let mut batch = keyed(key, value);
+        batch.producer = Some(brahmaputra_protocol::ProducerMetadata {
+            producer_id,
+            producer_epoch: 0,
+            base_sequence: 0,
+        });
+        batch.transactional = true;
+        batch
+    }
+
+    fn marker(producer_id: i64, marker: brahmaputra_protocol::ControlMarker) -> RecordBatch {
+        brahmaputra_protocol::control_batch(
+            brahmaputra_protocol::ProducerMetadata {
+                producer_id,
+                producer_epoch: 0,
+                base_sequence: 0,
+            },
+            marker,
+            1,
+        )
+    }
+
+    /// A value written inside a transaction that aborted was never a value
+    /// at all. It must neither supersede the committed one nor survive —
+    /// on `__consumer_offsets` that is the difference between a group
+    /// keeping its committed position and losing it to an aborted commit.
+    #[test]
+    fn aborted_transactional_records_neither_supersede_nor_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        log.append(keyed("group", "committed-100")).unwrap();
+        for filler in 0..8 {
+            log.append(keyed(&format!("pad-{filler}"), "x")).unwrap();
+        }
+        // A transactional write of the same key, then its abort marker.
+        log.append_producer_batch(&transactional_keyed(7, "group", "aborted-200").encode(), 0)
+            .unwrap();
+        log.append_producer_batch(
+            &marker(7, brahmaputra_protocol::ControlMarker::Abort).encode(),
+            0,
+        )
+        .unwrap();
+        for filler in 0..8 {
+            log.append(keyed(&format!("tail-{filler}"), "y")).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        assert!(!log.has_ongoing_transactions());
+
+        log.compact().unwrap();
+
+        let values: Vec<String> = read_all(&log)
+            .into_iter()
+            .filter(|(_, key, _)| key.as_deref() == Some(b"group".as_slice()))
+            .map(|(_, _, value)| String::from_utf8(value.unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec!["committed-100".to_string()],
+            "the committed value must survive and the aborted one must not"
+        );
+    }
+
+    /// A record inside a transaction still open is not decided, so the
+    /// range it starts is not cleanable yet: the committed value must not
+    /// be removed in favour of one that may be retracted.
+    #[test]
+    fn an_open_transaction_bounds_what_compaction_may_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), config()).unwrap();
+        log.append(keyed("group", "committed-100")).unwrap();
+        for filler in 0..8 {
+            log.append(keyed(&format!("pad-{filler}"), "x")).unwrap();
+        }
+        log.append_producer_batch(
+            &transactional_keyed(9, "group", "undecided-200").encode(),
+            0,
+        )
+        .unwrap();
+        for filler in 0..8 {
+            log.append(keyed(&format!("tail-{filler}"), "y")).unwrap();
+        }
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        assert!(log.has_ongoing_transactions());
+
+        log.compact().unwrap();
+
+        let values: Vec<String> = read_all(&log)
+            .into_iter()
+            .filter(|(_, key, _)| key.as_deref() == Some(b"group".as_slice()))
+            .map(|(_, _, value)| String::from_utf8(value.unwrap()).unwrap())
+            .collect();
+        assert!(
+            values.contains(&"committed-100".to_string()),
+            "the committed value was removed while its successor was undecided: {values:?}"
+        );
     }
 
     /// The point of compaction: repeated writes to one key stop

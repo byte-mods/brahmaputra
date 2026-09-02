@@ -8,6 +8,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::future::pending;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use brahmaputra_protocol::{validate_batch_header, BatchHeader, ProducerMetadata, RecordBatch};
@@ -426,9 +428,25 @@ pub struct PartitionHandle {
     /// `acks=all` the watermark cannot advance until that follower has
     /// fetched — waiting on the watermark would deadlock against itself.
     appends: watch::Receiver<i64>,
+    /// How many times this replica has had its log changed by something
+    /// other than a local leader append: a batch replicated from a leader,
+    /// or a truncation on becoming a follower. Anything that caches state
+    /// derived from the log — a coordinator shard — compares this against
+    /// the value it loaded at, because a change means the state on disk
+    /// moved without going through the cache.
+    disruptions: Arc<AtomicU64>,
 }
 
 impl PartitionHandle {
+    pub(crate) fn disruptions(&self) -> u64 {
+        self.disruptions.load(Ordering::Acquire)
+    }
+
+    /// Whether two handles drive the same actor.
+    pub(crate) fn same_actor(&self, other: &PartitionHandle) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+
     pub(crate) async fn shutdown(&self) {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Cmd::Shutdown { reply }).await.is_ok() {
@@ -808,6 +826,7 @@ fn spawn_mode(
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         interval
     });
+    let disruptions = Arc::new(AtomicU64::new(0));
     let task = tokio::spawn(run(
         log,
         rx,
@@ -816,17 +835,23 @@ fn spawn_mode(
         retention_tick,
         auto_commit,
         reset_context,
+        Arc::clone(&disruptions),
     ));
     (
         PartitionHandle {
             tx,
             watermark: wm_rx,
             appends: append_rx,
+            disruptions,
         },
         task,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+// Eight parameters because the actor is wired to exactly these signals
+// — its log, its mailbox, the two watches it publishes, its timers and the
+// disruption counter — and a struct would only move the list.
 async fn run(
     log: Log,
     mut rx: mpsc::Receiver<Cmd>,
@@ -835,6 +860,7 @@ async fn run(
     mut retention_tick: Option<Interval>,
     auto_commit: bool,
     reset_context: Option<ResetContext>,
+    disruptions: Arc<AtomicU64>,
 ) {
     let mut log = Some(log);
     let mut producer_state = match ProducerStateTable::rebuild(log.as_ref().expect("partition log"))
@@ -1109,6 +1135,9 @@ async fn run(
                     producer_state.observe_replicated(&header);
                     Ok(base)
                 })();
+                if result.is_ok() {
+                    disruptions.fetch_add(1, Ordering::AcqRel);
+                }
                 trace!(?result, "replica append");
                 let _ = reply.send(result);
             }
@@ -1162,6 +1191,7 @@ async fn run(
                     producer_state = ProducerStateTable::rebuild(current)?;
                     Ok(truncated)
                 });
+                disruptions.fetch_add(1, Ordering::AcqRel);
                 trace!(?result, "replica truncate");
                 let _ = reply.send(result);
             }
@@ -1188,6 +1218,7 @@ async fn run(
                             drop(old);
                             match reset_partition_log(context, offset) {
                                 Ok(reopened) => {
+                                    disruptions.fetch_add(1, Ordering::AcqRel);
                                     log = Some(reopened);
                                     producer_state = ProducerStateTable::default();
                                     let _ = watermark.send(offset);

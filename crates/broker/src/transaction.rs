@@ -48,6 +48,7 @@
 //! half-marked transaction went.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -210,7 +211,11 @@ enum LoadState {
 pub(crate) struct TransactionShard {
     partition: i32,
     handle: crate::actor::PartitionHandle,
-    leader_epoch: i32,
+    /// See [`crate::group::CoordinatorShard`]: refreshed on lookup.
+    leader_epoch: AtomicI32,
+    /// The handle's disruption count at creation; a change means the log
+    /// moved without this shard, and the shard is rebuilt.
+    loaded_at_disruption: u64,
     transactions: DashMap<String, TransactionMetadata>,
     load: Mutex<LoadState>,
 }
@@ -219,8 +224,9 @@ impl TransactionShard {
     fn new(partition: i32, handle: crate::actor::PartitionHandle, leader_epoch: i32) -> Self {
         TransactionShard {
             partition,
+            loaded_at_disruption: handle.disruptions(),
             handle,
-            leader_epoch,
+            leader_epoch: AtomicI32::new(leader_epoch),
             transactions: DashMap::new(),
             load: Mutex::new(LoadState::Unloaded),
         }
@@ -324,7 +330,7 @@ impl TransactionShard {
         );
         let batch = RecordBatch::new(
             0,
-            self.leader_epoch,
+            self.leader_epoch.load(Ordering::Acquire),
             now_ms(),
             vec![Record::with_key(
                 metadata.transactional_id.clone().into_bytes(),
@@ -339,7 +345,7 @@ impl TransactionShard {
     async fn persist_tombstone(&self, transactional_id: &str) -> Result<i64, BrokerError> {
         let batch = RecordBatch::new(
             0,
-            self.leader_epoch,
+            self.leader_epoch.load(Ordering::Acquire),
             now_ms(),
             vec![Record::tombstone(
                 transactional_id.to_owned().into_bytes(),
@@ -375,10 +381,30 @@ impl TransactionCoordinator {
         handle: crate::actor::PartitionHandle,
         leader_epoch: i32,
     ) -> Arc<TransactionShard> {
-        self.shards
-            .entry(partition)
-            .or_insert_with(|| Arc::new(TransactionShard::new(partition, handle, leader_epoch)))
-            .clone()
+        let mut entry = self.shards.entry(partition);
+        if let dashmap::mapref::entry::Entry::Occupied(ref mut occupied) = entry {
+            let existing = occupied.get();
+            if existing.handle.same_actor(&handle)
+                && existing.loaded_at_disruption == handle.disruptions()
+            {
+                existing.leader_epoch.store(leader_epoch, Ordering::Release);
+                return Arc::clone(existing);
+            }
+            debug!(
+                partition,
+                "transaction shard is stale after a leadership change; rebuilding"
+            );
+        }
+        let fresh = Arc::new(TransactionShard::new(partition, handle, leader_epoch));
+        match entry {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                occupied.insert(Arc::clone(&fresh));
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(Arc::clone(&fresh));
+            }
+        }
+        fresh
     }
 }
 
@@ -1055,7 +1081,7 @@ pub(crate) async fn append_marker(
     committed: bool,
 ) -> Result<(), BrokerError> {
     let handle = broker.partition(topic, partition)?;
-    let marker = brahmaputra_protocol::control_batch(
+    let mut marker = brahmaputra_protocol::control_batch(
         brahmaputra_protocol::ProducerMetadata {
             producer_id,
             producer_epoch,
@@ -1088,6 +1114,13 @@ pub(crate) async fn append_marker(
         }
         None => None,
     };
+    // A marker is replicated like any other batch, and a follower checks
+    // every batch's leader epoch against its checkpoint. Left at zero it
+    // is rejected as non-monotonic after the partition's first leader
+    // change, and the follower retries the same offset forever.
+    if let Some(assignment) = assignment.as_ref() {
+        marker.leader_epoch = assignment.leader_epoch;
+    }
     let guard = if assignment.is_some() {
         Some(broker.partition_mutation_guard(topic, partition).await)
     } else {
@@ -1101,6 +1134,14 @@ pub(crate) async fn append_marker(
             .await?;
     }
     drop(guard);
+    // The group coordinator parks transactional offset commits until this
+    // marker; it is the same broker, because a marker is only ever written
+    // by the partition's leader and the leader is the coordinator.
+    if topic == crate::group::OFFSETS_TOPIC {
+        broker
+            .groups()
+            .resolve_transaction(partition, producer_id, committed);
+    }
     Ok(())
 }
 
