@@ -1,0 +1,8 @@
+stage,exit_code
+format,0
+workspace,0
+clippy,0
+debug-build,0
+release-build,0
+linux-workspace-and-m3,0
+benchmarks,1

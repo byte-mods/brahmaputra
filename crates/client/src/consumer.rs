@@ -375,12 +375,14 @@ impl Consumer {
         requests: &[(String, i32, i64)],
         max_wait_ms: i32,
     ) -> Result<Vec<(String, i32, Vec<FetchedRecord>)>, ClientError> {
-        Ok(self
-            .fetch_many(requests, max_wait_ms)
+        self.fetch_many(requests, max_wait_ms)
             .await?
             .into_iter()
-            .map(|fetched| (fetched.topic, fetched.partition, fetched.records))
-            .collect())
+            .map(|fetched| {
+                ClientError::from_error_code(fetched.error_code)?;
+                Ok((fetched.topic, fetched.partition, fetched.records))
+            })
+            .collect()
     }
 
     pub(crate) async fn fetch_many(
@@ -473,7 +475,7 @@ impl Consumer {
             // A session the broker no longer has — evicted, or lost with a
             // restart — costs one round trip, never a stalled consumer:
             // forget it and ask again in full.
-            if decoded.error_code != ec::NONE {
+            if decoded.error_code == ec::FETCH_SESSION_NOT_FOUND {
                 self.forget_session(address);
                 let retry = FetchMultiRequest {
                     max_wait_ms: max_wait_ms.min(self.max_wait_ms),
@@ -493,6 +495,7 @@ impl Consumer {
                 (decoded, batches) =
                     codec::decode_fetch_multi_response(response).map_err(ClientError::Protocol)?;
             }
+            ClientError::from_error_code(decoded.error_code)?;
             self.note_session(address, &decoded, &descriptors);
 
             for (result, raw_batches) in decoded.results.iter().zip(batches) {
@@ -595,8 +598,8 @@ pub(crate) const INITIAL_SESSION_EPOCH: i32 = 0;
 struct FetchSessionState {
     session_id: i32,
     session_epoch: i32,
-    /// Fetch offset per partition, as last sent to this broker.
-    sent: HashMap<(String, i32), i64>,
+    /// Fetch offset and byte budget per partition, as last sent to this broker.
+    sent: HashMap<(String, i32), (i64, i32)>,
 }
 
 impl Consumer {
@@ -626,7 +629,9 @@ impl Consumer {
                 state
                     .sent
                     .get(&(descriptor.topic.clone(), descriptor.partition))
-                    .is_none_or(|offset| *offset != descriptor.fetch_offset)
+                    .is_none_or(|previous| {
+                        *previous != (descriptor.fetch_offset, descriptor.max_bytes)
+                    })
             })
             .cloned()
             .collect();
@@ -673,7 +678,7 @@ impl Consumer {
         for descriptor in descriptors {
             state.sent.insert(
                 (descriptor.topic.clone(), descriptor.partition),
-                descriptor.fetch_offset,
+                (descriptor.fetch_offset, descriptor.max_bytes),
             );
         }
     }

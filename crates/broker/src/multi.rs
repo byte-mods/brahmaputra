@@ -416,7 +416,7 @@ pub(crate) async fn fetch_multi(
     // Resolve the incremental fetch session (KIP-227) before anything
     // reads a partition: what the client sent is a *delta*, and every path
     // below wants the full set the session stands for.
-    let (session, request) = match resolve_session(broker, request) {
+    let (session, request) = match resolve_session(broker, request, client.principal) {
         Ok(resolved) => resolved,
         Err(session) => {
             // The session is unknown or out of step. Answering with no
@@ -428,6 +428,20 @@ pub(crate) async fn fetch_multi(
                 .into();
         }
     };
+
+    // Session descriptors are restored after dispatch authorization. ACLs
+    // can also change between polls, so authorize every restored topic.
+    for partition in &request.partitions {
+        if let Err(code) = crate::handlers::authorize_principal(
+            broker,
+            client.principal,
+            brahmaputra_metadata::ResourceType::Topic,
+            &partition.topic,
+            brahmaputra_metadata::AclOperation::Read,
+        ) {
+            return encode_error_for(ApiKey::FetchMulti, code).into();
+        }
+    }
 
     let isolation = IsolationLevel::from_wire(request.isolation_level);
     // The fast path: hand the socket file ranges and let the kernel move
@@ -483,6 +497,7 @@ pub(crate) async fn fetch_multi(
 fn resolve_session(
     broker: &Broker,
     request: FetchMultiRequest,
+    principal: Option<&str>,
 ) -> Result<(codec::FetchSessionInfo, FetchMultiRequest), codec::FetchSessionInfo> {
     let updates: Vec<(String, i32, i64, i32)> = request
         .partitions
@@ -502,7 +517,8 @@ fn resolve_session(
         .map(|partition| (partition.topic.clone(), partition.partition))
         .collect();
 
-    match broker.fetch_sessions().resolve(
+    match broker.fetch_sessions().resolve_owned(
+        principal,
         request.session_id,
         request.session_epoch,
         &updates,

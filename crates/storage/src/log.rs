@@ -1007,51 +1007,55 @@ impl Log {
         offset: i64,
         max_bytes: usize,
     ) -> Result<Vec<Bytes>, StorageError> {
+        if offset < self.start_offset {
+            return Err(StorageError::OffsetOutOfRange {
+                offset,
+                start: self.start_offset,
+                end: self.next_offset,
+            });
+        }
         let stable = self.last_stable_offset();
         if offset >= stable {
             // Nothing is readable yet even though the log may hold more:
             // the records past here are undecided.
-            if offset < self.start_offset {
-                return Err(StorageError::OffsetOutOfRange {
-                    offset,
-                    start: self.start_offset,
-                    end: self.next_offset,
-                });
-            }
             return Ok(Vec::new());
         }
 
-        let raw = self.read(offset, max_bytes)?;
-        if raw.is_empty() {
-            return Ok(raw);
-        }
         let aborted = self.transactions.aborted_in_range(offset, self.next_offset);
-        let mut kept = Vec::with_capacity(raw.len());
-        for batch in raw {
-            let Ok(header) = validate_batch_header(&batch) else {
-                // The read path already validates; a batch that fails here
-                // is not one to hand a consumer.
+        let mut kept = Vec::new();
+        let mut cursor = offset;
+        let mut bytes = 0;
+        // The budget applies to visible bytes. Stopping after a window of
+        // aborted/control batches returns empty forever to a consumer that
+        // advances its offset only when it receives records.
+        while cursor < stable && bytes < max_bytes {
+            let raw = self.read(cursor, max_bytes - bytes)?;
+            if raw.is_empty() {
                 break;
-            };
-            // Never past the stable point, whatever the byte budget said.
-            if header.base_offset >= stable {
-                break;
             }
-            if header.control {
-                continue;
+            for batch in raw {
+                let header = validate_batch_header(&batch)?;
+                cursor = header.base_offset + i64::from(header.last_offset_delta) + 1;
+                // A batch is visible only if every record is stable.
+                if cursor > stable {
+                    return Ok(kept);
+                }
+                if header.control {
+                    continue;
+                }
+                let discarded = header.transactional
+                    && header.producer_id().is_some_and(|producer_id| {
+                        aborted.iter().any(|txn| {
+                            txn.producer_id == producer_id
+                                && header.base_offset >= txn.first_offset
+                                && header.base_offset <= txn.last_offset
+                        })
+                    });
+                if !discarded {
+                    bytes += batch.len();
+                    kept.push(batch);
+                }
             }
-            let discarded = header.transactional
-                && header.producer_id().is_some_and(|producer_id| {
-                    aborted.iter().any(|txn| {
-                        txn.producer_id == producer_id
-                            && header.base_offset >= txn.first_offset
-                            && header.base_offset <= txn.last_offset
-                    })
-                });
-            if discarded {
-                continue;
-            }
-            kept.push(batch);
         }
         Ok(kept)
     }
@@ -1367,6 +1371,34 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn committed_reads_skip_filtered_batches_beyond_the_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), txn_config()).unwrap();
+        for sequence in 0..4 {
+            append_raw(&mut log, &transactional_batch(1, sequence, "aborted"));
+        }
+        append_raw(
+            &mut log,
+            &brahmaputra_protocol::control_batch(
+                brahmaputra_protocol::ProducerMetadata {
+                    producer_id: 1,
+                    producer_epoch: 0,
+                    base_sequence: -1,
+                },
+                brahmaputra_protocol::ControlMarker::Abort,
+                1_000,
+            ),
+        );
+        append_raw(
+            &mut log,
+            &RecordBatch::new(0, 0, 1_000, vec![Record::new(b"visible".to_vec())]),
+        );
+        log.set_high_watermark(log.log_end_offset()).unwrap();
+        assert_eq!(values(&log.read_committed(0, 1).unwrap()), vec!["visible"]);
+        assert!(log.read_committed(0, 0).unwrap().is_empty());
     }
 
     #[test]

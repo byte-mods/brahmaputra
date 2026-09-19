@@ -26,6 +26,59 @@ const PARTITIONS: i32 = 3;
 /// One poll call's wait budget; loops below re-poll until their deadline.
 const POLL: Duration = Duration::from_millis(200);
 
+#[tokio::test]
+async fn committed_groups_skip_large_aborts_and_wait_for_open_transactions() {
+    use brahmaputra_client::TransactionalProducer;
+    use brahmaputra_protocol::{IsolationLevel, Record};
+    let dir = TempDir::new().unwrap();
+    let broker = start_broker(dir.path()).await;
+    let mut producer = TransactionalProducer::init(broker.addr, "group-isolation")
+        .await
+        .unwrap();
+    producer.begin().unwrap();
+    for _ in 0..3 {
+        producer
+            .send(TOPIC, 0, Record::new(vec![b'x'; 70_000]))
+            .await
+            .unwrap();
+    }
+    producer.abort().await.unwrap();
+    producer.begin().unwrap();
+    producer
+        .send(TOPIC, 0, Record::new(b"committed".to_vec()))
+        .await
+        .unwrap();
+    producer.commit().await.unwrap();
+    producer.begin().unwrap();
+    producer
+        .send(TOPIC, 0, Record::new(b"pending".to_vec()))
+        .await
+        .unwrap();
+
+    // Configuration order must not reset isolation or rack settings.
+    let mut consumer = group_consumer(broker.addr, "isolated", "reader")
+        .await
+        .with_isolation_level(IsolationLevel::ReadCommitted)
+        .with_rack("local")
+        .with_max_bytes(1);
+    let records = poll_until(&mut consumer, 1, Duration::from_secs(10)).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].value.as_deref(), Some(b"committed".as_slice()));
+    consumer.commit_sync().await.unwrap();
+    assert!(consumer.poll(POLL).await.unwrap().is_empty());
+    producer.commit().await.unwrap();
+    let records = poll_until(&mut consumer, 1, Duration::from_secs(10)).await;
+    assert_eq!(records[0].value.as_deref(), Some(b"pending".as_slice()));
+    consumer.close().await.unwrap();
+
+    let mut resumed = group_consumer(broker.addr, "isolated", "resumed")
+        .await
+        .with_isolation_level(IsolationLevel::ReadCommitted);
+    assert!(resumed.poll(POLL).await.unwrap().is_empty());
+    resumed.close().await.unwrap();
+    stop_broker(broker).await;
+}
+
 struct RunningBroker {
     addr: SocketAddr,
     shutdown: oneshot::Sender<()>,

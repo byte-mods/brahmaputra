@@ -301,6 +301,10 @@ pass "the dashboard is served from the binary with no external assets"
 printf '%s' "$PAGE" | grep -Eq 'https?://[^"]*(cdn|googleapis|unpkg|jsdelivr)' \
   && die "the dashboard references an external asset; it must work air-gapped"
 pass "the dashboard loads nothing from the network"
+for feature in 'id="analytics"' 'id="health"' 'id="feedstatus"' 'exportAnalytics()' 'toggleAnalytics()'; do
+  [[ "$PAGE" == *"$feature"* ]] || die "dashboard is missing analytics control: $feature"
+done
+pass "the shipping dashboard includes live analytics, health, freshness, pause and export controls"
 
 stage "M6 verification complete"
 printf 'checks passed: %s\n' "$CHECKS"

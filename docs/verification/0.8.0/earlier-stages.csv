@@ -1,0 +1,13 @@
+"stage","exit_code"
+"linux-m3","0"
+"format","0"
+"dashboard-js","0"
+"workspace","0"
+"clippy","0"
+"debug-build","0"
+"release-build","0"
+"live-suites","0"
+"m2","0"
+controller-outage,0
+soak,0
+benchmarks,1

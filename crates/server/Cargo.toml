@@ -25,3 +25,6 @@ async-trait = "0.1"
 getrandom = "0.3"
 serde_json.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

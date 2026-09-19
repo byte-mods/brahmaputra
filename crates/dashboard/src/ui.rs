@@ -1,7 +1,7 @@
 //! The dashboard, compiled into the binary (DESIGN.md §9.3).
 //!
-//! One file, no build step, no Node toolchain, no CDN: vanilla JS with a
-//! hand-drawn SVG sparkline. That is a deliberate trade — a framework would
+//! One file, no build step, no Node toolchain, no CDN: vanilla JS with
+//! interactive SVG charts. That is a deliberate trade — a framework would
 //! buy nicer code and cost an entire toolchain in the release path, and an
 //! operations page that ships inside the broker has to work in an air-gapped
 //! network with no package registry in reach.
@@ -71,6 +71,12 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
   #login .card { display:grid; gap:10px; }
   #err { color:var(--bad); min-height:1.2em; }
   svg { width:100%; height:120px; display:block; }
+  .analytics { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr)); gap:12px; }
+  progress { width:100%; height:14px; accent-color:var(--accent); }
+  .chart-summary { display:flex; justify-content:space-between; gap:12px; font-variant-numeric:tabular-nums; }
+  .chart-summary strong { font-size:22px; }
+  #feedstatus { margin:12px 0; }
+  @media (max-width:640px) { main { padding:10px; } header { flex-wrap:wrap; } section { overflow-x:auto; } }
 </style>
 </head>
 <body>
@@ -95,6 +101,18 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
   </header>
   <main>
     <div class="grid" id="tiles"></div>
+    <div id="feedstatus" role="status" aria-live="polite" class="muted">Connecting to live metrics...</div>
+    <section>
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">Live analytics</h2>
+        <label>Window <select id="window" onchange="drawChart()"><option value="300">5 minutes</option><option value="1800">30 minutes</option><option value="21600">6 hours</option></select></label>
+        <button id="pausebtn" onclick="toggleAnalytics()">Pause updates</button>
+        <button onclick="exportAnalytics()">Export samples</button>
+      </div>
+      <p class="muted">Rates are sampled every 5 seconds on this broker. Health and consumer lag cover the cluster.</p>
+      <div class="analytics" id="analytics"></div>
+      <div class="analytics" id="health" style="margin-top:12px"></div>
+    </section>
 
     <section>
       <h2>Throughput</h2>
@@ -163,9 +181,13 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
 let token = sessionStorage.getItem("token") || "";
 let role = sessionStorage.getItem("role") || "";
 let user = sessionStorage.getItem("user") || "";
+let refreshTimer = null, chartTimer = null, refreshing = false, charting = false;
+let paused = false, lastRefresh = null, chartSamples = {};
+let sessionGeneration = 0;
 
 async function api(path, options) {
   const response = await fetch(path, Object.assign({
+    signal: AbortSignal.timeout(10000),
     headers: { "authorization": "Bearer " + token, "content-type": "application/json" }
   }, options || {}));
   if (response.status === 401) { logout(); throw new Error("session expired"); }
@@ -196,6 +218,9 @@ async function login() {
 }
 
 function logout() {
+  sessionGeneration++;
+  clearTimeout(refreshTimer); clearTimeout(chartTimer);
+  if (liveSource) { liveSource.close(); liveSource = null; }
   token = ""; sessionStorage.clear();
   document.getElementById("app").hidden = true;
   document.getElementById("login").hidden = false;
@@ -284,7 +309,7 @@ async function renderBrokerDetail() {
           <td><span class="pill ${d.online ? "ok" : "no"}">${d.online ? "online" : escapeHtml(d.offline_reason || "offline")}</span></td>
           <td>${fmtBytes(d.size_bytes)}</td>
           <td>${fmtBytes(d.usable_bytes)}</td>
-          <td>${fmtBytes(d.total_bytes)}</td></tr>`).join("") +
+          <td>${fmtBytes(d.total_bytes)}${d.total_bytes > 0 && d.usable_bytes >= 0 ? `<progress max="100" value="${Math.max(0, Math.min(100, (1-d.usable_bytes/d.total_bytes)*100))}" aria-label="Filesystem space used"></progress>` : ""}</td></tr>`).join("") +
         "</table>"
       : '<div class="muted">no directories reported</div>';
     detailBox("brokerdetail", html);
@@ -367,6 +392,8 @@ async function renderGroupDetail() {
 }
 
 async function refresh() {
+  if (refreshing || !token || paused) return;
+  refreshing = true;
   try {
     const o = await api("/api/v1/overview");
     document.getElementById("tiles").innerHTML =
@@ -424,6 +451,11 @@ async function refresh() {
       api(`/api/v1/groups/${encodeURIComponent(x.group_id)}/lag`)
         .then(l => (l.partitions || []).reduce((sum, p) => sum + (p.lag > 0 ? p.lag : 0), 0))
         .catch(() => -1)));
+    document.getElementById("health").innerHTML =
+      healthBar("Brokers available", o.brokers_alive, o.brokers) +
+      healthBar("Partitions fully replicated", o.partitions - o.under_replicated_partitions, o.partitions) +
+      healthBar("Partitions online", o.partitions - o.offline_partitions, o.partitions) +
+      tile("Consumer group lag", lags.some(l => l < 0) ? "Unavailable" : fmt(lags.reduce((a, b) => a + b, 0)) + " records");
     document.getElementById("groups").innerHTML =
       "<tr><th>Group</th><th>State</th><th>Members</th><th>Generation</th><th>Lag</th></tr>" +
       (g.groups.length ? g.groups.map((x, i) => `<tr class="pick ${picked.group === x.group_id ? "on" : ""}"
@@ -435,44 +467,112 @@ async function refresh() {
         : '<tr><td class="muted" colspan="5">no groups</td></tr>');
 
     document.getElementById("clock").textContent = new Date().toLocaleTimeString();
+    lastRefresh = Date.now();
+    document.getElementById("feedstatus").textContent = "Live · updated " + new Date(lastRefresh).toLocaleTimeString();
     // Whatever is expanded follows the same three-second cadence as the
     // tables above it; lag that only moved when clicked would be worse
     // than no lag column at all.
     if (picked.broker !== null) renderBrokerDetail();
     if (picked.topic) renderTopicDetail();
     if (picked.group) renderGroupDetail();
-  } catch (e) { /* a transient failure should not blank the page */ }
+  } catch (e) {
+    document.getElementById("feedstatus").textContent = "Updates unavailable · " + e.message +
+      (lastRefresh ? " · last success " + new Date(lastRefresh).toLocaleTimeString() : "");
+  } finally { refreshing = false; }
 }
 
-async function drawChart() {
-  const select = document.getElementById("metric");
-  const metric = select.value;
-  if (!metric) return;
-  const data = await api("/api/v1/metrics/timeseries?metric=" + encodeURIComponent(metric));
-  const samples = data.samples || [];
-  const svg = document.getElementById("chart");
-  if (samples.length < 2) {
-    svg.innerHTML = '<text x="8" y="20" fill="#8b93a7" font-size="11">collecting…</text>';
-    return;
-  }
-  // Counters only make sense as a rate; gauges are plotted as-is.
-  const isCounter = metric.includes("_total");
+function healthBar(label, value, total) {
+  const valid = Number.isFinite(value) && Number.isFinite(total) && total > 0;
+  const percent = valid ? Math.max(0, Math.min(100, value / total * 100)) : 0;
+  return `<div class="card"><h3>${escapeHtml(label)}</h3><div class="chart-summary"><strong>${valid ? percent.toFixed(1) + "%" : "N/A"}</strong><span>${fmt(value)} / ${fmt(total)}</span></div>` +
+    (valid ? `<progress max="100" value="${percent}" aria-label="${escapeHtml(label)}"></progress>` : '<div class="muted">No resources reported</div>') + '</div>';
+}
+
+// Counter resets and duplicate timestamps are gaps, never artificial spikes.
+function seriesPoints(samples, counter, since) {
   const points = [];
-  for (let i = 1; i < samples.length; i++) {
-    const dt = (samples[i].timestamp_ms - samples[i-1].timestamp_ms) / 1000 || 1;
-    points.push(isCounter ? Math.max(0, (samples[i].value - samples[i-1].value) / dt)
-                          : samples[i].value);
+  for (let i = counter ? 1 : 0; i < samples.length; i++) {
+    const s = samples[i], previous = samples[i - 1];
+    if (!Number.isFinite(s.timestamp_ms) || !Number.isFinite(s.value) || s.timestamp_ms < since) continue;
+    if (counter && (!Number.isFinite(previous.value) || s.timestamp_ms <= previous.timestamp_ms || s.value < previous.value)) continue;
+    const value = counter ? (s.value - previous.value) * 1000 / (s.timestamp_ms - previous.timestamp_ms) : s.value;
+    if (Number.isFinite(value)) points.push({ time: s.timestamp_ms, value });
   }
-  const max = Math.max(...points, 1), min = Math.min(...points, 0);
-  const span = (max - min) || 1;
-  const path = points.map((v, i) => {
-    const x = (i / (points.length - 1)) * 600;
-    const y = 115 - ((v - min) / span) * 110;
-    return `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
-  svg.innerHTML = `<path d="${path}" fill="none" stroke="#4da3ff" stroke-width="2"/>`;
-  document.getElementById("chartinfo").textContent =
-    `${isCounter ? "rate/sec" : "value"} · now ${fmt(points[points.length-1])} · peak ${fmt(max)} · ${points.length} samples`;
+  return points;
+}
+
+function chartValue(value) {
+  return value !== 0 && Math.abs(value) < 10 ? value.toFixed(2) : fmt(value);
+}
+
+function chartMarkup(points, width = 600) {
+  if (!points.length) return '<text x="12" y="55" fill="currentColor" font-size="12">Waiting for samples...</text>';
+  // Preserve each bucket's extrema while bounding SVG nodes for six-hour views.
+  if (points.length > 240) {
+    const reduced = [points[0]], bucketSize = Math.ceil(points.length / 119);
+    for (let start = 0; start < points.length; start += bucketSize) {
+      const bucket = points.slice(start, start + bucketSize);
+      const low = bucket.reduce((a, b) => a.value < b.value ? a : b);
+      const high = bucket.reduce((a, b) => a.value > b.value ? a : b);
+      reduced.push(...(low === high ? [low] : [low, high].sort((a, b) => a.time - b.time)));
+    }
+    reduced.push(points[points.length - 1]);
+    points = reduced;
+  }
+  const values = points.map(p => p.value), max = Math.max(...values, 1), min = Math.min(...values, 0);
+  const first = points[0].time, duration = Math.max(1, points[points.length - 1].time - first);
+  const right = width - 10;
+  const coords = points.map(p => ({ x: 44 + (p.time - first) / duration * (right - 44), y: 96 - (p.value - min) / (max - min) * 84 }));
+  const path = coords.map((p, i) => `${i ? "L" : "M"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  return [0, .5, 1].map(f => `<line x1="44" y1="${96-f*84}" x2="${right}" y2="${96-f*84}" stroke="var(--line)"/><text x="1" y="${99-f*84}" fill="currentColor" font-size="10">${chartValue(min + f*(max-min))}</text>`).join("") +
+    `<path d="${path}" fill="none" stroke="var(--accent)" stroke-width="2"/>` +
+    coords.map((p, i) => `<circle cx="${p.x}" cy="${p.y}" r="2" fill="var(--accent)"><title>${new Date(points[i].time).toLocaleTimeString()}: ${points[i].value.toFixed(2)}</title></circle>`).join("") +
+    `<text x="44" y="116" fill="currentColor" font-size="10">${new Date(first).toLocaleTimeString()}</text><text x="${right}" y="116" text-anchor="end" fill="currentColor" font-size="10">${new Date(points[points.length-1].time).toLocaleTimeString()}</text>`;
+}
+
+const analyticsMetrics = [
+  ["Records in / sec", "brahmaputra_produce_records_total"],
+  ["Bytes in / sec", "brahmaputra_produce_bytes_total"],
+  ["Bytes out / sec", "brahmaputra_fetch_bytes_total"],
+  ["Produce errors / sec", "brahmaputra_produce_errors_total"],
+  ["Throttled requests / sec", "brahmaputra_throttled_requests_total"],
+  ["Open connections", "brahmaputra_connections_open"]
+];
+
+async function drawChart() {
+  if (charting || !token || paused) return;
+  charting = true;
+  try {
+    const metric = document.getElementById("metric").value;
+    const since = Date.now() - Number(document.getElementById("window").value) * 1000;
+    const names = [...new Set([...analyticsMetrics.map(x => x[1]), metric].filter(Boolean))];
+    const fetched = await Promise.all(names.map(async name => [name, await api("/api/v1/metrics/timeseries?metric=" + encodeURIComponent(name) + "&from=" + (since - 5000))]));
+    chartSamples = Object.fromEntries(fetched.map(([name, data]) => [name, data.samples || []]));
+    const pointsFor = name => seriesPoints(chartSamples[name] || [], name.split("{")[0].endsWith("_total"), since);
+    document.getElementById("analytics").innerHTML = analyticsMetrics.map(([label, name]) => {
+      const points = pointsFor(name), values = points.map(p => p.value);
+      return `<div class="card"><h3>${label}</h3><div class="chart-summary"><strong>${points.length ? chartValue(values[values.length-1]) : "—"}</strong><span class="muted">peak ${points.length ? chartValue(Math.max(...values)) : "—"}</span></div><svg viewBox="0 0 320 120" role="img" aria-label="${label}">${chartMarkup(points, 320)}</svg></div>`;
+    }).join("");
+    const points = pointsFor(metric);
+    document.getElementById("chart").innerHTML = chartMarkup(points);
+    document.getElementById("chartinfo").textContent = `${metric.split("{")[0].endsWith("_total") ? "rate/sec" : "value"} · ${points.length} samples · hover for details`;
+  } catch (error) {
+    document.getElementById("chartinfo").textContent = "Chart updates unavailable · " + error.message;
+  } finally { charting = false; }
+}
+
+function toggleAnalytics() {
+  paused = !paused;
+  document.getElementById("pausebtn").textContent = paused ? "Resume updates" : "Pause updates";
+  document.getElementById("feedstatus").textContent = paused ? "Updates paused" : "Resuming updates...";
+  if (!paused) { refresh(); drawChart(); }
+}
+
+function exportAnalytics() {
+  const blob = new Blob([JSON.stringify({ exported_at: new Date().toISOString(), scope: "local broker", metrics: chartSamples }, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob), link = document.createElement("a");
+  link.href = url; link.download = "brahmaputra-metrics.json"; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function loadMetricList() {
@@ -480,7 +580,7 @@ async function loadMetricList() {
   const select = document.getElementById("metric");
   const preferred = "brahmaputra_produce_records_total";
   select.innerHTML = (data.available || [preferred])
-    .map(m => `<option ${m === preferred ? "selected" : ""}>${m}</option>`).join("");
+    .map(m => `<option ${m === preferred ? "selected" : ""}>${escapeHtml(m)}</option>`).join("");
 }
 
 
@@ -670,6 +770,10 @@ async function removeTopic() {
 }
 
 async function start() {
+  const generation = ++sessionGeneration;
+  clearTimeout(refreshTimer); clearTimeout(chartTimer);
+  paused = false;
+  document.getElementById("pausebtn").textContent = "Pause updates";
   document.getElementById("login").hidden = true;
   document.getElementById("app").hidden = false;
   document.getElementById("who").textContent = `${user} · ${role}`;
@@ -677,11 +781,13 @@ async function start() {
   await refresh();
   await loadMessages();
   await drawChart();
-  setInterval(refresh, 3000);
-  setInterval(drawChart, 5000);
+  const active = () => token && generation === sessionGeneration;
+  const poll = async () => { if (!active()) return; await refresh(); if (active()) refreshTimer = setTimeout(poll, 3000); };
+  const charts = async () => { if (!active()) return; await drawChart(); if (active()) chartTimer = setTimeout(charts, 5000); };
+  if (active()) { refreshTimer = setTimeout(poll, 3000); chartTimer = setTimeout(charts, 5000); }
 }
 
-if (token) start(); else logout();
+if (token) start().catch(error => { logout(); document.getElementById("err").textContent = error.message; }); else logout();
 </script>
 </body>
 </html>

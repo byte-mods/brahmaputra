@@ -22,9 +22,8 @@
 #
 # Fairness rules, all of which matter:
 #   - Every container of every system gets identical --cpus and --memory.
-#   - Both clusters are three nodes on this one host, so both pay the same
-#     shared-disk and shared-NIC penalty. Absolute numbers are therefore
-#     below any real deployment for BOTH systems; the comparison survives.
+#   - Both clusters are three nodes on this one host. Shared disk and NIC
+#     contention can affect them differently; results describe this host.
 #   - Load generators run inside the broker containers and are spread
 #     round-robin across all three, so sampled CPU covers broker plus client
 #     for everyone and no single node carries all the client load.
@@ -33,13 +32,8 @@
 #     Brahmaputra CLI takes milliseconds; wall clock alone flatters the
 #     latter.
 #   - Broker leases stay at their defaults (1 s heartbeat, 5 s session).
-#     `bench-replicated.sh` tightens them to 500 ms/3 s because it descends
-#     from a failover test where a short lease is the point; here it is
-#     actively harmful. A broker saturating its four CPUs can miss a 3 s
-#     controller heartbeat, and a broker that misses one *exits* — which
-#     showed up as all three brokers dying mid-run and every producer
-#     reporting "connection closed". Five runs at the default lease, same
-#     load, did not reproduce it.
+#     Expiry suspends the data plane until conditional re-registration;
+#     the benchmark does not lengthen leases to conceal recovery failures.
 #   - Each level's replication is verified, not assumed: Kafka must report
 #     ISR=3 and Brahmaputra must have the partition logs on all three nodes
 #     with log-end offsets summing to the records produced.
@@ -123,6 +117,14 @@ KAFKA_NODES=(bench-k1 bench-k2 bench-k3)
 BRAHMA_NODES=(bench-b1 bench-b2 bench-b3)
 
 cleanup() {
+  # Capture diagnostics before removing this run's containers, on success
+  # as well as failure. Client errors alone cannot explain lease loss.
+  for node in "${KAFKA_NODES[@]}" "${BRAHMA_NODES[@]}"; do
+    if docker_run inspect "$node" >/dev/null 2>&1; then
+      docker_run logs "$node" > "$RESULTS/$node.log" 2>&1 || true
+      docker_run inspect "$node" > "$RESULTS/$node-inspect.json" 2>/dev/null || true
+    fi
+  done
   docker_run rm -f "${KAFKA_NODES[@]}" "${BRAHMA_NODES[@]}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -148,16 +150,17 @@ start_sampling() {
   (
     while :; do
       docker_run stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "${names[@]}" 2>/dev/null \
-        | awk '{
+        | awk -v expected="${#names[@]}" '{
             cpu = $1; sub("%", "", cpu); cpu += 0;
             mem = $2; unit = mem; sub("^[0-9.]+", "", unit);
             value = mem; sub("[A-Za-z]+$", "", value); value += 0;
             if (unit == "GiB") value *= 1024;
             else if (unit == "KiB") value /= 1024;
             else if (unit == "B") value /= 1048576;
+            if (value <= 0) invalid = 1;
             cpu_sum += cpu; mem_sum += value;
           }
-          END { if (NR > 0) printf "%.1f %.1f\n", cpu_sum, mem_sum }' >> "$out"
+          END { if (NR == expected && !invalid) printf "%.1f %.1f\n", cpu_sum, mem_sum }' >> "$out"
       sleep 1
     done
   ) &
@@ -171,12 +174,12 @@ stop_sampling() {
 }
 summarize_samples() {
   awk '
-    { cpu = $1 + 0; mem = $2 + 0;
+    $2 + 0 > 0 { cpu = $1 + 0; mem = $2 + 0;
       cpu_sum += cpu; mem_sum += mem; n++;
       if (cpu > cpu_max) cpu_max = cpu;
       if (mem > mem_max) mem_max = mem; }
     END {
-      if (n == 0) { print "0 0 0 0"; exit }
+      if (n == 0) { print "NA NA NA NA"; exit }
       printf "%.1f %.1f %.0f %.0f\n", cpu_sum / n, cpu_max, mem_sum / n, mem_max;
     }
   ' "$1"
@@ -215,7 +218,7 @@ latency_summary() {
         n=$(( n + 1 ))
     done
     if (( n == 0 )); then
-        printf '0,0,0,0'
+        printf 'NA,NA,NA,NA'
         return
     fi
     awk -v a="$p50" -v b="$p99" -v c="$p999" -v d="$max" -v n="$n" \
@@ -264,7 +267,7 @@ if [[ "$SKIP_BUILD" != "1" && "$ONLY" != "kafka" ]]; then
     -v brahma-bench-target:/target \
     -e CARGO_TARGET_DIR=/target \
     -w /src "$RUST_IMAGE" \
-    cargo build --release -p brahmaputra-server -p brahmaputra-cli \
+    cargo build --release -j "${BUILD_JOBS:-2}" -p brahmaputra-server -p brahmaputra-cli \
     || die "release build failed"
 
   stage "Assemble the Brahmaputra runtime image"
@@ -349,10 +352,10 @@ kafka_topic() {
 # allowed to stand for RF=3: a topic that silently fell back to one replica
 # would produce a flatteringly fast, and completely meaningless, result.
 kafka_verify_isr() {
-  local name="$1" expect="$2" described bad
+  local name="$1" expect="$2" described bad total deadline=$((SECONDS + 60))
+  while (( SECONDS < deadline )); do
   described="$(docker_run exec bench-k1 /opt/kafka/bin/kafka-topics.sh \
-    --bootstrap-server "$KAFKA_BOOTSTRAP" --describe --topic "$name" 2>/dev/null)"
-  local total
+    --bootstrap-server "$KAFKA_BOOTSTRAP" --describe --topic "$name" 2>/dev/null)" || described=''
   total="$(printf '%s\n' "$described" | grep -c 'Partition:' || true)"
   bad="$(printf '%s\n' "$described" | awk -v want="$expect" '
     /Partition:/ {
@@ -361,9 +364,14 @@ kafka_verify_isr() {
       if (n != want) bad++
     }
     END { print bad + 0 }')"
-  printf 'kafka %s: %s/%s partitions at ISR=%s\n' \
-    "$name" "$(( total - bad ))" "$total" "$expect" >> "$NOTES"
-  [[ "$bad" == "0" ]] || warn "kafka $name: $bad partition(s) not at ISR=$expect"
+    if [[ "$total" == "$PARTITIONS" && "$bad" == 0 ]]; then
+      printf 'kafka %s: %s/%s partitions at ISR=%s\n' \
+        "$name" "$total" "$total" "$expect" >> "$NOTES"
+      return 0
+    fi
+    sleep 1
+  done
+  die "kafka $name: $total partitions, $bad not at ISR=$expect"
 }
 
 run_kafka_level() {
@@ -373,7 +381,9 @@ run_kafka_level() {
   for (( index = 0; index < clients; index++ )); do
     kafka_topic "$TOPIC-$config-$clients-$index" "$rf"
   done
-  kafka_verify_isr "$TOPIC-$config-$clients-0" "$rf"
+  for (( index = 0; index < clients; index++ )); do
+    kafka_verify_isr "$TOPIC-$config-$clients-$index" "$rf"
+  done
 
   start_sampling "$RESULTS/kafka-$config-produce-$clients.stats" "${KAFKA_NODES[@]}"
   start="$(now_ms)"
@@ -389,7 +399,7 @@ run_kafka_level() {
       --producer-props bootstrap.servers="$KAFKA_BOOTSTRAP" "acks=$acks" \
         "batch.size=$BATCH_SIZE" "linger.ms=$LINGER_MS" \
         "compression.type=$COMPRESSION" "max.request.size=$MAX_BYTES" \
-        "buffer.memory=268435456" \
+        "buffer.memory=268435456" "enable.idempotence=false" \
       > "$RESULTS/kafka-$config-produce-$clients-$index.txt" 2>&1 &
     pids+=($!)
   done
@@ -400,6 +410,10 @@ run_kafka_level() {
     "$RESULTS/kafka-$config-produce-$clients.stats" \
     "$(sum_client_rates kafka-produce "$RESULTS"/kafka-"$config"-produce-"$clients"-*.txt)" \
     "$(latency_summary kafka "$RESULTS"/kafka-"$config"-produce-"$clients"-*.txt)"
+
+  for (( index = 0; index < clients; index++ )); do
+    kafka_verify_isr "$TOPIC-$config-$clients-$index" "$rf"
+  done
 
   start_sampling "$RESULTS/kafka-$config-consume-$clients.stats" "${KAFKA_NODES[@]}"
   start="$(now_ms)"
@@ -485,18 +499,26 @@ brahma_topic() {
 # nodes hold a log for the topic, and check the log-end offsets sum to the
 # records produced. Both must hold or the RF=3 reading means nothing.
 brahma_verify() {
-  local name="$1" rf="$2" expected="$3" i holders=0 count total
+  local name="$1" rf="$2" expected="$3" i holders=0 count total offsets deadline=$((SECONDS + 60))
+  while (( SECONDS < deadline )); do
+  holders=0
   for (( i = 1; i <= NODES; i++ )); do
     count="$(docker_run exec "bench-b$i" sh -c "find /data -name '*.log' -path '*$name*' 2>/dev/null | wc -l" | tr -d '[:space:]')"
     (( ${count:-0} > 0 )) && holders=$(( holders + 1 ))
   done
-  total="$(docker_run exec bench-b1 /usr/local/bin/brahmaputra-cli \
-    --broker "${BRAHMA_IPS[0]}:9092" offsets --topic "$name" 2>/dev/null \
-    | grep -oE 'latest=[0-9]+' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')"
-  printf 'brahmaputra %s: %s/%s nodes hold logs, offsets sum %s (expected %s)\n' \
-    "$name" "$holders" "$rf" "${total:-0}" "$expected" >> "$NOTES"
-  (( holders >= rf )) || warn "brahmaputra $name: only $holders node(s) hold logs, wanted $rf"
-  [[ "${total:-0}" == "$expected" ]] || warn "brahmaputra $name: offsets sum ${total:-0}, expected $expected"
+  if offsets="$(docker_run exec bench-b1 /usr/local/bin/brahmaputra-cli \
+    --broker "${BRAHMA_IPS[0]}:9092" offsets --topic "$name" 2>/dev/null)"; then
+    total="$(printf '%s\n' "$offsets" | grep -oE 'latest=[0-9]+' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')" || total=0
+    count="$(printf '%s\n' "$offsets" | grep -c 'latest=' || true)"
+    if (( holders >= rf )) && [[ "$count" == "$PARTITIONS" && "$total" == "$expected" ]]; then
+      printf 'brahmaputra %s: %s/%s nodes hold logs, %s partitions, offsets sum %s (expected %s)\n' \
+        "$name" "$holders" "$rf" "$count" "$total" "$expected" >> "$NOTES"
+      return 0
+    fi
+  fi
+  sleep 1
+  done
+  die "brahmaputra $name: replication/offset verification did not converge in 60 seconds"
 }
 
 run_brahmaputra_level() {
@@ -531,7 +553,9 @@ run_brahmaputra_level() {
     "$(sum_client_rates brahmaputra "$RESULTS"/brahmaputra-"$config"-produce-"$clients"-*.txt)" \
     "$(latency_summary brahmaputra "$RESULTS"/brahmaputra-"$config"-produce-"$clients"-*.txt)"
 
-  brahma_verify "$TOPIC-$config-$clients-0" "$rf" "$PER_CLIENT"
+  for (( index = 0; index < clients; index++ )); do
+    brahma_verify "$TOPIC-$config-$clients-$index" "$rf" "$PER_CLIENT"
+  done
 
   start_sampling "$RESULTS/brahmaputra-$config-consume-$clients.stats" "${BRAHMA_NODES[@]}"
   start="$(now_ms)"
@@ -563,14 +587,14 @@ if [[ "$ONLY" == "both" || "$ONLY" == "kafka" ]]; then
   start_kafka
   for level in $LEVELS; do run_kafka_level rf3 3 all "$level"; done
   for level in $LEVELS; do run_kafka_level rf1 1 1 "$level"; done
-  docker_run rm -f "${KAFKA_NODES[@]}" >/dev/null 2>&1 || true
+  cleanup
 fi
 
 if [[ "$ONLY" == "both" || "$ONLY" == "brahmaputra" ]]; then
   start_brahmaputra
   for level in $LEVELS; do run_brahmaputra_level rf3 3 all "$level"; done
   for level in $LEVELS; do run_brahmaputra_level rf1 1 1 "$level"; done
-  docker_run rm -f "${BRAHMA_NODES[@]}" >/dev/null 2>&1 || true
+  cleanup
 fi
 
 # -------------------------------------------------------------- report
@@ -616,10 +640,11 @@ emit_replication_cost() {
     "$PARTITIONS" "$RECORD_SIZE" "$PER_CLIENT" "$(printf '%s' "$LEVELS" | tr ' ' '/')"
   printf 'clients, batch.size=%s, linger.ms=%s, compression=%s. Kafka image `%s`.\n\n' \
     "$BATCH_SIZE" "$LINGER_MS" "$COMPRESSION" "$KAFKA_IMAGE"
-  printf 'Both clusters are three nodes sharing one machine, so they share a disk\n'
-  printf 'and a NIC and both read below what real hardware would give. That\n'
-  printf 'penalty applies to both systems equally, which is what makes the ratio\n'
-  printf 'meaningful even though the absolute numbers are not deployment figures.\n\n'
+  printf 'Producer idempotence is disabled on both systems.\n\n'
+  printf 'Offered rate per producer: %s records/sec (unlimited means saturation).\n\n' "${RATE:-unlimited}"
+  printf 'Both clusters share one host, disk and NIC. Contention can affect\n'
+  printf 'the systems differently; these observations are not deployment\n'
+  printf 'capacity estimates or evidence of a universal throughput ratio.\n\n'
   printf 'Load generators run inside the broker containers, spread round-robin\n'
   printf 'across all three, so sampled CPU and memory cover broker plus client\n'
   printf 'for both systems and no one node carries all the client work.\n\n'
@@ -641,6 +666,7 @@ emit_replication_cost() {
   printf 'measure the same span: record admitted to record acknowledged.\n\n'
 
   printf '### Every level\n\n'
+  printf '`NA` means no valid resource sample completed during the workload.\n\n'
   printf '| System | Config | Phase | Clients | Records | Seconds | msgs/sec | Client msgs/sec | CPU avg %% | CPU peak %% | Mem avg MiB | Mem peak MiB | p50 ms | p99 ms | p99.9 ms | max ms |\n'
   printf '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n'
   tail -n +2 "$CSV" | awk -F, '{ printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16 }'

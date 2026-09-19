@@ -72,6 +72,167 @@ async fn stop_broker(running: RunningBroker) {
     running.task.await.unwrap();
 }
 
+#[tokio::test]
+async fn producers_retry_a_suspended_broker_lease_without_duplicate_appends() {
+    use brahmaputra_client::{Producer, ProducerConfig};
+    use std::time::Duration;
+    for linger_ms in [0, 5] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut image = ClusterMetadata::new("lease-retry");
+        image
+            .apply(MetadataCommand::RegisterBroker {
+                broker_id: 1,
+                host: "127.0.0.1".into(),
+                data_port: 0,
+                control_port: 0,
+                internal_port: 0,
+                expected_epoch: None,
+                roles: vec![NodeRole::Broker],
+                rack: None,
+                now_ms: 1_000,
+            })
+            .unwrap();
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: "lease".into(),
+                partitions: 1,
+                replication_factor: 1,
+                configs: BTreeMap::new(),
+            })
+            .unwrap();
+        let cache = MetadataCache::new(image.clone());
+        let running = start_broker(1, dir.path(), cache.clone()).await;
+        image.brokers.get_mut(&1).unwrap().data_port = running.addr.port();
+        cache.replace(image);
+        let producer = Producer::connect(
+            running.addr,
+            ProducerConfig {
+                linger_ms,
+                retries: 100,
+                retry_backoff_ms: 10,
+                ..ProducerConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        producer
+            .send("lease", Some(0), None, Bytes::from_static(b"before"))
+            .await
+            .unwrap();
+        running.broker.suspend_broker_lease();
+        let fresh_consumer = Consumer::connect(running.addr, "suspended-seed-metadata")
+            .await
+            .unwrap();
+        let routing = fresh_consumer.metadata(&["lease".into()]).await.unwrap();
+        assert_eq!(
+            routing.topics.len(),
+            1,
+            "a suspended seed must still provide read-only cluster routes"
+        );
+        assert_eq!(routing.topics[0].error_code, ec::NONE);
+        assert_eq!(routing.topics[0].partitions[0].leader, 1);
+        let broker = running.broker.clone();
+        let recovery = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            broker
+                .activate_broker_epoch(broker.local_broker_epoch())
+                .unwrap();
+        });
+        let offset = tokio::time::timeout(
+            Duration::from_secs(5),
+            producer.send("lease", Some(0), None, Bytes::from_static(b"after")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(offset, 1);
+        recovery.await.unwrap();
+        let consumer = Consumer::connect(running.addr, "check-lease")
+            .await
+            .unwrap();
+        let records = consumer.fetch("lease", 0, 0, 0).await.unwrap();
+        assert_eq!(records.len(), 2, "neither send may be lost or duplicated");
+        stop_broker(running).await;
+    }
+}
+
+#[tokio::test]
+async fn new_group_waits_for_an_unroutable_coordinator_to_recover() {
+    use brahmaputra_client::{AutoOffsetReset, GroupConsumer, Producer, ProducerConfig};
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let mut image = ClusterMetadata::new("coordinator-recovery");
+    image
+        .apply(MetadataCommand::RegisterBroker {
+            broker_id: 1,
+            host: "127.0.0.1".into(),
+            data_port: 0,
+            control_port: 0,
+            internal_port: 0,
+            expected_epoch: None,
+            roles: vec![NodeRole::Broker],
+            rack: None,
+            now_ms: 1_000,
+        })
+        .unwrap();
+    for name in ["records", "__consumer_offsets"] {
+        image
+            .apply(MetadataCommand::CreateTopic {
+                name: name.into(),
+                partitions: 1,
+                replication_factor: 1,
+                configs: BTreeMap::new(),
+            })
+            .unwrap();
+    }
+    let cache = MetadataCache::new(image.clone());
+    let running = start_broker(1, directory.path(), cache.clone()).await;
+    image.brokers.get_mut(&1).unwrap().data_port = running.addr.port();
+    cache.replace(image.clone());
+    let producer = Producer::connect(running.addr, ProducerConfig::default())
+        .await
+        .unwrap();
+    producer
+        .send("records", Some(0), None, Bytes::from_static(b"survives"))
+        .await
+        .unwrap();
+    let mut unavailable = image.clone();
+    unavailable
+        .topics
+        .get_mut("__consumer_offsets")
+        .unwrap()
+        .partitions
+        .get_mut(&0)
+        .unwrap()
+        .leader = -1;
+    cache.replace(unavailable);
+    let mut consumer = GroupConsumer::connect(running.addr, "new-reader", "new-group")
+        .await
+        .unwrap()
+        .with_auto_offset_reset(AutoOffsetReset::Earliest);
+    consumer.subscribe(&["records"]);
+    let recovery = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cache.replace(image);
+    });
+    let records = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let records = consumer.poll(Duration::from_millis(100)).await.unwrap();
+            if !records.is_empty() {
+                break records;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].value.as_deref(), Some(b"survives".as_slice()));
+    consumer.commit_sync().await.unwrap();
+    consumer.close().await.unwrap();
+    recovery.await.unwrap();
+    stop_broker(running).await;
+}
+
 fn cluster_image() -> ClusterMetadata {
     let mut image = ClusterMetadata::new("cluster-test");
     for (broker_id, host, data_port) in [(1, "broker-one", 19_091), (2, "broker-two", 19_092)] {

@@ -410,16 +410,30 @@ function Wait-ForMatchingTcpMetadata {
         [string]$Description
     )
     return Wait-ForValue $Description {
+        # ISR reconciliation may advance epochs after the caller's snapshot.
+        # Compare all TCP replies with a contemporaneous HTTP image, then
+        # check it again after the sweep so a moving image cannot pass.
+        $currentImage = Invoke-ControllerGet $NodeIds[0] "/api/v1/controller/metadata"
+        $expectedTopic = Get-MapValue $Image.topics $TopicName
+        $currentTopic = Get-MapValue $currentImage.topics $TopicName
+        if ($null -eq $currentTopic -or $currentTopic.topic_epoch -ne $expectedTopic.topic_epoch) {
+            return $null
+        }
         $outputs = @()
         foreach ($nodeId in $NodeIds) {
             $output = Get-TcpMetadata $nodeId $TopicName
-            if (-not (Test-TcpMetadataAgainstImage $output $Image $TopicName)) {
+            if (-not (Test-TcpMetadataAgainstImage $output $currentImage $TopicName)) {
                 return $null
             }
             $outputs += $output
         }
         $unique = @($outputs | Select-Object -Unique)
         if ($unique.Count -eq 1) {
+            $latestImage = Invoke-ControllerGet $NodeIds[0] "/api/v1/controller/metadata"
+            if (-not (Test-TcpMetadataAgainstImage $unique[0] $latestImage $TopicName)) {
+                return $null
+            }
+            $script:LastMatchingMetadataImage = $latestImage
             return $unique[0]
         }
         return $null
@@ -581,7 +595,8 @@ try {
     }
     Pass "orders has six partitions with replication factor three and full ISR"
     $tcpImage = Wait-ForMatchingTcpMetadata @(1, 2, 3) $topicImage "orders" "identical TCP Metadata images from all three brokers"
-    Assert-True ($tcpImage.Contains('leader_epoch=0')) "TCP Metadata exposes partition leader epochs"
+    $topicImage = $script:LastMatchingMetadataImage
+    Assert-True ($tcpImage -match 'leader_epoch=\d+') "TCP Metadata exposes partition leader epochs"
     Pass "all live brokers returned identical leaders, replicas, ISR, and epochs"
 
     $ordersBeforeKill = Get-MapValue $topicImage.topics "orders"
@@ -631,6 +646,7 @@ try {
     }
     Pass "expired broker $killedNodeId was fenced, removed from ISR, and its partition leaders were re-elected"
     $survivorTcp = Wait-ForMatchingTcpMetadata $survivors $fencedImage "orders" "identical post-failover TCP Metadata from both surviving brokers"
+    $fencedImage = $script:LastMatchingMetadataImage
     $fencedOrders = Get-MapValue $fencedImage.topics "orders"
     $fencedAffected = Get-MapValue $fencedOrders.partitions $affectedPartitionId
     $fencedEpoch = [int]$fencedAffected.leader_epoch
@@ -674,6 +690,7 @@ try {
     Assert-True ([UInt64]$rejoinedBroker.broker_epoch -gt $initialEpochs[$killedNodeId]) "broker $killedNodeId epoch increased from $($initialEpochs[$killedNodeId]) to $($rejoinedBroker.broker_epoch)"
     Pass "restarted broker rejoined every assigned orders ISR"
     $rejoinedTcp = Wait-ForMatchingTcpMetadata @(1, 2, 3) $rejoinedImage "orders" "identical TCP Metadata after broker/controller restart"
+    $rejoinedImage = $script:LastMatchingMetadataImage
     Assert-True ($rejoinedTcp.Contains("broker $killedNodeId`: 127.0.0.1:$($script:Nodes[$killedNodeId].DataPort)")) "restarted broker is advertised through every TCP Metadata endpoint"
 
     Write-Stage "Route explicit-partition data-plane calls from follower seeds"

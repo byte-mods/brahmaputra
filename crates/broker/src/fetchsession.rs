@@ -53,6 +53,7 @@ const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
 /// What the broker remembers between two fetches of one session.
 struct Session {
+    principal: Option<String>,
     epoch: i32,
     /// Fetch offset and byte allowance per partition, exactly as the
     /// client last stated them.
@@ -98,6 +99,7 @@ impl FetchSessions {
     ///
     /// `updates` are the partitions the client sent this time, `forgotten`
     /// the ones it has stopped holding.
+    #[cfg(test)]
     pub(crate) fn resolve(
         &self,
         session_id: i32,
@@ -105,8 +107,30 @@ impl FetchSessions {
         updates: &[(String, i32, i64, i32)],
         forgotten: &[(String, i32)],
     ) -> SessionOutcome {
+        self.resolve_owned(None, session_id, session_epoch, updates, forgotten)
+    }
+
+    pub(crate) fn resolve_owned(
+        &self,
+        principal: Option<&str>,
+        session_id: i32,
+        session_epoch: i32,
+        updates: &[(String, i32, i64, i32)],
+        forgotten: &[(String, i32)],
+    ) -> SessionOutcome {
         let mut inner = self.inner.lock().expect("fetch sessions");
         inner.expire();
+
+        // Check ownership before any mutation, including close and stale
+        // epochs. A guessed id must neither expose nor evict another
+        // principal's cached partitions.
+        if inner
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.principal.as_deref() != principal)
+        {
+            return SessionOutcome::Invalid(session_id);
+        }
 
         if session_epoch == CLOSE_EPOCH {
             inner.sessions.remove(&session_id);
@@ -133,6 +157,7 @@ impl FetchSessions {
             inner.sessions.insert(
                 id,
                 Session {
+                    principal: principal.map(str::to_owned),
                     epoch: 1,
                     partitions,
                     last_used: Instant::now(),
@@ -358,6 +383,31 @@ mod tests {
 
     /// A client that asks for nothing gets no session, and the broker
     /// allocates nothing for it.
+    #[test]
+    fn another_principal_cannot_read_modify_or_close_a_session() {
+        let sessions = FetchSessions::default();
+        let SessionOutcome::Resolved { session_id, .. } =
+            sessions.resolve_owned(Some("alice"), -1, INITIAL_EPOCH, &updates(), &[])
+        else {
+            panic!("new session");
+        };
+        for principal in [None, Some("bob")] {
+            for epoch in [1, 7, CLOSE_EPOCH] {
+                assert!(matches!(
+                    sessions.resolve_owned(principal, session_id, epoch, &[], &[]),
+                    SessionOutcome::Invalid(_)
+                ));
+            }
+        }
+        assert!(matches!(
+            sessions.resolve_owned(Some("alice"), session_id, 1, &[], &[]),
+            SessionOutcome::Resolved {
+                session_epoch: 2,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn a_fetch_without_a_session_allocates_nothing() {
         let sessions = FetchSessions::default();

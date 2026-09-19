@@ -31,7 +31,8 @@ use crate::transport::{Transport, TransportConfig};
 /// Internal topic whose partition leaders act as group coordinators.
 const OFFSETS_TOPIC: &str = "__consumer_offsets";
 /// Retries per coordinator request after a coordinator move/load.
-const COORDINATOR_ATTEMPTS: usize = 4;
+const COORDINATOR_ATTEMPTS: usize = 100;
+const COORDINATOR_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Join+sync rounds before giving up on a stabilizing group.
 const JOIN_ATTEMPTS: usize = 4;
 /// Idle delay between poll sweeps when no records arrive.
@@ -423,25 +424,46 @@ impl GroupCoordinator {
         decode: impl Fn(&[u8]) -> Result<T, ClientError>,
         error_code: impl Fn(&T) -> i32,
     ) -> Result<T, ClientError> {
+        let deadline = Instant::now() + COORDINATOR_RECOVERY_TIMEOUT;
         for attempt in 0..COORDINATOR_ATTEMPTS {
-            let partition = self.partition().await?;
-            let response = self
-                .router
-                .request_partition(OFFSETS_TOPIC, partition, api_key, body)
-                .await?;
-            let parsed = decode(&response)?;
-            match error_code(&parsed) {
-                ec::NONE => return Ok(parsed),
-                ec::NOT_COORDINATOR | ec::NOT_LEADER_OR_FOLLOWER
-                    if attempt + 1 < COORDINATOR_ATTEMPTS =>
+            let result = async {
+                let partition = self.partition().await?;
+                let response = self
+                    .router
+                    .request_partition(OFFSETS_TOPIC, partition, api_key, body)
+                    .await?;
+                let parsed = decode(&response)?;
+                ClientError::from_error_code(error_code(&parsed))?;
+                Ok(parsed)
+            }
+            .await;
+            match result {
+                Ok(parsed) => return Ok(parsed),
+                Err(ClientError::Server { code, .. })
+                    if matches!(
+                        code,
+                        ec::UNKNOWN_TOPIC_OR_PARTITION
+                            | ec::NOT_COORDINATOR
+                            | ec::NOT_LEADER_OR_FOLLOWER
+                            | ec::FENCED_BROKER_EPOCH
+                            | ec::COORDINATOR_LOAD_IN_PROGRESS
+                    ) && attempt + 1 < COORDINATOR_ATTEMPTS
+                        && Instant::now() < deadline =>
                 {
-                    let _ = self.router.refresh_topic(OFFSETS_TOPIC).await;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    // A coordinator can temporarily have no routable leader.
+                    // Routing refusals occur before a response is decoded and
+                    // must receive the same recovery as wire error responses.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let _ =
+                        tokio::time::timeout(remaining, self.router.refresh_topic(OFFSETS_TOPIC))
+                            .await;
+                    tokio::time::sleep(
+                        Duration::from_millis(100)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
                 }
-                ec::COORDINATOR_LOAD_IN_PROGRESS if attempt + 1 < COORDINATOR_ATTEMPTS => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                other => ClientError::from_error_code(other)?,
+                Err(error) => return Err(error),
             }
         }
         unreachable!("the last attempt returns or fails")
@@ -827,19 +849,31 @@ impl GroupConsumer {
 
     /// Cap on response batch bytes per fetch.
     pub fn with_max_bytes(mut self, max_bytes: i32) -> Self {
-        self.consumer = Consumer::from_router(self.coordinator.router.clone(), max_bytes);
+        self.configure_consumer(|consumer| consumer.with_max_bytes(max_bytes));
+        self
+    }
+
+    /// Select transaction visibility (`isolation.level`). The default is
+    /// `ReadUncommitted`; use `ReadCommitted` to exclude aborted records
+    /// and wait for pending transactions to be resolved.
+    pub fn with_isolation_level(mut self, level: brahmaputra_protocol::IsolationLevel) -> Self {
+        self.configure_consumer(|consumer| consumer.with_isolation_level(level));
         self
     }
 
     /// Where this consumer is running (`client.rack`), so its fetches can
     /// be served by a replica in the same failure domain.
     pub fn with_rack(mut self, rack: impl Into<String>) -> Self {
+        self.configure_consumer(|consumer| consumer.with_rack(rack));
+        self
+    }
+
+    fn configure_consumer(&mut self, configure: impl FnOnce(Consumer) -> Consumer) {
         let consumer = std::mem::replace(
             &mut self.consumer,
             Consumer::from_router(self.coordinator.router.clone(), 8 * 1024 * 1024),
         );
-        self.consumer = consumer.with_rack(rack);
-        self
+        self.consumer = configure(consumer);
     }
 
     /// Set the subscription; the next [`GroupConsumer::poll`] (re)joins the
@@ -896,7 +930,17 @@ impl GroupConsumer {
         self.last_poll_ms.store(now_ms(), Ordering::Relaxed);
         if !self.is_joined() || self.rejoin.load(Ordering::Relaxed) {
             tracing::debug!(member = %self.membership.lock().expect("membership").member_id, "poll triggers (re)join");
-            self.join().await?;
+            match self.join().await {
+                Err(ClientError::Server {
+                    code: ec::FENCED_BROKER_EPOCH,
+                    ..
+                }) => {
+                    // A suspended broker can resume its lease. Keep the
+                    // group eligible to rejoin on the next poll.
+                    return Ok(Vec::new());
+                }
+                result => result?,
+            }
         }
         // Everything handed out before this call is now the application's
         // acknowledged past; the auto-commit timer may commit up to here.
@@ -967,7 +1011,7 @@ impl GroupConsumer {
                             .expect("positions")
                             .insert((fetched.topic, fetched.partition), earliest);
                     }
-                    ec::NOT_LEADER_OR_FOLLOWER => {
+                    ec::NOT_LEADER_OR_FOLLOWER | ec::FENCED_BROKER_EPOCH => {
                         // Leadership moved mid-poll; refresh routes and let
                         // the next sweep pick up the new leader.
                         let _ = self.consumer.refresh_topic(&fetched.topic).await;

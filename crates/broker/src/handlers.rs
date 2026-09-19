@@ -148,10 +148,26 @@ pub(crate) fn authorize(
     resource_name: &str,
     operation: AclOperation,
 ) -> Result<(), i32> {
+    authorize_principal(
+        broker,
+        session.principal().as_deref(),
+        resource_type,
+        resource_name,
+        operation,
+    )
+}
+
+pub(crate) fn authorize_principal(
+    broker: &Broker,
+    principal: Option<&str>,
+    resource_type: ResourceType,
+    resource_name: &str,
+    operation: AclOperation,
+) -> Result<(), i32> {
     if !broker.config().require_auth {
         return Ok(());
     }
-    let Some(principal) = session.principal() else {
+    let Some(principal) = principal else {
         return Err(ec::SASL_AUTHENTICATION_FAILED);
     };
     let Some(cache) = broker.metadata_cache() else {
@@ -161,7 +177,7 @@ pub(crate) fn authorize(
     };
     if cache
         .snapshot()
-        .is_authorized(&principal, resource_type, resource_name, operation)
+        .is_authorized(principal, resource_type, resource_name, operation)
     {
         Ok(())
     } else {
@@ -751,8 +767,7 @@ pub(crate) fn encode_error_for(api_key: ApiKey, error_code: i32) -> Bytes {
         }
         .encode(),
         ApiKey::Metadata => MetadataResponse {
-            // No error_code field on MetadataResponse itself; report an
-            // empty cluster (topics carry their own error codes).
+            error_code,
             ..Default::default()
         }
         .encode(),
@@ -836,7 +851,11 @@ pub(crate) fn encode_error_for(api_key: ApiKey, error_code: i32) -> Bytes {
         // means the request itself was unusable, so the result list is
         // empty rather than carrying a partition that was never attempted.
         ApiKey::ProduceMulti => brahmaputra_protocol::gen::ProduceMultiResponse::default().encode(),
-        ApiKey::FetchMulti => brahmaputra_protocol::gen::FetchMultiResponse::default().encode(),
+        ApiKey::FetchMulti => brahmaputra_protocol::gen::FetchMultiResponse {
+            error_code,
+            ..Default::default()
+        }
+        .encode(),
         ApiKey::DeleteRecords => {
             brahmaputra_protocol::gen::DeleteRecordsResponse::default().encode()
         }
@@ -2123,9 +2142,6 @@ async fn write_txn_markers(broker: &Broker, body: Bytes) -> Bytes {
 // ---------- Metadata (api_key 3) ----------
 
 fn metadata(broker: &Broker, body: Bytes) -> Bytes {
-    if let Err(error) = broker.validate_local_broker_lease() {
-        return encode_error_for(ApiKey::Metadata, code_of(&error));
-    }
     let req = match MetadataRequest::decode(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -2134,6 +2150,9 @@ fn metadata(broker: &Broker, body: Bytes) -> Bytes {
         }
     };
     if let Some(cache) = broker.metadata_cache() {
+        // Routing information is read-only and remains useful while this
+        // seed broker renews its own lease. Authentication/ACLs were checked
+        // before dispatch; every data operation still checks its lease.
         let image = cache.snapshot();
         let brokers = image
             .brokers
@@ -2188,6 +2207,10 @@ fn metadata(broker: &Broker, body: Bytes) -> Bytes {
         );
     }
 
+    // Standalone metadata can create topics, so it still requires a lease.
+    if let Err(error) = broker.validate_local_broker_lease() {
+        return encode_error_for(ApiKey::Metadata, code_of(&error));
+    }
     // Empty = all topics; named topics are auto-created on first sight (M1).
     let names: Vec<String> = if req.topics.is_empty() {
         broker

@@ -1,0 +1,15 @@
+suite,exit_code
+verify-m1,0
+verify-m4,0
+verify-m5,0
+verify-m6,0
+verify-replication,0
+verify-retention,0
+verify-failures,0
+verify-transport-parity,0
+verify-reassignment,0
+verify-admin-and-security,0
+verify-transactions,0
+verify-compaction,0
+verify-jbod,0
+verify-chaos,0

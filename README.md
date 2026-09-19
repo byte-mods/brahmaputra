@@ -9,8 +9,8 @@ binary, with no JVM, no ZooKeeper and no heap to tune.
 [![CI](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml/badge.svg)](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-389%20passing-brightgreen.svg)](#verification)
-[![Throughput](https://img.shields.io/badge/vs%20Kafka-3.4%C3%97%20produce%20at%20RF%3D3-brightgreen.svg)](#performance)
+[![Tests](https://img.shields.io/badge/tests-413%20passing-brightgreen.svg)](#verification)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-Kafka%20comparison-blue.svg)](#performance)
 [![Transports](https://img.shields.io/badge/transport-TCP%20%C2%B7%20TLS%201.3%20%C2%B7%20QUIC-informational.svg)](#transports)
 [![Auth](https://img.shields.io/badge/auth-mTLS%20%C2%B7%20SCRAM--SHA--256%20%C2%B7%20ACLs-blueviolet.svg)](#authentication-and-access-control)
 [![Wire](https://img.shields.io/badge/wire-v4-lightgrey.svg)](docs/kafka-parity.md)
@@ -26,7 +26,7 @@ open http://localhost:8080                              # dashboard
 
 |  | |
 |---|---|
-| 🚀 **Faster than Kafka where it counts** | Three brokers at RF=3, `acks=all` — the durable setting — **3.4× produce** and **2.1× consume**, on **4.5× less memory**. Replication costs it 1.47× against Kafka's 3.18×. [Measured, with method →](#performance) |
+| 🚀 **Measured against Kafka** | Reproducible comparisons cover replication, concurrency, record size, codecs and delivery settings. Results depend on workload and host. [Measurements and method →](#performance) |
 | 🧩 **One static binary** | Broker, controller, dashboard and metrics compiled in. No JVM, no ZooKeeper, no Prometheus required. |
 | 🔁 **Kafka semantics, not just Kafka shape** | Leader/ISR replication, leader-epoch truncation (KIP-101), high-watermark visibility, `acks=0/1/all`, idempotent **and transactional** producer, `read_committed` isolation, consumer groups with generation fencing. |
 | 🔌 **Three transports, one flag** | Plain TCP, TLS 1.3, or QUIC — same wire format, same correctness suite. |
@@ -90,6 +90,43 @@ open http://localhost:8080                              # dashboard
 Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
+
+### Upgrading to 0.8.0
+
+The wire protocol remains version 4 and the disk format is unchanged.
+Restart brokers and upgrade clients to get the fixes described in the
+[changelog](CHANGELOG.md). This release closes an authorization gap in
+incremental fetch sessions and makes transactional consumption available
+through consumer groups:
+
+```bash
+brahmaputra-cli consume --topic orders --group billing \
+  --isolation-level read_committed --follow
+```
+
+In Rust, use
+`GroupConsumer::with_isolation_level(IsolationLevel::ReadCommitted)`.
+The default remains `ReadUncommitted`. Aborted records stay hidden in
+committed mode, even when they exceed the fetch byte budget; open
+transactions hold consumption until their decision is known.
+
+Run the complete shell verification set with `bash scripts/verify-release.sh`
+after building both debug and release binaries. Logs and a CSV of results
+are retained under `bench/results/release-verification/`.
+The [validation matrix](docs/release-validation-matrix.md) maps failure,
+consumer-group, configuration, security and benchmark scenarios to their suites.
+
+Lease recovery also handles delayed expiry commands, out-of-order heartbeats,
+stale controller validation, and seed-broker re-registration. Cluster routing
+metadata remains readable during a local lease suspension; writes and fetches
+remain fenced until the lease is valid.
+
+Kafka wire compatibility remains the largest missing capability: native
+Kafka clients and ecosystem tools cannot connect to this custom protocol.
+
+Controller defaults now use a 200-ms Raft heartbeat, 1–2-second elections,
+and at most 32 metadata entries per replication batch to improve catch-up
+after outages. These are distinct from broker heartbeat and lease settings.
 
 ### Upgrading to 0.7.0
 
@@ -271,10 +308,9 @@ Brahmaputra keeps the model and removes those costs:
 
 - **One static binary.** No JVM, no ZooKeeper, no separate controller
   process, no external metrics stack. The dashboard is compiled in.
-- **Memory that does not grow with load.** The broker passes refcounted
-  byte slices and leans on the page cache. A three-broker cluster under
-  RF=3 `acks=all` load holds under 1 GiB across the whole cluster where
-  Kafka holds 4.5 GiB ([benchmarks](#performance)).
+- **No JVM heap to configure.** The broker passes refcounted byte slices
+  and uses the page cache. Actual memory use depends on the workload;
+  the [benchmarks](#performance) report measured broker and client costs.
 - **Choice of transport.** Plain TCP, TLS 1.3 over TCP, or QUIC — same
   wire format, one flag.
 
@@ -811,6 +847,36 @@ Every broker serves an operations surface on `--http-port` (default 8080):
 | ACL rules | admin | via the controller, `put_acl` / `delete_acl` |
 | `GET /metrics` | none | Prometheus text format |
 
+The live analytics panel shows records and bytes per second, produce errors,
+throttling and open connections, with 5-minute, 30-minute and 6-hour windows.
+Charts include axes, timestamps, peaks and sample tooltips; counter resets are
+excluded from rate calculations. Pause/resume and JSON export support incident
+review. Rates describe the **local broker**, while health progress bars show
+cluster broker availability, replication and online partitions. Filesystem
+usage bars appear in broker details. Failed refreshes visibly retain the last
+successful update time. Metrics are sampled every five seconds; this is sampled
+monitoring, not a per-message event feed.
+
+![0.8.0 analytics dashboard with illustrative sample data](docs/images/dashboard-0.8.0.png)
+
+Fresh screenshots of the shipping 0.8.0 UI, rendered with illustrative sample
+data. These previews demonstrate the interface; benchmark measurements are
+published separately below.
+
+<details>
+<summary>Broker configuration and filesystem usage</summary>
+
+![Broker configuration and disk capacity with illustrative sample data](docs/images/dashboard-broker-0.8.0.png)
+
+</details>
+
+<details>
+<summary>Topic replication, configuration and consumer group lag</summary>
+
+![Partition replicas, ISR and consumer lag with illustrative sample data](docs/images/dashboard-topic-0.8.0.png)
+
+</details>
+
 Every row in the dashboard's broker, topic and group tables expands:
 
 - **A broker** shows its configuration and its data directories with logs,
@@ -1208,7 +1274,7 @@ default, `producer`, keeps whatever the producer chose.
 ## Verification
 
 ```bash
-cargo test --workspace          # 389 unit and integration tests
+cargo test --workspace          # 413 unit and integration tests
 
 bash scripts/verify-m1.sh       # 31  single-node storage and protocol
 bash scripts/verify-m2.ps1      #     controller quorum and metadata
@@ -1233,7 +1299,7 @@ missed assertion, and cleans up after itself. `TRANSPORT=quic` runs most of
 them over QUIC. [.github/workflows/ci.yml](.github/workflows/ci.yml) runs
 the suite on every pull request.
 
-Last full run on the development host:
+Historical development-host run (before 0.8.0):
 
 | Suite | Checks | Result |
 |---|---|---|
@@ -1273,110 +1339,52 @@ than papered over with a larger timeout. Run the live suites serially.
 
 ## Performance
 
-Head-to-head with Apache Kafka 4.3.1 in the configuration a durable
-deployment actually runs: **three brokers each, RF=3, `acks=all`,
-`min.insync.replicas=2`**. Same host, same container limits (4 CPUs and
-4 GiB per broker, so 1200 % is the CPU ceiling for a three-node cluster),
-same record size and partition count, each system driven by its own
-clients from inside its own containers.
+Version 0.8.0 includes a reproducible Kafka comparison matrix covering RF=1/3,
+TCP/QUIC concurrency, 1-MiB records, all five codecs, acks=0/1/all, idempotence
+and a fixed offered rate. Both systems use consumer groups and matched producer
+idempotence. Codec comparisons use identical, highly compressible payloads.
 
-Means of three consecutive runs, 8 000 000 × 256 B records across
-4 concurrent clients and 6 partitions.
+Current measurements are collected in the [0.8.0 benchmark reports](docs/benchmarks/0.8.0/README.md).
+Results and limitations are discussed in the
+[release review](docs/release-0.8.0-review.md). Correctness evidence is
+mapped separately in the [validation matrix](docs/release-validation-matrix.md).
 
-```
-RF=3 · acks=all · min.insync.replicas=2 · 256 B records
+One current configuration: RF=3, `acks=all`, minimum ISR 2, four clients,
+500,000 × 256-B records per client (single shared-host run):
 
-produce   Kafka         ████████                          231 454 msgs/sec
-          Brahmaputra   ████████████████████████████      787 385  (3.40×)
+| Rate (records/sec) | Kafka 4.3.1 | Brahmaputra 0.8.0 |
+| --- | ---: | ---: |
+| Produce, wall clock | 182,050 | 158,529 |
+| Produce, client-measured | 229,433 | 313,667 |
+| Consume, wall clock | 505,561 | 1,046,025 |
+| Consume, client-measured | 1,635,754 | 1,495,821 |
 
-consume   Kafka         ██████████████                  1 413 122 msgs/sec
-          Brahmaputra   ██████████████████████████████  2 977 061  (2.11×)
-
-memory    Kafka         ████████████████████████████        4 464 MiB
-          Brahmaputra   ██████                                999 MiB  (4.5× less)
-```
-
-| Metric | Kafka | Brahmaputra |
-|---|---|---|
-| **Produce msgs/sec** (RF=3, `acks=all`) | 231 454 | **787 385** (3.40×) |
-| Produce msgs/sec, client-measured | 257 503 | **838 655** (3.26×) |
-| Produce cluster CPU % (ceiling 1200) | 940 | **828** |
-| Produce cluster memory MiB | 4 464 | **999** |
-| **Consume msgs/sec** (RF=3) | 1 413 122 | **2 977 061** (2.11×) |
-| Consume msgs/sec, client-measured | 3 159 988 | **3 712 925** (1.17×) |
-
-Consume is close, and honestly so: wall clock favours Brahmaputra because
-it charges Kafka roughly two seconds of JVM startup, while each client's
-own reported rate puts them within 17 %.
-
-### What replication costs
-
-The number that decides whether a design replicates cheaply. Each ratio is
-computed *within* one system, using the same client and the same metric.
-
-| System | RF=1 `acks=1` | RF=3 `acks=all` | Kept | Cost |
-|---|---|---|---|---|
-| Kafka | 735 668 | 231 454 | 31 % | 3.18× |
-| **Brahmaputra** | 1 157 006 | **787 385** | **68 %** | **1.47×** |
-
-Brahmaputra keeps more than twice the share of its unreplicated throughput
-that Kafka keeps. Across three runs the two cost ranges — 3.04–3.31× and
-1.39–1.59× — do not overlap.
-
-### What made it fast
-
-Two defects found by building this benchmark, both fixed in 0.2.0.
-
-| Problem | Fix | Effect |
-|---|---|---|
-| A follower learned about new appends only by asking again, and slept 50 ms between empty answers. Under `acks=all` the high watermark cannot advance until followers have fetched, so **every producer waited out that sleep before its record could commit** — the cluster ran at the polling interval, not at the speed of the log | Leaders hold a caught-up follower's fetch until an append arrives or 500 ms passes, waiting on a log-end-offset watch rather than the high watermark (which cannot advance until this follower fetches — waiting on it would be waiting on itself) | RF=3 produce **106 077 → 787 385** msgs/sec; replication cost 13.35× → **1.47×** |
-| The client resolved the broker hostname on **every send** and never cached it — a measured 6 418 `lookup_host` calls to produce 2 000 records. Only name-advertised clusters paid it, which is every Kubernetes or Compose deployment | Cache resolved addresses on the router with a 30 s TTL, dropped when the connection to that address is invalidated so a broker returning at a new IP is re-resolved at once | 400 000 records to a name-advertised cluster: **6.22 s → 1.45 s** |
-
-Memory is the most stable difference and it is structural rather than
-tuning: the JVM holds its heap and copies records through it, while the
-Rust broker passes refcounted `Bytes` slices and leans on the page cache.
-
-The earlier read- and write-path work that got the single-node numbers
-here — removing four copies from the fetch path, `sendfile`, multi-partition
-requests, concurrent request dispatch — is documented with its own
-measurements in [docs/benchmarks.md](docs/benchmarks.md).
-
-### Benchmark method
-
-| | |
-|---|---|
-| Host | AMD Ryzen AI MAX+ 395, 32 logical CPUs, 64 GB RAM |
-| OS | Windows 11 26200, Docker Desktop 29.6.2, WSL2 |
-| Per container | `--cpus 4 --memory 4g`, overlayfs on the WSL2 virtual disk |
-| Cluster | 3 brokers per system; Kafka `apache/kafka:4.3.1` in KRaft mode |
-| Workload | 2 000 000 × 256 B records per client, 4 clients, 6 partitions |
-| Producer | `batch.size` 64 KiB, `linger.ms` 5, no compression |
-
-Load generators run inside the broker containers, spread round-robin
-across all three, so sampled CPU and memory cover broker *plus* client for
-both systems. Both clusters advertise static IPs, and **both consumers
-join a consumer group** — `kafka-consumer-perf-test` always does, and
-comparing it against an uncoordinated reader overstates the other side by
-about 3×.
-
-Every RF=3 level asserts it actually replicated: Kafka must report ISR=3 on
-all six partitions, and Brahmaputra must hold partition logs on all three
-nodes with log end offsets summing exactly to the records produced.
-
-Reproduce:
+Results depend on the workload and timing boundary. RF=3 production remains
+sensitive to saturation: the four-client native run showed multi-second tail
+latency and lower wall throughput than its two-client level. The full reports
+include every level and latency measurements, including these stalls.
 
 ```bash
-PER_CLIENT=2000000 LEVELS=4 bash scripts/bench-replicated-vs-kafka.sh
-bash scripts/bench-replicated.sh    # native, no Docker: RF=3 against RF=1
+bash scripts/bench-release.sh
 ```
 
-**Caveats.** Three brokers per system share one host's disk and NIC, so
-absolute numbers sit below real hardware — for both systems equally, which
-is what preserves the ratios. Kafka gains up to 40 % on longer runs from
-JIT warmup and was still climbing when measurement stopped, so its side of
-every ratio is a floor. Throughput only; no latency percentiles. Full
-report, including two findings this benchmark surfaced that are not fixed,
-in [docs/replicated-benchmark-2026-08-22.md](docs/replicated-benchmark-2026-08-22.md).
+Each scenario retains its report, client counts and resource samples in
+`bench/results/release-benchmarks/`. A scenario fails if a client fails or reports
+an incomplete record count. Replicated comparisons also require all workload
+topics to pass bounded partition/replica/offset verification.
+
+The comparisons use Kafka 4.3.1 on the same Docker host, with 4 CPUs and 4 GiB
+per broker. Clients run inside their respective broker containers. Reports
+separate wall-clock and client-measured rates, and include CPU, memory and
+producer latency where available. Equal container limits do not imply equal
+measured CPU use. Shared-host, short single-pass results are not production
+capacity estimates or universal throughput ratios.
+
+Historical work on follower long polling, DNS caching, zero-copy reads and
+batching remains in [the earlier replicated report](docs/replicated-benchmark-2026-08-22.md)
+and [benchmark notes](docs/benchmarks.md). Those older measurements do not describe
+0.8.0. Kafka wire compatibility remains an ecosystem gap: use native Brahmaputra
+clients; Kafka clients and Kafka Connect cannot connect directly.
 
 ## Architecture
 

@@ -202,10 +202,7 @@ fn run_controller_process_helper() -> Result<()> {
             let listener = TcpListener::bind(&bind_address).await?;
             let mut config =
                 ControllerConfig::new(node_id, cluster_id, peers).with_data_dir(data_dir);
-            config.raft.heartbeat_interval = 40;
-            config.raft.election_timeout_min = 180;
-            config.raft.election_timeout_max = 360;
-            config.raft_rpc_timeout = Duration::from_millis(500);
+            // Exercise shipping Raft timing and catch-up batch limits.
             config.command_timeout = Duration::from_secs(12);
             let node = ControllerNode::new(config).await?;
             node.serve(listener, async move {
@@ -449,6 +446,18 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
     )
     .await?;
 
+    post_command(
+        &client,
+        &command_address,
+        MetadataCommand::CreateTopic {
+            name: "catch-up".to_owned(),
+            partitions: 100,
+            replication_factor: 1,
+            configs: BTreeMap::new(),
+        },
+    )
+    .await?;
+
     // Exceed the exact live failure's ~274 entries before restarting a
     // follower from its original store.
     for sequence in 1..=300_i64 {
@@ -463,7 +472,7 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
         )
         .await?;
     }
-    wait_for_process_metadata(&client, &nodes, 301).await?;
+    wait_for_process_metadata(&client, &nodes, 302).await?;
 
     let follower_index = nodes
         .iter()
@@ -471,7 +480,9 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
         .context("three-node cluster needs a follower")?;
     nodes[follower_index].hard_stop()?;
 
-    for sequence in 301..=340_i64 {
+    // A lag larger than one old 300-entry batch, with a realistic metadata
+    // image, must converge instead of endlessly reapplying a timed-out batch.
+    for sequence in 301..=640_i64 {
         let survivor = nodes
             .iter()
             .find(|node| node.child.is_some())
@@ -489,7 +500,7 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
     }
     nodes[follower_index].restart()?;
     wait_for_process_http_ready(&client, &nodes).await?;
-    wait_for_process_metadata(&client, &nodes, 341).await?;
+    wait_for_process_metadata(&client, &nodes, 642).await?;
 
     // A full graceful restart must elect directly from persisted membership,
     // without bootstrap, and retain the exact metadata image.
@@ -501,7 +512,7 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
     }
     wait_for_process_http_ready(&client, &nodes).await?;
     wait_for_process_leader(&client, &nodes).await?;
-    wait_for_process_metadata(&client, &nodes, 341).await?;
+    wait_for_process_metadata(&client, &nodes, 642).await?;
     post_command(
         &client,
         nodes[1].address(),
@@ -510,7 +521,7 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
         },
     )
     .await?;
-    wait_for_process_metadata(&client, &nodes, 342).await?;
+    wait_for_process_metadata(&client, &nodes, 643).await?;
 
     // Kill every OS process, then reopen all three redb stores. This is the
     // hard-restart proof that vote/log/commit/state survived process death.
@@ -522,7 +533,7 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
     }
     wait_for_process_http_ready(&client, &nodes).await?;
     wait_for_process_leader(&client, &nodes).await?;
-    wait_for_process_metadata(&client, &nodes, 342).await?;
+    wait_for_process_metadata(&client, &nodes, 643).await?;
     post_command(
         &client,
         nodes[2].address(),
@@ -537,7 +548,7 @@ async fn durable_follower_and_full_cluster_restarts_retain_raft_state() -> Resul
         },
     )
     .await?;
-    wait_for_process_metadata(&client, &nodes, 343).await?;
+    wait_for_process_metadata(&client, &nodes, 644).await?;
 
     for node in &mut nodes {
         node.graceful_stop()?;

@@ -4,8 +4,9 @@
 //! Metadata, and lazily opens one multiplexed [`Connection`] per address.
 //! Transport failures evict that pooled connection but are never replayed:
 //! in particular, a Produce request may have reached the broker before its
-//! connection failed. Callers may retry once only after decoding an explicit
-//! `NOT_LEADER_OR_FOLLOWER` response, which proves that broker did not append.
+//! connection failed. Callers apply their retry policy to explicit broker
+//! errors. Leadership errors can occur after append; idempotence is required
+//! to suppress duplicates when those requests are retried.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -451,7 +452,20 @@ impl BrokerRouter {
             };
             match pooled.connection.request(ApiKey::Metadata, &body).await {
                 Ok(response) => {
-                    return MetadataResponse::decode(&response).map_err(message_error);
+                    let response = MetadataResponse::decode(&response).map_err(message_error)?;
+                    if let Err(error) = ClientError::from_error_code(response.error_code) {
+                        // An unavailable metadata peer is not an empty cluster.
+                        // Try another known peer only for transient lifecycle errors.
+                        if matches!(
+                            response.error_code,
+                            ec::FENCED_BROKER_EPOCH | ec::COORDINATOR_LOAD_IN_PROGRESS
+                        ) {
+                            last_error = Some(error);
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    return Ok(response);
                 }
                 Err(error) => {
                     self.invalidate(&pooled);

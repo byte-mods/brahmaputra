@@ -61,10 +61,9 @@ pub struct ProducerConfig {
     /// cost once and paying it per partition.
     pub batch_partitions: bool,
     /// How many times to retry a send the broker refused with a *retriable*
-    /// error (`retries`). Retriable means the broker proved it did not
-    /// durably append — a stale leader, an ISR momentarily too small, a
-    /// coordinator still loading. Retrying one of those cannot duplicate a
-    /// record.
+    /// error (`retries`): a stale leader, an ISR momentarily too small, a
+    /// suspended broker lease, or a coordinator still loading. Some errors
+    /// can occur after append; enable idempotence to deduplicate retries.
     ///
     /// Non-retriable errors are returned immediately: a malformed request
     /// or a failed authorization fails identically however often it is
@@ -1023,6 +1022,7 @@ impl Inner {
                         code,
                         ec::UNKNOWN_TOPIC_OR_PARTITION
                             | ec::NOT_LEADER_OR_FOLLOWER
+                            | ec::FENCED_BROKER_EPOCH
                             | ec::FENCED_LEADER_EPOCH
                             | ec::UNKNOWN_LEADER_EPOCH
                     ) {
@@ -1076,10 +1076,11 @@ impl Inner {
     }
 }
 
-/// Whether a broker error code means "this send did not happen, try again".
+/// Whether a broker error describes a condition that can recover.
 ///
-/// The distinction that matters is *durability*, not severity. Each code
-/// here is one the broker returns strictly before it appends anything:
+/// These refusals often happen before append, but lease/leadership changes
+/// and replication timeouts can also happen afterwards. Non-idempotent
+/// retries are at-least-once; producer identity and sequence provide dedup.
 ///
 /// - `UNKNOWN_TOPIC_OR_PARTITION`: the broker has not seen the topic *yet*.
 ///   Creation is a controller write that reaches brokers asynchronously, so
@@ -1089,11 +1090,13 @@ impl Inner {
 ///   broker's own code — which is what Kafka does with this code too.
 /// - `NOT_LEADER_OR_FOLLOWER` / `FENCED_LEADER_EPOCH` /
 ///   `UNKNOWN_LEADER_EPOCH`: the request reached a broker that does not
-///   lead the partition, so it appended nothing and the client's routing
-///   is stale.
+///   lead the partition, or lost leadership during append. Refresh routing.
+/// - `FENCED_BROKER_EPOCH`: the broker cannot currently serve its lease.
+///   Refresh routing and allow a replacement or a resumed lease to serve
+///   the retry. A lease can expire during an append as well as before it.
 /// - `NOT_ENOUGH_REPLICAS`: `acks=all` was refused because the ISR is
-///   below `min.insync.replicas`. Deliberately refused, never partially
-///   written — and it recovers on its own when a follower catches up.
+///   below `min.insync.replicas`, or the replication wait timed out after
+///   append. It can recover when a follower catches up.
 /// - `COORDINATOR_LOAD_IN_PROGRESS`: the coordinator is replaying its log
 ///   and is not ready to answer yet.
 /// - `INTERNAL`: the broker failed the request rather than completing it.
@@ -1108,6 +1111,7 @@ fn is_retriable_error_code(code: i32) -> bool {
         code,
         ec::UNKNOWN_TOPIC_OR_PARTITION
             | ec::NOT_LEADER_OR_FOLLOWER
+            | ec::FENCED_BROKER_EPOCH
             | ec::FENCED_LEADER_EPOCH
             | ec::UNKNOWN_LEADER_EPOCH
             | ec::NOT_ENOUGH_REPLICAS
@@ -1246,17 +1250,16 @@ mod retry_classification_tests {
     use super::is_retriable_error_code;
     use brahmaputra_protocol::error_code as ec;
 
-    /// Every code here is one the broker returns *before* appending, so a
-    /// retry cannot duplicate a record. This is the property that makes
-    /// automatic retry safe at all; if a code that could have been durably
-    /// written appeared in this list, retrying would silently duplicate.
+    /// Transient broker lifecycle and replication failures remain eligible
+    /// for retry within the configured budget.
     #[test]
-    fn only_codes_that_prove_no_append_are_retried() {
+    fn transient_broker_errors_are_retried() {
         for code in [
             // Metadata staleness, not a verdict: the topic may exist and
             // this broker may simply not have been told yet.
             ec::UNKNOWN_TOPIC_OR_PARTITION,
             ec::NOT_LEADER_OR_FOLLOWER,
+            ec::FENCED_BROKER_EPOCH,
             ec::FENCED_LEADER_EPOCH,
             ec::UNKNOWN_LEADER_EPOCH,
             ec::NOT_ENOUGH_REPLICAS,

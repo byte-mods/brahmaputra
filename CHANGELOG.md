@@ -1,5 +1,115 @@
 # Changelog
 
+## 0.8.0 — 2026-09-20
+
+Controller writes survive caller cancellation, broker leases and consumer
+groups recover through temporary outages, and the dashboard adds live analytics.
+This release also secures fetch sessions and adds transactional group consumption.
+The wire protocol remains version 4 and the on-disk format is unchanged.
+
+### Added
+
+- Live dashboard analytics with six rate/gauge charts, selectable time windows,
+  sample tooltips, peak values, health and filesystem progress bars, pause/resume,
+  stale-data status and JSON sample export. Polling is bounded and stops at logout;
+  charts handle sparse samples and counter resets. Nine JavaScript behavior tests
+  run against the embedded shipping script in CI.
+- The Windows metadata verification compares stable, contemporaneous HTTP and
+  TCP views instead of waiting forever for an obsolete leader-epoch snapshot.
+
+- Rust `GroupConsumer::with_isolation_level` supports `ReadCommitted`.
+  The CLI now honors `consume --group ... --isolation-level read_committed`.
+  Aborted records are excluded and pending transactions hold the reader at
+  the last stable offset. Byte-budget and rack configuration preserve isolation.
+- `scripts/verify-release.sh` runs the shell verification suites, retains
+  their individual logs and exit codes, and fails if any suite fails.
+  CI now includes transaction, security, compaction, reassignment and JBOD
+  verification alongside the earlier live suites.
+
+### Fixed
+
+- Metadata writes retain their serialization guard through Raft completion
+  even if the caller is cancelled by a lease deadline. A subsequent command
+  can no longer reuse a pending write's metadata offset or overwrite its
+  image. A three-controller regression cancels a write during quorum loss and
+  verifies that it and the following registration both survive recovery.
+- New consumer groups retry temporarily missing coordinator routes as well
+  as coordinator error responses. Recovery has a ten-second retry window;
+  transport errors with ambiguous outcomes remain visible to callers.
+
+- ISR reconciliation retains its partition mutation guard while a temporarily
+  suspended broker lease recovers. It previously propagated that refusal as a
+  fatal task error and shut down the broker under concurrent replicated load.
+  A newer broker incarnation still irreversibly fences the old process.
+- Replicated benchmark verification checks every workload topic, fails on
+  missing partitions or incorrect counts, and gives transient read-only
+  verification requests a bounded recovery window outside timed workloads.
+
+- Controller validation failures are rechecked after quorum confirmation, so
+  an obsolete local error cannot reject a now-valid registration. Conditional
+  registration also routes around a locally older broker epoch and keeps the
+  data plane suspended while waiting for that image to catch up.
+
+- A cluster seed renewing its broker lease continues to serve authorized,
+  read-only routing metadata. It previously returned an empty cluster and made
+  fresh clients report missing topics even while other replicas were healthy.
+  Metadata errors now preserve their error code, and the client checks that
+  code before replacing its route cache.
+
+- Automatic broker expiry now compares the heartbeat observed by maintenance
+  with the heartbeat in the metadata image being committed. A delayed expiry
+  cannot fence a broker whose lease renewed while the command was queued.
+  Durable and coalesced heartbeat timestamps no longer regress when requests
+  complete out of order. Explicit administrative fencing is unchanged.
+
+- Incremental fetch sessions are bound to their authenticated principal.
+  A different principal cannot read, modify or close a session by guessing
+  its id. Every restored partition is authorized again, so revoking an ACL
+  takes effect even when subsequent requests send no partition descriptors.
+- Request-level multi-fetch errors carry their actual error code. The
+  client reports request and partition errors instead of returning empty
+  success, and retries session recovery only for a missing session.
+- Committed reads continue past aborted and control batches that exhaust
+  a raw read's byte budget. Previously they could return empty forever even
+  with committed records available farther along the log. The response
+  budget counts visible bytes and the last stable offset remains the limit.
+- Producers retry a broker-epoch refusal within their existing retry and
+  delivery budgets. A suspended lease can recover; it is distinct from a
+  fenced producer identity, which remains a permanent error. Group polling
+  also tolerates this temporary refusal. Non-idempotent retries remain
+  at-least-once; enable idempotence when duplicate suppression is required.
+- Incremental fetch descriptors include a changed byte budget even when
+  their offset stays the same.
+- Controller Raft defaults use a 200-ms heartbeat and 1–2-second election
+  window, with at most 32 metadata entries per replication batch. The
+  inherited 50-ms deadline and 300-entry batches repeatedly cancelled
+  catch-up requests to live peers during combined failure recovery.
+  Broker lease settings and live-test recovery deadlines are unchanged.
+- The replicated benchmark retains broker logs and container inspection
+  output before cleanup. Missing resource samples are reported as `NA`.
+- All comparison harnesses use consumer groups on both systems. The older
+  single-node and large-record harnesses now give Kafka clients a separate
+  512-MiB heap instead of inheriting the broker heap. `bench-release.sh`
+  runs replication, concurrency, size, codec, acknowledgment and
+  idempotent and rate-limited scenarios sequentially and preserves each result.
+  Kafka idempotence is explicit and matches the native producer in each run.
+  Successful scenarios must also report the expected produced/consumed counts.
+- Codec comparisons use the same repeated-byte payload on both systems,
+  so differences in compressibility no longer bias the comparison.
+- The extended replication fixture pauses native Windows test brokers
+  through a process-identity-checked helper, observes in-flight requests
+  during launch, and uses the deterministic gate in release checks and CI.
+  Its uniqueness assertions now use idempotent producers, as required for
+  duplicate suppression when a leader changes after append but before reply.
+  Shell scripts are checked out with LF endings for Linux execution.
+
+Verification and benchmark results are recorded in the
+[release review](docs/release-0.8.0-review.md). The correctness run passed 419 Rust
+tests on each of Windows and Linux, nine dashboard JavaScript tests, 14 Windows
+live suites, 31 M2 checks and 97 extended replication checks. A five-minute soak
+retained 1,260,000 acknowledged records across six broker kills with no failed
+batches. Independent timing-sensitive Rust tests run serially in CI.
+
 ## 0.7.0 — 2026-09-02
 
 A review release. The code was read against the guarantees it claims, and

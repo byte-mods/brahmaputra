@@ -1,0 +1,9 @@
+system,config,phase,clients,records,seconds,msgs_per_sec,client_msgs_per_sec,cpu_avg,cpu_peak,mem_avg,mem_peak,lat_p50_ms,lat_p99_ms,lat_p999_ms,lat_max_ms
+kafka,rf3,produce,1,50000,6.61,7562,9978,232.7,291.8,1165,1239,7.00,72.00,81.00,267.00
+kafka,rf3,consume,1,50000,2.98,16795,56561,285.6,285.6,1182,1182,0,0,0,0
+kafka,rf1,produce,1,50000,6.75,7405,9974,131.8,192.0,1240,1243,5.00,26.00,30.00,262.00
+kafka,rf1,consume,1,50000,2.52,19810,123457,197.3,197.3,1305,1305,0,0,0,0
+brahmaputra,rf3,produce,1,50000,5.36,9327,9984,90.7,91.5,70,73,4.22,26.44,57.04,64.75
+brahmaputra,rf3,consume,1,50000,1.53,32595,43520,19.4,19.4,59,59,0,0,0,0
+brahmaputra,rf1,produce,1,50000,5.33,9383,9989,47.8,49.9,72,80,3.77,7.77,12.47,19.62
+brahmaputra,rf1,consume,1,50000,1.51,33201,44744,18.3,18.3,76,76,0,0,0,0

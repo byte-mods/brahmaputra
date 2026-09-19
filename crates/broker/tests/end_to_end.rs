@@ -19,6 +19,68 @@ const PARTITIONS: i32 = 3;
 const RECORDS_PER_PRODUCER: u64 = 500;
 const CONTINUATION_RECORDS: u64 = 10;
 
+#[tokio::test]
+async fn incremental_fetch_applies_a_changed_byte_budget_at_the_same_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_broker(dir.path()).await;
+    let producer = Producer::connect(
+        broker.addr,
+        ProducerConfig {
+            linger_ms: 0,
+            compression: Compression::None,
+            ..ProducerConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    for _ in 0..4 {
+        producer
+            .send(TOPIC, Some(0), None, Bytes::from(vec![b'x'; 70_000]))
+            .await
+            .unwrap();
+    }
+    let consumer = Consumer::connect(broker.addr, "budget-reader")
+        .await
+        .unwrap()
+        .with_max_bytes(64 * 1024);
+    let requests = [(TOPIC.to_owned(), 0, 0)];
+    let first = consumer.fetch_many_public(&requests, 0).await.unwrap();
+    assert_eq!(first[0].2.len(), 1);
+    let consumer = consumer.with_max_bytes(300_000);
+    let next = consumer.fetch_many_public(&requests, 0).await.unwrap();
+    assert_eq!(
+        next[0].2.len(),
+        4,
+        "an unchanged offset must not hide a changed budget"
+    );
+    stop_broker(broker).await;
+}
+
+#[tokio::test]
+async fn multi_fetch_reports_partition_errors_instead_of_empty_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_broker(dir.path()).await;
+    let producer = Producer::connect(broker.addr, ProducerConfig::default())
+        .await
+        .unwrap();
+    producer
+        .send(TOPIC, Some(0), None, Bytes::from_static(b"record"))
+        .await
+        .unwrap();
+    let consumer = Consumer::connect(broker.addr, "error-reader")
+        .await
+        .unwrap();
+    let error = consumer
+        .fetch_many_public(&[(TOPIC.to_owned(), 0, -1)], 0)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, brahmaputra_client::ClientError::Server { code, .. }
+        if code == brahmaputra_protocol::error_code::OFFSET_OUT_OF_RANGE)
+    );
+    stop_broker(broker).await;
+}
+
 type ExpectedPartition = BTreeMap<i64, (Option<Bytes>, Bytes)>;
 type ExpectedRecords = HashMap<i32, ExpectedPartition>;
 

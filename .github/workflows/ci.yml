@@ -29,7 +29,15 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace
+        # Several real-time lease tests use subsecond session deadlines.
+        # Keep independent tests from competing for the runner's CPU.
+        run: cargo test --workspace --locked -- --test-threads=1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Dashboard behavior
+        run: node --test scripts/test-dashboard.cjs
 
   # The live suites: real brokers, real kills, real logs on disk. These are
   # what actually catch replication and recovery regressions, so they gate
@@ -42,21 +50,34 @@ jobs:
       fail-fast: false
       matrix:
         suite:
+          - verify-m1
+          - verify-m3
+          - verify-m4
+          - verify-m6
           - verify-replication
           - verify-retention
           - verify-failures
           - verify-transport-parity
           - verify-m5
+          - verify-reassignment
+          - verify-admin-and-security
+          - verify-transactions
+          - verify-compaction
+          - verify-jbod
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Build binaries
-        run: cargo build -p brahmaputra-server -p brahmaputra-cli
+        run: |
+          cargo build --locked -p brahmaputra-server -p brahmaputra-cli
+          cargo build --locked --release -p brahmaputra-server -p brahmaputra-cli
 
       - name: ${{ matrix.suite }}
         run: bash scripts/${{ matrix.suite }}.sh
+        env:
+          STORM_GATE: "1"
 
       - name: Upload artifacts on failure
         if: failure()

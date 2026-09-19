@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Resource-matched benchmark: Kafka, Brahmaputra/TCP and Brahmaputra/QUIC
-# driven at increasing client concurrency until each reaches the same CPU
-# envelope, so the comparison is throughput at equal resource draw rather
-# than throughput at whatever load one client happens to offer.
+# Equal-container-limit benchmark: Kafka, Brahmaputra/TCP and Brahmaputra/QUIC
+# driven at increasing client concurrency. Reports peak throughput and
+# nearest sampled CPU points; these are not equal-CPU measurements.
 #
 # A single client can leave a fast broker idle, which reads as "similar
 # throughput" when it really means "the client ran out of work to give".
 # Each system is therefore driven at 1, 2, 4, ... concurrent clients inside
 # its own container; the level whose CPU is closest to Kafka's is the
-# matched point, and the peak across levels is the saturation point.
+# nearest point, and the peak is the best observed rate across levels.
 #
 # Every system gets the same container limits, record size, partition count
 # and durability setting. Clients run inside the broker container on both
@@ -51,7 +50,10 @@ MAX_BYTES="${MAX_BYTES:-16777216}"
 # Confluent's and LinkedIn's recommended production setting.
 KAFKA_BROKER_HEAP="${KAFKA_BROKER_HEAP:--Xmx2g -Xms2g}"
 KAFKA_BROKER_GC="${KAFKA_BROKER_GC:--XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:G1HeapRegionSize=16M -XX:MetaspaceSize=96m -XX:MinMetaspaceFreeRatio=50 -XX:MaxMetaspaceFreeRatio=80 -XX:+ExplicitGCInvokesConcurrent -Djava.awt.headless=true}"
-KAFKA_CLIENT_HEAP="${KAFKA_CLIENT_HEAP:--Xmx512m -Xms512m}"
+# Eight clients must coexist with the broker within the same 4-GiB limit.
+# Match the native producer's 32-MiB buffer rather than reserving 256 MiB
+# per Kafka producer before accounting for eight JVM heaps.
+KAFKA_CLIENT_HEAP="${KAFKA_CLIENT_HEAP:--Xmx128m -Xms64m}"
 KAFKA_CLIENT_GC="${KAFKA_CLIENT_GC:--XX:+UseG1GC -XX:MaxGCPauseMillis=20}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -102,12 +104,13 @@ summarize_samples() {
       if (unit == "GiB") value *= 1024;
       else if (unit == "KiB") value /= 1024;
       else if (unit == "B") value /= 1048576;
+      if (value <= 0) next;
       cpu_sum += cpu; mem_sum += value; n++;
       if (cpu > cpu_max) cpu_max = cpu;
       if (value > mem_max) mem_max = value;
     }
     END {
-      if (n == 0) { print "0 0 0 0"; exit }
+      if (n == 0) { print "NA NA NA NA"; exit }
       printf "%.1f %.1f %.0f %.0f\n", cpu_sum / n, cpu_max, mem_sum / n, mem_max;
     }
   ' "$1"
@@ -240,7 +243,7 @@ run_kafka_level() {
       --producer-props bootstrap.servers=bench-kafka:9092 "acks=$ACKS" \
         "batch.size=$BATCH_SIZE" "linger.ms=$LINGER_MS" \
         "compression.type=$COMPRESSION" "max.request.size=$MAX_BYTES" \
-        "buffer.memory=268435456" \
+        "buffer.memory=33554432" "enable.idempotence=false" \
       > "$RESULTS/kafka-produce-$clients-$index.txt" 2>&1 &
     pids+=($!)
   done
@@ -326,7 +329,8 @@ run_brahmaputra_level() {
   for (( index = 0; index < clients; index++ )); do
     docker_run exec "$name" /usr/local/bin/brahmaputra-cli \
       --transport "$transport" --broker "$name:9092" consume \
-      --topic "$TOPIC-$tag$clients-$index" --from earliest \
+      --topic "$TOPIC-$tag$clients-$index" --group "bench-$tag-$clients-$index-$RANDOM" \
+      --commit-interval-ms 0 \
       --max "$PER_CLIENT" --quiet \
       > "$RESULTS/$tag-consume-$clients-$index.txt" 2>&1 &
     pids+=($!)
@@ -360,15 +364,15 @@ docker_run rm -f bench-quic >/dev/null
 
 # -------------------------------------------------------------- report
 # Two readings per phase: the level whose CPU sits closest to Kafka's own
-# CPU at that phase (equal-resource comparison), and the best throughput
+# CPU at that phase (a descriptive nearest point), and the best throughput
 # any level reached (saturation comparison).
 
 kafka_cpu_at() {
-  awk -F, -v phase="$1" '$1=="kafka" && $2==phase { cpu=$8; rate=$6 } END { print cpu+0, rate+0 }' "$CSV"
+  awk -F, -v phase="$1" '$1=="kafka" && $2==phase && $6+0 > rate+0 { cpu=$8; rate=$6 } END { print cpu, rate+0 }' "$CSV"
 }
 matched_row() {
   awk -F, -v sys="$1" -v phase="$2" -v target="$3" '
-    $1==sys && $2==phase {
+    $1==sys && $2==phase && $8 != "NA" && target != "NA" {
       diff = $8 - target; if (diff < 0) diff = -diff;
       if (best == "" || diff < best) { best = diff; row = $0 }
     }
@@ -400,7 +404,7 @@ emit_matched() {
   printf '|---|---|---|---|\n'
   printf '| Clients | %s | %s | %s |\n' \
     "$(field "$kafka_row" 3)" "$(field "$tcp_row" 3)" "$(field "$quic_row" 3)"
-  printf '| msgs/sec at matched CPU | %s | %s | %s |\n' \
+  printf '| msgs/sec at nearest sampled CPU | %s | %s | %s |\n' \
     "$(field "$kafka_row" 6)" "$(field "$tcp_row" 6)" "$(field "$quic_row" 6)"
   printf '| msgs/sec, client-measured | %s | %s | %s |\n' \
     "$(field "$kafka_row" 7)" "$(field "$tcp_row" 7)" "$(field "$quic_row" 7)"
@@ -408,7 +412,7 @@ emit_matched() {
     "$(field "$kafka_row" 8)" "$(field "$tcp_row" 8)" "$(field "$quic_row" 8)"
   printf '| Memory MiB avg | %s | %s | %s |\n' \
     "$(field "$kafka_row" 10)" "$(field "$tcp_row" 10)" "$(field "$quic_row" 10)"
-  printf '| Ratio vs Kafka at matched CPU | 1.00x | %s | %s |\n' \
+  printf '| Ratio vs Kafka at those points | 1.00x | %s | %s |\n' \
     "$(ratio "$(field "$tcp_row" 6)" "$(field "$kafka_row" 6)")" \
     "$(ratio "$(field "$quic_row" 6)" "$(field "$kafka_row" 6)")"
   printf '| Peak msgs/sec (any level) | %s | %s | %s |\n' \
@@ -429,11 +433,14 @@ emit_matched() {
   printf 'and clients run inside the broker container on both sides, so the\n'
   printf 'sampled CPU and memory cover broker plus client for everyone.\n'
   printf 'Kafka image `%s`.\n\n' "$KAFKA_IMAGE"
+  printf 'Producer idempotence is disabled on both systems.\n\n'
+  printf 'Kafka client heap: `%s`; producer buffer: 32 MiB on both systems.\n\n' "$KAFKA_CLIENT_HEAP"
   printf 'A single client can leave a fast broker idle, so raw single-client\n'
   printf 'throughput understates a system that was never saturated. The\n'
   printf 'matched reading picks, for each system, the concurrency level whose\n'
   printf 'average CPU is closest to Kafka best level, which is what makes\n'
-  printf 'the throughput comparison a like-for-like cost comparison.\n\n'
+  printf 'these descriptive nearest points, not equal-CPU measurements.\n'
+  printf 'The fixed container limits are identical; actual usage can differ.\n\n'
 
   emit_matched produce "$KAFKA_PRODUCE_CPU" "$KAFKA_PRODUCE_BEST"
   emit_matched consume "$KAFKA_CONSUME_CPU" "$KAFKA_CONSUME_BEST"

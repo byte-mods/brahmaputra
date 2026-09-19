@@ -24,6 +24,7 @@ CPUS="${CPUS:-4}"
 MEMORY="${MEMORY:-4g}"
 KAFKA_IMAGE="${KAFKA_IMAGE:-apache/kafka:4.3.1}"
 KAFKA_BROKER_HEAP="${KAFKA_BROKER_HEAP:--Xmx2g -Xms2g}"
+KAFKA_CLIENT_HEAP="${KAFKA_CLIENT_HEAP:--Xmx512m -Xms512m}"
 KAFKA_BROKER_GC="${KAFKA_BROKER_GC:--XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:G1HeapRegionSize=16M -XX:MetaspaceSize=96m -XX:MinMetaspaceFreeRatio=50 -XX:MaxMetaspaceFreeRatio=80 -XX:+ExplicitGCInvokesConcurrent -Djava.awt.headless=true}"
 NETWORK="${NETWORK:-brahma-bench}"
 # One record is 1 MiB, so frames and fetches must be allowed past the
@@ -75,6 +76,7 @@ summarize_samples() {
       if (unit == "GiB") value *= 1024;
       else if (unit == "KiB") value /= 1024;
       else if (unit == "B") value /= 1048576;
+      if (value <= 0) next;
       cpu_sum += cpu; mem_sum += value; n++;
       if (cpu > cpu_max) cpu_max = cpu;
       if (value > mem_max) mem_max = value;
@@ -166,7 +168,8 @@ brahma_consume() {
   local name="$1" transport="$2" topic="$3" records="$4" out="$5"
   docker_run exec "$name" /usr/local/bin/brahmaputra-cli \
     --transport "$transport" --broker "$name:9092" consume --topic "$topic" \
-    --from earliest --max "$records" --quiet > "$out" 2>&1
+    --group "bench-$topic-$RANDOM" --commit-interval-ms 0 \
+    --max "$records" --quiet > "$out" 2>&1
 }
 
 # ------------------------------------------------------------- parsing
@@ -191,19 +194,19 @@ docker_run exec bench-kafka /opt/kafka/bin/kafka-topics.sh \
   --config max.message.bytes="$MAX_BYTES" >/dev/null
 info "produce"
 start_sampling bench-kafka "$RESULTS/kafka-produce-stats.txt"
-docker_run exec bench-kafka /opt/kafka/bin/kafka-producer-perf-test.sh \
+docker_run exec -e KAFKA_HEAP_OPTS="$KAFKA_CLIENT_HEAP" bench-kafka /opt/kafka/bin/kafka-producer-perf-test.sh \
   --topic "$TOPIC" --num-records "$RECORDS" --record-size "$RECORD_SIZE" \
   --throughput -1 \
   --producer-props bootstrap.servers=bench-kafka:9092 "acks=$ACKS" \
     "batch.size=$BATCH_SIZE" "linger.ms=$LINGER_MS" "compression.type=$COMPRESSION" \
-    "max.request.size=$MAX_BYTES" "buffer.memory=268435456" \
+    "max.request.size=$MAX_BYTES" "buffer.memory=268435456" "enable.idempotence=false" \
   > "$RESULTS/kafka-produce.txt" 2>&1 \
   || { stop_sampling; cat "$RESULTS/kafka-produce.txt" >&2; die "Kafka produce failed"; }
 stop_sampling
 KAFKA_DISK="$(disk_bytes bench-kafka /tmp/kraft-combined-logs)"
 info "consume"
 start_sampling bench-kafka "$RESULTS/kafka-consume-stats.txt"
-docker_run exec bench-kafka /opt/kafka/bin/kafka-consumer-perf-test.sh \
+docker_run exec -e KAFKA_HEAP_OPTS="$KAFKA_CLIENT_HEAP" bench-kafka /opt/kafka/bin/kafka-consumer-perf-test.sh \
   --bootstrap-server bench-kafka:9092 --topic "$TOPIC" --messages "$RECORDS" \
   --group "threeway-$RANDOM" --timeout 180000 --fetch-size "$MAX_BYTES" \
   > "$RESULTS/kafka-consume.txt" 2>&1 \
@@ -258,6 +261,7 @@ QUIC_DISK="$(cat "$RESULTS/quic-disk.txt" 2>/dev/null || true)"
     "$BATCH_SIZE" "$LINGER_MS" "$COMPRESSION" "$CPUS"
   printf 'and %s, and each system is driven by its own client from inside its\n' "$MEMORY"
   printf 'own container. Kafka image `%s`.\n\n' "$KAFKA_IMAGE"
+  printf 'Producer idempotence is disabled on both systems.\n\n'
 
   printf '| Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC |\n'
   printf '|---|---|---|---|\n'
@@ -278,9 +282,9 @@ QUIC_DISK="$(cat "$RESULTS/quic-disk.txt" 2>/dev/null || true)"
   printf '| Log bytes on disk | %s | %s | %s |\n' \
     "${KAFKA_DISK:-n/a}" "${TCP_DISK:-n/a}" "${QUIC_DISK:-n/a}"
   printf '| Disk bytes per record | %s | %s | %s |\n' \
-    "$(awk -v d="${KAFKA_DISK:-0}" -v r="$RECORDS" 'BEGIN{if(r) printf "%.0f", d/r; else print "n/a"}')" \
-    "$(awk -v d="${TCP_DISK:-0}" -v r="$RECORDS" 'BEGIN{if(r) printf "%.0f", d/r; else print "n/a"}')" \
-    "$(awk -v d="${QUIC_DISK:-0}" -v r="$RECORDS" 'BEGIN{if(r) printf "%.0f", d/r; else print "n/a"}')"
+    "$(awk -v d="${KAFKA_DISK:-n/a}" -v r="$RECORDS" 'BEGIN{if(r && d ~ /^[0-9]+$/) printf "%.0f", d/r; else print "n/a"}')" \
+    "$(awk -v d="${TCP_DISK:-n/a}" -v r="$RECORDS" 'BEGIN{if(r && d ~ /^[0-9]+$/) printf "%.0f", d/r; else print "n/a"}')" \
+    "$(awk -v d="${QUIC_DISK:-n/a}" -v r="$RECORDS" 'BEGIN{if(r && d ~ /^[0-9]+$/) printf "%.0f", d/r; else print "n/a"}')"
   printf '| Produce msgs/sec per CPU%% | %s | %s | %s |\n' \
     "$(awk -v t="${KP_RATE:-0}" -v c="$KP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')" \
     "$(awk -v t="${TP_RATE:-0}" -v c="$TP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')" \

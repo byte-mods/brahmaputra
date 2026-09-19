@@ -1,5 +1,25 @@
 # Kafka Parity Audit
 
+## 0.8.0 review update
+
+Consumer groups now expose `read_committed` in the Rust client and honor
+the CLI isolation flag. Previously only the direct consumer could select
+isolation, so a grouped transactional pipeline could consume aborted data.
+Committed fetches also continue past filtered batches larger than their
+byte budget. These changes close a functional gap in the existing
+transaction implementation; they do not add Kafka wire compatibility.
+
+Fetch sessions now bind to an authenticated principal and recheck read
+permission for their restored partitions on every request, including
+incremental requests carrying no descriptors. Broker-lease refusals are
+retryable by producers and tolerated during group polling. Non-idempotent
+retries remain at-least-once.
+
+Use `scripts/verify-release.sh` and `scripts/bench-release.sh` for the
+release verification and finite comparison matrices. Historical benchmark
+figures below retain their original methodology; the new harnesses use
+group consumers on both systems and separate Kafka broker/client heaps.
+
 Where Brahmaputra stands against Apache Kafka (3.x/4.x), checked against
 the code rather than against DESIGN.md's intentions. Kafka defaults are
 quoted for context; the benchmark harness pins the exact Kafka version it
@@ -222,7 +242,7 @@ deltas survive, so records inside one batch keep their relative spacing.
 | `max.in.flight.requests.per.connection` | 5 | same | ✅ |
 | `enable.idempotence` | true | off | ✅ supported; default differs |
 | `request.timeout.ms` | 30 s | same | ✅ |
-| `retries` | ∞ | **5** | ✅ *new*, gated on codes that prove no append |
+| `retries` | ∞ | **5** | ✅ transient broker errors; non-idempotent retries can duplicate |
 | `retry.backoff.ms` | 100 ms | **100 ms** | ✅ *new* |
 | `delivery.timeout.ms` | 2 min | **120 s** | ✅ *new* |
 | `buffer.memory` | 32 MiB | **32 MiB** | ✅ *new*, blocks rather than growing |

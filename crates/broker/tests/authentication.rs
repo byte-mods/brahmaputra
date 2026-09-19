@@ -180,6 +180,70 @@ async fn connect(addr: std::net::SocketAddr) -> Connection {
 }
 
 #[tokio::test]
+async fn incremental_fetch_cannot_bypass_principal_or_revoked_acls() {
+    use brahmaputra_protocol::gen::{FetchMultiPartition, FetchMultiRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let mut image = image_with_users();
+    let cache = MetadataCache::new(image.clone());
+    let running = start_secured_broker(dir.path(), cache.clone()).await;
+    let reader = connect(running.addr).await;
+    reader
+        .authenticate(&Credentials {
+            username: "reader".into(),
+            password: "correct horse".into(),
+            mechanism: SaslMechanism::Plain,
+        })
+        .await
+        .unwrap();
+    let request = FetchMultiRequest {
+        session_id: -1,
+        session_epoch: 0,
+        partitions: vec![FetchMultiPartition {
+            topic: "orders".into(),
+            partition: 0,
+            fetch_offset: 0,
+            max_bytes: 1024,
+        }],
+        ..Default::default()
+    };
+    let response = reader
+        .request(ApiKey::FetchMulti, &request.encode().unwrap())
+        .await
+        .unwrap();
+    let (opened, _) = codec::decode_fetch_multi_response(response).unwrap();
+    assert_eq!(opened.error_code, ec::NONE);
+    assert_eq!(opened.results[0].error_code, ec::NONE);
+    let incremental = FetchMultiRequest {
+        session_id: opened.session_id,
+        session_epoch: opened.session_epoch,
+        ..Default::default()
+    }
+    .encode()
+    .unwrap();
+    // An anonymous connection sends no descriptors, attempting to use the
+    // authenticated reader's cached partition list.
+    let anonymous = connect(running.addr).await;
+    let response = anonymous
+        .request(ApiKey::FetchMulti, &incremental)
+        .await
+        .unwrap();
+    let (denied, batches) = codec::decode_fetch_multi_response(response).unwrap();
+    assert_ne!(denied.error_code, ec::NONE);
+    assert!(batches.is_empty());
+    // Even the owner must be checked again when its ACL is revoked.
+    image.acls.clear();
+    cache.replace(image);
+    let response = reader
+        .request(ApiKey::FetchMulti, &incremental)
+        .await
+        .unwrap();
+    let (denied, batches) = codec::decode_fetch_multi_response(response).unwrap();
+    assert_eq!(denied.error_code, ec::AUTHORIZATION_FAILED);
+    assert!(batches.is_empty());
+    stop(running).await;
+}
+
+#[tokio::test]
 async fn an_unauthenticated_connection_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = MetadataCache::new(image_with_users());
@@ -194,6 +258,23 @@ async fn an_unauthenticated_connection_is_refused() {
         produce_error(&response),
         ec::SASL_AUTHENTICATION_FAILED,
         "an anonymous connection must not be able to produce"
+    );
+    let consumer = brahmaputra_client::Consumer::connect_with(
+        Transport::TcpTls,
+        running.addr,
+        "metadata-denied",
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            consumer.metadata(&["orders".into()]).await,
+            Err(brahmaputra_client::ClientError::Server {
+                code: ec::SASL_AUTHENTICATION_FAILED,
+                ..
+            })
+        ),
+        "metadata authorization errors must not masquerade as an empty cluster"
     );
 
     stop(running).await;

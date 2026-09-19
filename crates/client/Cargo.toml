@@ -19,4 +19,4 @@ tokio-rustls.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-brahmaputra-metadata = { version = "0.7.0", path = "../metadata" }
+brahmaputra-metadata = { workspace = true }

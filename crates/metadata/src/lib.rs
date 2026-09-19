@@ -543,6 +543,24 @@ impl ClusterMetadata {
     }
 
     pub fn apply(&mut self, command: MetadataCommand) -> Result<MetadataEvent, MetadataError> {
+        // Maintenance computes expiry from a snapshot. A heartbeat can renew
+        // the same incarnation while that command waits for the write lock.
+        // Compare again against the image being committed (which also includes
+        // quorum-confirmed, coalesced heartbeats).
+        if let MetadataCommand::ExpireBroker {
+            broker_id,
+            last_heartbeat_ms,
+            ..
+        } = &command
+        {
+            if self
+                .brokers
+                .get(broker_id)
+                .is_some_and(|broker| broker.last_heartbeat_ms > *last_heartbeat_ms)
+            {
+                return Err(MetadataError::BrokerHeartbeatAdvanced(*broker_id));
+            }
+        }
         let event = match command {
             MetadataCommand::SetController { broker_id } => {
                 let broker = self
@@ -630,7 +648,7 @@ impl ClusterMetadata {
                     });
                 }
                 broker.alive = true;
-                broker.last_heartbeat_ms = now_ms;
+                broker.last_heartbeat_ms = broker.last_heartbeat_ms.max(now_ms);
                 MetadataEvent::BrokerHeartbeat {
                     broker_id,
                     broker_epoch,
@@ -639,6 +657,11 @@ impl ClusterMetadata {
             MetadataCommand::FenceBroker {
                 broker_id,
                 broker_epoch,
+            }
+            | MetadataCommand::ExpireBroker {
+                broker_id,
+                broker_epoch,
+                ..
             } => {
                 let broker = self
                     .brokers
@@ -1109,6 +1132,13 @@ pub enum MetadataCommand {
         broker_id: BrokerId,
         broker_epoch: BrokerEpoch,
     },
+    /// Conditional lease expiry. Explicit administrative fencing remains
+    /// unconditional; automatic expiry must not race a renewed heartbeat.
+    ExpireBroker {
+        broker_id: BrokerId,
+        broker_epoch: BrokerEpoch,
+        last_heartbeat_ms: i64,
+    },
     CreateTopic {
         name: String,
         partitions: i32,
@@ -1255,6 +1285,8 @@ pub enum MetadataError {
     InvalidReplicationFactor { requested: i32, live_brokers: usize },
     #[error("unknown broker: {0}")]
     UnknownBroker(BrokerId),
+    #[error("broker {0} renewed its heartbeat after the expiry observation")]
+    BrokerHeartbeatAdvanced(BrokerId),
     #[error("a reassignment is already in flight for {topic}-{partition}")]
     ReassignmentInProgress { topic: String, partition: i32 },
     #[error("no reassignment is in flight for {topic}-{partition}")]
@@ -1402,6 +1434,67 @@ mod tests {
         let second = state.topics["orders"].topic_epoch;
         assert_ne!(first, second);
         assert!(second > first);
+    }
+
+    #[test]
+    fn delayed_expiry_cannot_fence_a_renewed_broker() {
+        let mut state = ClusterMetadata::new("expiry-race");
+        let epoch = register(&mut state, 1, 1_000);
+        state
+            .apply(MetadataCommand::CreateTopic {
+                name: "orders".into(),
+                partitions: 1,
+                replication_factor: 1,
+                configs: BTreeMap::new(),
+            })
+            .unwrap();
+        let expiry = MetadataCommand::ExpireBroker {
+            broker_id: 1,
+            broker_epoch: epoch,
+            last_heartbeat_ms: 1_000,
+        };
+        state
+            .apply(MetadataCommand::Heartbeat {
+                broker_id: 1,
+                broker_epoch: epoch,
+                now_ms: 7_000,
+            })
+            .unwrap();
+        let renewed = state.clone();
+        assert_eq!(
+            state.apply(expiry),
+            Err(MetadataError::BrokerHeartbeatAdvanced(1))
+        );
+        assert_eq!(
+            state, renewed,
+            "stale expiry must not alter ISR, leader, or offset"
+        );
+        state
+            .apply(MetadataCommand::ExpireBroker {
+                broker_id: 1,
+                broker_epoch: epoch,
+                last_heartbeat_ms: 7_000,
+            })
+            .unwrap();
+        assert!(!state.brokers[&1].alive);
+        assert_eq!(state.topics["orders"].partitions[&0].leader, -1);
+    }
+
+    #[test]
+    fn delayed_heartbeat_cannot_move_lease_time_backwards() {
+        let mut state = ClusterMetadata::default();
+        let epoch = register(&mut state, 1, 1_000);
+        for now_ms in [7_000, 2_000] {
+            state
+                .apply(MetadataCommand::Heartbeat {
+                    broker_id: 1,
+                    broker_epoch: epoch,
+                    now_ms,
+                })
+                .unwrap();
+        }
+        assert_eq!(state.brokers[&1].last_heartbeat_ms, 7_000);
+        assert!(state.expired_brokers(8_000, 5_000).is_empty());
     }
 
     #[test]

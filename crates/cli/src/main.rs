@@ -905,6 +905,7 @@ async fn run(cli: Cli) -> Result<()> {
                         &topic,
                         group,
                         GroupConsumeOptions {
+                            isolation_level: &isolation_level,
                             commit_interval_ms,
                             assignor: &assignor,
                             auto_offset_reset: &auto_offset_reset,
@@ -2115,6 +2116,7 @@ fn report_consume_rate(quiet: bool, records: u64, bytes: u64, started: Instant) 
 /// format, and print the new assignment (one line) whenever it changes.
 /// The group-specific half of the same thing.
 struct GroupConsumeOptions<'a> {
+    isolation_level: &'a str,
     commit_interval_ms: u64,
     assignor: &'a str,
     auto_offset_reset: &'a str,
@@ -2131,6 +2133,7 @@ async fn consume_group(
     options: GroupConsumeOptions<'_>,
 ) -> Result<()> {
     let GroupConsumeOptions {
+        isolation_level,
         commit_interval_ms,
         assignor,
         auto_offset_reset,
@@ -2163,6 +2166,7 @@ async fn consume_group(
     let auto_commit = (commit_interval_ms > 0).then_some(Duration::from_millis(commit_interval_ms));
     let mut consumer = GroupConsumer::connect_with(transport(), broker, "brahmaputra-cli", &group)
         .await?
+        .with_isolation_level(IsolationLevel::parse(isolation_level).unwrap_or_default())
         .with_assignor(assignor)
         .with_auto_offset_reset(auto_offset_reset)
         .with_auto_commit(auto_commit);
@@ -3232,6 +3236,82 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].value, Some(Bytes::from_static(b"one")));
 
+        let _ = shutdown_tx.send(());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_cli_honors_read_committed() {
+        use brahmaputra_client::{Connection, TransactionalProducer};
+        use brahmaputra_protocol::gen::{OffsetFetchRequest, OffsetFetchResponse};
+        let dir = tempdir().unwrap();
+        let broker = Broker::bind(BrokerConfig {
+            port: 0,
+            data_dirs: vec![dir.path().to_path_buf()],
+            default_partitions: 1,
+            ..BrokerConfig::default()
+        })
+        .await
+        .unwrap();
+        let addr = broker.local_addr();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(Arc::new(broker).run(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let mut producer = TransactionalProducer::init(addr, "cli-isolation")
+            .await
+            .unwrap();
+        producer.begin().unwrap();
+        producer
+            .send("isolated", 0, Record::new(b"aborted".to_vec()))
+            .await
+            .unwrap();
+        producer.abort().await.unwrap();
+        producer.begin().unwrap();
+        let offset = producer
+            .send("isolated", 0, Record::new(b"committed".to_vec()))
+            .await
+            .unwrap();
+        producer.commit().await.unwrap();
+        let cli = Cli::try_parse_from([
+            "brahmaputra-cli",
+            "--broker",
+            &addr.to_string(),
+            "consume",
+            "--topic",
+            "isolated",
+            "--group",
+            "cli-isolated",
+            "--isolation-level",
+            "read_committed",
+            "--max",
+            "1",
+        ])
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), run(cli))
+            .await
+            .unwrap()
+            .unwrap();
+        let connection = Connection::connect(addr, None, 1).await.unwrap();
+        let request = OffsetFetchRequest {
+            group_id: "cli-isolated".into(),
+            partitions: vec![],
+        };
+        let response = connection
+            .request(
+                brahmaputra_protocol::ApiKey::OffsetFetch,
+                &request.encode().unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = OffsetFetchResponse::decode(&response).unwrap();
+        assert_eq!(response.error_code, 0);
+        assert_eq!(response.offsets.len(), 1);
+        assert_eq!(
+            response.offsets[0].offset,
+            offset + 1,
+            "the CLI must consume the committed record rather than the earlier aborted one"
+        );
         let _ = shutdown_tx.send(());
         server.await.unwrap().unwrap();
     }

@@ -1147,7 +1147,25 @@ async fn register_broker(
             tracing::warn!(%error, "broker registration failed; retrying after next tick");
             Ok(None)
         }
-        Err(error) => Err(anyhow!("broker registration was rejected: {error}")),
+        Err(error) => {
+            if let Some(epoch) = expected_epoch {
+                let image = controller.local_metadata().await?;
+                if image
+                    .brokers
+                    .get(&registration.broker_id)
+                    .is_none_or(|registered| registered.broker_epoch < epoch)
+                {
+                    // The process already received this epoch from a committed
+                    // registration. An older local image cannot prove that a
+                    // replacement superseded it. Stay suspended and retry the
+                    // same conditional registration; never drop the epoch guard.
+                    tracing::warn!(%error, broker_id = registration.broker_id, epoch,
+                        "registration rejected against older local metadata; retrying");
+                    return Ok(None);
+                }
+            }
+            Err(anyhow!("broker registration was rejected: {error}"))
+        }
     }
 }
 
@@ -1489,7 +1507,19 @@ async fn apply_partition_change(
             .await
             .context("failed to read locally applied ISR metadata")?;
         publish_if_newer(metadata_cache, image.clone());
-        broker.validate_local_broker_epoch(&image)?;
+        if let Err(error) = broker.validate_local_broker_epoch(&image) {
+            if broker.is_fenced() {
+                return Err(error.into());
+            }
+            // Lease suspension is recoverable. In particular, an ambiguous
+            // ISR write may still commit while the lifecycle re-registers.
+            // Keep the partition gate closed until a current image resolves
+            // it; propagating this refusal would terminate the entire broker.
+            if wait_or_shutdown(Duration::from_millis(25), shutdown).await {
+                return Ok(None);
+            }
+            continue;
+        }
 
         let Some(assignment) = image
             .topics
@@ -1800,9 +1830,10 @@ fn leader_maintenance_commands(
             image
                 .expired_brokers(fencing.now_ms, fencing.session_timeout_ms)
                 .into_iter()
-                .map(|(broker_id, broker_epoch)| MetadataCommand::FenceBroker {
+                .map(|(broker_id, broker_epoch)| MetadataCommand::ExpireBroker {
                     broker_id,
                     broker_epoch,
+                    last_heartbeat_ms: image.brokers[&broker_id].last_heartbeat_ms,
                 }),
         );
     }
@@ -2168,6 +2199,103 @@ mod tests {
         Args::try_parse_from(arguments).unwrap()
     }
 
+    #[tokio::test]
+    async fn isr_mutation_waits_for_lease_recovery_but_rejects_replacement() {
+        let controller = ControllerNode::new(ControllerConfig::new(
+            1,
+            "isr-lease",
+            BTreeMap::from([(1, "127.0.0.1:9".into())]),
+        ))
+        .await
+        .unwrap();
+        controller.bootstrap().await.unwrap();
+        controller
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let registration = MetadataCommand::RegisterBroker {
+            broker_id: 1,
+            host: "127.0.0.1".into(),
+            data_port: 0,
+            control_port: 0,
+            internal_port: 0,
+            expected_epoch: None,
+            roles: vec![NodeRole::Broker],
+            rack: None,
+            now_ms: unix_time_ms(),
+        };
+        controller
+            .write_metadata(registration.clone())
+            .await
+            .unwrap();
+        let cache = MetadataCache::new(controller.local_metadata().await.unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Broker::bind(BrokerConfig {
+            broker_id: 1,
+            broker_epoch: Some(1),
+            port: 0,
+            data_dirs: vec![directory.path().to_owned()],
+            metadata_cache: Some(cache.clone()),
+            ..BrokerConfig::default()
+        })
+        .await
+        .unwrap();
+        let command = MetadataCommand::ChangePartition {
+            topic: "removed-during-recovery".into(),
+            partition: 0,
+            leader: 1,
+            isr: vec![1],
+            expected_leader_epoch: 0,
+        };
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        broker.suspend_broker_lease();
+        let mutation = apply_partition_change(
+            &broker,
+            &controller,
+            &cache,
+            command.clone(),
+            Duration::from_secs(10),
+            &mut shutdown_rx,
+        );
+        tokio::pin!(mutation);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), &mut mutation)
+                .await
+                .is_err()
+        );
+        assert!(!broker.is_fenced());
+        // Even during suspension, a competing Produce cannot pass an ISR
+        // mutation whose commit status has not yet been resolved.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(25),
+            broker.partition_mutation_guard("removed-during-recovery", 0),
+        )
+        .await
+        .is_err());
+        broker.activate_broker_epoch(1).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), &mut mutation)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+
+        // An actual replacement must still irreversibly fence this process.
+        controller.write_metadata(registration).await.unwrap();
+        let mut replacement_shutdown = shutdown_tx.subscribe();
+        assert!(apply_partition_change(
+            &broker,
+            &controller,
+            &cache,
+            command,
+            Duration::from_secs(10),
+            &mut replacement_shutdown,
+        )
+        .await
+        .is_err());
+        assert!(broker.is_fenced());
+        controller.shutdown_raft().await.unwrap();
+    }
+
     #[test]
     fn original_invocation_remains_standalone() {
         let args = parse(&[
@@ -2285,7 +2413,7 @@ mod tests {
         assert!(
             !commands
                 .iter()
-                .any(|command| matches!(command, MetadataCommand::FenceBroker { .. })),
+                .any(|command| matches!(command, MetadataCommand::ExpireBroker { .. })),
             "a leader inside its grace window must fence nobody"
         );
         assert!(
@@ -2300,7 +2428,7 @@ mod tests {
             leader_maintenance_commands(&image, 1, 1, Some(1), open_window(2_000, 500), false);
         assert!(commands
             .iter()
-            .any(|command| matches!(command, MetadataCommand::FenceBroker { broker_id: 2, .. })));
+            .any(|command| matches!(command, MetadataCommand::ExpireBroker { broker_id: 2, .. })));
     }
 
     #[test]
@@ -2322,9 +2450,10 @@ mod tests {
         ));
         assert!(matches!(
             commands[1],
-            MetadataCommand::FenceBroker {
+            MetadataCommand::ExpireBroker {
                 broker_id: 2,
-                broker_epoch: 9
+                broker_epoch: 9,
+                last_heartbeat_ms: 10,
             }
         ));
 

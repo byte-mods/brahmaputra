@@ -30,9 +30,12 @@ BATCH_SIZE="${BATCH_SIZE:-65536}"
 LINGER_MS="${LINGER_MS:-10}"
 COMPRESSION="${COMPRESSION:-none}"       # none | lz4
 ACKS="${ACKS:-1}"                        # 0 | 1 | all
+IDEMPOTENT="${IDEMPOTENT:-false}"
 CPUS="${CPUS:-4}"
 MEMORY="${MEMORY:-4g}"
 KAFKA_IMAGE="${KAFKA_IMAGE:-apache/kafka:4.3.1}"
+KAFKA_BROKER_HEAP="${KAFKA_BROKER_HEAP:--Xmx2g -Xms2g}"
+KAFKA_CLIENT_HEAP="${KAFKA_CLIENT_HEAP:--Xmx512m -Xms512m}"
 RUST_IMAGE="${RUST_IMAGE:-rust:1-bookworm}"
 NETWORK="${NETWORK:-brahma-bench}"
 WARMUP_RECORDS="${WARMUP_RECORDS:-20000}"
@@ -81,7 +84,7 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
     -v brahma-bench-target:/target \
     -e CARGO_TARGET_DIR=/target \
     -w /src "$RUST_IMAGE" \
-    cargo build --release -p brahmaputra-server -p brahmaputra-cli \
+    cargo build --release -j "${BUILD_JOBS:-2}" -p brahmaputra-server -p brahmaputra-cli \
     || die "release build failed"
 
   stage "Assemble the Brahmaputra runtime image"
@@ -136,6 +139,7 @@ summarize_samples() {
       # Force numeric comparison: these came out of sub() as strings, and
       # lexically "64.6" sorts above "204.1".
       cpu += 0; value += 0;
+      if (value <= 0) next;
       cpu_sum += cpu; mem_sum += value; n++;
       if (cpu > cpu_max) cpu_max = cpu;
       if (value > mem_max) mem_max = value;
@@ -188,7 +192,7 @@ start_kafka() {
     -e KAFKA_LOG_SEGMENT_BYTES=1073741824 \
     -e KAFKA_NUM_NETWORK_THREADS=4 \
     -e KAFKA_NUM_IO_THREADS=8 \
-    -e KAFKA_HEAP_OPTS="-Xmx3g -Xms3g" \
+    -e KAFKA_HEAP_OPTS="$KAFKA_BROKER_HEAP" \
     "$KAFKA_IMAGE" >/dev/null || die "cannot start Kafka"
   # Kafka's image runs as uid 1000 and can only write its own default log
   # dir, so leave KAFKA_LOG_DIRS alone and read that path for disk usage.
@@ -214,17 +218,21 @@ kafka_topic() {
 
 kafka_produce() {
   local topic="$1" records="$2" out="$3"
-  docker_run exec bench-kafka /opt/kafka/bin/kafka-producer-perf-test.sh \
-    --topic "$topic" --num-records "$records" --record-size "$RECORD_SIZE" \
+  # Match the CLI's count-mode payload exactly. Different compressibility
+  # would otherwise turn a codec comparison into a payload comparison.
+  docker_run exec bench-kafka sh -c \
+    'head -c "$1" /dev/zero | tr "\000" x > /tmp/benchmark-payload.txt' sh "$RECORD_SIZE"
+  docker_run exec -e KAFKA_HEAP_OPTS="$KAFKA_CLIENT_HEAP" bench-kafka /opt/kafka/bin/kafka-producer-perf-test.sh \
+    --topic "$topic" --num-records "$records" --payload-file /tmp/benchmark-payload.txt \
     --throughput -1 \
     --producer-props bootstrap.servers=bench-kafka:9092 \
       "acks=$ACKS" "batch.size=$BATCH_SIZE" "linger.ms=$LINGER_MS" \
-      "compression.type=$COMPRESSION" > "$out" 2>&1
+      "compression.type=$COMPRESSION" "enable.idempotence=$IDEMPOTENT" > "$out" 2>&1
 }
 
 kafka_consume() {
   local topic="$1" records="$2" out="$3"
-  docker_run exec bench-kafka /opt/kafka/bin/kafka-consumer-perf-test.sh \
+  docker_run exec -e KAFKA_HEAP_OPTS="$KAFKA_CLIENT_HEAP" bench-kafka /opt/kafka/bin/kafka-consumer-perf-test.sh \
     --bootstrap-server bench-kafka:9092 --topic "$topic" \
     --messages "$records" --group "bench-$RANDOM" --timeout 120000 \
     > "$out" 2>&1
@@ -264,16 +272,19 @@ brahma_cli() {
 
 brahma_produce() {
   local topic="$1" records="$2" out="$3"
+  local -a identity=()
+  [[ "$IDEMPOTENT" == true ]] && identity=(--idempotent)
   brahma_cli produce --topic "$topic" \
     --count "$records" --value-size "$RECORD_SIZE" --no-key \
     --acks "$ACKS" --batch-size "$BATCH_SIZE" --linger-ms "$LINGER_MS" \
     --in-flight "$IN_FLIGHT" \
-    --compression "$COMPRESSION" > "$out" 2>&1
+    --compression "$COMPRESSION" "${identity[@]}" > "$out" 2>&1
 }
 
 brahma_consume() {
   local topic="$1" records="$2" out="$3"
-  brahma_cli consume --topic "$topic" --from earliest --max "$records" --quiet \
+  brahma_cli consume --topic "$topic" --group "bench-$topic-$RANDOM" \
+    --commit-interval-ms 0 --max "$records" --quiet \
     > "$out" 2>&1
 }
 
@@ -367,6 +378,9 @@ ratio() { awk -v a="$1" -v b="$2" 'BEGIN { if (b+0 == 0) print "n/a"; else print
   printf 'linger.ms=%s, compression=%s. Kafka image `%s`.\n\n' "$LINGER_MS" "$COMPRESSION" "$KAFKA_IMAGE"
   printf 'Each system is driven by its own client (Kafka: kafka-*-perf-test;\n'
   printf 'Brahmaputra: brahmaputra-cli), so these are system+client numbers.\n\n'
+  printf 'Both producers send identical repeated `x` payloads. These are\n'
+  printf 'highly compressible; codec results do not represent high-entropy data.\n\n'
+  printf 'Idempotence is `%s` on both producers.\n\n' "$IDEMPOTENT"
   printf '| Workload | Kafka | Brahmaputra | Brahmaputra / Kafka |\n'
   printf '|---|---|---|---|\n'
   printf '| Produce (msgs/sec) | %s | %s | %s |\n' "${KP_RATE:-n/a}" "${BP_RATE:-n/a}" "$(ratio "${BP_RATE:-0}" "${KP_RATE:-0}")"
@@ -391,8 +405,8 @@ ratio() { awk -v a="$1" -v b="$2" 'BEGIN { if (b+0 == 0) print "n/a"; else print
     "$KC_MEM_AVG" "$KC_MEM_MAX" "$BC_MEM_AVG" "$BC_MEM_MAX"
   printf '| Log directory bytes after produce | %s | %s |\n' "${KAFKA_DISK:-n/a}" "${BRAHMA_DISK:-n/a}"
   printf '| Bytes on disk per record | %s | %s |\n' \
-    "$(awk -v d="${KAFKA_DISK:-0}" -v r="$RECORDS" 'BEGIN{if(r) printf "%.1f", d/r; else print "n/a"}')" \
-    "$(awk -v d="${BRAHMA_DISK:-0}" -v r="$RECORDS" 'BEGIN{if(r) printf "%.1f", d/r; else print "n/a"}')"
+    "$(awk -v d="${KAFKA_DISK:-n/a}" -v r="$RECORDS" 'BEGIN{if(r && d ~ /^[0-9]+$/) printf "%.1f", d/r; else print "n/a"}')" \
+    "$(awk -v d="${BRAHMA_DISK:-n/a}" -v r="$RECORDS" 'BEGIN{if(r && d ~ /^[0-9]+$/) printf "%.1f", d/r; else print "n/a"}')"
   printf '| Msgs/sec per CPU%% (produce) | %s | %s |\n' \
     "$(awk -v t="${KP_RATE:-0}" -v c="$KP_CPU_AVG" 'BEGIN{if(c+0>0) printf "%.0f", t/c; else print "n/a"}')" \
     "$(awk -v t="${BP_RATE:-0}" -v c="$BP_CPU_AVG" 'BEGIN{if(c+0>0) printf "%.0f", t/c; else print "n/a"}')"

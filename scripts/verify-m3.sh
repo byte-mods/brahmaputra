@@ -143,7 +143,7 @@ start_node() {
   for peer in $(seq 1 "$NODE_COUNT"); do
     args+=(--controller-peer "$peer=127.0.0.1:${CONTROL_PORT[$peer]}")
   done
-  RUST_LOG=brahmaputra=info "$SERVER_EXE" "${args[@]}" >"$stdout" 2>"$stderr" &
+  RUST_LOG="${RUST_LOG:-brahmaputra=info}" "$SERVER_EXE" "${args[@]}" >"$stdout" 2>"$stderr" &
   local pid=$!
   NODE_PID[$node]="$pid"
   NODE_DATA[$node]="$data_dir"
@@ -391,7 +391,7 @@ start_capture() {
   local out="$dir/$stem.stdout.log" err="$dir/$stem.stderr.log"
   timeout --kill-after=2s "${CAPTURE_WALL_TIMEOUT_SECONDS}s" "$CLI_EXE" \
     --broker "$(broker_address "$seed")" produce --topic "$TOPIC" --partition "$PARTITION" \
-    --value "$value" --acks all --timeout-ms 30000 >"$out" 2>"$err" &
+    --value "$value" --acks all --idempotent --timeout-ms 30000 >"$out" 2>"$err" &
   CAP_PID[$id]=$!
   CAP_OUT[$id]="$out"
   CAP_ERR[$id]="$err"
@@ -419,9 +419,29 @@ start_storm() {
         fi
       done
       [[ -n "$STORM_BLOCKER" ]] || die "no live ISR follower available for deterministic storm gate"
-      kill -STOP "${NODE_PID[$STORM_BLOCKER]}"
+      pause_storm_broker Suspend
     fi
+    # Observe the overlap while launching, rather than after starting all
+    # 64 processes: process startup can outlast the follower's lease.
+    if (( i >= 7 )) && storm_armed_probe; then return 0; fi
   done
+}
+
+pause_storm_broker() {
+  local action="$1" pid="${NODE_PID[$STORM_BLOCKER]}" win_pid
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      # POSIX STOP/CONT do not suspend a native Windows Rust process.
+      win_pid="$(cat "/proc/$pid/winpid")"
+      powershell.exe -NoProfile -ExecutionPolicy Bypass \
+        -File "$(cygpath -w "$ROOT/scripts/pause-test-broker.ps1")" \
+        -ProcessId "$win_pid" -ExpectedExecutable "$(cygpath -w "$SERVER_EXE")" \
+        -Action "$action"
+      ;;
+    *)
+      if [[ "$action" == Suspend ]]; then kill -STOP "$pid"; else kill -CONT "$pid"; fi
+      ;;
+  esac
 }
 
 storm_acked_at_least() {
@@ -436,7 +456,7 @@ storm_acked_at_least() {
 
 resume_storm_blocker() {
   if [[ -n "$STORM_BLOCKER" ]] && node_alive "$STORM_BLOCKER"; then
-    kill -CONT "${NODE_PID[$STORM_BLOCKER]}" 2>/dev/null || true
+    pause_storm_broker Resume 2>/dev/null || true
   fi
   STORM_BLOCKER=""
 }
@@ -741,6 +761,8 @@ show_diagnostics() {
   for node in $(seq 1 "$NODE_COUNT"); do
     [[ -n "${NODE_PID[$node]:-}" ]] || continue
     printf 'node %s pid=%s status=%s\n' "$node" "${NODE_PID[$node]}" "$(node_alive "$node" && echo running || echo stopped)" >&2
+    controller_get "$node" /api/v1/controller/raft > "$WORK_DIR/node-$node/raft-at-exit.json" 2>/dev/null || true
+    controller_get "$node" /api/v1/controller/metadata > "$WORK_DIR/node-$node/metadata-at-exit.json" 2>/dev/null || true
     for file in "${NODE_STDOUT[$node]}" "${NODE_STDERR[$node]}"; do
       printf '  tail %s\n' "$file" >&2
       [[ -f "$file" ]] && tail -n 100 "$file" >&2 || true

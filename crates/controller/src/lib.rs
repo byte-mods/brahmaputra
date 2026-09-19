@@ -73,6 +73,17 @@ impl ControllerConfig {
         let cluster_id = cluster_id.into();
         let raft = RaftConfig {
             cluster_name: cluster_id.clone(),
+            // OpenRaft's 50-ms heartbeat also bounds AppendEntries RPCs.
+            // Durable writes and catch-up on a shared disk can exceed that
+            // budget, causing repeated cancellation and election storms.
+            // Keep election timing comfortably above a replication round.
+            heartbeat_interval: 200,
+            election_timeout_min: 1_000,
+            election_timeout_max: 2_000,
+            // Entries contain a full metadata image. A 300-entry catch-up
+            // batch can apply successfully but time out before its reply,
+            // then be resent forever without advancing confirmed progress.
+            max_payload_entries: 32,
             ..RaftConfig::default()
         };
 
@@ -145,7 +156,7 @@ pub struct ControllerNode {
     store: Arc<DurableStore>,
     data_dir: PathBuf,
     _ephemeral_data_dir: Option<tempfile::TempDir>,
-    write_mutex: Mutex<()>,
+    write_mutex: Arc<Mutex<()>>,
     confirmed_heartbeats: StdMutex<BTreeMap<i32, (u64, i64)>>,
     forwarding_client: reqwest::Client,
 }
@@ -224,7 +235,7 @@ impl ControllerNode {
             store,
             data_dir,
             _ephemeral_data_dir: ephemeral_data_dir,
-            write_mutex: Mutex::new(()),
+            write_mutex: Arc::new(Mutex::new(())),
             confirmed_heartbeats: StdMutex::new(BTreeMap::new()),
             forwarding_client,
         }))
@@ -436,13 +447,18 @@ impl ControllerNode {
     /// bypass an obviously stale self-leader hint without first spending a
     /// Raft RPC timeout proving that the local validation result is obsolete.
     async fn command_outpaces_local_broker_epoch(&self, command: &MetadataCommand) -> bool {
-        let MetadataCommand::Heartbeat {
-            broker_id,
-            broker_epoch,
-            ..
-        } = command
-        else {
-            return false;
+        let (broker_id, broker_epoch) = match command {
+            MetadataCommand::Heartbeat {
+                broker_id,
+                broker_epoch,
+                ..
+            } => (broker_id, broker_epoch),
+            MetadataCommand::RegisterBroker {
+                broker_id,
+                expected_epoch: Some(epoch),
+                ..
+            } => (broker_id, epoch),
+            _ => return false,
         };
         let Ok(metadata) = self.local_metadata().await else {
             return false;
@@ -471,7 +487,7 @@ impl ControllerNode {
         // Holding this mutex while a follower forwards or retries can make an
         // unrelated broker heartbeat wait behind a slow remote operation and
         // expire an otherwise healthy broker lease.
-        let guard = self.write_mutex.lock().await;
+        let guard = self.write_mutex.clone().lock_owned().await;
         let mut next_metadata = self
             .local_metadata()
             .await
@@ -503,14 +519,14 @@ impl ControllerNode {
             }
         }
         self.merge_confirmed_heartbeats(&mut next_metadata);
-        let event = match next_metadata.apply(command) {
+        let event = match next_metadata.apply(command.clone()) {
             Ok(event) => event,
             Err(error) => {
                 // Leadership confirmation can wait on quorum I/O. It must not
                 // retain the write mutex or one stale maintenance command can
                 // prevent every broker from renewing its lease.
                 drop(guard);
-                return Err(self.classify_metadata_rejection(error).await);
+                return Err(self.classify_metadata_rejection(command, error).await);
             }
         };
         let status = serde_json::to_string(&next_metadata).map_err(|error| {
@@ -526,29 +542,46 @@ impl ControllerNode {
             status,
         };
 
-        match self.raft.client_write(request).await {
-            Ok(_) => Ok(event),
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
-                let error = ControllerErrorBody::new(
-                    "not_leader",
-                    "local node is not the writable Raft leader",
-                    true,
-                )
-                .with_leader(forward.leader_id);
-                Err(LocalWriteError::Retry {
-                    leader_id: forward.leader_id,
-                    error,
-                })
+        // Dropping a caller does not cancel an already submitted Raft write.
+        // Its serialized metadata image must retain the write guard until the
+        // result is known, or a later command can overwrite it from an older
+        // image (and even reuse its deduplication serial). A detached task owns
+        // both the guard and the completion when a lease deadline cancels us.
+        let raft = self.raft.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            match raft.client_write(request).await {
+                Ok(_) => Ok(event),
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
+                    let error = ControllerErrorBody::new(
+                        "not_leader",
+                        "local node is not the writable Raft leader",
+                        true,
+                    )
+                    .with_leader(forward.leader_id);
+                    Err(LocalWriteError::Retry {
+                        leader_id: forward.leader_id,
+                        error,
+                    })
+                }
+                Err(error) => {
+                    let leader_id = raft.metrics().borrow().current_leader;
+                    Err(LocalWriteError::Retry {
+                        leader_id,
+                        error: ControllerErrorBody::new("raft_write", error.to_string(), true)
+                            .with_leader(leader_id),
+                    })
+                }
             }
-            Err(error) => {
-                let leader_id = self.raft_metrics().current_leader;
-                Err(LocalWriteError::Retry {
-                    leader_id,
-                    error: ControllerErrorBody::new("raft_write", error.to_string(), true)
-                        .with_leader(leader_id),
-                })
-            }
-        }
+        })
+        .await
+        .map_err(|error| {
+            LocalWriteError::Rejected(ControllerErrorBody::new(
+                "metadata_writer_task",
+                error.to_string(),
+                false,
+            ))
+        })?
     }
 
     async fn preflight_heartbeat(
@@ -588,7 +621,17 @@ impl ControllerNode {
         self.confirmed_heartbeats
             .lock()
             .expect("confirmed heartbeat mutex poisoned")
-            .insert(*broker_id, (*broker_epoch, *now_ms));
+            .entry(*broker_id)
+            .and_modify(|observation| {
+                // Concurrent ReadIndex rounds can finish out of order. Keep
+                // the newest confirmed lease, including across incarnations.
+                if *broker_epoch > observation.0 {
+                    *observation = (*broker_epoch, *now_ms);
+                } else if *broker_epoch == observation.0 {
+                    observation.1 = observation.1.max(*now_ms);
+                }
+            })
+            .or_insert((*broker_epoch, *now_ms));
 
         if heartbeat_can_coalesce(
             &metadata,
@@ -679,18 +722,43 @@ impl ControllerNode {
     /// leader. A restarted follower can retain a stale self-leader metric and
     /// an older state-machine image; in that case route the original command
     /// to another fixed peer rather than returning a false rejection.
-    async fn classify_metadata_rejection(&self, metadata_error: MetadataError) -> LocalWriteError {
+    async fn classify_metadata_rejection(
+        &self,
+        command: MetadataCommand,
+        metadata_error: MetadataError,
+    ) -> LocalWriteError {
         match tokio::time::timeout(
             self.config.raft_rpc_timeout,
             self.raft.ensure_linearizable(),
         )
         .await
         {
-            Ok(Ok(_)) => LocalWriteError::Rejected(ControllerErrorBody::new(
-                "metadata_rejected",
-                metadata_error.to_string(),
-                false,
-            )),
+            Ok(Ok(_)) => {
+                // Quorum confirmation may have waited for a newer applied
+                // image. Never attach that confirmation to an older error.
+                // Revalidate under the write lock and retry a now-valid write.
+                let _guard = self.write_mutex.lock().await;
+                let mut image = match self.local_metadata().await {
+                    Ok(image) => image,
+                    Err(error) => return LocalWriteError::Rejected(error),
+                };
+                self.merge_confirmed_heartbeats(&mut image);
+                match image.apply(command) {
+                    Ok(_) => LocalWriteError::Retry {
+                        leader_id: Some(self.config.node_id),
+                        error: ControllerErrorBody::new(
+                            "metadata_changed",
+                            metadata_error.to_string(),
+                            true,
+                        ),
+                    },
+                    Err(current_error) => LocalWriteError::Rejected(ControllerErrorBody::new(
+                        "metadata_rejected",
+                        current_error.to_string(),
+                        false,
+                    )),
+                }
+            }
             Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))) => {
                 LocalWriteError::Retry {
                     leader_id: forward.leader_id,
@@ -971,6 +1039,185 @@ fn validate_controller_config(config: &ControllerConfig) -> Result<(), Controlle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn coalesced_heartbeat_invalidates_queued_expiry() {
+        let config = ControllerConfig::new(
+            1,
+            "expiry-race",
+            BTreeMap::from([(1, "127.0.0.1:9".into())]),
+        );
+        let node = ControllerNode::new(config).await.unwrap();
+        node.bootstrap().await.unwrap();
+        node.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+        node.write_metadata(MetadataCommand::RegisterBroker {
+            broker_id: 7,
+            host: "127.0.0.1".into(),
+            data_port: 9092,
+            control_port: 19092,
+            internal_port: 0,
+            expected_epoch: None,
+            roles: vec![],
+            rack: None,
+            now_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        for now_ms in [1_500, 1_200] {
+            node.write_metadata(MetadataCommand::Heartbeat {
+                broker_id: 7,
+                broker_epoch: 1,
+                now_ms,
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            node.local_metadata().await.unwrap().brokers[&7].last_heartbeat_ms,
+            1_000,
+            "renewals must still be coalesced for this regression"
+        );
+        let result = node
+            .write_metadata(MetadataCommand::ExpireBroker {
+                broker_id: 7,
+                broker_epoch: 1,
+                last_heartbeat_ms: 1_400,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "the latest coalesced renewal must invalidate expiry"
+        );
+        assert!(node.local_metadata().await.unwrap().brokers[&7].alive);
+        let stale_rejection = node
+            .classify_metadata_rejection(
+                MetadataCommand::Heartbeat {
+                    broker_id: 7,
+                    broker_epoch: 1,
+                    now_ms: 1_600,
+                },
+                MetadataError::UnknownBroker(7),
+            )
+            .await;
+        assert!(
+            matches!(stale_rejection, LocalWriteError::Retry { .. }),
+            "quorum confirmation must revalidate an earlier metadata rejection"
+        );
+        node.write_metadata(MetadataCommand::FenceBroker {
+            broker_id: 7,
+            broker_epoch: 1,
+        })
+        .await
+        .unwrap();
+        assert!(!node.local_metadata().await.unwrap().brokers[&7].alive);
+        node.shutdown_raft().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_metadata_write_keeps_serialization_until_raft_completes() {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut listeners = Vec::new();
+        let mut peers = BTreeMap::new();
+        for id in 1..=3 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            peers.insert(id, format!("http://{}", listener.local_addr().unwrap()));
+            listeners.push((id, listener));
+        }
+        let mut nodes = Vec::new();
+        let mut servers = Vec::new();
+        let mut paused = Vec::new();
+        for (id, listener) in listeners {
+            let mut config = ControllerConfig::new(id, "cancelled-write", peers.clone());
+            config.raft.election_timeout_min = 5_000;
+            config.raft.election_timeout_max = 10_000;
+            let node = ControllerNode::new(config).await.unwrap();
+            let flag = Arc::new(AtomicBool::new(false));
+            let gate = flag.clone();
+            let router = node.router().layer(axum::middleware::from_fn(
+                move |request, next: axum::middleware::Next| {
+                    let gate = gate.clone();
+                    async move {
+                        if gate.load(Ordering::SeqCst) {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            next.run(request).await
+                        }
+                    }
+                },
+            ));
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap()
+            }));
+            nodes.push(node);
+            paused.push(flag);
+        }
+        nodes[0].bootstrap().await.unwrap();
+        let leader_id = nodes[0]
+            .wait_for_leader(Duration::from_secs(15))
+            .await
+            .unwrap();
+        let leader = nodes[(leader_id - 1) as usize].clone();
+        let registration = |broker_id| MetadataCommand::RegisterBroker {
+            broker_id,
+            host: "127.0.0.1".into(),
+            data_port: 9092,
+            control_port: 19092,
+            internal_port: 0,
+            expected_epoch: None,
+            roles: vec![],
+            rack: None,
+            now_ms: 1_000,
+        };
+        // Establish a committed baseline before disabling quorum responses.
+        leader.write_metadata(registration(10)).await.unwrap();
+        for (index, flag) in paused.iter().enumerate() {
+            flag.store(index + 1 != leader_id as usize, Ordering::SeqCst);
+        }
+        let before = leader.raft_metrics().last_log_index;
+        let first_node = leader.clone();
+        let first = tokio::spawn(async move { first_node.write_metadata(registration(11)).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while leader.raft_metrics().last_log_index == before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(
+            leader.write_mutex.try_lock().is_err(),
+            "pending Raft write lost its guard"
+        );
+        let second_node = leader.clone();
+        let mut second =
+            tokio::spawn(async move { second_node.write_metadata(registration(12)).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err()
+        );
+        for flag in &paused {
+            flag.store(false, Ordering::SeqCst);
+        }
+        tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let image = leader.local_metadata().await.unwrap();
+        assert_eq!(image.brokers.len(), 3);
+        assert_eq!(image.brokers[&11].broker_epoch, 1);
+        assert_eq!(image.brokers[&12].broker_epoch, 1);
+        assert_eq!(image.offset, 3);
+        for node in nodes {
+            node.shutdown_raft().await.unwrap();
+        }
+        for server in servers {
+            server.abort();
+        }
+    }
 
     #[test]
     fn config_normalizes_http_addresses() {
