@@ -178,6 +178,10 @@ fn broker_configs(broker: &Broker) -> Vec<(String, String)> {
     let log = &config.log_config;
     vec![
         ("broker.id".to_owned(), config.broker_id.to_string()),
+        (
+            "group.initial.rebalance.delay.ms".to_owned(),
+            config.group_initial_rebalance_delay.as_millis().to_string(),
+        ),
         ("host".to_owned(), config.host.clone()),
         ("port".to_owned(), config.port.to_string()),
         (

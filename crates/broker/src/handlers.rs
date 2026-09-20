@@ -2621,6 +2621,7 @@ mod tests {
                         control_port: 19092 + broker_id as u16,
                         internal_port: 0,
                         broker_epoch: 1,
+                        registration_id: None,
                         roles: BTreeSet::from([NodeRole::Broker]),
                         rack: Some(rack.to_owned()),
                         alive: true,

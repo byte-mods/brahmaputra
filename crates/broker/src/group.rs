@@ -48,13 +48,6 @@ const MAX_SESSION_TIMEOUT_MS: i64 = 30 * 60 * 1_000;
 
 const DEFAULT_SESSION_TIMEOUT_MS: i64 = 3_000;
 const DEFAULT_REBALANCE_TIMEOUT_MS: i64 = 3_000;
-/// How long a group forming for the first time waits for more members
-/// before assigning anything (`group.initial.rebalance.delay.ms`).
-///
-/// Kafka defaults to 3 s. This is shorter because the rest of this
-/// coordinator's timeouts are shorter, and because a delay longer than
-/// the rebalance timeout would simply expire into it.
-const INITIAL_REBALANCE_DELAY_MS: i64 = 1_000;
 /// Extra grace beyond the rebalance deadline before a blocked JoinGroup or
 /// SyncGroup gives up waiting for the group watch.
 const REBALANCE_WAIT_GRACE: Duration = Duration::from_millis(1_000);
@@ -847,7 +840,7 @@ impl GroupCoordinator {
             };
             if restart {
                 debug!(group = %request.group_id, member = %request.member_id, state = ?group.state, gen = group.generation + 1, "join restarts rebalance");
-                restart_rebalance(group, now);
+                restart_rebalance(group, now, broker.config().group_initial_rebalance_delay);
             }
             let member_id = match reclaimed_member_id {
                 Some(existing) => existing,
@@ -1165,7 +1158,11 @@ impl GroupCoordinator {
                 // The survivors need a new assignment covering the
                 // partitions this member held, and the leader may itself
                 // be the member that just left.
-                restart_rebalance(&mut group, now_ms());
+                restart_rebalance(
+                    &mut group,
+                    now_ms(),
+                    broker.config().group_initial_rebalance_delay,
+                );
             }
             true
         };
@@ -1434,7 +1431,11 @@ impl GroupCoordinator {
                             if now > group.rebalance_deadline_ms + group.rebalance_timeout_ms =>
                         {
                             debug!(group = %group_id, gen = group.generation, "awaiting-sync wedged; restarting rebalance");
-                            restart_rebalance(&mut group, now);
+                            restart_rebalance(
+                                &mut group,
+                                now,
+                                broker.config().group_initial_rebalance_delay,
+                            );
                             true
                         }
                         GroupState::AwaitingSync | GroupState::Dead => false,
@@ -1460,7 +1461,11 @@ impl GroupCoordinator {
                                     group.leader = None;
                                     group.watch.send_replace(());
                                 } else {
-                                    restart_rebalance(&mut group, now);
+                                    restart_rebalance(
+                                        &mut group,
+                                        now,
+                                        broker.config().group_initial_rebalance_delay,
+                                    );
                                 }
                                 true
                             }
@@ -1610,12 +1615,15 @@ fn local_coordinator_partitions(
 
 /// (Re)start a rebalance: bump the generation and require every current
 /// member to rejoin before the deadline.
-fn restart_rebalance(group: &mut Group, now: i64) {
+fn restart_rebalance(group: &mut Group, now: i64, initial_delay: Duration) {
     // A group with no members is forming for the first time, so hold it
     // open briefly for the rest of the fleet. A group that already has
     // members is rebalancing for a reason and must not be delayed.
     if group.members.is_empty() {
-        group.initial_delay_until_ms = Some(now + INITIAL_REBALANCE_DELAY_MS);
+        let delay_ms = i64::try_from(initial_delay.as_millis())
+            .unwrap_or(i64::MAX)
+            .min(group.rebalance_timeout_ms.max(0));
+        group.initial_delay_until_ms = Some(now.saturating_add(delay_ms));
     }
     group.state = GroupState::PreparingRebalance;
     group.generation += 1;

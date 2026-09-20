@@ -15,6 +15,7 @@ set -Eeuo pipefail
 RECORDS="${RECORDS:-2000}"
 RECORD_SIZE="${RECORD_SIZE:-1048576}"     # 1 MiB
 PARTITIONS="${PARTITIONS:-6}"
+GROUP_INITIAL_REBALANCE_DELAY_MS="${GROUP_INITIAL_REBALANCE_DELAY_MS:-0}"
 BATCH_SIZE="${BATCH_SIZE:-2097152}"
 LINGER_MS="${LINGER_MS:-5}"
 COMPRESSION="${COMPRESSION:-none}"
@@ -42,51 +43,19 @@ info() { printf '    %s\n' "$1"; }
 die() { printf '\n\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 docker_run() { MSYS_NO_PATHCONV=1 docker "$@"; }
 
-cleanup() { docker_run rm -f bench-kafka bench-tcp bench-quic >/dev/null 2>&1 || true; }
+cleanup() {
+  if declare -F stop_resource_sampling >/dev/null; then stop_resource_sampling || true; fi
+  docker_run rm -f bench-kafka bench-tcp bench-quic >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 cleanup
 docker_run network create "$NETWORK" >/dev/null 2>&1 || true
 
 # ------------------------------------------------------------- sampling
 
-SAMPLER_PID=""
-start_sampling() {
-  local container="$1" out="$2"
-  : > "$out"
-  (
-    while docker_run stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "$container" \
-        >> "$out" 2>/dev/null; do
-      sleep 1
-    done
-  ) &
-  SAMPLER_PID=$!
-}
-stop_sampling() {
-  [[ -n "$SAMPLER_PID" ]] || return 0
-  kill "$SAMPLER_PID" 2>/dev/null || true
-  wait "$SAMPLER_PID" 2>/dev/null || true
-  SAMPLER_PID=""
-}
-summarize_samples() {
-  awk '
-    {
-      cpu = $1; sub("%", "", cpu); cpu += 0;
-      mem = $2; unit = mem; sub("^[0-9.]+", "", unit);
-      value = mem; sub("[A-Za-z]+$", "", value); value += 0;
-      if (unit == "GiB") value *= 1024;
-      else if (unit == "KiB") value /= 1024;
-      else if (unit == "B") value /= 1048576;
-      if (value <= 0) next;
-      cpu_sum += cpu; mem_sum += value; n++;
-      if (cpu > cpu_max) cpu_max = cpu;
-      if (value > mem_max) mem_max = value;
-    }
-    END {
-      if (n == 0) { print "n/a n/a n/a n/a"; exit }
-      printf "%.1f %.1f %.0f %.0f\n", cpu_sum / n, cpu_max, mem_sum / n, mem_max;
-    }
-  ' "$1"
-}
+source "$ROOT/scripts/bench-resources.sh"
+start_sampling() { start_resource_sampling "$2" "$1"; }
+stop_sampling() { stop_resource_sampling; }
+summarize_samples() { summarize_resource_samples "$1"; }
 disk_bytes() {
   local out=""
   out="$(docker_run exec "$1" du -sb "$2" 2>/dev/null || true)"
@@ -109,7 +78,7 @@ start_kafka() {
     -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
     -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
     -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
-    -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+    -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS="$GROUP_INITIAL_REBALANCE_DELAY_MS" \
     -e KAFKA_NUM_PARTITIONS="$PARTITIONS" \
     -e KAFKA_LOG_SEGMENT_BYTES=1073741824 \
     -e KAFKA_NUM_NETWORK_THREADS=4 \
@@ -120,8 +89,8 @@ start_kafka() {
     -e KAFKA_HEAP_OPTS="$KAFKA_BROKER_HEAP" \
     -e KAFKA_JVM_PERFORMANCE_OPTS="$KAFKA_BROKER_GC" \
     "$KAFKA_IMAGE" >/dev/null || die "cannot start Kafka"
-  local deadline=$((SECONDS + 150))
-  while (( SECONDS < deadline )); do
+  local deadline=$(( $(benchmark_now_ms) + 150000 ))
+  while (( $(benchmark_now_ms) < deadline )); do
     if docker_run exec bench-kafka /opt/kafka/bin/kafka-broker-api-versions.sh \
         --bootstrap-server bench-kafka:9092 >/dev/null 2>&1; then
       return 0
@@ -142,9 +111,10 @@ start_brahmaputra() {
     brahmaputra-bench:latest \
     --host "$name" --port 9092 --data-dir /data \
     --default-partitions "$PARTITIONS" --segment-bytes 1073741824 \
+    --group-initial-rebalance-delay-ms "$GROUP_INITIAL_REBALANCE_DELAY_MS" \
     --transport "$transport" >/dev/null || die "cannot start $name"
-  local deadline=$((SECONDS + 60))
-  while (( SECONDS < deadline )); do
+  local deadline=$(( $(benchmark_now_ms) + 60000 ))
+  while (( $(benchmark_now_ms) < deadline )); do
     if docker_run exec "$name" /usr/local/bin/brahmaputra-cli \
         --transport "$transport" --broker "$name:9092" metadata >/dev/null 2>&1; then
       return 0
@@ -262,6 +232,7 @@ QUIC_DISK="$(cat "$RESULTS/quic-disk.txt" 2>/dev/null || true)"
   printf 'and %s, and each system is driven by its own client from inside its\n' "$MEMORY"
   printf 'own container. Kafka image `%s`.\n\n' "$KAFKA_IMAGE"
   printf 'Producer idempotence is disabled on both systems.\n\n'
+  printf 'Initial consumer-group rebalance delay is %s ms on both brokers.\n\n' "$GROUP_INITIAL_REBALANCE_DELAY_MS"
 
   printf '| Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC |\n'
   printf '|---|---|---|---|\n'
@@ -289,7 +260,8 @@ QUIC_DISK="$(cat "$RESULTS/quic-disk.txt" 2>/dev/null || true)"
     "$(awk -v t="${KP_RATE:-0}" -v c="$KP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')" \
     "$(awk -v t="${TP_RATE:-0}" -v c="$TP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')" \
     "$(awk -v t="${QP_RATE:-0}" -v c="$QP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')"
-  printf '\nRaw output and per-second samples: `bench/results/three-way/`.\n'
+  printf '\nRaw output, cgroup samples and CPU-time summaries: `bench/results/three-way/`.\n'
+  resource_report "$RESULTS"
 } > "$REPORT"
 
 stage "Three-way benchmark complete"

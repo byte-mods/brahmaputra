@@ -360,6 +360,41 @@ impl Record {
     }
 }
 
+fn uvarint_len(value: u64) -> usize {
+    ((64 - value.leading_zeros()).max(1) as usize).div_ceil(7)
+}
+
+// Compute framing before writing so records go straight into one payload
+// allocation. The nullable-value bit changes the length encoding for every
+// record in a batch, including its non-null records.
+fn encoded_record_len(record: &Record, has_headers: bool, has_null_values: bool) -> usize {
+    let key = record
+        .key
+        .as_ref()
+        .map_or(1, |key| uvarint_len(key.len() as u64 + 1) + key.len());
+    let value = record.value.as_ref().map_or(1, |value| {
+        uvarint_len(value.len() as u64 + u64::from(has_null_values)) + value.len()
+    });
+    let headers = if has_headers {
+        uvarint_len(record.headers.len() as u64)
+            + record
+                .headers
+                .iter()
+                .map(|header| {
+                    uvarint_len(header.key.len() as u64)
+                        + header.key.len()
+                        + header
+                            .value
+                            .as_ref()
+                            .map_or(1, |value| uvarint_len(value.len() as u64 + 1) + value.len())
+                })
+                .sum::<usize>()
+    } else {
+        0
+    };
+    key + value + uvarint_len(zigzag_encode(record.timestamp_delta)) + headers
+}
+
 /// The only unit on disk and on the wire (DESIGN.md §4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordBatch {
@@ -490,54 +525,67 @@ impl RecordBatch {
         let has_null_values = self.records.iter().any(|r| r.value.is_none());
 
         // Records payload.
-        let mut payload = BytesMut::new();
+        let payload_len = self
+            .records
+            .iter()
+            .map(|record| {
+                let len = encoded_record_len(record, has_headers, has_null_values);
+                uvarint_len(len as u64) + len
+            })
+            .sum();
+        let mut payload = BytesMut::with_capacity(payload_len);
         for record in &self.records {
-            let mut rec = BytesMut::new();
+            put_uvarint(
+                &mut payload,
+                encoded_record_len(record, has_headers, has_null_values) as u64,
+            );
             match &record.key {
-                None => put_uvarint(&mut rec, 0),
+                None => put_uvarint(&mut payload, 0),
                 Some(key) => {
-                    put_uvarint(&mut rec, key.len() as u64 + 1);
-                    rec.extend_from_slice(key);
+                    put_uvarint(&mut payload, key.len() as u64 + 1);
+                    payload.extend_from_slice(key);
                 }
             }
             match (&record.value, has_null_values) {
                 (Some(value), false) => {
-                    put_uvarint(&mut rec, value.len() as u64);
-                    rec.extend_from_slice(value);
+                    put_uvarint(&mut payload, value.len() as u64);
+                    payload.extend_from_slice(value);
                 }
                 (Some(value), true) => {
-                    put_uvarint(&mut rec, value.len() as u64 + 1);
-                    rec.extend_from_slice(value);
+                    put_uvarint(&mut payload, value.len() as u64 + 1);
+                    payload.extend_from_slice(value);
                 }
                 // Unreachable when the bit is clear: it is set from exactly
                 // this condition.
-                (None, _) => put_uvarint(&mut rec, 0),
+                (None, _) => put_uvarint(&mut payload, 0),
             }
-            put_uvarint(&mut rec, zigzag_encode(record.timestamp_delta));
+            put_uvarint(&mut payload, zigzag_encode(record.timestamp_delta));
             if has_headers {
-                put_uvarint(&mut rec, record.headers.len() as u64);
+                put_uvarint(&mut payload, record.headers.len() as u64);
                 for header in &record.headers {
-                    put_uvarint(&mut rec, header.key.len() as u64);
-                    rec.extend_from_slice(header.key.as_bytes());
+                    put_uvarint(&mut payload, header.key.len() as u64);
+                    payload.extend_from_slice(header.key.as_bytes());
                     match &header.value {
-                        None => put_uvarint(&mut rec, 0),
+                        None => put_uvarint(&mut payload, 0),
                         Some(value) => {
-                            put_uvarint(&mut rec, value.len() as u64 + 1);
-                            rec.extend_from_slice(value);
+                            put_uvarint(&mut payload, value.len() as u64 + 1);
+                            payload.extend_from_slice(value);
                         }
                     }
                 }
             }
-            put_uvarint(&mut payload, rec.len() as u64);
-            payload.extend_from_slice(&rec);
         }
+        debug_assert_eq!(payload.len(), payload_len);
         // Compression cannot fail for any codec here (all are pure encoders
         // over an in-memory buffer), but an encoder that did fail must not
         // silently ship uncompressed bytes under a compressed attribute —
         // that would be unreadable. Fall back to `None` honestly instead.
-        let (payload, compression) = match compress(self.compression, &payload) {
-            Ok(compressed) => (BytesMut::from(compressed.as_slice()), self.compression),
-            Err(_) => (payload, Compression::None),
+        let (payload, compression) = match self.compression {
+            Compression::None => (payload.freeze(), Compression::None),
+            codec => match compress(codec, &payload) {
+                Ok(compressed) => (Bytes::from(compressed), codec),
+                Err(_) => (payload.freeze(), Compression::None),
+            },
         };
 
         let extension_len = self.producer.map_or(0, |_| PRODUCER_EXTENSION_LEN);
@@ -1011,6 +1059,107 @@ mod tests {
 
     fn sample_batch(n: usize) -> RecordBatch {
         RecordBatch::new(42, 7, 1_700_000_000_000, sample_records(n))
+    }
+
+    #[test]
+    fn direct_record_encoding_preserves_wire_bytes_at_varint_boundaries() {
+        // Reference the old framing algorithm, which measured a separately
+        // serialized record. This deliberately does not use encoded_record_len.
+        fn legacy_payload(records: &[Record]) -> BytesMut {
+            let headers = records.iter().any(|r| !r.headers.is_empty());
+            let nullable = records.iter().any(|r| r.value.is_none());
+            let mut payload = BytesMut::new();
+            for record in records {
+                let mut rec = BytesMut::new();
+                match &record.key {
+                    None => put_uvarint(&mut rec, 0),
+                    Some(key) => {
+                        put_uvarint(&mut rec, key.len() as u64 + 1);
+                        rec.extend_from_slice(key);
+                    }
+                }
+                match &record.value {
+                    None => put_uvarint(&mut rec, 0),
+                    Some(value) => {
+                        put_uvarint(&mut rec, value.len() as u64 + u64::from(nullable));
+                        rec.extend_from_slice(value);
+                    }
+                }
+                put_uvarint(&mut rec, zigzag_encode(record.timestamp_delta));
+                if headers {
+                    put_uvarint(&mut rec, record.headers.len() as u64);
+                    for header in &record.headers {
+                        put_uvarint(&mut rec, header.key.len() as u64);
+                        rec.extend_from_slice(header.key.as_bytes());
+                        match &header.value {
+                            None => put_uvarint(&mut rec, 0),
+                            Some(value) => {
+                                put_uvarint(&mut rec, value.len() as u64 + 1);
+                                rec.extend_from_slice(value);
+                            }
+                        }
+                    }
+                }
+                put_uvarint(&mut payload, rec.len() as u64);
+                payload.extend_from_slice(&rec);
+            }
+            payload
+        }
+        for nullable in [false, true] {
+            for headers in [false, true] {
+                let mut records = Vec::new();
+                for len in [0, 1, 126, 127, 128, 16_382, 16_383, 16_384] {
+                    for delta in [0, 63, 64, -64, -65, i64::MIN, i64::MAX] {
+                        let mut record = Record::with_key(vec![b'k'; len], vec![b'v'; len], delta);
+                        if headers {
+                            record.headers = vec![
+                                RecordHeader::new("trace-λ", vec![b'h'; len]),
+                                RecordHeader {
+                                    key: "null".into(),
+                                    value: None,
+                                },
+                                RecordHeader::new("empty", Vec::new()),
+                            ];
+                        }
+                        records.push(record);
+                        records.push(Record::new(vec![b'x'; len]));
+                    }
+                }
+                if nullable {
+                    records.push(Record::tombstone(Vec::new(), -1));
+                }
+                let expected = legacy_payload(&records);
+                for codec in [
+                    Compression::None,
+                    Compression::Lz4,
+                    Compression::Gzip,
+                    Compression::Snappy,
+                    Compression::Zstd,
+                ] {
+                    for idempotent in [false, true] {
+                        let mut batch =
+                            RecordBatch::new(42, 7, 1234, records.clone()).with_compression(codec);
+                        if idempotent {
+                            batch = batch.with_producer(5, 2, 0);
+                        }
+                        let mut bytes = batch.encode();
+                        let start = 35
+                            + if idempotent {
+                                PRODUCER_EXTENSION_LEN
+                            } else {
+                                0
+                            };
+                        assert_eq!(
+                            &bytes[start..],
+                            compress(codec, &expected).unwrap(),
+                            "{codec:?}"
+                        );
+                        assert_eq!(RecordBatch::decode(&mut bytes).unwrap(), batch);
+                        assert!(bytes.is_empty());
+                    }
+                }
+            }
+        }
     }
 
     /// Every codec must return exactly what it was given, and must do so

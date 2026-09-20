@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use brahmaputra_protocol::{decode_payload, encode_payload, ApiKey, FrameHeader};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use quinn::{ClientConfig, Endpoint, TransportConfig};
+use quinn::{ClientConfig, Endpoint, EndpointConfig, MtuDiscoveryConfig, TransportConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
@@ -42,6 +42,18 @@ const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const STREAM_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 /// Bytes in flight across all streams of a connection.
 const CONNECTION_WINDOW: u32 = 256 * 1024 * 1024;
+const MAX_DISCOVERED_UDP_PAYLOAD: u16 = 9000;
+
+/// Advertise capacity for jumbo datagrams without assuming that the path can
+/// carry them. Transport discovery starts small and only grows after probes
+/// are acknowledged; standard-MTU paths retain their smaller packet size.
+pub fn datacenter_endpoint_config() -> EndpointConfig {
+    let mut config = EndpointConfig::default();
+    config
+        .max_udp_payload_size(MAX_DISCOVERED_UDP_PAYLOAD)
+        .expect("valid QUIC UDP payload size");
+    config
+}
 
 /// Retune quinn's defaults, which target a lossy ~100 ms internet path,
 /// for the links a broker actually runs on.
@@ -62,6 +74,9 @@ pub fn tune_for_datacenter(transport: &mut TransportConfig) {
     // Start near a standard Ethernet MTU instead of the 1200 B floor;
     // MTU discovery still probes and backs off if the path is smaller.
     transport.initial_mtu(1350);
+    let mut discovery = MtuDiscoveryConfig::default();
+    discovery.upper_bound(MAX_DISCOVERED_UDP_PAYLOAD);
+    transport.mtu_discovery_config(Some(discovery));
     transport.datagram_receive_buffer_size(Some(STREAM_RECEIVE_WINDOW as usize));
 }
 
@@ -89,7 +104,14 @@ impl QuicConnection {
         } else {
             "[::]:0".parse().expect("valid bind address")
         };
-        let mut endpoint = Endpoint::client(bind).map_err(ClientError::Io)?;
+        let socket = std::net::UdpSocket::bind(bind).map_err(ClientError::Io)?;
+        let mut endpoint = Endpoint::new(
+            datacenter_endpoint_config(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(ClientError::Io)?;
 
         let tls = crate::tls::client_config(tls_settings)?;
         let tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
@@ -237,5 +259,129 @@ impl ServerCertVerifier for AcceptAnyServerCert {
             SignatureScheme::RSA_PSS_SHA256,
             SignatureScheme::RSA_PKCS1_SHA256,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn quic_discovers_jumbo_paths_and_survives_dropped_oversized_datagrams() {
+        for path_limit in [9000, 1400] {
+            let certificate =
+                rcgen::generate_simple_self_signed(vec!["brahmaputra".into()]).unwrap();
+            let key =
+                rustls_pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());
+            let mut tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate.cert.der().clone()], key.into())
+                .unwrap();
+            tls.alpn_protocols = vec![ALPN.to_vec()];
+            let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+            ));
+            let mut transport = TransportConfig::default();
+            tune_for_datacenter(&mut transport);
+            server_config.transport_config(Arc::new(transport));
+            let endpoint = Endpoint::new(
+                datacenter_endpoint_config(),
+                Some(server_config),
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+                Arc::new(quinn::TokioRuntime),
+            )
+            .unwrap();
+            let server_address = endpoint.local_addr().unwrap();
+
+            // A UDP relay models a path that silently drops oversized packets.
+            // Its two directions share the same MTU, including discovery probes.
+            let proxy = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = proxy.local_addr().unwrap();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::new(AtomicUsize::new(0));
+            let dropped_proxy = dropped.clone();
+            let seen_proxy = seen.clone();
+            let relay = tokio::spawn(async move {
+                let mut client_address = None;
+                let mut buffer = vec![0_u8; 65536];
+                loop {
+                    let (length, from) = proxy.recv_from(&mut buffer).await.unwrap();
+                    let target = if from == server_address {
+                        client_address.expect("client sent the initial packet")
+                    } else {
+                        client_address = Some(from);
+                        server_address
+                    };
+                    if length > path_limit {
+                        dropped_proxy.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    seen_proxy.fetch_max(length, Ordering::Relaxed);
+                    proxy.send_to(&buffer[..length], target).await.unwrap();
+                }
+            });
+            let server_endpoint = endpoint.clone();
+            let (stop_server, stopped) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+                for _ in 0..8 {
+                    let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                    let frame = recv.read_to_end(MAX_FRAME_BYTES).await.unwrap();
+                    send.write_all(&frame).await.unwrap();
+                    send.finish().unwrap();
+                }
+                let _ = stopped.await;
+                connection.close(0_u32.into(), b"test complete");
+            });
+
+            tokio::time::timeout(Duration::from_secs(20), async {
+                let client =
+                    QuicConnection::connect(proxy_address, None, 5, &crate::TlsSettings::default())
+                        .await
+                        .unwrap();
+                if path_limit == 9000 {
+                    // Check acknowledged discovery before bulk traffic. A busy
+                    // UDP relay can lose packets in the kernel receive queue;
+                    // Quinn may correctly fall back after that loss even when
+                    // every MTU probe succeeded. The final MTU is not a record
+                    // of the largest size that was successfully discovered.
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while client.connection.stats().path.current_mtu != 9000 {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .expect("jumbo probes must be acknowledged up to the configured ceiling");
+                }
+                for sequence in 0..8 {
+                    let payload: Vec<u8> = (0..512 * 1024)
+                        .map(|index| ((index + sequence) % 251) as u8)
+                        .collect();
+                    let reply = client.request(ApiKey::Metadata, &payload).await.unwrap();
+                    assert_eq!(reply.as_ref(), payload.as_slice());
+                }
+                let mtu = client.connection.stats().path.current_mtu;
+                eprintln!(
+                    "path limit={path_limit}, discovered MTU={mtu}, dropped={}, largest forwarded={}, stats={:?}",
+                    dropped.load(Ordering::Relaxed),
+                    seen.load(Ordering::Relaxed),
+                    client.connection.stats().path
+                );
+                if path_limit == 9000 {
+                    assert_eq!(seen.load(Ordering::Relaxed), 9000);
+                } else {
+                    assert!(dropped.load(Ordering::Relaxed) > 0);
+                    assert!(mtu <= 1400, "oversized probes cannot raise the usable MTU");
+                }
+            })
+            .await
+            .expect("both paths must deliver every byte without stalling");
+            let _ = stop_server.send(());
+            server.await.unwrap();
+            relay.abort();
+            endpoint.close(0_u32.into(), b"test complete");
+        }
     }
 }

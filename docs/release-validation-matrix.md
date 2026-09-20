@@ -3,7 +3,8 @@
 The matrix is finite: passing it does not prove every combination of broker
 flags, operating systems, storage devices and workloads. Keep correctness
 results separate from Kafka throughput comparisons. An empty or missing result
-is not a pass. The 0.8.0 release review records actual execution results.
+is not a pass. The [0.8.1 release review](release-0.8.1-review.md) records actual
+execution results, including failures and their retests.
 
 | Area | Coverage | Executable evidence |
 | --- | --- | --- |

@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.8.1 — 2026-09-21
+
+Cold client routing and record encoding use fewer requests, connections and
+copies. Conditional broker lease recovery tolerates a lost registration reply
+and its metadata arriving before local activation. BitPacker wire encoding
+remains version 4; record framing and the disk format are unchanged.
+
+### Fixed
+
+- Concurrent cold routes share metadata refreshes, DNS resolution and one
+  authenticated connection per broker address. Different brokers can connect
+  independently. Explicit metadata refresh and leader-change recovery remain
+  available.
+- Record batches encode directly into a sized payload buffer, avoiding a
+  temporary allocation per record and redundant uncompressed payload copies.
+  Differential coverage checks framing across all five compression codecs.
+  Multi-partition compression runs outside the shared producer buffer lock.
+- Conditional re-registration retains an operation receipt across retries.
+  A receipt cannot renew a lease, revive a fenced broker or adopt a replacement
+  process's epoch. A fresh heartbeat is required before serving again.
+- Brokers recognize their own pending registration when metadata arrives ahead
+  of the RPC response. Requests remain fenced until activation; a different
+  process's receipt still irreversibly fences the old broker.
+- Durable controller writes run on the blocking pool while preserving write
+  ordering, immediate durability and completion after caller cancellation.
+- The admin/quota verification waits for a newly created topic to become
+  readable on the broker before producing its measured baseline. Controller
+  commit can precede the broker's metadata refresh; writes are not retried by
+  this readiness check.
+
+### Added
+
+- `--group-initial-rebalance-delay-ms` exposes the initial consumer-group wait
+  (default 1,000 ms). Benchmarks configure the same delay on both systems.
+- All comparison harnesses record cumulative cgroup CPU core-seconds and
+  working-set memory at 50-ms intervals, including aligned multi-node windows.
+  Resource accounting has regression coverage in CI. Replicated workloads have
+  a bounded phase timeout so a failed quorum cannot hang a benchmark forever.
+- Benchmark elapsed times and readiness/phase deadlines use a monotonic clock.
+  A phase outside its CPU/memory observation window is rejected. System-clock
+  adjustments previously produced false timeouts and corrupted wall rates.
+- QUIC discovers UDP payload sizes up to 9,000 bytes on capable paths. It
+  starts at the existing small packet size and grows only after acknowledged
+  probes; a regression verifies byte-identical delivery through a relay that
+  silently drops packets larger than 1,400 bytes.
+- Refreshed dashboard, broker and topic screenshots in the README.
+- Twelve verified Kafka comparison groups with CPU core-seconds, working-set
+  memory, source hashes and image IDs. All performance losses remain published
+  in the [release review](docs/release-0.8.1-review.md#final-measurements).
+
+Upgrade every controller to retain registration receipts throughout lease
+recovery. Mixed-version controller recovery has not been validated.
+
 ## 0.8.0 — 2026-09-20
 
 Controller writes survive caller cancellation, broker leases and consumer

@@ -31,6 +31,7 @@ pub use group_admin::{
 };
 pub use group_consumer::{Assignor, AutoOffsetReset, ConsumedRecord, GroupConsumer};
 pub use producer::{Producer, ProducerConfig};
+pub use quic::datacenter_endpoint_config as quic_endpoint_config;
 pub use quic::tune_for_datacenter as tune_quic_transport;
 pub use replica::{ReplicaClient, ReplicaFetchResult};
 pub use tls::TlsSettings;

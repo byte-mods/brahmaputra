@@ -598,6 +598,7 @@ impl Inner {
         }
         let mut payload: Vec<(ProduceMultiPartition, Vec<Bytes>)> = Vec::new();
         let mut units: Vec<Unit> = Vec::new();
+        let mut taken_buffers = Vec::with_capacity(partitions.len());
         {
             let mut buffers = self.buffers.lock().expect("buffers");
             for (topic, partition) in &partitions {
@@ -608,30 +609,36 @@ impl Inner {
                     continue;
                 }
                 let taken = std::mem::replace(buffer, Buffer::new());
-                // The records belong to this flush now, so the buffer space
-                // they occupied is free for new sends.
-                self.budget.release(taken.size);
-                let timestamped: Vec<(Record, i64)> = taken
-                    .records
-                    .iter()
-                    .map(|(record, created_ms, _)| (record.clone(), *created_ms))
-                    .collect();
-                let batch = RecordBatch::from_timestamped(0, 0, timestamped, now_ms())
-                    .with_compression(self.config.compression);
-                payload.push((
-                    ProduceMultiPartition {
-                        topic: topic.clone(),
-                        partition: *partition,
-                        batches_length: 0,
-                    },
-                    vec![batch.encode()],
-                ));
-                units.push(Unit {
-                    topic: topic.clone(),
-                    partition: *partition,
-                    records: taken.records,
-                });
+                taken_buffers.push((topic.clone(), *partition, taken));
             }
+        }
+        // Encoding and compression can be expensive. The per-partition send
+        // guards still preserve ordering, but other partitions can enqueue
+        // records while these detached buffers are being encoded.
+        for (topic, partition, taken) in taken_buffers {
+            // The records belong to this flush now, so the buffer space
+            // they occupied is free for new sends.
+            self.budget.release(taken.size);
+            let timestamped: Vec<(Record, i64)> = taken
+                .records
+                .iter()
+                .map(|(record, created_ms, _)| (record.clone(), *created_ms))
+                .collect();
+            let batch = RecordBatch::from_timestamped(0, 0, timestamped, now_ms())
+                .with_compression(self.config.compression);
+            payload.push((
+                ProduceMultiPartition {
+                    topic: topic.clone(),
+                    partition,
+                    batches_length: 0,
+                },
+                vec![batch.encode()],
+            ));
+            units.push(Unit {
+                topic,
+                partition,
+                records: taken.records,
+            });
         }
         if payload.is_empty() {
             return;

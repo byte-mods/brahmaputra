@@ -32,6 +32,7 @@ fn broker_metadata(broker_id: i32, broker_epoch: u64) -> BrokerMetadata {
         control_port: 0,
         internal_port: 0,
         broker_epoch,
+        registration_id: None,
         roles: BTreeSet::from([NodeRole::Broker]),
         rack: None,
         alive: true,

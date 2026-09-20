@@ -38,6 +38,8 @@ jobs:
           node-version: '22'
       - name: Dashboard behavior
         run: node --test scripts/test-dashboard.cjs
+      - name: Benchmark resource accounting
+        run: node --test scripts/test-bench-resources.cjs
 
   # The live suites: real brokers, real kills, real logs on disk. These are
   # what actually catch replication and recovery regressions, so they gate

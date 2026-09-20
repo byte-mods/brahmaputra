@@ -26,6 +26,7 @@ set -Eeuo pipefail
 RECORDS="${RECORDS:-500000}"
 RECORD_SIZE="${RECORD_SIZE:-256}"
 PARTITIONS="${PARTITIONS:-6}"
+GROUP_INITIAL_REBALANCE_DELAY_MS="${GROUP_INITIAL_REBALANCE_DELAY_MS:-0}"
 BATCH_SIZE="${BATCH_SIZE:-65536}"
 LINGER_MS="${LINGER_MS:-10}"
 COMPRESSION="${COMPRESSION:-none}"       # none | lz4
@@ -54,6 +55,7 @@ info() { printf '    %s\n' "$1"; }
 die() { printf '\n\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 
 cleanup() {
+  if declare -F stop_resource_sampling >/dev/null; then stop_resource_sampling || true; fi
   docker rm -f bench-kafka bench-brahmaputra bench-client >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -102,54 +104,11 @@ cleanup
 
 # ------------------------------------------------------------- resources
 
-# Sample a container's CPU and memory once a second for as long as the
-# caller's workload runs, so throughput can be read per unit of resource
-# rather than on its own.
-SAMPLER_PID=""
-start_sampling() {
-  local container="$1" out="$2"
-  : > "$out"
-  (
-    while docker_run stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "$container" \
-        >> "$out" 2>/dev/null; do
-      sleep 1
-    done
-  ) &
-  SAMPLER_PID=$!
-}
-
-stop_sampling() {
-  [[ -n "$SAMPLER_PID" ]] || return 0
-  kill "$SAMPLER_PID" 2>/dev/null || true
-  wait "$SAMPLER_PID" 2>/dev/null || true
-  SAMPLER_PID=""
-}
-
-# "avg_cpu peak_cpu avg_mem_mib peak_mem_mib" from a sample file.
-summarize_samples() {
-  awk '
-    {
-      cpu = $1; sub("%", "", cpu);
-      mem = $2;
-      unit = mem; sub("^[0-9.]+", "", unit);
-      value = mem; sub("[A-Za-z]+$", "", value);
-      if (unit == "GiB") value *= 1024;
-      else if (unit == "KiB") value /= 1024;
-      else if (unit == "B") value /= 1048576;
-      # Force numeric comparison: these came out of sub() as strings, and
-      # lexically "64.6" sorts above "204.1".
-      cpu += 0; value += 0;
-      if (value <= 0) next;
-      cpu_sum += cpu; mem_sum += value; n++;
-      if (cpu > cpu_max) cpu_max = cpu;
-      if (value > mem_max) mem_max = value;
-    }
-    END {
-      if (n == 0) { print "n/a n/a n/a n/a"; exit }
-      printf "%.1f %.1f %.0f %.0f\n", cpu_sum / n, cpu_max, mem_sum / n, mem_max;
-    }
-  ' "$1"
-}
+# Cumulative CPU and dense memory observations also cover subsecond phases.
+source "$ROOT/scripts/bench-resources.sh"
+start_sampling() { start_resource_sampling "$2" "$1"; }
+stop_sampling() { stop_resource_sampling; }
+summarize_samples() { summarize_resource_samples "$1"; }
 
 # On-disk size of a log directory, or empty when it cannot be read. Never
 # fails the run: a missing measurement is reported as n/a, not a crash.
@@ -187,7 +146,7 @@ start_kafka() {
     -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
     -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
     -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
-    -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+    -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS="$GROUP_INITIAL_REBALANCE_DELAY_MS" \
     -e KAFKA_NUM_PARTITIONS="$PARTITIONS" \
     -e KAFKA_LOG_SEGMENT_BYTES=1073741824 \
     -e KAFKA_NUM_NETWORK_THREADS=4 \
@@ -197,8 +156,8 @@ start_kafka() {
   # Kafka's image runs as uid 1000 and can only write its own default log
   # dir, so leave KAFKA_LOG_DIRS alone and read that path for disk usage.
 
-  local deadline=$((SECONDS + 120))
-  while (( SECONDS < deadline )); do
+  local deadline=$(( $(benchmark_now_ms) + 120000 ))
+  while (( $(benchmark_now_ms) < deadline )); do
     if docker_run exec bench-kafka /opt/kafka/bin/kafka-broker-api-versions.sh \
         --bootstrap-server bench-kafka:9092 >/dev/null 2>&1; then
       info "Kafka ready"
@@ -248,10 +207,11 @@ start_brahmaputra() {
     --host bench-brahmaputra --port 9092 \
     --data-dir /data \
     --default-partitions "$PARTITIONS" \
+    --group-initial-rebalance-delay-ms "$GROUP_INITIAL_REBALANCE_DELAY_MS" \
     --segment-bytes 1073741824 >/dev/null || die "cannot start Brahmaputra"
 
-  local deadline=$((SECONDS + 60))
-  while (( SECONDS < deadline )); do
+  local deadline=$(( $(benchmark_now_ms) + 60000 ))
+  while (( $(benchmark_now_ms) < deadline )); do
     if brahma_cli metadata >/dev/null 2>&1; then
       info "Brahmaputra ready"
       return 0
@@ -381,6 +341,7 @@ ratio() { awk -v a="$1" -v b="$2" 'BEGIN { if (b+0 == 0) print "n/a"; else print
   printf 'Both producers send identical repeated `x` payloads. These are\n'
   printf 'highly compressible; codec results do not represent high-entropy data.\n\n'
   printf 'Idempotence is `%s` on both producers.\n\n' "$IDEMPOTENT"
+  printf 'Initial consumer-group rebalance delay is %s ms on both brokers.\n\n' "$GROUP_INITIAL_REBALANCE_DELAY_MS"
   printf '| Workload | Kafka | Brahmaputra | Brahmaputra / Kafka |\n'
   printf '|---|---|---|---|\n'
   printf '| Produce (msgs/sec) | %s | %s | %s |\n' "${KP_RATE:-n/a}" "${BP_RATE:-n/a}" "$(ratio "${BP_RATE:-0}" "${KP_RATE:-0}")"
@@ -389,7 +350,7 @@ ratio() { awk -v a="$1" -v b="$2" 'BEGIN { if (b+0 == 0) print "n/a"; else print
   printf '| Consume (MB/sec) | %s | %s | %s |\n' "${KC_MB:-n/a}" "${BC_MB:-n/a}" "$(ratio "${BC_MB:-0}" "${KC_MB:-0}")"
 
   printf '\n## Resource cost for the same stream\n\n'
-  printf 'Broker-container CPU and memory sampled once a second for the\n'
+  printf 'Broker-container cumulative CPU and 50 ms memory samples cover the\n'
   printf 'duration of each phase; disk is the on-disk size of the log\n'
   printf 'directory after producing %s records of %s B (%s MiB of payload).\n\n' \
     "$RECORDS" "$RECORD_SIZE" "$(awk -v r="$RECORDS" -v s="$RECORD_SIZE" 'BEGIN{printf "%.0f", r*s/1048576}')"
@@ -411,7 +372,8 @@ ratio() { awk -v a="$1" -v b="$2" 'BEGIN { if (b+0 == 0) print "n/a"; else print
     "$(awk -v t="${KP_RATE:-0}" -v c="$KP_CPU_AVG" 'BEGIN{if(c+0>0) printf "%.0f", t/c; else print "n/a"}')" \
     "$(awk -v t="${BP_RATE:-0}" -v c="$BP_CPU_AVG" 'BEGIN{if(c+0>0) printf "%.0f", t/c; else print "n/a"}')"
 
-  printf '\nRaw tool output and per-second samples: `bench/results/raw/`.\n'
+  printf '\nRaw tool output, cgroup samples and CPU-time summaries: `bench/results/raw/`.\n'
+  resource_report "$RESULTS"
 } > "$REPORT"
 
 stage "Benchmark complete"

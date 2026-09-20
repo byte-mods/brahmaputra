@@ -1,0 +1,16 @@
+suite,checks,final_exit_code,attempts
+verify-m1,31,0,1
+verify-m3,97,0,1
+verify-m4,30,0,1
+verify-m5,15,0,1
+verify-m6,30,0,1
+verify-replication,14,0,1
+verify-retention,21,0,1
+verify-failures,15,0,1
+verify-transport-parity,18,0,2
+verify-reassignment,12,0,1
+verify-admin-and-security,29,0,2
+verify-transactions,24,0,1
+verify-compaction,17,0,1
+verify-jbod,26,0,1
+verify-chaos,7,0,1

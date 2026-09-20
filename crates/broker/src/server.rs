@@ -97,6 +97,9 @@ pub struct BrokerConfig {
     /// committed: a live group is still using its offsets however old they
     /// are, and expiring under it would silently rewind the consumer.
     pub offsets_retention: Option<Duration>,
+    /// Wait for additional members when a consumer group first forms
+    /// (`group.initial.rebalance.delay.ms`). Zero assigns immediately.
+    pub group_initial_rebalance_delay: Duration,
     /// A second data-plane listener for broker-to-broker traffic, with its
     /// own transport. `None` puts everything on the client listener.
     ///
@@ -157,6 +160,7 @@ impl Default for BrokerConfig {
             retention_check_interval: Duration::from_secs(1),
             // Kafka's default: 7 days.
             offsets_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)),
+            group_initial_rebalance_delay: Duration::from_secs(1),
             internal_listener: None,
             transaction_max_timeout: Duration::from_secs(15 * 60),
             transactional_id_expiration: Duration::from_secs(7 * 24 * 60 * 60),
@@ -326,6 +330,9 @@ pub struct Broker {
     /// plane until conditional re-registration succeeds, while `fence()`
     /// remains the irreversible response to a proven newer incarnation.
     lease_active: AtomicBool,
+    /// Serializes lease transitions and identifies an in-flight conditional
+    /// recovery before its metadata image can arrive on another task.
+    registration_recovery: Mutex<Option<(BrokerEpoch, String)>>,
     addr: SocketAddr,
 }
 
@@ -428,6 +435,7 @@ impl Broker {
             shutdown_tx,
             local_broker_epoch: AtomicU64::new(initial_broker_epoch),
             lease_active: AtomicBool::new(initial_lease_active),
+            registration_recovery: Mutex::new(None),
             addr,
         };
         let local_partitions = if let Some(cache) = broker.metadata_cache() {
@@ -505,6 +513,11 @@ impl Broker {
     /// immediately; [`Broker::run`] observes the signal, closes all tracked
     /// connections, and then drains partition actors before returning.
     pub fn fence(&self) {
+        let _recovery = self.registration_recovery.lock().expect("broker recovery");
+        self.fence_inner();
+    }
+
+    fn fence_inner(&self) {
         self.lease_active.store(false, Ordering::Release);
         self.lifecycle.lock().expect("broker lifecycle").closing = true;
         self.shutdown_tx.send_replace(true);
@@ -525,6 +538,7 @@ impl Broker {
     /// that first suspended its expired local lease may accept the next
     /// epoch returned by a *conditional* registration and resume safely.
     pub fn activate_broker_epoch(&self, broker_epoch: BrokerEpoch) -> Result<(), BrokerError> {
+        let mut recovery = self.registration_recovery.lock().expect("broker recovery");
         if broker_epoch == 0 {
             return Err(BrokerError::Meta(
                 "controller broker epochs must be non-zero".into(),
@@ -539,7 +553,7 @@ impl Broker {
         }
         let current = self.local_broker_epoch.load(Ordering::Acquire);
         if current != 0 && current != broker_epoch && self.lease_active.load(Ordering::Acquire) {
-            self.fence();
+            self.fence_inner();
             return Err(BrokerError::FencedBrokerEpoch {
                 broker_id: self.config.broker_id,
                 requested: current,
@@ -549,6 +563,7 @@ impl Broker {
         self.local_broker_epoch
             .store(broker_epoch, Ordering::Release);
         self.lease_active.store(true, Ordering::Release);
+        *recovery = None;
         Ok(())
     }
 
@@ -556,9 +571,40 @@ impl Broker {
     /// keep listeners and actors alive so this same process can
     /// conditionally re-register after the controller quorum recovers.
     pub fn suspend_broker_lease(&self) {
+        let _recovery = self.registration_recovery.lock().expect("broker recovery");
         if self.metadata_cache().is_some() && !self.is_fenced() {
             self.lease_active.store(false, Ordering::Release);
         }
+    }
+
+    /// Publish ownership before submitting a conditional registration. Seeing
+    /// this operation's receipt while suspended rejects traffic but must not
+    /// irreversibly fence the process that is waiting for its own response.
+    pub fn prepare_broker_registration(
+        &self,
+        expected_epoch: BrokerEpoch,
+        registration_id: &str,
+    ) -> Result<(), BrokerError> {
+        let mut recovery = self.registration_recovery.lock().expect("broker recovery");
+        if self.is_fenced() || self.is_lease_active() || registration_id.is_empty() {
+            return Err(BrokerError::Meta(
+                "broker registration requires a suspended lease and an operation identity".into(),
+            ));
+        }
+        let local = self.local_broker_epoch();
+        if expected_epoch < local
+            || (local != 0
+                && expected_epoch > local
+                && !recovery.as_ref().is_some_and(|(previous, _)| {
+                    *previous == expected_epoch || previous.checked_add(1) == Some(expected_epoch)
+                }))
+        {
+            return Err(BrokerError::Meta(
+                "registration predecessor is outside this broker's recovery sequence".into(),
+            ));
+        }
+        *recovery = Some((expected_epoch, registration_id.to_owned()));
+        Ok(())
     }
 
     pub fn is_lease_active(&self) -> bool {
@@ -596,20 +642,36 @@ impl Broker {
             return Ok(());
         }
 
+        // Only the rejected path takes this lock. Re-read under the same lock
+        // as activation so an old validation snapshot cannot fence a process
+        // that just activated its own next epoch.
+        let recovery = self.registration_recovery.lock().expect("broker recovery");
+        let requested = self.local_broker_epoch();
+        let lease_active = self.is_lease_active();
         if requested != 0 {
             let superseded = registered.is_some_and(|broker| broker.broker_epoch > requested);
+            let own_recovery = !lease_active
+                && registered.is_some_and(|broker| {
+                    recovery.as_ref().is_some_and(|(expected, identity)| {
+                        // The predecessor is also ours: a receipt can expire
+                        // before activation, requiring another conditional retry.
+                        broker.broker_epoch == *expected
+                            || (expected.checked_add(1) == Some(broker.broker_epoch)
+                                && broker.registration_id.as_ref() == Some(identity))
+                    })
+                });
             let fenced_in_place = lease_active
                 && registered.is_some_and(|broker| {
                     broker.broker_epoch == requested
                         && (!broker.alive || !broker.roles.contains(&NodeRole::Broker))
                 });
-            if superseded {
-                self.fence();
+            if superseded && !own_recovery {
+                self.fence_inner();
             } else if fenced_in_place {
                 // Stop serving, but stay alive: the lifecycle re-registers
                 // conditionally, and the controller refuses that if this
                 // really has been replaced.
-                self.suspend_broker_lease();
+                self.lease_active.store(false, Ordering::Release);
             }
         }
         Err(BrokerError::FencedBrokerEpoch {
@@ -2300,6 +2362,7 @@ mod live_topic_config_tests {
                 control_port: 19092,
                 internal_port: 0,
                 expected_epoch: None,
+                registration_id: None,
                 roles: vec![NodeRole::Broker],
                 rack: None,
                 now_ms: 1,
@@ -2374,6 +2437,7 @@ mod live_topic_config_tests {
                 control_port: 19092,
                 internal_port: 0,
                 expected_epoch: None,
+                registration_id: None,
                 roles: vec![NodeRole::Broker],
                 rack: None,
                 now_ms: 1,
@@ -2470,6 +2534,7 @@ mod live_topic_config_tests {
                 control_port: 19092,
                 internal_port: 0,
                 expected_epoch: None,
+                registration_id: None,
                 roles: vec![NodeRole::Broker, NodeRole::Controller],
                 rack: None,
                 now_ms: 1,
@@ -2498,6 +2563,9 @@ mod live_topic_config_tests {
         assert!(!broker.is_lease_active());
         assert!(broker.validate_local_broker_lease().is_err());
         assert!(!broker.is_fenced(), "contact loss must be reversible");
+        broker
+            .prepare_broker_registration(first_epoch, "own-recovery")
+            .unwrap();
 
         let second_epoch = match image
             .apply(MetadataCommand::RegisterBroker {
@@ -2507,6 +2575,7 @@ mod live_topic_config_tests {
                 control_port: 19092,
                 internal_port: 0,
                 expected_epoch: Some(first_epoch),
+                registration_id: Some("own-recovery".into()),
                 roles: vec![NodeRole::Broker, NodeRole::Controller],
                 rack: None,
                 now_ms: 2,
@@ -2518,7 +2587,19 @@ mod live_topic_config_tests {
             }
             event => panic!("unexpected event: {event:?}"),
         };
-        cache.replace(image);
+        cache.replace(image.clone());
+        // Metadata may arrive before the registration response/heartbeat.
+        // Requests stay rejected, but our own recovery must remain reversible.
+        assert!(broker.validate_local_broker_lease().is_err());
+        assert!(!broker.is_fenced());
+        assert!(!broker.is_lease_active());
+        // If that receipt expires before activation, the next conditional
+        // attempt still owns its predecessor while its new write is pending.
+        broker
+            .prepare_broker_registration(second_epoch, "next-recovery")
+            .unwrap();
+        assert!(broker.validate_local_broker_lease().is_err());
+        assert!(!broker.is_fenced());
         broker.activate_broker_epoch(second_epoch).unwrap();
         assert!(broker.is_lease_active());
         broker.validate_local_broker_lease().unwrap();
@@ -2529,6 +2610,27 @@ mod live_topic_config_tests {
         assert!(
             broker.is_fenced(),
             "an active epoch change still proves this is a zombie"
+        );
+
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = Broker::bind(BrokerConfig {
+            broker_id: 0,
+            broker_epoch: Some(first_epoch),
+            port: 0,
+            data_dirs: vec![other_dir.path().to_path_buf()],
+            metadata_cache: Some(cache),
+            ..BrokerConfig::default()
+        })
+        .await
+        .unwrap();
+        other.suspend_broker_lease();
+        other
+            .prepare_broker_registration(first_epoch, "different-operation")
+            .unwrap();
+        assert!(other.validate_local_broker_epoch(&image).is_err());
+        assert!(
+            other.is_fenced(),
+            "suspension cannot adopt another operation's receipt"
         );
     }
 }

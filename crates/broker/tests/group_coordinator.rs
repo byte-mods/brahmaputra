@@ -118,6 +118,7 @@ fn broker_metadata(broker_id: i32) -> BrokerMetadata {
         control_port: 0,
         internal_port: 0,
         broker_epoch: 100 + broker_id as u64,
+        registration_id: None,
         roles: BTreeSet::from([NodeRole::Broker]),
         rack: None,
         alive: true,
@@ -1370,5 +1371,30 @@ async fn a_forming_group_waits_briefly_for_the_rest_of_the_fleet() {
         "all three members should be in the group that formed"
     );
 
+    stop_broker(broker).await;
+}
+
+#[tokio::test]
+async fn zero_initial_rebalance_delay_assigns_without_the_default_one_second_wait() {
+    let temp = TempDir::new().unwrap();
+    let broker = start_standalone_with(&temp.path().join("broker"), 6, |config| {
+        config.group_initial_rebalance_delay = Duration::ZERO;
+    })
+    .await;
+    let conn = connect(broker.addr, "immediate-member").await;
+    let joined = tokio::time::timeout(Duration::from_millis(800), async {
+        loop {
+            let response = join(&conn, "immediate-group", "", 30_000, 3_000).await;
+            if response.error_code != ec::COORDINATOR_LOAD_IN_PROGRESS {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("zero delay must not pay the default one-second formation wait");
+    assert_eq!(joined.error_code, ec::NONE);
+    assert_eq!(joined.members.len(), 1);
+    assert_eq!(joined.leader_member_id, joined.member_id);
     stop_broker(broker).await;
 }

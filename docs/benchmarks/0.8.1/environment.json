@@ -1,0 +1,12 @@
+{
+  "dockerHost": "28 50510606336 6.18.33.2-microsoft-standard-WSL2 29.7.2",
+  "images": [
+    "sha256:6499838672d9a499f7374acab8a532184a6140f975383cab25b3b678b29774c8",
+    "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837"
+  ],
+  "imageOrder": [
+    "brahmaputra-bench:latest",
+    "apache/kafka:4.3.1"
+  ],
+  "sourceBase": "f95d72b4c92514a753334c60561110facb00dc0a"
+}

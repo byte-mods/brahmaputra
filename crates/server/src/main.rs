@@ -87,6 +87,10 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     default_partitions: i32,
 
+    /// Wait for more members before a new consumer group's first assignment.
+    #[arg(long, default_value_t = 1000)]
+    group_initial_rebalance_delay_ms: u64,
+
     /// Roll log segments at this many bytes.
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     segment_bytes: u64,
@@ -443,6 +447,7 @@ async fn run_standalone(args: Args) -> Result<()> {
         port: args.port,
         data_dirs: args.data_dirs,
         default_partitions: args.default_partitions,
+        group_initial_rebalance_delay: Duration::from_millis(args.group_initial_rebalance_delay_ms),
         log_config: LogConfig {
             segment_bytes: args.segment_bytes,
             retention_ms: args.retention_ms,
@@ -563,6 +568,9 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
             port: args.port,
             data_dirs: args.data_dirs,
             default_partitions: args.default_partitions,
+            group_initial_rebalance_delay: Duration::from_millis(
+                args.group_initial_rebalance_delay_ms,
+            ),
             log_config: LogConfig {
                 segment_bytes: args.segment_bytes,
                 retention_ms: args.retention_ms,
@@ -927,6 +935,7 @@ async fn broker_lifecycle(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut epoch: Option<BrokerEpoch> = None;
     let mut expected_epoch: Option<BrokerEpoch> = None;
+    let mut pending_registration = None;
     let mut last_renewal = None;
     let mut prefer_remote_heartbeat = false;
 
@@ -1032,10 +1041,19 @@ async fn broker_lifecycle(
                         }
                     }
                 } else {
+                    if pending_registration.is_none() {
+                        pending_registration = Some(PendingRegistration::new(expected_epoch)?);
+                    }
+                    let pending = pending_registration.as_mut().unwrap();
+                    if let (Some(expected), Some(identity)) =
+                        (pending.expected_epoch, pending.registration_id.as_deref())
+                    {
+                        broker.prepare_broker_registration(expected, identity)?;
+                    }
                     let registered = register_broker(
                         &controller,
                         &registration,
-                        expected_epoch,
+                        pending,
                         &mut shutdown,
                     )
                     .await?;
@@ -1043,6 +1061,7 @@ async fn broker_lifecycle(
                         broker.activate_broker_epoch(registered_epoch)?;
                         epoch = Some(registered_epoch);
                         expected_epoch = None;
+                        pending_registration = None;
                         last_renewal = Some(Instant::now());
                         prefer_remote_heartbeat = true;
                     }
@@ -1108,12 +1127,62 @@ async fn controller_maintenance(
     }
 }
 
+/// Keep a conditional operation's identity and receipt across RPC/tick retries.
+/// A receipt alone is not a lease: recovery always confirms a fresh heartbeat.
+struct PendingRegistration {
+    expected_epoch: Option<BrokerEpoch>,
+    registration_id: Option<String>,
+    acknowledged_epoch: Option<BrokerEpoch>,
+}
+
+impl PendingRegistration {
+    fn new(expected_epoch: Option<BrokerEpoch>) -> Result<Self> {
+        let registration_id = if expected_epoch.is_some() {
+            let mut random = [0_u8; 32];
+            getrandom::fill(&mut random)
+                .map_err(|error| anyhow!("cannot generate registration identity: {error}"))?;
+            Some(random.iter().map(|byte| format!("{byte:02x}")).collect())
+        } else {
+            None
+        };
+        Ok(Self {
+            expected_epoch,
+            registration_id,
+            acknowledged_epoch: None,
+        })
+    }
+}
+
 async fn register_broker(
     controller: &ControllerNode,
     registration: &BrokerRegistration,
-    expected_epoch: Option<BrokerEpoch>,
+    pending: &mut PendingRegistration,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Option<BrokerEpoch>> {
+    if pending.acknowledged_epoch.is_none() {
+        pending.acknowledged_epoch =
+            submit_registration(controller, registration, pending, shutdown).await?;
+    }
+    let Some(epoch) = pending.acknowledged_epoch else {
+        return Ok(None);
+    };
+    match heartbeat_broker(controller, registration.broker_id, epoch, true, shutdown).await? {
+        HeartbeatOutcome::Renewed => Ok(Some(epoch)),
+        HeartbeatOutcome::Reregister => {
+            *pending = PendingRegistration::new(Some(epoch))?;
+            Ok(None)
+        }
+        HeartbeatOutcome::Retry | HeartbeatOutcome::Shutdown => Ok(None),
+    }
+}
+
+async fn submit_registration(
+    controller: &ControllerNode,
+    registration: &BrokerRegistration,
+    pending: &PendingRegistration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Option<BrokerEpoch>> {
+    let expected_epoch = pending.expected_epoch;
     let command = MetadataCommand::RegisterBroker {
         broker_id: registration.broker_id,
         host: registration.host.clone(),
@@ -1121,6 +1190,7 @@ async fn register_broker(
         control_port: registration.control_port,
         internal_port: registration.internal_port,
         expected_epoch,
+        registration_id: pending.registration_id.clone(),
         roles: vec![NodeRole::Broker, NodeRole::Controller],
         rack: registration.rack.clone(),
         now_ms: unix_time_ms(),
@@ -2200,6 +2270,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lease_recovery_retries_a_lost_receipt_and_confirms_liveness_before_activation() {
+        let controller = ControllerNode::new(ControllerConfig::new(
+            1,
+            "registration-receipt",
+            BTreeMap::from([(1, "127.0.0.1:9".into())]),
+        ))
+        .await
+        .unwrap();
+        controller.bootstrap().await.unwrap();
+        controller
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let registration = BrokerRegistration {
+            broker_id: 1,
+            host: "127.0.0.1".into(),
+            data_port: 0,
+            control_port: 0,
+            internal_port: 0,
+            rack: None,
+        };
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut initial = PendingRegistration::new(None).unwrap();
+        assert_eq!(
+            register_broker(&controller, &registration, &mut initial, &mut shutdown_rx)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let mut recovery = PendingRegistration::new(Some(1)).unwrap();
+        // Commit, then discard the response as if the HTTP connection closed.
+        assert_eq!(
+            submit_registration(&controller, &registration, &recovery, &mut shutdown_rx)
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(recovery.acknowledged_epoch, None);
+        let identity = recovery.registration_id.clone();
+        assert_eq!(
+            register_broker(&controller, &registration, &mut recovery, &mut shutdown_rx)
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(recovery.registration_id, identity);
+        assert_eq!(
+            controller.local_metadata().await.unwrap().brokers[&1].broker_epoch,
+            2
+        );
+
+        controller
+            .write_metadata(MetadataCommand::FenceBroker {
+                broker_id: 1,
+                broker_epoch: 2,
+            })
+            .await
+            .unwrap();
+        // Even a known receipt must not activate an expired/fenced incarnation.
+        assert_eq!(
+            register_broker(&controller, &registration, &mut recovery, &mut shutdown_rx)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(recovery.expected_epoch, Some(2));
+        assert_ne!(recovery.registration_id, identity);
+        assert!(!controller.local_metadata().await.unwrap().brokers[&1].alive);
+        assert_eq!(
+            register_broker(&controller, &registration, &mut recovery, &mut shutdown_rx)
+                .await
+                .unwrap(),
+            Some(3)
+        );
+
+        let mut replacement = PendingRegistration::new(None).unwrap();
+        assert_eq!(
+            register_broker(
+                &controller,
+                &registration,
+                &mut replacement,
+                &mut shutdown_rx
+            )
+            .await
+            .unwrap(),
+            Some(4)
+        );
+        assert!(
+            register_broker(&controller, &registration, &mut recovery, &mut shutdown_rx)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            controller.local_metadata().await.unwrap().brokers[&1].broker_epoch,
+            4
+        );
+        controller.shutdown_raft().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn isr_mutation_waits_for_lease_recovery_but_rejects_replacement() {
         let controller = ControllerNode::new(ControllerConfig::new(
             1,
@@ -2220,6 +2390,7 @@ mod tests {
             control_port: 0,
             internal_port: 0,
             expected_epoch: None,
+            registration_id: None,
             roles: vec![NodeRole::Broker],
             rack: None,
             now_ms: unix_time_ms(),
@@ -2742,6 +2913,7 @@ mod tests {
             control_port: 19_092,
             internal_port: 0,
             broker_epoch,
+            registration_id: None,
             roles: BTreeSet::from([NodeRole::Broker, NodeRole::Controller]),
             rack: None,
             alive: true,

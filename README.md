@@ -9,7 +9,7 @@ binary, with no JVM, no ZooKeeper and no heap to tune.
 [![CI](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml/badge.svg)](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-413%20passing-brightgreen.svg)](#verification)
+[![Tests](https://img.shields.io/badge/tests-425%20passing-brightgreen.svg)](#verification)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-Kafka%20comparison-blue.svg)](#performance)
 [![Transports](https://img.shields.io/badge/transport-TCP%20%C2%B7%20TLS%201.3%20%C2%B7%20QUIC-informational.svg)](#transports)
 [![Auth](https://img.shields.io/badge/auth-mTLS%20%C2%B7%20SCRAM--SHA--256%20%C2%B7%20ACLs-blueviolet.svg)](#authentication-and-access-control)
@@ -90,6 +90,19 @@ open http://localhost:8080                              # dashboard
 Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
+
+### Upgrading to 0.8.1
+
+BitPacker message encoding remains wire version 4; record framing and the disk
+format are unchanged. This release reduces cold routing and connection setup
+costs, removes record-encoding copies, and makes conditional lease recovery
+safe when a registration response is lost or metadata arrives first.
+Controller disk writes preserve immediate durability while running outside
+Tokio's async workers. See the [changelog](CHANGELOG.md) for details.
+
+Upgrade every controller to retain registration receipts throughout recovery;
+mixed-version controller recovery has not been validated. The new
+`--group-initial-rebalance-delay-ms` flag defaults to the existing 1,000-ms wait.
 
 ### Upgrading to 0.8.0
 
@@ -431,6 +444,10 @@ inter-broker replication, and all three pass the same correctness suite
 substantially faster on a LAN — QUIC's advantages appear on lossy or
 long-haul links, and its costs are measured in
 [docs/benchmarks.md §5](docs/benchmarks.md).
+
+QUIC probes for larger UDP payloads up to 9,000 bytes on capable paths. It
+starts with small packets and increases their size only after successful
+probes, so ordinary-MTU paths do not require jumbo-frame configuration.
 
 TLS uses a self-signed certificate generated at startup. That gives
 confidentiality and integrity; identity comes from
@@ -857,23 +874,23 @@ usage bars appear in broker details. Failed refreshes visibly retain the last
 successful update time. Metrics are sampled every five seconds; this is sampled
 monitoring, not a per-message event feed.
 
-![0.8.0 analytics dashboard with illustrative sample data](docs/images/dashboard-0.8.0.png)
+![Analytics dashboard with illustrative sample data](docs/images/dashboard-0.8.1.png)
 
-Fresh screenshots of the shipping 0.8.0 UI, rendered with illustrative sample
+Screenshots refreshed on September 20, 2026, rendered with illustrative sample
 data. These previews demonstrate the interface; benchmark measurements are
 published separately below.
 
 <details>
 <summary>Broker configuration and filesystem usage</summary>
 
-![Broker configuration and disk capacity with illustrative sample data](docs/images/dashboard-broker-0.8.0.png)
+![Broker configuration and disk capacity with illustrative sample data](docs/images/dashboard-broker-0.8.1.png)
 
 </details>
 
 <details>
 <summary>Topic replication, configuration and consumer group lag</summary>
 
-![Partition replicas, ISR and consumer lag with illustrative sample data](docs/images/dashboard-topic-0.8.0.png)
+![Partition replicas, ISR and consumer lag with illustrative sample data](docs/images/dashboard-topic-0.8.1.png)
 
 </details>
 
@@ -1133,7 +1150,7 @@ Each row is asserted by a script, not by argument.
 | **Consumer leaves a group** | Rebalance; remaining members take its partitions and resume from committed offsets | `verify-m4.sh` |
 | **Coordinator broker dies** | Group state is rebuilt from `__consumer_offsets` by the new coordinator; committed offsets intact | `verify-m4.sh` |
 | **Repeated random kills under load** | Every acknowledged record survives, exactly once, offsets contiguous, replicas byte-identical | `verify-chaos.sh` |
-| **Controller quorum lost** | Metadata writes halt; the data plane keeps serving existing leaderships from cached metadata | by design (DESIGN §3.7) |
+| **Controller quorum lost** | Metadata writes halt; cached leadership serves only while the broker lease remains valid. Lease expiry suspends writes and fetches until recovery | `verify-m3.sh`, lifecycle regression tests |
 
 ## Configuration reference
 
@@ -1159,6 +1176,7 @@ Each row is asserted by a script, not by argument.
 | `--max-message-bytes` | off | largest batch a producer may send (`message.max.bytes`) |
 | `--index-interval-bytes` | 4096 | sparse-index density (`log.index.interval.bytes`) |
 | `--transaction-max-timeout-ms` | 900000 | ceiling on a producer's `transaction.timeout.ms`; past it the coordinator aborts and fences |
+| `--group-initial-rebalance-delay-ms` | 1000 | wait for additional members before a new group's first assignment; 0 assigns immediately |
 | `--transactional-id-expiration-ms` | 7 days | how long an idle `transactional.id` is remembered |
 | `--quota-produce-bytes-per-sec`, `--quota-fetch-bytes-per-sec` | off | per-client byte rates |
 | `--quota-max-throttle-ms` | 30000 | ceiling on a single throttle |
@@ -1187,7 +1205,7 @@ plaintext listener).
 | `--acks` | 1 | `acks` | `0` fire-and-forget, `1` leader append, `all` full ISR |
 | `--batch-size` | 16 KiB | `batch.size` | flush a partition buffer once it holds this many bytes |
 | `--linger-ms` | 5 | `linger.ms` | flush every non-empty buffer at least this often; `0` sends each record immediately |
-| `--compression` | `lz4` | `compression.type` | `none` or `lz4` |
+| `--compression` | `lz4` | `compression.type` | `none`, `lz4`, `gzip`, `snappy` or `zstd` |
 | `--max-in-flight` | 5 | `max.in.flight.requests.per.connection` | unacknowledged requests per connection; also the flush shard count |
 | `--in-flight` | — | closest to `buffer.memory` | records the bulk modes keep outstanding |
 | `--timeout-ms` | 30000 | `request.timeout.ms` | broker-side wait for `acks` |
@@ -1273,8 +1291,14 @@ default, `producer`, keeps whatever the producer chose.
 
 ## Verification
 
+The 0.8.1 validation passed 426 Rust tests on Windows and Linux, plus all 15
+Linux live suites (386 checks, including a corrected admin-fixture retest),
+nine dashboard behavior tests and four resource-accounting tests. See the
+[release review](docs/release-0.8.1-review.md#verification-status) and
+[suite results](docs/release-0.8.1-validation.csv) for details and limitations.
+
 ```bash
-cargo test --workspace          # 413 unit and integration tests
+cargo test --workspace --locked -- --test-threads=1  # 425 unit and integration tests
 
 bash scripts/verify-m1.sh       # 31  single-node storage and protocol
 bash scripts/verify-m2.ps1      #     controller quorum and metadata
@@ -1339,30 +1363,35 @@ than papered over with a larger timeout. Run the live suites serially.
 
 ## Performance
 
-Version 0.8.0 includes a reproducible Kafka comparison matrix covering RF=1/3,
+Version 0.8.1 includes a reproducible Kafka comparison matrix covering RF=1/3,
 TCP/QUIC concurrency, 1-MiB records, all five codecs, acks=0/1/all, idempotence
 and a fixed offered rate. Both systems use consumer groups and matched producer
 idempotence. Codec comparisons use identical, highly compressible payloads.
 
-Current measurements are collected in the [0.8.0 benchmark reports](docs/benchmarks/0.8.0/README.md).
+Current measurements are collected in the [0.8.1 benchmark reports](docs/benchmarks/0.8.1/README.md).
 Results and limitations are discussed in the
-[release review](docs/release-0.8.0-review.md). Correctness evidence is
+[release review](docs/release-0.8.1-review.md). Correctness evidence is
 mapped separately in the [validation matrix](docs/release-validation-matrix.md).
 
 One current configuration: RF=3, `acks=all`, minimum ISR 2, four clients,
 500,000 × 256-B records per client (single shared-host run):
 
-| Rate (records/sec) | Kafka 4.3.1 | Brahmaputra 0.8.0 |
+| Rate (records/sec) | Kafka 4.3.1 | Brahmaputra 0.8.1 |
 | --- | ---: | ---: |
-| Produce, wall clock | 182,050 | 158,529 |
-| Produce, client-measured | 229,433 | 313,667 |
-| Consume, wall clock | 505,561 | 1,046,025 |
-| Consume, client-measured | 1,635,754 | 1,495,821 |
+| Produce, wall clock | 235,516 | 757,576 |
+| Produce, client-measured | 324,641 | 1,118,540 |
+| Consume, wall clock | 439,657 | 1,403,509 |
+| Consume, client-measured | 1,676,449 | 4,684,019 |
 
-Results depend on the workload and timing boundary. RF=3 production remains
-sensitive to saturation: the four-client native run showed multi-second tail
-latency and lower wall throughput than its two-client level. The full reports
-include every level and latency measurements, including these stalls.
+Results depend on workload and timing boundary. Across the matrix, Brahmaputra
+leads 69 of 84 throughput comparisons and uses fewer CPU core-seconds in 50 of
+52 comparisons; all 104 average/peak working-set memory comparisons are lower.
+Kafka wins the remaining throughput and CPU-work comparisons, including both
+large-record QUIC CPU measurements. These counts include correlated measures
+of the same runs, not independent trials. All losing rows remain published.
+Two earlier attempts failed during broker lease recovery under load. The final
+run paused 14 unrelated application containers and passed every scenario, but
+still observed lease recovery; the heartbeat-stall cause remains unresolved.
 
 ```bash
 bash scripts/bench-release.sh
@@ -1383,7 +1412,7 @@ capacity estimates or universal throughput ratios.
 Historical work on follower long polling, DNS caching, zero-copy reads and
 batching remains in [the earlier replicated report](docs/replicated-benchmark-2026-08-22.md)
 and [benchmark notes](docs/benchmarks.md). Those older measurements do not describe
-0.8.0. Kafka wire compatibility remains an ecosystem gap: use native Brahmaputra
+0.8.1. Kafka wire compatibility remains an ecosystem gap: use native Brahmaputra
 clients; Kafka clients and Kafka Connect cannot connect directly.
 
 ## Architecture
@@ -1489,18 +1518,20 @@ tools/bit-packer/           vendored schema compiler (Go)
 
 ## Building
 
-Needs a stable Rust toolchain (edition 2024, so 1.85 or newer; CI builds on
-`rust:1-bookworm`). Nothing else — no JVM, no ZooKeeper, no system
+Needs a current stable Rust toolchain (CI builds on `rust:1-bookworm`).
+The workspace uses Rust edition 2021. No JVM, no ZooKeeper, no system
 libraries beyond libc.
 
 ```bash
 cargo build --release          # brahmaputra-server and brahmaputra-cli
-cargo test --workspace         # 230 unit and integration tests
+cargo test --workspace --locked -- --test-threads=1
 ```
 
 The live verification scripts additionally need `bash`; they run on Git
-Bash on Windows as well as on Unix. The benchmark harnesses need Docker,
-because they run Kafka and Brahmaputra under identical container limits.
+Bash on Windows as well as on Unix. The benchmark harnesses need Docker with
+cgroup v2 accounting and Node.js 18 or newer. They run Kafka and Brahmaputra
+under identical container limits, retaining cumulative CPU time and 50 ms
+working-set memory samples alongside the throughput results.
 
 Regenerating wire types after editing `schemas/protocol.buff` needs the
 BitPacker generator, built once from the vendored source (requires Go):

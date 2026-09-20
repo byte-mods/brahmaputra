@@ -243,6 +243,9 @@ pub struct BrokerMetadata {
     #[serde(default)]
     pub internal_port: u16,
     pub broker_epoch: BrokerEpoch,
+    /// Receipt identity for a conditional lease recovery. Older images have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<String>,
     pub roles: BTreeSet<NodeRole>,
     pub rack: Option<String>,
     pub alive: bool,
@@ -580,10 +583,35 @@ impl ClusterMetadata {
                 control_port,
                 internal_port,
                 expected_epoch,
+                registration_id,
                 roles,
                 rack,
                 now_ms,
             } => {
+                let roles: BTreeSet<_> = roles.into_iter().collect();
+                // An HTTP response may be lost after this registration commits.
+                // Return the receipt only for this exact conditional operation;
+                // never adopt an epoch installed by a different process. This
+                // does not renew a lease or revive a fenced broker. The caller
+                // must confirm a fresh heartbeat before activating its data plane.
+                if let Some(current) = self.brokers.get(&broker_id) {
+                    if registration_id.as_ref().is_some_and(|id| !id.is_empty())
+                        && registration_id == current.registration_id
+                        && expected_epoch.and_then(|epoch| epoch.checked_add(1))
+                            == Some(current.broker_epoch)
+                        && current.host == host
+                        && current.data_port == data_port
+                        && current.control_port == control_port
+                        && current.internal_port == internal_port
+                        && current.roles == roles
+                        && current.rack == rack
+                    {
+                        return Ok(MetadataEvent::BrokerRegistered {
+                            broker_id,
+                            broker_epoch: current.broker_epoch,
+                        });
+                    }
+                }
                 if let Some(expected) = expected_epoch {
                     let current = self
                         .brokers
@@ -599,7 +627,6 @@ impl ClusterMetadata {
                     }
                 }
                 let broker_epoch = self.next_broker_epoch(broker_id);
-                let roles = roles.into_iter().collect();
                 self.brokers.insert(
                     broker_id,
                     BrokerMetadata {
@@ -609,6 +636,7 @@ impl ClusterMetadata {
                         control_port,
                         internal_port,
                         broker_epoch,
+                        registration_id,
                         roles,
                         rack,
                         alive: true,
@@ -1119,6 +1147,10 @@ pub enum MetadataCommand {
         /// older incarnation with the same configured broker ID.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_epoch: Option<BrokerEpoch>,
+        /// Stable identity across retries of a conditional lease recovery.
+        /// Initial, unconditional registrations retain their historical behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registration_id: Option<String>,
         roles: Vec<NodeRole>,
         rack: Option<String>,
         now_ms: i64,
@@ -1366,6 +1398,7 @@ mod tests {
                 control_port: 19_092 + broker_id as u16,
                 internal_port: 0,
                 expected_epoch: None,
+                registration_id: None,
                 roles: vec![NodeRole::Broker, NodeRole::Controller],
                 rack: None,
                 now_ms,
@@ -1557,6 +1590,7 @@ mod tests {
             control_port: 19_099,
             internal_port: 0,
             expected_epoch: Some(expected_epoch),
+            registration_id: None,
             roles: vec![NodeRole::Broker, NodeRole::Controller],
             rack: None,
             now_ms: 20,
@@ -1582,6 +1616,84 @@ mod tests {
     }
 
     #[test]
+    fn conditional_registration_receipt_survives_replay_without_reviving_or_replacing() {
+        let mut state = ClusterMetadata::default();
+        register(&mut state, 7, 10);
+        let command = MetadataCommand::RegisterBroker {
+            broker_id: 7,
+            host: "127.0.0.1".into(),
+            data_port: 9_099,
+            control_port: 19_099,
+            internal_port: 0,
+            expected_epoch: Some(1),
+            registration_id: Some("recovery-operation-a".into()),
+            roles: vec![NodeRole::Broker, NodeRole::Controller],
+            rack: None,
+            now_ms: 20,
+        };
+        let receipt = state.apply(command.clone()).unwrap();
+        // A lost response followed by controller restart must still deduplicate.
+        state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        let committed = state.clone();
+        let mut retry = command.clone();
+        if let MetadataCommand::RegisterBroker { now_ms, .. } = &mut retry {
+            *now_ms = 100;
+        }
+        assert_eq!(state.apply(retry).unwrap(), receipt);
+        assert_eq!(state, committed, "a receipt must not renew a lease");
+
+        let mut altered = command.clone();
+        if let MetadataCommand::RegisterBroker { host, .. } = &mut altered {
+            *host = "different-process".into();
+        }
+        assert!(matches!(
+            state.apply(altered),
+            Err(MetadataError::StaleBrokerEpoch { .. })
+        ));
+        let mut other = command.clone();
+        if let MetadataCommand::RegisterBroker {
+            registration_id, ..
+        } = &mut other
+        {
+            *registration_id = Some("different-operation".into());
+        }
+        assert!(matches!(
+            state.apply(other),
+            Err(MetadataError::StaleBrokerEpoch { .. })
+        ));
+
+        state
+            .apply(MetadataCommand::FenceBroker {
+                broker_id: 7,
+                broker_epoch: 2,
+            })
+            .unwrap();
+        let fenced = state.clone();
+        assert_eq!(state.apply(command.clone()).unwrap(), receipt);
+        assert_eq!(state, fenced, "replay must not revive a fenced incarnation");
+        assert!(matches!(
+            state.apply(MetadataCommand::Heartbeat {
+                broker_id: 7,
+                broker_epoch: 2,
+                now_ms: 200,
+            }),
+            Err(MetadataError::BrokerFenced { .. })
+        ));
+
+        assert_eq!(register(&mut state, 7, 300), 3);
+        let replacement = state.clone();
+        assert!(matches!(
+            state.apply(command),
+            Err(MetadataError::StaleBrokerEpoch { .. })
+        ));
+        assert_eq!(
+            state, replacement,
+            "old receipt cannot adopt a replacement epoch"
+        );
+        assert_eq!(state.brokers[&7].registration_id, None);
+    }
+
+    #[test]
     fn controller_must_be_live_and_have_the_controller_role() {
         let mut state = ClusterMetadata::default();
         state
@@ -1592,6 +1704,7 @@ mod tests {
                 control_port: 19_092,
                 internal_port: 0,
                 expected_epoch: None,
+                registration_id: None,
                 roles: vec![NodeRole::Broker],
                 rack: None,
                 now_ms: 0,
@@ -1990,6 +2103,7 @@ mod tests {
                 control_port: 19092,
                 internal_port: 0,
                 expected_epoch: None,
+                registration_id: None,
                 roles: vec![NodeRole::Broker],
                 rack: None,
                 now_ms: 100,
@@ -2384,6 +2498,7 @@ mod partition_and_config_tests {
                     control_port: 19092,
                     internal_port: 0,
                     expected_epoch: None,
+                    registration_id: None,
                     roles: vec![NodeRole::Broker],
                     rack: None,
                     now_ms: 1_000,
@@ -2585,6 +2700,7 @@ mod placement_and_reassignment_tests {
                     control_port: 19092 + *id as u16,
                     internal_port: 0,
                     expected_epoch: None,
+                    registration_id: None,
                     roles: vec![NodeRole::Broker, NodeRole::Controller],
                     rack: Some((*rack).to_string()),
                     now_ms: 1,

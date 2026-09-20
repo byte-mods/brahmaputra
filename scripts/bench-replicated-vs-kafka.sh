@@ -50,6 +50,7 @@ set -Eeuo pipefail
 PER_CLIENT="${PER_CLIENT:-500000}"
 RECORD_SIZE="${RECORD_SIZE:-256}"
 PARTITIONS="${PARTITIONS:-6}"
+GROUP_INITIAL_REBALANCE_DELAY_MS="${GROUP_INITIAL_REBALANCE_DELAY_MS:-0}"
 LEVELS="${LEVELS:-1 2 4}"
 BATCH_SIZE="${BATCH_SIZE:-65536}"
 LINGER_MS="${LINGER_MS:-5}"
@@ -117,6 +118,7 @@ KAFKA_NODES=(bench-k1 bench-k2 bench-k3)
 BRAHMA_NODES=(bench-b1 bench-b2 bench-b3)
 
 cleanup() {
+  if declare -F stop_resource_sampling >/dev/null; then stop_resource_sampling || true; fi
   # Capture diagnostics before removing this run's containers, on success
   # as well as failure. Client errors alone cannot explain lease loss.
   for node in "${KAFKA_NODES[@]}" "${BRAHMA_NODES[@]}"; do
@@ -138,56 +140,34 @@ printf 'system,config,phase,clients,records,seconds,msgs_per_sec,client_msgs_per
 : > "$NOTES"
 
 # ------------------------------------------------------------- sampling
-# One sampler covering all three containers. `docker stats` is asked for the
-# whole set in one call, and the per-second sum is what gets recorded: the
-# cluster is the unit being compared, not any one node.
+# Cgroup probes cover all three containers. Their overlapping observation
+# window measures the cluster, including its clients, as one unit.
 
-SAMPLER_PID=""
-start_sampling() {
-  local out="$1"; shift
-  local -a names=("$@")
-  : > "$out"
-  (
-    while :; do
-      docker_run stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "${names[@]}" 2>/dev/null \
-        | awk -v expected="${#names[@]}" '{
-            cpu = $1; sub("%", "", cpu); cpu += 0;
-            mem = $2; unit = mem; sub("^[0-9.]+", "", unit);
-            value = mem; sub("[A-Za-z]+$", "", value); value += 0;
-            if (unit == "GiB") value *= 1024;
-            else if (unit == "KiB") value /= 1024;
-            else if (unit == "B") value /= 1048576;
-            if (value <= 0) invalid = 1;
-            cpu_sum += cpu; mem_sum += value;
-          }
-          END { if (NR == expected && !invalid) printf "%.1f %.1f\n", cpu_sum, mem_sum }' >> "$out"
-      sleep 1
-    done
-  ) &
-  SAMPLER_PID=$!
-}
-stop_sampling() {
-  [[ -n "$SAMPLER_PID" ]] || return 0
-  kill "$SAMPLER_PID" 2>/dev/null || true
-  wait "$SAMPLER_PID" 2>/dev/null || true
-  SAMPLER_PID=""
-}
-summarize_samples() {
-  awk '
-    $2 + 0 > 0 { cpu = $1 + 0; mem = $2 + 0;
-      cpu_sum += cpu; mem_sum += mem; n++;
-      if (cpu > cpu_max) cpu_max = cpu;
-      if (mem > mem_max) mem_max = mem; }
-    END {
-      if (n == 0) { print "NA NA NA NA"; exit }
-      printf "%.1f %.1f %.0f %.0f\n", cpu_sum / n, cpu_max, mem_sum / n, mem_max;
-    }
-  ' "$1"
-}
+source "$ROOT/scripts/bench-resources.sh"
+start_sampling() { start_resource_sampling "$@"; }
+stop_sampling() { stop_resource_sampling; }
+summarize_samples() { summarize_resource_samples "$1"; }
 
-now_ms() { date +%s%3N; }
+now_ms() { benchmark_now_ms; }
 rate() { awk -v r="$1" -v ms="$2" 'BEGIN { if (ms > 0) printf "%.0f", r * 1000 / ms; else print 0 }'; }
-wait_all() { local pid status=0; for pid in "${pids[@]}"; do wait "$pid" || status=1; done; return $status; }
+wait_all() {
+  local pid status=0 checks=0 deadline=$(( $(now_ms) + ${PHASE_TIMEOUT_SECONDS:-180} * 1000 ))
+  for pid in "${pids[@]}"; do
+    while kill -0 "$pid" 2>/dev/null; do
+      # Read the monotonic clock approximately once a second; completion is
+      # still observed every 50 ms without spawning a clock process each poll.
+      if (( checks % 20 == 0 )) && (( $(now_ms) >= deadline )); then
+        printf 'Benchmark phase exceeded %s seconds\n' "${PHASE_TIMEOUT_SECONDS:-180}" >&2
+        for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+        return 1
+      fi
+      checks=$((checks + 1))
+      sleep 0.05
+    done
+    wait "$pid" || status=1
+  done
+  return "$status"
+}
 
 # Acknowledgement-latency percentiles, in milliseconds.
 #
@@ -242,6 +222,7 @@ sum_client_rates() {
 
 record_level() {
   local system="$1" config="$2" phase="$3" clients="$4" records="$5" ms="$6" stats="$7" client_rate="$8"
+  node "$ROOT/scripts/bench-resource-summary.cjs" --check-window "$stats.resources.json" "$ms"
   local latency="${9:-0,0,0,0}"
   local seconds throughput
   seconds="$(awk -v ms="$ms" 'BEGIN { printf "%.2f", ms / 1000 }')"
@@ -307,7 +288,7 @@ start_kafka() {
       -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=3 \
       -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=2 \
       -e KAFKA_DEFAULT_REPLICATION_FACTOR=3 \
-      -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+      -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS="$GROUP_INITIAL_REBALANCE_DELAY_MS" \
       -e KAFKA_NUM_PARTITIONS="$PARTITIONS" \
       -e KAFKA_LOG_SEGMENT_BYTES=1073741824 \
       -e KAFKA_NUM_NETWORK_THREADS=4 \
@@ -323,8 +304,8 @@ start_kafka() {
       -e KAFKA_JVM_PERFORMANCE_OPTS="$KAFKA_BROKER_GC" \
       "$KAFKA_IMAGE" >/dev/null || die "cannot start bench-k$i"
   done
-  local deadline=$((SECONDS + 240))
-  while (( SECONDS < deadline )); do
+  local deadline=$(( $(benchmark_now_ms) + 240000 ))
+  while (( $(benchmark_now_ms) < deadline )); do
     if docker_run exec bench-k1 /opt/kafka/bin/kafka-broker-api-versions.sh \
         --bootstrap-server "$KAFKA_BOOTSTRAP" >/dev/null 2>&1; then
       sleep 5
@@ -352,8 +333,8 @@ kafka_topic() {
 # allowed to stand for RF=3: a topic that silently fell back to one replica
 # would produce a flatteringly fast, and completely meaningless, result.
 kafka_verify_isr() {
-  local name="$1" expect="$2" described bad total deadline=$((SECONDS + 60))
-  while (( SECONDS < deadline )); do
+  local name="$1" expect="$2" described bad total deadline=$(( $(benchmark_now_ms) + 60000 ))
+  while (( $(benchmark_now_ms) < deadline )); do
   described="$(docker_run exec bench-k1 /opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server "$KAFKA_BOOTSTRAP" --describe --topic "$name" 2>/dev/null)" || described=''
   total="$(printf '%s\n' "$described" | grep -c 'Partition:' || true)"
@@ -462,18 +443,19 @@ start_brahmaputra() {
       --node-id "$i" --cluster-id brahma-rep \
       --control-port 19311 --http-port 0 \
       --default-partitions "$PARTITIONS" --segment-bytes 1073741824 \
+      --group-initial-rebalance-delay-ms "$GROUP_INITIAL_REBALANCE_DELAY_MS" \
       "${peers[@]}" >/dev/null || die "cannot start bench-b$i"
   done
 
-  local deadline=$((SECONDS + 60))
-  while (( SECONDS < deadline )); do
+  local deadline=$(( $(benchmark_now_ms) + 60000 ))
+  while (( $(benchmark_now_ms) < deadline )); do
     curl -fsS -X POST "http://127.0.0.1:19311/api/v1/controller/bootstrap" >/dev/null 2>&1 && break
     sleep 2
   done
   sleep 5
 
-  deadline=$((SECONDS + 90))
-  while (( SECONDS < deadline )); do
+  deadline=$(( $(benchmark_now_ms) + 90000 ))
+  while (( $(benchmark_now_ms) < deadline )); do
     if docker_run exec bench-b1 /usr/local/bin/brahmaputra-cli \
         --broker "${BRAHMA_IPS[0]}:9092" metadata >/dev/null 2>&1; then
       sleep 3
@@ -499,8 +481,8 @@ brahma_topic() {
 # nodes hold a log for the topic, and check the log-end offsets sum to the
 # records produced. Both must hold or the RF=3 reading means nothing.
 brahma_verify() {
-  local name="$1" rf="$2" expected="$3" i holders=0 count total offsets deadline=$((SECONDS + 60))
-  while (( SECONDS < deadline )); do
+  local name="$1" rf="$2" expected="$3" i holders=0 count total offsets deadline=$(( $(benchmark_now_ms) + 60000 ))
+  while (( $(benchmark_now_ms) < deadline )); do
   holders=0
   for (( i = 1; i <= NODES; i++ )); do
     count="$(docker_run exec "bench-b$i" sh -c "find /data -name '*.log' -path '*$name*' 2>/dev/null | wc -l" | tr -d '[:space:]')"
@@ -641,6 +623,7 @@ emit_replication_cost() {
   printf 'clients, batch.size=%s, linger.ms=%s, compression=%s. Kafka image `%s`.\n\n' \
     "$BATCH_SIZE" "$LINGER_MS" "$COMPRESSION" "$KAFKA_IMAGE"
   printf 'Producer idempotence is disabled on both systems.\n\n'
+  printf 'Initial consumer-group rebalance delay is %s ms on both brokers.\n\n' "$GROUP_INITIAL_REBALANCE_DELAY_MS"
   printf 'Offered rate per producer: %s records/sec (unlimited means saturation).\n\n' "${RATE:-unlimited}"
   printf 'Both clusters share one host, disk and NIC. Contention can affect\n'
   printf 'the systems differently; these observations are not deployment\n'
@@ -673,7 +656,8 @@ emit_replication_cost() {
 
   printf '\n### Replication actually happened\n\n```\n'
   cat "$NOTES"
-  printf '```\n\nRaw client output and per-second samples: `bench/results/replicated/`.\n'
+  printf '```\n\nRaw client output, cgroup samples and CPU-time summaries: `bench/results/replicated/`.\n'
+  resource_report "$RESULTS"
 } > "$REPORT"
 
 stage "Replicated head-to-head complete"

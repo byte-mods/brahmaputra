@@ -5,6 +5,9 @@
 //! instead of rewriting an ever-growing log image, while every storage callback
 //! still commits atomically with immediate durability before returning.
 
+// OpenRaft fixes the storage error type, including for blocking write closures.
+#![allow(clippy::result_large_err)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::io::Cursor;
@@ -147,7 +150,7 @@ pub(crate) enum StoreOpenError {
 pub(crate) struct DurableStore {
     database: Database,
     database_path: PathBuf,
-    state: RwLock<StoreState>,
+    state: Arc<RwLock<StoreState>>,
 }
 
 impl DurableStore {
@@ -255,12 +258,12 @@ impl DurableStore {
         Ok(Arc::new(Self {
             database,
             database_path,
-            state: RwLock::new(StoreState {
+            state: Arc::new(RwLock::new(StoreState {
                 meta,
                 log,
                 state_machine,
                 current_snapshot,
-            }),
+            })),
         }))
     }
 
@@ -313,17 +316,36 @@ impl DurableStore {
     }
 
     async fn update_meta(
-        &self,
-        mutation: impl FnOnce(&mut PersistedMeta),
+        self: &Arc<Self>,
+        mutation: impl FnOnce(&mut PersistedMeta) + Send + 'static,
     ) -> Result<(), StorageError<NodeId>> {
-        let mut state = self.state.write().await;
-        let mut next = state.meta.clone();
-        mutation(&mut next);
-        let transaction = self.begin_write()?;
-        Self::write_json(&transaction, META_TABLE, META_KEY, &next)?;
-        Self::commit(transaction)?;
-        state.meta = next;
-        Ok(())
+        self.run_blocking_write(move |store, state| {
+            let mut next = state.meta.clone();
+            mutation(&mut next);
+            let transaction = store.begin_write()?;
+            Self::write_json(&transaction, META_TABLE, META_KEY, &next)?;
+            Self::commit(transaction)?;
+            state.meta = next;
+            Ok(())
+        })
+        .await
+    }
+
+    /// redb transactions and immediate durability can block on disk. Keep that
+    /// work off the executor that runs Raft RPCs, broker leases and data I/O.
+    /// The owned operation continues through commit/publication if its caller
+    /// is cancelled, preserving the store's durable-before-visible ordering.
+    async fn run_blocking_write<T: Send + 'static>(
+        self: &Arc<Self>,
+        operation: impl FnOnce(&Self, &mut StoreState) -> Result<T, StorageError<NodeId>>
+            + Send
+            + 'static,
+    ) -> Result<T, StorageError<NodeId>> {
+        let store = self.clone();
+        let mut state = self.state.clone().write_owned().await;
+        tokio::task::spawn_blocking(move || operation(&store, &mut state))
+            .await
+            .map_err(|error| StorageIOError::write(&std::io::Error::other(error.to_string())))?
     }
 }
 
@@ -343,38 +365,40 @@ impl RaftLogReader<TypeConfig> for Arc<DurableStore> {
 
 impl RaftSnapshotBuilder<TypeConfig> for Arc<DurableStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let mut state = self.state.write().await;
-        let mut next_meta = state.meta.clone();
-        next_meta.snapshot_sequence = next_meta.snapshot_sequence.saturating_add(1);
-        let data = serde_json::to_vec(&state.state_machine)
-            .map_err(|error| StorageIOError::read_state_machine(&error))?;
-        let snapshot_id = match state.state_machine.last_applied_log {
-            Some(last) => format!(
-                "{}-{}-{}",
-                last.leader_id, last.index, next_meta.snapshot_sequence
-            ),
-            None => format!("--{}", next_meta.snapshot_sequence),
-        };
-        let snapshot = StoredSnapshot {
-            meta: SnapshotMeta {
-                last_log_id: state.state_machine.last_applied_log,
-                last_membership: state.state_machine.last_membership.clone(),
-                snapshot_id,
-            },
-            data,
-        };
+        self.run_blocking_write(move |store, state| {
+            let mut next_meta = state.meta.clone();
+            next_meta.snapshot_sequence = next_meta.snapshot_sequence.saturating_add(1);
+            let data = serde_json::to_vec(&state.state_machine)
+                .map_err(|error| StorageIOError::read_state_machine(&error))?;
+            let snapshot_id = match state.state_machine.last_applied_log {
+                Some(last) => format!(
+                    "{}-{}-{}",
+                    last.leader_id, last.index, next_meta.snapshot_sequence
+                ),
+                None => format!("--{}", next_meta.snapshot_sequence),
+            };
+            let snapshot = StoredSnapshot {
+                meta: SnapshotMeta {
+                    last_log_id: state.state_machine.last_applied_log,
+                    last_membership: state.state_machine.last_membership.clone(),
+                    snapshot_id,
+                },
+                data,
+            };
 
-        let transaction = self.begin_write()?;
-        DurableStore::write_json(&transaction, META_TABLE, META_KEY, &next_meta)?;
-        DurableStore::write_json(&transaction, SNAPSHOT_TABLE, SNAPSHOT_KEY, &snapshot)?;
-        DurableStore::commit(transaction)?;
-        state.meta = next_meta;
-        state.current_snapshot = Some(snapshot.clone());
+            let transaction = store.begin_write()?;
+            DurableStore::write_json(&transaction, META_TABLE, META_KEY, &next_meta)?;
+            DurableStore::write_json(&transaction, SNAPSHOT_TABLE, SNAPSHOT_KEY, &snapshot)?;
+            DurableStore::commit(transaction)?;
+            state.meta = next_meta;
+            state.current_snapshot = Some(snapshot.clone());
 
-        Ok(Snapshot {
-            meta: snapshot.meta,
-            snapshot: Box::new(Cursor::new(snapshot.data)),
+            Ok(Snapshot {
+                meta: snapshot.meta,
+                snapshot: Box::new(Cursor::new(snapshot.data)),
+            })
         })
+        .await
     }
 }
 
@@ -383,7 +407,8 @@ impl RaftStorage<TypeConfig> for Arc<DurableStore> {
     type SnapshotBuilder = Self;
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.update_meta(|meta| meta.vote = Some(*vote)).await
+        let vote = *vote;
+        self.update_meta(move |meta| meta.vote = Some(vote)).await
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
@@ -394,7 +419,8 @@ impl RaftStorage<TypeConfig> for Arc<DurableStore> {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        self.update_meta(|meta| meta.committed = committed).await
+        self.update_meta(move |meta| meta.committed = committed)
+            .await
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
@@ -423,82 +449,88 @@ impl RaftStorage<TypeConfig> for Arc<DurableStore> {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
     {
         let entries: Vec<_> = entries.into_iter().collect();
-        let mut state = self.state.write().await;
-        let transaction = self.begin_write()?;
-        {
-            let mut table = transaction
-                .open_table(LOG_TABLE)
-                .map_err(|error| StorageIOError::write_logs(&error))?;
-            for entry in &entries {
-                let encoded = serde_json::to_vec(entry)
-                    .map_err(|error| StorageIOError::write_log_entry(entry.log_id, &error))?;
-                table
-                    .insert(&entry.log_id.index, encoded.as_slice())
-                    .map_err(|error| StorageIOError::write_log_entry(entry.log_id, &error))?;
+        self.run_blocking_write(move |store, state| {
+            let transaction = store.begin_write()?;
+            {
+                let mut table = transaction
+                    .open_table(LOG_TABLE)
+                    .map_err(|error| StorageIOError::write_logs(&error))?;
+                for entry in &entries {
+                    let encoded = serde_json::to_vec(entry)
+                        .map_err(|error| StorageIOError::write_log_entry(entry.log_id, &error))?;
+                    table
+                        .insert(&entry.log_id.index, encoded.as_slice())
+                        .map_err(|error| StorageIOError::write_log_entry(entry.log_id, &error))?;
+                }
             }
-        }
-        DurableStore::commit(transaction)?;
-        for entry in entries {
-            state.log.insert(entry.log_id.index, entry);
-        }
-        Ok(())
+            DurableStore::commit(transaction)?;
+            for entry in entries {
+                state.log.insert(entry.log_id.index, entry);
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn delete_conflict_logs_since(
         &mut self,
         log_id: LogId<NodeId>,
     ) -> Result<(), StorageError<NodeId>> {
-        let mut state = self.state.write().await;
-        let indexes: Vec<_> = state
-            .log
-            .range(log_id.index..)
-            .map(|(index, _)| *index)
-            .collect();
-        let transaction = self.begin_write()?;
-        {
-            let mut table = transaction
-                .open_table(LOG_TABLE)
-                .map_err(|error| StorageIOError::write_logs(&error))?;
-            for index in &indexes {
-                table
-                    .remove(index)
+        self.run_blocking_write(move |store, state| {
+            let indexes: Vec<_> = state
+                .log
+                .range(log_id.index..)
+                .map(|(index, _)| *index)
+                .collect();
+            let transaction = store.begin_write()?;
+            {
+                let mut table = transaction
+                    .open_table(LOG_TABLE)
                     .map_err(|error| StorageIOError::write_logs(&error))?;
+                for index in &indexes {
+                    table
+                        .remove(index)
+                        .map_err(|error| StorageIOError::write_logs(&error))?;
+                }
             }
-        }
-        DurableStore::commit(transaction)?;
-        for index in indexes {
-            state.log.remove(&index);
-        }
-        Ok(())
+            DurableStore::commit(transaction)?;
+            for index in indexes {
+                state.log.remove(&index);
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let mut state = self.state.write().await;
-        let indexes: Vec<_> = state
-            .log
-            .range(..=log_id.index)
-            .map(|(index, _)| *index)
-            .collect();
-        let mut next_meta = state.meta.clone();
-        next_meta.last_purged_log_id = Some(log_id);
-        let transaction = self.begin_write()?;
-        DurableStore::write_json(&transaction, META_TABLE, META_KEY, &next_meta)?;
-        {
-            let mut table = transaction
-                .open_table(LOG_TABLE)
-                .map_err(|error| StorageIOError::write_logs(&error))?;
-            for index in &indexes {
-                table
-                    .remove(index)
+        self.run_blocking_write(move |store, state| {
+            let indexes: Vec<_> = state
+                .log
+                .range(..=log_id.index)
+                .map(|(index, _)| *index)
+                .collect();
+            let mut next_meta = state.meta.clone();
+            next_meta.last_purged_log_id = Some(log_id);
+            let transaction = store.begin_write()?;
+            DurableStore::write_json(&transaction, META_TABLE, META_KEY, &next_meta)?;
+            {
+                let mut table = transaction
+                    .open_table(LOG_TABLE)
                     .map_err(|error| StorageIOError::write_logs(&error))?;
+                for index in &indexes {
+                    table
+                        .remove(index)
+                        .map_err(|error| StorageIOError::write_logs(&error))?;
+                }
             }
-        }
-        DurableStore::commit(transaction)?;
-        state.meta = next_meta;
-        for index in indexes {
-            state.log.remove(&index);
-        }
-        Ok(())
+            DurableStore::commit(transaction)?;
+            state.meta = next_meta;
+            for index in indexes {
+                state.log.remove(&index);
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn last_applied_state(
@@ -515,41 +547,45 @@ impl RaftStorage<TypeConfig> for Arc<DurableStore> {
         &mut self,
         entries: &[Entry<TypeConfig>],
     ) -> Result<Vec<ClientResponse>, StorageError<NodeId>> {
-        let mut state = self.state.write().await;
-        let mut next = state.state_machine.clone();
-        let mut responses = Vec::with_capacity(entries.len());
-        for entry in entries {
-            next.last_applied_log = Some(entry.log_id);
-            match &entry.payload {
-                EntryPayload::Blank => responses.push(ClientResponse(None)),
-                EntryPayload::Normal(data) => {
-                    if let Some((serial, response)) = next.client_serial_responses.get(&data.client)
-                    {
-                        if *serial == data.serial {
-                            responses.push(ClientResponse(response.clone()));
-                            continue;
+        let entries = entries.to_vec();
+        self.run_blocking_write(move |store, state| {
+            let mut next = state.state_machine.clone();
+            let mut responses = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                next.last_applied_log = Some(entry.log_id);
+                match &entry.payload {
+                    EntryPayload::Blank => responses.push(ClientResponse(None)),
+                    EntryPayload::Normal(data) => {
+                        if let Some((serial, response)) =
+                            next.client_serial_responses.get(&data.client)
+                        {
+                            if *serial == data.serial {
+                                responses.push(ClientResponse(response.clone()));
+                                continue;
+                            }
                         }
+                        let previous = next
+                            .client_status
+                            .insert(data.client.clone(), data.status.clone());
+                        next.client_serial_responses
+                            .insert(data.client.clone(), (data.serial, previous.clone()));
+                        responses.push(ClientResponse(previous));
                     }
-                    let previous = next
-                        .client_status
-                        .insert(data.client.clone(), data.status.clone());
-                    next.client_serial_responses
-                        .insert(data.client.clone(), (data.serial, previous.clone()));
-                    responses.push(ClientResponse(previous));
-                }
-                EntryPayload::Membership(membership) => {
-                    next.last_membership =
-                        StoredMembership::new(Some(entry.log_id), membership.clone());
-                    responses.push(ClientResponse(None));
+                    EntryPayload::Membership(membership) => {
+                        next.last_membership =
+                            StoredMembership::new(Some(entry.log_id), membership.clone());
+                        responses.push(ClientResponse(None));
+                    }
                 }
             }
-        }
 
-        let transaction = self.begin_write()?;
-        DurableStore::write_json(&transaction, STATE_MACHINE_TABLE, STATE_MACHINE_KEY, &next)?;
-        DurableStore::commit(transaction)?;
-        state.state_machine = next;
-        Ok(responses)
+            let transaction = store.begin_write()?;
+            DurableStore::write_json(&transaction, STATE_MACHINE_TABLE, STATE_MACHINE_KEY, &next)?;
+            DurableStore::commit(transaction)?;
+            state.state_machine = next;
+            Ok(responses)
+        })
+        .await
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -575,19 +611,21 @@ impl RaftStorage<TypeConfig> for Arc<DurableStore> {
             .map_err(|error| {
                 StorageIOError::read_snapshot(Some(snapshot.meta.signature()), &error)
             })?;
-        let mut state = self.state.write().await;
-        let transaction = self.begin_write()?;
-        DurableStore::write_json(
-            &transaction,
-            STATE_MACHINE_TABLE,
-            STATE_MACHINE_KEY,
-            &state_machine,
-        )?;
-        DurableStore::write_json(&transaction, SNAPSHOT_TABLE, SNAPSHOT_KEY, &snapshot)?;
-        DurableStore::commit(transaction)?;
-        state.state_machine = state_machine;
-        state.current_snapshot = Some(snapshot);
-        Ok(())
+        self.run_blocking_write(move |store, state| {
+            let transaction = store.begin_write()?;
+            DurableStore::write_json(
+                &transaction,
+                STATE_MACHINE_TABLE,
+                STATE_MACHINE_KEY,
+                &state_machine,
+            )?;
+            DurableStore::write_json(&transaction, SNAPSHOT_TABLE, SNAPSHOT_KEY, &snapshot)?;
+            DurableStore::commit(transaction)?;
+            state.state_machine = state_machine;
+            state.current_snapshot = Some(snapshot);
+            Ok(())
+        })
+        .await
     }
 
     async fn get_current_snapshot(
@@ -614,6 +652,50 @@ mod tests {
     use super::*;
 
     struct DurableStoreBuilder;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_disk_write_yields_the_executor_and_survives_caller_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(directory.path(), "blocked-disk", 1)
+            .await
+            .unwrap();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker_store = store.clone();
+        let blocker = std::thread::spawn(move || {
+            let transaction = blocker_store.database.begin_write().unwrap();
+            locked_tx.send(()).unwrap();
+            // A hard timeout releases the disk lock even if a regression blocks
+            // this test's single-thread executor, so the failure cannot hang CI.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(2));
+            transaction.abort().unwrap();
+        });
+        locked_rx.await.unwrap();
+        let mut writer_store = store.clone();
+        let started = std::time::Instant::now();
+        let write = tokio::spawn(async move { writer_store.save_vote(&Vote::new(7, 1)).await });
+        // Wait until the operation owns the state lock and has been submitted.
+        while store.state.try_read().is_ok() && !write.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let responsive = started.elapsed() < std::time::Duration::from_secs(1);
+        write.abort();
+        let _ = write.await;
+        let _ = release_tx.send(());
+        blocker.join().unwrap();
+        assert!(
+            responsive,
+            "a blocked disk transaction monopolized the async executor"
+        );
+        // Cancellation cannot split durable commit from in-memory publication.
+        assert_eq!(store.state.read().await.meta.vote, Some(Vote::new(7, 1)));
+        drop(store);
+        let mut reopened = DurableStore::open(directory.path(), "blocked-disk", 1)
+            .await
+            .unwrap();
+        assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(7, 1)));
+    }
 
     impl
         StoreBuilder<

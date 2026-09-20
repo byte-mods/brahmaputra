@@ -84,8 +84,15 @@ impl QuicListener {
         brahmaputra_client::tune_quic_transport(&mut transport);
         config.transport_config(Arc::new(transport));
 
-        let endpoint = Endpoint::server(config, addr)
-            .map_err(|error| BrokerError::Meta(format!("cannot bind quic endpoint: {error}")))?;
+        let socket = std::net::UdpSocket::bind(addr)
+            .map_err(|error| BrokerError::Meta(format!("cannot bind quic socket: {error}")))?;
+        let endpoint = Endpoint::new(
+            brahmaputra_client::quic_endpoint_config(),
+            Some(config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|error| BrokerError::Meta(format!("cannot bind quic endpoint: {error}")))?;
         let local_addr = endpoint
             .local_addr()
             .map_err(|error| BrokerError::Meta(format!("quic endpoint has no address: {error}")))?;

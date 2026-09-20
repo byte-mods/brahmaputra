@@ -230,6 +230,7 @@ fn proxy_cluster_image(proxy_port: u16) -> ClusterMetadata {
                 control_port: 0,
                 internal_port: 0,
                 broker_epoch: 1,
+                registration_id: None,
                 roles: BTreeSet::from([NodeRole::Broker]),
                 rack: None,
                 alive: true,

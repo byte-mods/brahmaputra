@@ -23,6 +23,8 @@ const TOPIC: &str = "routed-topic";
 
 #[derive(Default)]
 struct RequestCounts {
+    connections: AtomicUsize,
+    metadata: AtomicUsize,
     produce: AtomicUsize,
     fetch: AtomicUsize,
     list_offsets: AtomicUsize,
@@ -52,6 +54,10 @@ fn serve(listener: TcpListener, broker_id: i32, state: Arc<ClusterState>) -> Joi
     tokio::spawn(async move {
         loop {
             let (socket, _) = listener.accept().await.unwrap();
+            state
+                .count(broker_id)
+                .connections
+                .fetch_add(1, Ordering::SeqCst);
             let state = Arc::clone(&state);
             tokio::spawn(async move {
                 serve_connection(socket, broker_id, state).await;
@@ -85,7 +91,13 @@ async fn serve_connection(socket: TcpStream, broker_id: i32, state: Arc<ClusterS
 
 fn dispatch(broker_id: i32, state: &ClusterState, api_key: ApiKey, body: Bytes) -> Bytes {
     match api_key {
-        ApiKey::Metadata => metadata(state, body),
+        ApiKey::Metadata => {
+            state
+                .count(broker_id)
+                .metadata
+                .fetch_add(1, Ordering::SeqCst);
+            metadata(state, body)
+        }
         ApiKey::Produce => produce(broker_id, state, body),
         ApiKey::Fetch => fetch(broker_id, state, body),
         ApiKey::ListOffsets => list_offsets(broker_id, state, body),
@@ -263,6 +275,48 @@ fn producer_config() -> ProducerConfig {
         compression: brahmaputra_protocol::Compression::None,
         ..ProducerConfig::default()
     }
+}
+
+#[tokio::test]
+async fn concurrent_cold_routes_share_one_metadata_fetch_per_client() {
+    let (listener_one, listener_two) = bind_brokers().await;
+    let address_one = listener_one.local_addr().unwrap();
+    let address_two = listener_two.local_addr().unwrap();
+    let state = Arc::new(ClusterState {
+        leader: AtomicI32::new(2),
+        brokers: vec![(1, address_one), (2, address_two)],
+        records: Mutex::new(HashMap::new()),
+        counts: HashMap::from([(1, RequestCounts::default()), (2, RequestCounts::default())]),
+    });
+    let server_one = serve(listener_one, 1, Arc::clone(&state));
+    let server_two = serve(listener_two, 2, Arc::clone(&state));
+    let producer = Producer::connect(address_one, producer_config())
+        .await
+        .unwrap();
+    // All sends miss the cold partition cache before the first network reply.
+    let offsets = futures::future::join_all(
+        (0..64).map(|_| producer.send(TOPIC, None, None, Bytes::from_static(b"concurrent"))),
+    )
+    .await;
+    let mut offsets: Vec<_> = offsets.into_iter().map(Result::unwrap).collect();
+    offsets.sort_unstable();
+    assert_eq!(offsets, (0..64).collect::<Vec<_>>());
+    assert_eq!(state.count(1).metadata.load(Ordering::SeqCst), 1);
+
+    // Explicit partition routing has its own cold-cache path. It must also
+    // recheck after the shared refresh completes, rather than queue 64 RPCs.
+    let consumer = Consumer::connect(address_one, "cold-routes").await.unwrap();
+    let ends =
+        futures::future::join_all((0..64).map(|_| consumer.list_offsets(TOPIC, 0, LATEST))).await;
+    assert!(ends.into_iter().all(|end| end.unwrap() == 64));
+    assert_eq!(state.count(1).metadata.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        state.count(2).connections.load(Ordering::SeqCst),
+        2,
+        "each client should open one leader connection, even on a concurrent cold start"
+    );
+    server_one.abort();
+    server_two.abort();
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use brahmaputra_protocol::error_code as ec;
@@ -116,6 +116,12 @@ struct PooledConnection {
     connection: Connection,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum StartupTarget {
+    Resolve(BrokerEndpoint),
+    Connect(SocketAddr),
+}
+
 struct Inner {
     seed: SocketAddr,
     client_id: Option<String>,
@@ -127,6 +133,7 @@ struct Inner {
     refresh: AsyncMutex<()>,
     /// Resolved broker addresses, keyed by the endpoint metadata advertised.
     resolved: Mutex<HashMap<BrokerEndpoint, (SocketAddr, Instant)>>,
+    starting: Mutex<HashMap<StartupTarget, Weak<AsyncMutex<()>>>>,
 }
 
 /// How long a resolved broker address is reused before being looked up
@@ -189,6 +196,7 @@ impl BrokerRouter {
                 routes: Mutex::new(RoutingTable::default()),
                 refresh: AsyncMutex::new(()),
                 resolved: Mutex::new(HashMap::new()),
+                starting: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -198,15 +206,15 @@ impl BrokerRouter {
     /// An IP literal never reaches the cache — `BrokerEndpoint::resolve`
     /// answers it without a syscall.
     async fn resolve(&self, endpoint: &BrokerEndpoint) -> Result<SocketAddr, ClientError> {
-        if let Some(address) = self
-            .inner
-            .resolved
-            .lock()
-            .expect("resolved")
-            .get(endpoint)
-            .filter(|(_, seen)| seen.elapsed() < RESOLVE_TTL)
-            .map(|(address, _)| *address)
-        {
+        if let Ok(ip) = endpoint.host.parse::<IpAddr>() {
+            return Ok(SocketAddr::new(ip, endpoint.port));
+        }
+        if let Some(address) = self.cached_address(endpoint) {
+            return Ok(address);
+        }
+        let gate = self.startup_gate(StartupTarget::Resolve(endpoint.clone()));
+        let _guard = gate.lock().await;
+        if let Some(address) = self.cached_address(endpoint) {
             return Ok(address);
         }
         let address = endpoint.resolve().await?;
@@ -218,12 +226,42 @@ impl BrokerRouter {
         Ok(address)
     }
 
+    fn cached_address(&self, endpoint: &BrokerEndpoint) -> Option<SocketAddr> {
+        self.inner
+            .resolved
+            .lock()
+            .expect("resolved")
+            .get(endpoint)
+            .filter(|(_, seen)| seen.elapsed() < RESOLVE_TTL)
+            .map(|(address, _)| *address)
+    }
+
+    /// Coalesce setup for one endpoint without making a healthy broker wait
+    /// behind another broker's DNS, connection or authentication timeout.
+    /// Weak entries avoid retaining a lock for every historical broker address.
+    fn startup_gate(&self, target: StartupTarget) -> Arc<AsyncMutex<()>> {
+        let mut starting = self.inner.starting.lock().expect("connection setup");
+        if let Some(gate) = starting.get(&target).and_then(Weak::upgrade) {
+            return gate;
+        }
+        starting.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(AsyncMutex::new(()));
+        starting.insert(target, Arc::downgrade(&gate));
+        gate
+    }
+
     /// Fetch Metadata from a live seed/cached broker and publish its routes.
     pub(crate) async fn metadata(
         &self,
         topics: &[String],
     ) -> Result<MetadataResponse, ClientError> {
         let _refresh = self.inner.refresh.lock().await;
+        self.metadata_locked(topics).await
+    }
+
+    // Caller owns `refresh`. Cache misses recheck after acquiring that lock;
+    // explicit metadata requests still always fetch a fresh image.
+    async fn metadata_locked(&self, topics: &[String]) -> Result<MetadataResponse, ClientError> {
         let response = self.fetch_metadata(topics).await?;
         self.inner
             .routes
@@ -251,8 +289,12 @@ impl BrokerRouter {
         if let Some(partitions) = self.cached_partitions(topic) {
             return Ok(partitions);
         }
+        let _refresh = self.inner.refresh.lock().await;
+        if let Some(partitions) = self.cached_partitions(topic) {
+            return Ok(partitions);
+        }
         let topics = [topic.to_owned()];
-        let response = self.metadata(&topics).await?;
+        let response = self.metadata_locked(&topics).await?;
         validate_topic_response(&response, topic)?;
         self.cached_partitions(topic)
             .ok_or_else(|| unknown_partition(topic, -1))
@@ -370,11 +412,17 @@ impl BrokerRouter {
         let endpoint = match self.cached_endpoint(topic, partition) {
             Some(endpoint) => endpoint,
             None => {
-                let topics = [topic.to_owned()];
-                let response = self.metadata(&topics).await?;
-                validate_topic_response(&response, topic)?;
-                self.cached_endpoint(topic, partition)
-                    .ok_or_else(|| unknown_partition(topic, partition))?
+                let _refresh = self.inner.refresh.lock().await;
+                match self.cached_endpoint(topic, partition) {
+                    Some(endpoint) => endpoint,
+                    None => {
+                        let topics = [topic.to_owned()];
+                        let response = self.metadata_locked(&topics).await?;
+                        validate_topic_response(&response, topic)?;
+                        self.cached_endpoint(topic, partition)
+                            .ok_or_else(|| unknown_partition(topic, partition))?
+                    }
+                }
             }
         };
         let address = self.resolve(&endpoint).await?;
@@ -500,14 +548,12 @@ impl BrokerRouter {
     }
 
     async fn connection(&self, address: SocketAddr) -> Result<PooledConnection, ClientError> {
-        if let Some(connection) = self
-            .inner
-            .connections
-            .lock()
-            .expect("connections")
-            .get(&address)
-            .cloned()
-        {
+        if let Some(connection) = self.cached_connection(address) {
+            return Ok(connection);
+        }
+        let gate = self.startup_gate(StartupTarget::Connect(address));
+        let _guard = gate.lock().await;
+        if let Some(connection) = self.cached_connection(address) {
             return Ok(connection);
         }
 
@@ -535,6 +581,15 @@ impl BrokerRouter {
             .entry(address)
             .or_insert_with(|| candidate)
             .clone())
+    }
+
+    fn cached_connection(&self, address: SocketAddr) -> Option<PooledConnection> {
+        self.inner
+            .connections
+            .lock()
+            .expect("connections")
+            .get(&address)
+            .cloned()
     }
 
     fn invalidate(&self, failed: &PooledConnection) {

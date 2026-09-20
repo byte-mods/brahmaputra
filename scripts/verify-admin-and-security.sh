@@ -172,6 +172,20 @@ sleep 3
 
 ctl() { "$CLI_EXE" --controller "$CONTROLLER" "$@"; }
 ctl topic create --name quota-demo --partitions 1 --replication-factor 1 >/dev/null
+# A committed controller command can precede the broker's metadata refresh.
+# Wait on a read-only data-plane operation before timing/writing the baseline;
+# retrying produce here would change the record-count and quota assertions.
+deadline=$((SECONDS + 40))
+quota_ready=0
+while (( SECONDS < deadline )); do
+  if offsets="$("$CLI_EXE" --broker "$BROKER" offsets --topic quota-demo 2>/dev/null)" \
+      && [[ "$offsets" == *"quota-demo-0: earliest=0 latest=0"* ]]; then
+    quota_ready=1
+    break
+  fi
+  sleep 0.1
+done
+(( quota_ready == 1 )) || die "quota-demo did not become readable before the baseline"
 
 produce_rate() {
   "$CLI_EXE" --broker "$BROKER" produce --topic quota-demo --count 4000 \
