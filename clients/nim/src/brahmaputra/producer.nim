@@ -264,14 +264,23 @@ proc send*(p: Producer, topic: string, value: string, key = none(string),
   p.send(topic, some(value), key, headers, timestamp)
 
 proc sendSync*(p: Producer, topic: string, value: Option[string], key = none(string),
-               headers: openArray[RecordHeader] = []): int64 =
+               headers: openArray[RecordHeader] = [], partition: int32 = -1,
+               timestamp: int64 = -1): int64 =
   ## Sends one record on its own and returns its offset (-1 with acks=0).
-  ## A full round trip per record — correct, and slow.
-  let partition = p.choosePartition(topic, key)
+  ## A full round trip per record — correct, and slow. A non-negative
+  ## `partition` bypasses the partitioner; `timestamp` is unix ms
+  ## (negative means now).
+  let partition = if partition >= 0: partition else: p.choosePartition(topic, key)
+  let created = if timestamp >= 0: timestamp else: nowMillis()
   let item = Buffered(record: Record(key: key, value: value, headers: @headers),
-                      createdMs: nowMillis())
+                      createdMs: created)
   withLock p.flushLock:
     result = p.raw.produce(topic, partition, [item])
+
+proc sendSync*(p: Producer, topic: string, value: string, key = none(string),
+               headers: openArray[RecordHeader] = [], partition: int32 = -1,
+               timestamp: int64 = -1): int64 =
+  p.sendSync(topic, some(value), key, headers, partition, timestamp)
 
 proc flush*(p: Producer) =
   ## Sends every buffered record and waits for acknowledgement. Also raises

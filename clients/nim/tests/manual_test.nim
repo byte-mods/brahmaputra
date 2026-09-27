@@ -6,7 +6,7 @@
 ##
 ## Every check asserts a property of the system, not that a function ran.
 
-import std/[os, strutils, times, tables, sets, net, nativesockets, posix, atomics]
+import std/[os, strutils, times, tables, sets, net, nativesockets, posix, atomics, algorithm, sequtils]
 import brahmaputra
 
 var passed, failed: int
@@ -176,6 +176,513 @@ proc lateProducer(args: tuple[address, topic: string]) {.thread.} =
     producer.close()
   except CatchableError as e:
     echo "  late producer failed: ", e.msg
+
+# ---------------------------------------------------------------------------
+# Coverage: one check per client feature the Go suite's sections do not
+# already exercise.
+# ---------------------------------------------------------------------------
+
+proc lz4Compress(data: string): string {.nimcall, gcsafe.} =
+  ## The broker's lz4 payload: a little-endian uncompressed length, then a
+  ## raw LZ4 block. This encoder writes literals only (valid, if uncompressed).
+  let n = data.len
+  for shift in [0, 8, 16, 24]: result.add char((n shr shift) and 0xff)
+  if n >= 15:
+    result.add '\xf0'
+    var rest = n - 15
+    while rest >= 255:
+      result.add '\xff'
+      rest -= 255
+    result.add char(rest)
+  else:
+    result.add char(n shl 4)
+  result.add data
+
+proc lz4Decompress(data: string): string {.nimcall, gcsafe.} =
+  var pos = 4
+  proc length(n: int, pos: var int): int =
+    result = n
+    if n == 15:
+      while true:
+        let b = int(data[pos])
+        inc pos
+        result += b
+        if b != 255: break
+  while pos < data.len:
+    let token = int(data[pos])
+    inc pos
+    let lits = length(token shr 4, pos)
+    result.add data[pos ..< pos + lits]
+    pos += lits
+    if pos >= data.len: break
+    let offset = int(data[pos]) or (int(data[pos + 1]) shl 8)
+    pos += 2
+    for _ in 0 ..< length(token and 15, pos) + 4:
+      result.add result[result.len - offset]
+
+# A broker that answers Metadata with itself as the only broker and refuses
+# every produce: topic "fatal" with a non-retriable code, anything else with
+# NOT_ENOUGH_REPLICAS (retriable). Counts produces and the acks/timeout they
+# carried.
+var fakeStop: Atomic[bool]
+var fakeProduces: Atomic[int]
+var fakeAcks: Atomic[int]
+var fakeTimeout: Atomic[int]
+
+proc fakeAnswer(api: int, req: string, port: int): string =
+  var w = initBodyWriter()
+  var r = initBodyReader(req)
+  case api
+  of 3:
+    let topics = r.readStringArray()
+    for v in [0'i32, 1, 0]: w.writeInt32(v)
+    w.writeString("127.0.0.1")
+    w.writeInt32(int32(port))
+    w.writeString("")
+    w.writeInt32(0)
+    w.writeInt32(int32(topics.len))
+    for t in topics:
+      w.writeString(t)
+      for v in [0'i32, 1, 0, 0, 1, 0, 1, 0, 0]: w.writeInt32(v)
+  of 0:
+    let topic = r.readString()
+    let partition = r.readInt32()
+    fakeAcks.store(int(r.readInt32()))
+    fakeTimeout.store(int(r.readInt32()))
+    discard fakeProduces.fetchAdd(1)
+    w.writeString(topic)
+    w.writeInt32(partition)
+    w.writeInt32(if topic == "fatal": 87 else: 10)
+    w.writeInt64(-1)
+    w.writeInt64(-1)
+  else:
+    w.writeInt32(35)
+  w.buf
+
+proc fakeLoop(args: tuple[listenFd: SocketHandle, port: int]) {.thread.} =
+  var fds = @[args.listenFd]
+  var pending = @[""]
+  var buf = newString(65536)
+  while not fakeStop.load:
+    var pfds = newSeq[TPollfd](fds.len)
+    for i, fd in fds: pfds[i] = TPollfd(fd: fd.cint, events: POLLIN, revents: 0)
+    if posix.poll(addr pfds[0], Tnfds(pfds.len), 20) <= 0: continue
+    var closedFds: seq[SocketHandle]
+    for i, p in pfds:
+      if (p.revents and (POLLIN or POLLHUP or POLLERR)) == 0: continue
+      if fds[i] == args.listenFd:
+        let client = posix.accept(args.listenFd, nil, nil)
+        if client.cint >= 0:
+          fds.add client
+          pending.add ""
+        continue
+      let n = posix.recv(fds[i], addr buf[0], buf.len, 0)
+      if n <= 0:
+        closedFds.add fds[i]
+        continue
+      pending[i].add buf[0 ..< n]
+      while pending[i].len >= 4:
+        let size = (int(pending[i][0]) shl 24) or (int(pending[i][1]) shl 16) or
+                   (int(pending[i][2]) shl 8) or int(pending[i][3])
+        if pending[i].len < 4 + size: break
+        let payload = pending[i][4 ..< 4 + size]
+        pending[i] = pending[i][4 + size .. ^1]
+        let api = (int(payload[0]) shl 8) or int(payload[1])
+        let clen = (int(payload[8]) shl 8) or int(payload[9])
+        var body = ""
+        try: body = fakeAnswer(api, payload[10 + clen .. ^1], args.port)
+        except CatchableError: discard
+        let resp = payload[0 ..< 10 + clen] & body
+        var frame = ""
+        for shift in [24, 16, 8, 0]: frame.add char((resp.len shr shift) and 0xff)
+        frame.add resp
+        discard writeFully(fds[i], frame, frame.len)
+    for fd in closedFds:
+      let index = fds.find(fd)
+      discard posix.close(fd)
+      fds.delete(index)
+      pending.delete(index)
+  for fd in fds:
+    if fd != args.listenFd: discard posix.close(fd)
+
+# A group member on its own thread, polling until told to stop and
+# publishing how many partitions it holds.
+var memberStop: Atomic[bool]
+var memberAssigned: Atomic[int]
+
+proc memberLoop(args: tuple[address, group, topic: string, sessionMs, heartbeatMs: int]) {.thread.} =
+  try:
+    var config = defaultGroupConfig()
+    config.autoCommitIntervalMs = 0
+    config.sessionTimeoutMs = int32(args.sessionMs)
+    config.heartbeatIntervalMs = args.heartbeatMs
+    let g = newGroupConsumer(args.address, args.group, config)
+    g.subscribe([args.topic])
+    while not memberStop.load:
+      try: discard g.poll(200)
+      except CatchableError: discard
+      memberAssigned.store(g.assignment.len)
+    g.close()
+  except CatchableError as e:
+    echo "  member thread failed: ", e.msg
+
+proc elapsedMs(started: int64): int64 = monoMillis() - started
+
+proc waitFor(cond: proc (): bool, ms: int, poller: GroupConsumer = nil): bool =
+  let deadline = monoMillis() + int64(ms)
+  while monoMillis() < deadline:
+    if poller != nil:
+      try: discard poller.poll(200)
+      except CatchableError: discard
+    else:
+      sleep(20)
+    if cond(): return true
+  cond()
+
+proc pollUntil(g: GroupConsumer, want, ms: int): seq[ConsumedRecord] =
+  let deadline = monoMillis() + int64(ms)
+  while result.len < want and monoMillis() < deadline:
+    result.add must g.poll(300)
+
+proc groupConfigWith(autoCommitMs = 0): GroupConfig =
+  result = defaultGroupConfig()
+  result.autoCommitIntervalMs = autoCommitMs
+
+proc coverage(address: string) =
+  section("producer settings")
+  let c = must newConsumer(address)
+  block:
+    let topic = unique("nim-batchsize")
+    var config = defaultProducerConfig()
+    config.lingerMs = 60_000
+    config.batchSize = 64
+    let p = must newProducer(address, config)
+    for i in 0 ..< 3: must p.sendTo(topic, 0, repeatStr("b", 100) & $i)
+    let got = must c.fetch(topic, 0, 0, 1000)
+    check("batch.size sends a full batch without waiting for linger", got.len == 3, "got " & $got.len)
+    try: p.close() except CatchableError: discard
+  block:
+    let topic = unique("nim-linger")
+    var config = defaultProducerConfig()
+    config.lingerMs = 50
+    config.batchSize = 1_048_576
+    let p = must newProducer(address, config)
+    must p.sendTo(topic, 0, "lingering")
+    sleep(500)
+    let got = must c.fetch(topic, 0, 0, 1000)
+    check("linger.ms flushes a partial batch on its own", got.len == 1, "got " & $got.len)
+    try: p.close() except CatchableError: discard
+  block:
+    let topic = unique("nim-sync")
+    let p = must newProducer(address, noLinger())
+    let stamp = 1_600_000_000_000'i64
+    let first = must p.sendSync(topic, "one", partition = 2, timestamp = stamp)
+    let second = must p.sendSync(topic, "two", partition = 2, timestamp = stamp + 1000)
+    check("send_sync returns consecutive offsets", first == 0 and second == 1, $first & ", " & $second)
+    let got = must c.fetch(topic, 2, 0, 1000)
+    check("an explicit partition is honoured", got.len == 2, "partition 2 holds " & $got.len)
+    var stamps: seq[int64]
+    for r in got: stamps.add r.timestamp
+    check("an explicit timestamp is stored exactly", stamps == @[stamp, stamp + 1000], $stamps)
+    let rrTopic = unique("nim-roundrobin")
+    let parts = must p.router.partitions(rrTopic)
+    for i in 0 ..< 2 * parts.len: must p.send(rrTopic, "rr" & $i)
+    must p.flush()
+    var counts: seq[int]
+    for part in parts: counts.add (must c.fetch(rrTopic, part, 0, 300)).len
+    var even = true
+    for n in counts: even = even and n == 2
+    check("keyless records are spread round-robin", even, $counts)
+    must p.close()
+  block:
+    # A codec the driver does not carry, registered by the application: a
+    # valid LZ4 block of literals only, which the broker accepts as-is.
+    registerCodec(compressionLz4, lz4Compress, lz4Decompress)
+    let topic = unique("nim-lz4")
+    var config = noLinger()
+    config.compressionType = "lz4"
+    let p = must newProducer(address, config)
+    var want: seq[string]
+    for i in 0 ..< 5:
+      want.add repeatStr("registered codec payload ", 20) & $i
+      must p.sendTo(topic, 0, want[^1])
+    must p.close()
+    let got = must c.fetch(topic, 0, 0, 1000)
+    var values: seq[string]
+    for r in got: values.add r.value.get("")
+    check("a registered codec round-trips through the broker", values == want, "got " & $got.len)
+  c.close()
+
+  section("retries against a broker that refuses")
+  block:
+    let listener = listenLocal()
+    let port = listener.localPort
+    fakeStop.store(false)
+    var fakeThread: Thread[tuple[listenFd: SocketHandle, port: int]]
+    createThread(fakeThread, fakeLoop, (listener.getFd, port))
+    let fakeAddress = "127.0.0.1:" & $port
+    var config = noLinger()
+    config.acks = -1
+    config.requestTimeoutMs = 1234
+    config.retries = 2
+    config.retryBackoffMs = 150
+    let p = must newProducer(fakeAddress, config)
+    var started = monoMillis()
+    var failedSend = false
+    try: discard p.sendSync("retriable", "x", partition = 0)
+    except CatchableError: failedSend = true
+    var took = elapsedMs(started)
+    let attempts = fakeProduces.load
+    check("request.timeout.ms and acks reach the broker",
+          attempts > 0 and fakeAcks.load == -1 and fakeTimeout.load == 1234,
+          "acks=" & $fakeAcks.load & " timeout=" & $fakeTimeout.load)
+    check("a retriable error is retried `retries` times", failedSend and attempts == 3,
+          $attempts & " attempts")
+    check("retry.backoff.ms spaces the retries", took >= 300, $took & " ms")
+    fakeProduces.store(0)
+    var fatal = false
+    try: discard p.sendSync("fatal", "x", partition = 0)
+    except CatchableError: fatal = true
+    check("a non-retriable error is not retried", fatal and fakeProduces.load == 1,
+          $fakeProduces.load & " attempts")
+    try: p.close() except CatchableError: discard
+    fakeProduces.store(0)
+    var capped = noLinger()
+    capped.retries = 1_000_000
+    capped.retryBackoffMs = 50
+    capped.deliveryTimeoutMs = 400
+    let p2 = must newProducer(fakeAddress, capped)
+    started = monoMillis()
+    var cappedFailed = false
+    try: discard p2.sendSync("retriable", "x", partition = 0)
+    except CatchableError: cappedFailed = true
+    took = elapsedMs(started)
+    check("delivery.timeout.ms caps the retries", cappedFailed and took < 3000,
+          $took & " ms, " & $fakeProduces.load & " attempts")
+    try: p2.close() except CatchableError: discard
+    fakeStop.store(true)
+    joinThread(fakeThread)
+    listener.close()
+
+  section("consumer settings")
+  block:
+    let topic = unique("nim-fetchcfg")
+    let p = must newProducer(address, noLinger())
+    for i in 0 ..< 20: must p.sendTo(topic, 0, repeatStr("f", 1000) & $i)
+    must p.close()
+    let c = must newConsumer(address)
+    let res = must c.fetchVerbose(topic, 0, 0, 500)
+    check("fetch reports the high watermark", res.highWatermark == 20, $res.highWatermark)
+    check("a default fetch returns every record", res.records.len == 20, "got " & $res.records.len)
+    let meta = must c.router.metadata([topic], true)
+    var brokers: seq[int32]
+    for b in meta.brokers: brokers.add b.nodeId
+    var leadersKnown = false
+    for t in meta.topics:
+      if t.name == topic:
+        leadersKnown = t.partitions.len > 0
+        for info in t.partitions: leadersKnown = leadersKnown and info.leader in brokers
+    check("metadata names a live leader for every partition", leadersKnown, $meta.topics.len & " topics")
+    c.close()
+    var smallConfig = defaultConsumerConfig()
+    smallConfig.fetchMaxBytes = 2500
+    let small = must newConsumer(address, smallConfig)
+    let got = must small.fetch(topic, 0, 0, 500)
+    check("fetch.max.bytes caps a response", got.len >= 1 and got.len < 20, "got " & $got.len)
+    small.close()
+    var patientConfig = defaultConsumerConfig()
+    patientConfig.fetchMinBytes = 10_000_000
+    patientConfig.fetchMaxWaitMs = 400
+    let patient = must newConsumer(address, patientConfig)
+    let started = monoMillis()
+    let tail = must patient.fetch(topic, 0, 19, 400)
+    let waited = elapsedMs(started)
+    check("fetch.min.bytes holds a fetch for up to fetch.max.wait.ms",
+          tail.len == 1 and waited >= 300 and waited < 5000, $waited & " ms, " & $tail.len & " records")
+    patient.close()
+  block:
+    let topic = unique("nim-bytime")
+    let p = must newProducer(address, noLinger())
+    let base = 1_700_000_000_000'i64
+    for i in 0 ..< 3: must p.sendTo(topic, 0, "t" & $i, timestamp = base + int64(i) * 10_000)
+    must p.close()
+    let c = must newConsumer(address)
+    let at = must c.listOffsets(topic, 0, base + 5000)
+    check("list offsets by timestamp finds the first record at or after it", at == 1, $at)
+    c.close()
+  block:
+    let topic = unique("nim-maxpoll")
+    let p = must newProducer(address, noLinger())
+    for i in 0 ..< 10: must p.sendTo(topic, 0, "m" & $i)
+    must p.close()
+    var config = groupConfigWith()
+    config.maxPollRecords = 3
+    let g = must newGroupConsumer(address, unique("nim-maxpoll-grp"), config)
+    g.subscribe([topic])
+    var sizes: seq[int]
+    var total = 0
+    let deadline = monoMillis() + 15_000
+    while total < 10 and monoMillis() < deadline:
+      var got: seq[ConsumedRecord]
+      try: got = g.poll(300)
+      except CatchableError: discard
+      if got.len > 0:
+        sizes.add got.len
+        total += got.len
+    var capped = true
+    for n in sizes: capped = capped and n <= 3
+    check("max.poll.records caps a poll", total == 10 and capped, $sizes)
+    try: g.close() except CatchableError: discard
+
+  section("consumer group settings")
+  let p = must newProducer(address, noLinger())
+  block:
+    let t1 = unique("nim-multi-a")
+    let t2 = unique("nim-multi-b")
+    for i in 0 ..< 5:
+      must p.send(t1, "a" & $i)
+      must p.send(t2, "b" & $i)
+    let g = must newGroupConsumer(address, unique("nim-multi-grp"), groupConfigWith())
+    g.subscribe([t1, t2])
+    let got = pollUntil(g, 10, 15_000)
+    var perTopic = initCountTable[string]()
+    for r in got: perTopic.inc r.topic
+    check("a group consumes every subscribed topic", perTopic[t1] == 5 and perTopic[t2] == 5, $perTopic)
+    try: g.close() except CatchableError: discard
+  block:
+    let topic = unique("nim-autocommit")
+    for i in 0 ..< 6: must p.sendTo(topic, 0, "c" & $i)
+    proc committedAfter(intervalMs: int): int64 =
+      let g = must newGroupConsumer(address, unique("nim-auto-grp"), groupConfigWith(intervalMs))
+      g.subscribe([topic])
+      discard pollUntil(g, 6, 15_000)
+      sleep(200)
+      try: discard g.poll(300) except CatchableError: discard
+      let committed = must g.committed([(topic, 0'i32)])
+      result = committed.getOrDefault((topic, 0'i32), -1)
+      try: g.close() except CatchableError: discard
+    let auto = committedAfter(100)
+    check("auto-commit records positions without an explicit commit", auto == 6, $auto)
+    let manual = committedAfter(0)
+    check("disabled auto-commit commits nothing", manual < 0, $manual)
+  block:
+    # Static membership: a second instance presenting the same
+    # group.instance.id takes over the first one's partitions at once,
+    # without a rebalance, while the first is still heartbeating.
+    let topic = unique("nim-static")
+    discard must p.router.partitions(topic)
+    let group = unique("nim-static-grp")
+    var config = groupConfigWith()
+    config.groupInstanceId = "instance-1"
+    let first = must newGroupConsumer(address, group, config)
+    first.subscribe([topic])
+    try: discard first.poll(2000) except CatchableError: discard
+    let firstAssignment = first.assignment
+    let second = must newGroupConsumer(address, group, config)
+    second.subscribe([topic])
+    let started = monoMillis()
+    try: discard second.poll(200) except CatchableError: discard
+    let took = elapsedMs(started)
+    let secondAssignment = second.assignment
+    check("a static member reclaims its partitions without a rebalance",
+          firstAssignment.len == 4 and sorted(secondAssignment, cmpSlot) == sorted(firstAssignment, cmpSlot) and
+            took < 2000,
+          "first=" & $firstAssignment.len & " second=" & $secondAssignment.len & " " & $took & " ms")
+    try: second.close() except CatchableError: discard
+    try: first.close() except CatchableError: discard
+  for silent in [false, true]:
+    # LeaveGroup on close (30 s session, 200 ms heartbeat: the survivor takes
+    # over within a heartbeat, not a session), then session.timeout.ms (a
+    # member whose only route is a proxy that is shut goes silent without
+    # leaving, and is evicted once its 2 s session lapses).
+    let topic = unique(if silent: "nim-session" else: "nim-leave")
+    discard must p.router.partitions(topic)
+    let group = unique("nim-member-grp")
+    let sessionMs = if silent: 2000 else: 30_000
+    var config = groupConfigWith()
+    config.sessionTimeoutMs = int32(sessionMs)
+    config.heartbeatIntervalMs = 200
+    let proxy = if silent: newProxy(address) else: nil
+    let a = must newGroupConsumer(if silent: proxy.address else: address, group, config)
+    a.subscribe([topic])
+    memberStop.store(false)
+    memberAssigned.store(0)
+    var member: Thread[tuple[address, group, topic: string, sessionMs, heartbeatMs: int]]
+    createThread(member, memberLoop, (address, group, topic, sessionMs, 200))
+    let split = waitFor(proc (): bool = a.assignment.len == 2 and memberAssigned.load == 2, 20_000, a)
+    if silent: proxy.close()
+    else: must a.close()
+    let started = monoMillis()
+    let tookOver = waitFor(proc (): bool = memberAssigned.load == 4, 20_000)
+    let took = elapsedMs(started)
+    let detail = "split=" & $split & " took_over=" & $tookOver & " " & $took & " ms"
+    if silent:
+      check("a silent member is evicted after session.timeout.ms",
+            split and tookOver and took >= 1000 and took < 12_000, detail)
+    else:
+      check("closing a member hands its partitions over within a heartbeat",
+            split and tookOver and took < 5000, detail)
+    memberStop.store(true)
+    joinThread(member)
+    if silent:
+      try: a.close() except CatchableError: discard
+  block:
+    # Generation fencing: a member whose generation moved on cannot commit.
+    let topic = unique("nim-fence")
+    for i in 0 ..< 4: must p.send(topic, "f" & $i)
+    let group = unique("nim-fence-grp")
+    let a = must newGroupConsumer(address, group, groupConfigWith())
+    a.subscribe([topic])
+    discard pollUntil(a, 4, 10_000)
+    let b = must newGroupConsumer(address, group, groupConfigWith())
+    b.subscribe([topic])
+    try: discard b.poll(500) except CatchableError: discard
+    var fenced = false
+    try: a.commit()
+    except CatchableError: fenced = true
+    check("a commit from a stale generation is refused", fenced, "commit succeeded")
+    try: b.close() except CatchableError: discard
+    try: a.close() except CatchableError: discard
+  must p.close()
+
+  section("assignors (unit)")
+  block:
+    let members = @[AssignorMember(id: "a", topics: @["t"]), AssignorMember(id: "b", topics: @["t"])]
+    proc slots(ids: openArray[int]): seq[TopicPartition] =
+      for i in ids: result.add ("t", int32(i))
+    var all: seq[int32]
+    for i in 0 .. 11: all.add int32(i)
+    let sticky = stickyAssign(members, {"t": all}.toTable,
+                              {"a": slots(toSeq(0 .. 11)), "b": newSeq[TopicPartition]()}.toTable)
+    check("sticky keeps partitions in numeric order",
+          sticky["a"] == slots(toSeq(0 .. 5)) and sticky["b"] == slots(toSeq(6 .. 11)), $sticky)
+    let held = {"a": slots([1, 3]), "b": slots([0, 2])}.toTable
+    let kept = stickyAssign(members, {"t": @[0'i32, 1, 2, 3]}.toTable, held)
+    check("sticky keeps what members already hold", kept["a"] == held["a"] and kept["b"] == held["b"], $kept)
+
+  section("decoder bounds")
+  block:
+    var w = initBodyWriter()
+    w.writeInt32(-5)
+    var negative = false
+    try:
+      var r = initBodyReader(w.buf)
+      discard r.readString()
+    except CatchableError: negative = true
+    check("a negative length is an error", negative)
+    var w2 = initBodyWriter()
+    w2.writeInt32(1_000_000)
+    w2.writeRaw("short")
+    var oversized = false
+    try:
+      var r = initBodyReader(w2.buf)
+      discard r.readString()
+    except CatchableError: oversized = true
+    check("a length past the end of the data is an error", oversized)
+    var truncated = false
+    try: discard decodeRecordBatch("\0\0\0\0\0\0\0\0\x7f\xff\xff\xff\0\0\0\0", 0)
+    except CatchableError: truncated = true
+    check("a batch longer than its bytes is an error", truncated)
 
 # ---------------------------------------------------------------------------
 
@@ -680,6 +1187,8 @@ proc main() =
     joinThread(late)
     must consumer.close()
     must producer.close()
+
+  coverage(address)
 
   echo "\n", passed, " passed, ", failed, " failed"
   if failed > 0: quit(1)

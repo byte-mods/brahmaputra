@@ -24,6 +24,9 @@ type config = {
   (* session.timeout.ms: the coordinator evicts a member that stops
      heartbeating for this long. *)
   session_timeout_ms : int32;
+  (* heartbeat.interval.ms: how often this member heartbeats, and so how
+     soon it notices a rebalance; 0 means a third of the session timeout. *)
+  heartbeat_interval_ms : int;
   (* How long the coordinator waits for members to rejoin. *)
   rebalance_timeout_ms : int32;
   (* max.poll.interval.ms: the longest gap between polls before this member
@@ -47,6 +50,7 @@ let default_config =
   {
     client_id = Connection.default_client_id;
     session_timeout_ms = 10_000l;
+    heartbeat_interval_ms = 0;
     rebalance_timeout_ms = 3_000l;
     max_poll_interval_ms = 300_000;
     auto_commit_interval_ms = 5_000;
@@ -338,7 +342,10 @@ let leave t =
 
 let heartbeat_loop t =
   (* Two independent deadlines, so wake often enough for the shorter. *)
-  let heartbeat_every = max 1 (Int32.to_int t.config.session_timeout_ms / 3) in
+  let heartbeat_every =
+    if t.config.heartbeat_interval_ms > 0 then t.config.heartbeat_interval_ms
+    else max 1 (Int32.to_int t.config.session_timeout_ms / 3)
+  in
   let poll_check_every = max 1 (t.config.max_poll_interval_ms / 3) in
   let interval = float_of_int (min heartbeat_every poll_check_every) /. 1000. in
   let is_closed () = with_lock t.mu (fun () -> t.closed) in

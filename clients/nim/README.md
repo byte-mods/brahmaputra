@@ -18,7 +18,7 @@ Compile applications with threads and ORC:
 nim c -d:release --threads:on --mm:orc app.nim
 ```
 
-Verified end to end against a live broker: **54/54 checks**
+Verified end to end against a live broker: **85/85 checks**
 (`./test.sh HOST PORT`, which compiles `tests/manual_test.nim` with
 `nim c -d:release --threads:on --mm:orc` and runs it; the build fails on
 any compiler warning from this package).
@@ -72,6 +72,7 @@ producer.sendTo("orders", 1, "late", timestamp = 1_700_000_000_000)
 
 # Or wait for one record's offset. A full round trip — correct, and slow.
 let offset = producer.sendSync("orders", some("""{"id":2}"""))
+let pinned = producer.sendSync("orders", "x", partition = 3, timestamp = 1_700_000_000_000)
 
 producer.flush()
 ```
@@ -150,6 +151,7 @@ while true:
 | `GroupConfig` | Kafka name | Default |
 |---|---|---|
 | `sessionTimeoutMs` | `session.timeout.ms` | 10000 (Kafka: 45000) |
+| `heartbeatIntervalMs` | `heartbeat.interval.ms` | 0 = a third of the session timeout |
 | `rebalanceTimeoutMs` | `rebalance.timeout.ms` | 3000 |
 | `maxPollIntervalMs` | `max.poll.interval.ms` | 300000 |
 | `autoCommitIntervalMs` | `auto.commit.interval.ms` (0 = off) | 5000 |
@@ -199,7 +201,13 @@ brahmaputra-server --data-dir ./data --default-partitions 4
 clients/nim/test.sh 127.0.0.1 9092        # works from any directory
 ```
 
-It prints `54 passed, 0 failed` and exits non-zero on any failure.
+It runs the Go suite's 54 checks, then 31 coverage checks for every setting
+above (batch.size, linger.ms, explicit partition and timestamp,
+retries/backoff/delivery timeout against a fake refusing broker, fetch.max
+and fetch.min bytes, list offsets by timestamp, max.poll.records, auto
+commit, static membership, LeaveGroup, session timeout, generation fencing,
+a registered codec, decoder bounds). It prints `85 passed, 0 failed` and
+exits non-zero on any failure.
 
 ## Not implemented
 

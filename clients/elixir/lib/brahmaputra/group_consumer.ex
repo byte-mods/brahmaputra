@@ -11,6 +11,9 @@ defmodule Brahmaputra.GroupConsumer do
     * `:client_id` — default `"brahmaputra-elixir"`
     * `:session_timeout_ms` — the coordinator evicts a member that stops
       heartbeating for this long (10 000; Kafka: 45 000)
+    * `:heartbeat_interval_ms` — how often this member heartbeats, which is
+      also how soon it notices a rebalance; nil (default) means a third of
+      the session timeout. Keep it well under `:session_timeout_ms`
     * `:rebalance_timeout_ms` — how long the coordinator waits for rejoins (3 000)
     * `:max_poll_interval_ms` — longest gap between polls before this member
       is presumed stuck and leaves the group (300 000)
@@ -49,6 +52,7 @@ defmodule Brahmaputra.GroupConsumer do
   @defaults [
     client_id: "brahmaputra-elixir",
     session_timeout_ms: 10_000,
+    heartbeat_interval_ms: nil,
     rebalance_timeout_ms: 3_000,
     max_poll_interval_ms: 300_000,
     enable_auto_commit: true,
@@ -134,7 +138,7 @@ defmodule Brahmaputra.GroupConsumer do
         # The timer enforces two independent deadlines, so it wakes often
         # enough for the shorter of them.
         interval =
-          max(1, min(div(config.session_timeout_ms, 3), div(config.max_poll_interval_ms, 3)))
+          max(1, min(heartbeat_every(config), div(config.max_poll_interval_ms, 3)))
 
         state = %{
           group_id: group_id,
@@ -627,7 +631,9 @@ defmodule Brahmaputra.GroupConsumer do
 
   # -- heartbeat ----------------------------------------------------------------
 
-  defp heartbeat_every(state), do: max(1, div(state.config.session_timeout_ms, 3))
+  defp heartbeat_every(%{config: config}), do: heartbeat_every(config)
+  defp heartbeat_every(%{heartbeat_interval_ms: ms}) when is_integer(ms) and ms > 0, do: ms
+  defp heartbeat_every(config), do: max(1, div(config.session_timeout_ms, 3))
 
   defp maybe_heartbeat(state) do
     if state.joined and state.member_id != "" and

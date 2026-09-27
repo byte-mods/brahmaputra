@@ -39,7 +39,8 @@ class Connection {
     _socket.setOption(SocketOption.tcpNoDelay, true);
     _socket.listen(_onData,
         onError: (Object error) => _fail(BrahmaputraException('$error')),
-        onDone: () => _fail(BrahmaputraException('connection closed by broker')),
+        onDone: () =>
+            _fail(BrahmaputraException('connection closed by broker')),
         cancelOnError: true);
     // Write errors surface here; without a handler they would be unhandled.
     _socket.done.then((_) {}, onError: (Object error) {
@@ -189,7 +190,8 @@ class Connection {
     if (code != ErrorCode.none) throw ServerException(code, 'api_versions');
     final n = r.count();
     final versions = [
-      for (var i = 0; i < n; i++) ApiVersionRange(r.int32(), r.int32(), r.int32())
+      for (var i = 0; i < n; i++)
+        ApiVersionRange(r.int32(), r.int32(), r.int32())
     ];
     return (versions, r.string());
   }
@@ -203,7 +205,8 @@ class Connection {
     final bare = 'n=$username,r=$nonce';
     final first = await _authStep(username, '', 'SCRAM-SHA-256', 'n,,$bare');
     if (first.$4) {
-      throw ProtocolException('broker ended the SCRAM exchange before it began');
+      throw ProtocolException(
+          'broker ended the SCRAM exchange before it began');
     }
     final serverFirst = first.$3;
     final serverNonce = scramField(serverFirst, 'r');
@@ -315,8 +318,8 @@ ClusterMetadata decodeMetadata(Reader r) {
       final replicas = [for (var i = 0; i < rc; i++) r.int32()];
       final ic = r.count();
       final isr = [for (var i = 0; i < ic; i++) r.int32()];
-      partitions.add(
-          PartitionInfo(partition, leader, replicas, isr, r.int32()));
+      partitions
+          .add(PartitionInfo(partition, leader, replicas, isr, r.int32()));
     }
     if (topicError != ErrorCode.none &&
         topicError != ErrorCode.unknownTopicOrPartition) {
@@ -378,7 +381,13 @@ class Router {
           clientId: clientId,
           connectTimeout: connectTimeout,
           requestTimeout: requestTimeout);
-      future.then((_) {}, onError: (_) {}).whenComplete(() => _dialing.remove(key));
+      // A block body, not `=> _dialing.remove(key)`: remove() returns the
+      // (possibly failed) dial future, and whenComplete would wait on it
+      // and re-raise its error on a future nobody listens to, crashing the
+      // process with an unhandled exception whenever a redial is refused.
+      future.then((_) {}, onError: (_) {}).whenComplete(() {
+        _dialing.remove(key);
+      });
       return future;
     });
   }
@@ -404,8 +413,8 @@ class Router {
     }
     final w = bodyWriter()..stringArray(topics);
     final seed = await liveSeed();
-    final result =
-        decodeMetadata(bodyReader(await seed.request(ApiKey.metadata, w.bytes())));
+    final result = decodeMetadata(
+        bodyReader(await seed.request(ApiKey.metadata, w.bytes())));
     _brokers = result.brokers;
     for (final t in result.topics) {
       if (t.partitions.isEmpty) {

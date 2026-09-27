@@ -185,6 +185,479 @@ let close_proxy p =
   drop_all p
 
 (* ------------------------------------------------------------------------ *)
+(* Coverage: one check per client feature the Go suite's sections do not   *)
+(* already exercise.                                                        *)
+(* ------------------------------------------------------------------------ *)
+
+(* The broker's lz4 payload: a little-endian uncompressed length, then a raw
+   LZ4 block. This encoder writes literals only (valid, if uncompressed). *)
+let lz4_compress s =
+  let n = String.length s in
+  let b = Buffer.create (n + 16) in
+  Buffer.add_int32_le b (Int32.of_int n);
+  if n >= 15 then begin
+    Buffer.add_char b '\xf0';
+    let rec ext k =
+      if k >= 255 then (Buffer.add_char b '\xff'; ext (k - 255)) else Buffer.add_char b (Char.chr k)
+    in
+    ext (n - 15)
+  end
+  else Buffer.add_char b (Char.chr (n lsl 4));
+  Buffer.add_string b s;
+  Buffer.contents b
+
+let lz4_decompress s =
+  let out = Buffer.create (String.length s) in
+  let pos = ref 4 in
+  let byte () = let c = Char.code s.[!pos] in incr pos; c in
+  let length n = if n < 15 then n else
+      let rec more acc = let b = byte () in if b = 255 then more (acc + 255) else acc + b in
+      more 15
+  in
+  let rec block () =
+    if !pos < String.length s then begin
+      let token = byte () in
+      let lits = length (token lsr 4) in
+      Buffer.add_string out (String.sub s !pos lits);
+      pos := !pos + lits;
+      if !pos < String.length s then begin
+        let lo = byte () in
+        let offset = lo lor (byte () lsl 8) in
+        let mlen = length (token land 15) + 4 in
+        for _ = 1 to mlen do
+          Buffer.add_char out (Buffer.nth out (Buffer.length out - offset))
+        done;
+        block ()
+      end
+    end
+  in
+  block ();
+  Buffer.contents out
+
+(* A broker that answers Metadata with itself as the only broker and refuses
+   every produce: topic "fatal" with a non-retriable code, anything else
+   with NOT_ENOUGH_REPLICAS (retriable). Records (topic, acks, timeout) for
+   each produce it sees. *)
+type fake = { fake_address : string; fake_listener : Unix.file_descr; fake_mu : Mutex.t;
+              mutable produces : (string * int32 * int32) list }
+
+let read_exact fd n =
+  let buf = Bytes.create n in
+  let rec go off = if off < n then
+      let got = Unix.read fd buf off (n - off) in
+      if got = 0 then raise End_of_file else go (off + got)
+  in
+  go 0;
+  Bytes.to_string buf
+
+let fake_broker () =
+  let listener, address = listen_local () in
+  let port = match Unix.getsockname listener with Unix.ADDR_INET (_, p) -> p | _ -> 0 in
+  let f = { fake_address = address; fake_listener = listener; fake_mu = Mutex.create (); produces = [] } in
+  let answer api req =
+    let w = P.Writer.body () in
+    (match api with
+    | 3 ->
+        let r = P.Reader.body req in
+        let topics = P.Reader.string_array r in
+        List.iter (P.Writer.int32 w) [ 0l; 1l; 0l ];
+        P.Writer.string w "127.0.0.1";
+        P.Writer.int32 w (Int32.of_int port);
+        P.Writer.string w "";
+        P.Writer.int32 w 0l;
+        P.Writer.int32 w (Int32.of_int (List.length topics));
+        List.iter
+          (fun t ->
+            P.Writer.string w t;
+            List.iter (P.Writer.int32 w) [ 0l; 1l; 0l; 0l; 1l; 0l; 1l; 0l; 0l ])
+          topics
+    | 0 ->
+        let r = P.Reader.body req in
+        let topic = P.Reader.string r in
+        let partition = P.Reader.int32 r in
+        let acks = P.Reader.int32 r in
+        let timeout = P.Reader.int32 r in
+        Mutex.lock f.fake_mu;
+        f.produces <- f.produces @ [ (topic, acks, timeout) ];
+        Mutex.unlock f.fake_mu;
+        P.Writer.string w topic;
+        P.Writer.int32 w partition;
+        P.Writer.int32 w (if topic = "fatal" then 87l else 10l);
+        P.Writer.int64 w (-1L);
+        P.Writer.int64 w (-1L)
+    | _ -> P.Writer.int32 w 35l);
+    P.Writer.contents w
+  in
+  let serve fd =
+    (try
+       while true do
+         let n = Int32.to_int (String.get_int32_be (read_exact fd 4) 0) in
+         let payload = read_exact fd n in
+         let api = String.get_int16_be payload 0 in
+         let clen = String.get_int16_be payload 8 in
+         let header = String.sub payload 0 (10 + clen) in
+         let resp = header ^ answer api (String.sub payload (10 + clen) (n - 10 - clen)) in
+         let b = Buffer.create (String.length resp + 4) in
+         Buffer.add_int32_be b (Int32.of_int (String.length resp));
+         Buffer.add_string b resp;
+         let out = Buffer.contents b in
+         ignore (Unix.write_substring fd out 0 (String.length out) : int)
+       done
+     with _ -> ());
+    try Unix.close fd with Unix.Unix_error _ -> ()
+  in
+  ignore
+    (Thread.create
+       (fun () ->
+         let rec loop () =
+           match Unix.accept listener with
+           | fd, _ -> ignore (Thread.create serve fd : Thread.t); loop ()
+           | exception _ -> ()
+         in
+         loop ())
+       ()
+      : Thread.t);
+  f
+
+let fake_produces f = Mutex.lock f.fake_mu; let p = f.produces in Mutex.unlock f.fake_mu; p
+let fake_reset f = Mutex.lock f.fake_mu; f.produces <- []; Mutex.unlock f.fake_mu
+
+let fails f = match f () with _ -> false | exception _ -> true
+let elapsed_ms started = int_of_float ((Unix.gettimeofday () -. started) *. 1000.)
+
+(* Sizes of successive non-empty polls until [want] records or [seconds]. *)
+let poll_sizes group ~want ~seconds =
+  let deadline = Unix.gettimeofday () +. seconds in
+  let rec go acc =
+    if List.fold_left ( + ) 0 acc >= want || Unix.gettimeofday () > deadline then List.rev acc
+    else
+      match Group.poll group ~timeout_ms:300 with
+      | [] -> go acc
+      | records -> go (List.length records :: acc)
+      | exception _ -> go acc
+  in
+  go []
+
+(* Polls every group in parallel (a join blocks until every member has
+   rejoined) until [is_done ()] or [seconds] pass. *)
+let settle groups is_done ~seconds =
+  let deadline = Unix.gettimeofday () +. seconds in
+  let rec go () =
+    let threads =
+      List.map (fun g -> Thread.create (fun g -> try ignore (Group.poll g ~timeout_ms:200) with _ -> ()) g) groups
+    in
+    List.iter Thread.join threads;
+    if is_done () then true else if Unix.gettimeofday () > deadline then false else go ()
+  in
+  go ()
+
+let quietly f = try f () with _ -> ()
+
+let coverage address =
+  section "producer settings";
+  let c = must (fun () -> Consumer.create address) in
+  (let topic = unique "ml-batchsize" in
+   let p = must (fun () ->
+     Producer.create ~config:{ Producer.default_config with linger_ms = 60_000; batch_size = 64 } address) in
+   for i = 0 to 2 do
+     must (fun () -> Producer.send p ~partition:0l topic (Some (String.make 100 'b' ^ string_of_int i)))
+   done;
+   let got = must (fun () -> Consumer.fetch c ~max_wait_ms:1000l topic 0l 0L) in
+   check "batch.size sends a full batch without waiting for linger" (List.length got = 3)
+     (sp "got %d" (List.length got));
+   quietly (fun () -> Producer.close p));
+  (let topic = unique "ml-linger" in
+   let p = must (fun () ->
+     Producer.create ~config:{ Producer.default_config with linger_ms = 50; batch_size = 1_048_576 } address) in
+   must (fun () -> Producer.send p ~partition:0l topic (Some "lingering"));
+   sleep_ms 500;
+   let got = must (fun () -> Consumer.fetch c ~max_wait_ms:1000l topic 0l 0L) in
+   check "linger.ms flushes a partial batch on its own" (List.length got = 1) (sp "got %d" (List.length got));
+   quietly (fun () -> Producer.close p));
+  (let topic = unique "ml-sync" in
+   let p = must (fun () -> Producer.create ~config:producer_config address) in
+   let stamp = 1_600_000_000_000L in
+   let first = must (fun () -> Producer.send_sync p ~partition:2l ~timestamp:stamp topic (Some "one")) in
+   let second =
+     must (fun () -> Producer.send_sync p ~partition:2l ~timestamp:(Int64.add stamp 1000L) topic (Some "two"))
+   in
+   check "send_sync returns consecutive offsets" (first = 0L && second = 1L) (sp "%Ld, %Ld" first second);
+   let got = must (fun () -> Consumer.fetch c ~max_wait_ms:1000l topic 2l 0L) in
+   check "an explicit partition is honoured" (List.length got = 2) (sp "partition 2 holds %d" (List.length got));
+   let stamps = List.map (fun r -> r.Consumer.timestamp) got in
+   check "an explicit timestamp is stored exactly" (stamps = [ stamp; Int64.add stamp 1000L ])
+     (String.concat "," (List.map Int64.to_string stamps));
+   let rr_topic = unique "ml-roundrobin" in
+   let parts = must (fun () -> Router.partitions (Producer.router p) rr_topic) in
+   for i = 1 to 2 * List.length parts do
+     must (fun () -> Producer.send p rr_topic (Some (sp "rr%d" i)))
+   done;
+   must (fun () -> Producer.flush p);
+   let counts = List.map (fun part -> List.length (must (fun () -> Consumer.fetch c ~max_wait_ms:300l rr_topic part 0L))) parts in
+   check "keyless records are spread round-robin" (List.for_all (( = ) 2) counts)
+     (String.concat "," (List.map string_of_int counts));
+   must (fun () -> Producer.close p));
+  (* A codec the driver does not carry, registered by the application: a
+     valid LZ4 block of literals only, which the broker accepts as-is. *)
+  (P.register_codec `Lz4 ~compress:lz4_compress ~decompress:lz4_decompress;
+   let topic = unique "ml-lz4" in
+   let body i = String.concat "" (List.init 20 (fun _ -> "registered codec payload ")) ^ string_of_int i in
+   let p = must (fun () -> Producer.create ~config:{ producer_config with compression_type = "lz4" } address) in
+   for i = 0 to 4 do
+     must (fun () -> Producer.send p ~partition:0l topic (Some (body i)))
+   done;
+   must (fun () -> Producer.close p);
+   let got = must (fun () -> Consumer.fetch c ~max_wait_ms:1000l topic 0l 0L) in
+   check "a registered codec round-trips through the broker"
+     (List.map (fun r -> r.Consumer.value) got = List.init 5 (fun i -> Some (body i)))
+     (sp "got %d" (List.length got)));
+  Consumer.close c;
+
+  section "retries against a broker that refuses";
+  (let f = fake_broker () in
+   let p = must (fun () ->
+     Producer.create
+       ~config:{ producer_config with acks = -1l; request_timeout_ms = 1234l; retries = 2; retry_backoff_ms = 150 }
+       f.fake_address) in
+   let started = Unix.gettimeofday () in
+   let failed_send = fails (fun () -> Producer.send_sync p ~partition:0l "retriable" (Some "x")) in
+   let took = elapsed_ms started in
+   let attempts = fake_produces f in
+   check "request.timeout.ms and acks reach the broker"
+     (attempts <> [] && List.for_all (fun (_, acks, t) -> acks = -1l && t = 1234l) attempts)
+     (sp "%d attempts" (List.length attempts));
+   check "a retriable error is retried `retries` times" (failed_send && List.length attempts = 3)
+     (sp "%d attempts" (List.length attempts));
+   check "retry.backoff.ms spaces the retries" (took >= 300) (sp "%d ms" took);
+   fake_reset f;
+   let fatal = fails (fun () -> Producer.send_sync p ~partition:0l "fatal" (Some "x")) in
+   let n = List.length (fake_produces f) in
+   check "a non-retriable error is not retried" (fatal && n = 1) (sp "%d attempts" n);
+   quietly (fun () -> Producer.close p);
+   fake_reset f;
+   let p = must (fun () ->
+     Producer.create
+       ~config:{ producer_config with retries = 1_000_000; retry_backoff_ms = 50; delivery_timeout_ms = 400 }
+       f.fake_address) in
+   let started = Unix.gettimeofday () in
+   let capped = fails (fun () -> Producer.send_sync p ~partition:0l "retriable" (Some "x")) in
+   let took = elapsed_ms started in
+   check "delivery.timeout.ms caps the retries" (capped && took < 3000)
+     (sp "%d ms, %d attempts" took (List.length (fake_produces f)));
+   quietly (fun () -> Producer.close p);
+   shutdown_quietly f.fake_listener;
+   (try Unix.close f.fake_listener with Unix.Unix_error _ -> ()));
+
+  section "consumer settings";
+  (let topic = unique "ml-fetchcfg" in
+   let p = must (fun () -> Producer.create ~config:producer_config address) in
+   for i = 0 to 19 do
+     must (fun () -> Producer.send p ~partition:0l topic (Some (String.make 1000 'f' ^ string_of_int i)))
+   done;
+   must (fun () -> Producer.close p);
+   let c = must (fun () -> Consumer.create address) in
+   let records, hw = must (fun () -> Consumer.fetch_verbose c ~max_wait_ms:500l topic 0l 0L) in
+   check "fetch reports the high watermark" (hw = 20L) (Int64.to_string hw);
+   check "a default fetch returns every record" (List.length records = 20) (sp "got %d" (List.length records));
+   let meta = must (fun () -> Router.refresh (Consumer.router c) topic) in
+   let brokers = List.map (fun b -> b.Router.node_id) meta.Router.brokers in
+   let infos =
+     match List.find_opt (fun t -> t.Router.name = topic) meta.Router.topics with
+     | Some t -> t.Router.partitions
+     | None -> []
+   in
+   check "metadata names a live leader for every partition"
+     (infos <> [] && List.for_all (fun i -> List.mem i.Router.leader brokers) infos)
+     (sp "%d partitions" (List.length infos));
+   Consumer.close c;
+   let small = must (fun () ->
+     Consumer.create ~config:{ Consumer.default_config with fetch_max_bytes = 2500l } address) in
+   let got = must (fun () -> Consumer.fetch small ~max_wait_ms:500l topic 0l 0L) in
+   check "fetch.max.bytes caps a response" (got <> [] && List.length got < 20) (sp "got %d" (List.length got));
+   Consumer.close small;
+   let patient = must (fun () ->
+     Consumer.create
+       ~config:{ Consumer.default_config with fetch_min_bytes = 10_000_000l; fetch_max_wait_ms = 400l }
+       address) in
+   let started = Unix.gettimeofday () in
+   let got = must (fun () -> Consumer.fetch patient ~max_wait_ms:400l topic 0l 19L) in
+   let waited = elapsed_ms started in
+   check "fetch.min.bytes holds a fetch for up to fetch.max.wait.ms"
+     (List.length got = 1 && waited >= 300 && waited < 5000)
+     (sp "%d ms, %d records" waited (List.length got));
+   Consumer.close patient);
+  (let topic = unique "ml-bytime" in
+   let p = must (fun () -> Producer.create ~config:producer_config address) in
+   let base = 1_700_000_000_000L in
+   for i = 0 to 2 do
+     must (fun () ->
+       Producer.send p ~partition:0l ~timestamp:(Int64.add base (Int64.of_int (i * 10_000))) topic
+         (Some (sp "t%d" i)))
+   done;
+   must (fun () -> Producer.close p);
+   let c = must (fun () -> Consumer.create address) in
+   let at = must (fun () -> Consumer.list_offsets c topic 0l (Int64.add base 5000L)) in
+   check "list offsets by timestamp finds the first record at or after it" (at = 1L) (Int64.to_string at);
+   Consumer.close c);
+  (let topic = unique "ml-maxpoll" in
+   let p = must (fun () -> Producer.create ~config:producer_config address) in
+   for i = 0 to 9 do
+     must (fun () -> Producer.send p ~partition:0l topic (Some (sp "m%d" i)))
+   done;
+   must (fun () -> Producer.close p);
+   let g = must (fun () ->
+     Group.create ~config:{ group_config with max_poll_records = 3 } address (unique "ml-maxpoll-grp")) in
+   Group.subscribe g [ topic ];
+   let sizes = poll_sizes g ~want:10 ~seconds:15. in
+   check "max.poll.records caps a poll"
+     (List.fold_left ( + ) 0 sizes = 10 && List.for_all (fun n -> n <= 3) sizes)
+     (String.concat "," (List.map string_of_int sizes));
+   quietly (fun () -> Group.close g));
+
+  section "consumer group settings";
+  let p = must (fun () -> Producer.create ~config:producer_config address) in
+  (let t1 = unique "ml-multi-a" and t2 = unique "ml-multi-b" in
+   for i = 0 to 4 do
+     must (fun () -> Producer.send p t1 (Some (sp "a%d" i)));
+     must (fun () -> Producer.send p t2 (Some (sp "b%d" i)))
+   done;
+   let g = must (fun () -> Group.create ~config:group_config address (unique "ml-multi-grp")) in
+   Group.subscribe g [ t1; t2 ];
+   let got = poll_until g ~want:10 ~seconds:15. ~timeout_ms:300 in
+   let count t = List.length (List.filter (fun r -> r.Consumer.topic = t) got) in
+   check "a group consumes every subscribed topic" (count t1 = 5 && count t2 = 5)
+     (sp "%d + %d" (count t1) (count t2));
+   quietly (fun () -> Group.close g));
+  (let topic = unique "ml-autocommit" in
+   for i = 0 to 5 do
+     must (fun () -> Producer.send p ~partition:0l topic (Some (sp "c%d" i)))
+   done;
+   let committed_after config =
+     let g = must (fun () -> Group.create ~config address (unique "ml-auto-grp")) in
+     Group.subscribe g [ topic ];
+     ignore (poll_until g ~want:6 ~seconds:15. ~timeout_ms:300 : Consumer.record list);
+     sleep_ms 200;
+     quietly (fun () -> ignore (Group.poll g ~timeout_ms:300 : Consumer.record list));
+     let committed = must (fun () -> Group.committed g [ (topic, 0l) ]) in
+     quietly (fun () -> Group.close g);
+     List.assoc_opt (topic, 0l) committed
+   in
+   let auto = committed_after { Group.default_config with auto_commit_interval_ms = 100 } in
+   check "auto-commit records positions without an explicit commit" (auto = Some 6L)
+     (match auto with Some o -> Int64.to_string o | None -> "none");
+   let manual = committed_after group_config in
+   check "disabled auto-commit commits nothing"
+     (match manual with None -> true | Some o -> Int64.compare o 0L < 0)
+     (match manual with Some o -> Int64.to_string o | None -> "none"));
+  (* Static membership: a second instance presenting the same
+     group.instance.id takes over the first one's partitions at once,
+     without a rebalance, while the first is still heartbeating. *)
+  (let topic = unique "ml-static" in
+   ignore (must (fun () -> Router.partitions (Producer.router p) topic) : int32 list);
+   let group_id = unique "ml-static-grp" in
+   let config = { group_config with group_instance_id = "instance-1" } in
+   let first = must (fun () -> Group.create ~config address group_id) in
+   Group.subscribe first [ topic ];
+   quietly (fun () -> ignore (Group.poll first ~timeout_ms:2000 : Consumer.record list));
+   let first_assignment = Group.assignment first in
+   let second = must (fun () -> Group.create ~config address group_id) in
+   Group.subscribe second [ topic ];
+   let started = Unix.gettimeofday () in
+   quietly (fun () -> ignore (Group.poll second ~timeout_ms:200 : Consumer.record list));
+   let took = elapsed_ms started in
+   let second_assignment = Group.assignment second in
+   check "a static member reclaims its partitions without a rebalance"
+     (List.length first_assignment = 4
+      && List.sort compare second_assignment = List.sort compare first_assignment
+      && took < 2000)
+     (sp "first=%d second=%d %d ms" (List.length first_assignment) (List.length second_assignment) took);
+   quietly (fun () -> Group.close second);
+   quietly (fun () -> Group.close first));
+  (* LeaveGroup on close: with a 30 s session and a 200 ms heartbeat, the
+     survivor takes over within a heartbeat, not a session. *)
+  (let topic = unique "ml-leave" in
+   ignore (must (fun () -> Router.partitions (Producer.router p) topic) : int32 list);
+   let group_id = unique "ml-leave-grp" in
+   let config = { group_config with session_timeout_ms = 30_000l; heartbeat_interval_ms = 200 } in
+   let a = must (fun () -> Group.create ~config address group_id) in
+   let b = must (fun () -> Group.create ~config address group_id) in
+   Group.subscribe a [ topic ];
+   Group.subscribe b [ topic ];
+   let split =
+     settle [ a; b ] (fun () -> List.map (fun g -> List.length (Group.assignment g)) [ a; b ] = [ 2; 2 ]) ~seconds:20.
+   in
+   must (fun () -> Group.close a);
+   let started = Unix.gettimeofday () in
+   let took_over = settle [ b ] (fun () -> List.length (Group.assignment b) = 4) ~seconds:15. in
+   let took = elapsed_ms started in
+   check "closing a member hands its partitions over within a heartbeat" (split && took_over && took < 5000)
+     (sp "split=%b took_over=%b %d ms" split took_over took);
+   quietly (fun () -> Group.close b));
+  (* session.timeout.ms: a member that goes silent without leaving (its only
+     route to the broker is a proxy that is shut) is evicted once its
+     session lapses, and the survivor takes over. *)
+  (let topic = unique "ml-session" in
+   ignore (must (fun () -> Router.partitions (Producer.router p) topic) : int32 list);
+   let group_id = unique "ml-session-grp" in
+   let config = { group_config with session_timeout_ms = 2_000l; heartbeat_interval_ms = 200 } in
+   let proxy = new_proxy address in
+   let a = must (fun () -> Group.create ~config proxy.address group_id) in
+   let b = must (fun () -> Group.create ~config address group_id) in
+   Group.subscribe a [ topic ];
+   Group.subscribe b [ topic ];
+   let split =
+     settle [ a; b ] (fun () -> List.map (fun g -> List.length (Group.assignment g)) [ a; b ] = [ 2; 2 ]) ~seconds:20.
+   in
+   close_proxy proxy;
+   let started = Unix.gettimeofday () in
+   let took_over = settle [ b ] (fun () -> List.length (Group.assignment b) = 4) ~seconds:20. in
+   let took = elapsed_ms started in
+   check "a silent member is evicted after session.timeout.ms"
+     (split && took_over && took >= 1000 && took < 12_000)
+     (sp "split=%b took_over=%b %d ms" split took_over took);
+   quietly (fun () -> Group.close b);
+   quietly (fun () -> Group.close a));
+  (* Generation fencing: a member whose generation moved on cannot commit. *)
+  (let topic = unique "ml-fence" in
+   for i = 0 to 3 do
+     must (fun () -> Producer.send p topic (Some (sp "f%d" i)))
+   done;
+   let group_id = unique "ml-fence-grp" in
+   let a = must (fun () -> Group.create ~config:group_config address group_id) in
+   Group.subscribe a [ topic ];
+   ignore (poll_until a ~want:4 ~seconds:10. ~timeout_ms:300 : Consumer.record list);
+   let b = must (fun () -> Group.create ~config:group_config address group_id) in
+   Group.subscribe b [ topic ];
+   quietly (fun () -> ignore (Group.poll b ~timeout_ms:500 : Consumer.record list));
+   check "a commit from a stale generation is refused" (fails (fun () -> Group.commit a)) "commit succeeded";
+   quietly (fun () -> Group.close b);
+   quietly (fun () -> Group.close a));
+  must (fun () -> Producer.close p);
+
+  section "assignors (unit)";
+  (let members = [ { Assignor.id = "a"; topics = [ "t" ] }; { Assignor.id = "b"; topics = [ "t" ] } ] in
+   let slots l = List.map (fun i -> ("t", Int32.of_int i)) l in
+   let range a b = List.init (b - a + 1) (fun i -> a + i) in
+   let sticky =
+     Assignor.sticky members [ ("t", List.map Int32.of_int (range 0 11)) ] [ ("a", slots (range 0 11)); ("b", []) ]
+   in
+   check "sticky keeps partitions in numeric order"
+     (sticky = [ ("a", slots (range 0 5)); ("b", slots (range 6 11)) ]) "";
+   let held = [ ("a", slots [ 1; 3 ]); ("b", slots [ 0; 2 ]) ] in
+   let kept = Assignor.sticky members [ ("t", [ 0l; 1l; 2l; 3l ]) ] held in
+   check "sticky keeps what members already hold" (kept = held) "");
+
+  section "decoder bounds";
+  (let body f = let w = P.Writer.body () in f w; P.Writer.contents w in
+   let negative = body (fun w -> P.Writer.int32 w (-5l)) in
+   check "a negative length is an error"
+     (fails (fun () -> P.Reader.string (P.Reader.body negative))) "decoded";
+   let oversized = body (fun w -> P.Writer.int32 w 1_000_000l; P.Writer.raw w "short") in
+   check "a length past the end of the data is an error"
+     (fails (fun () -> P.Reader.string (P.Reader.body oversized))) "decoded";
+   let batch = "\000\000\000\000\000\000\000\000\x7f\xff\xff\xff\000\000\000\000" in
+   check "a batch longer than its bytes is an error"
+     (fails (fun () -> P.decode_record_batch batch 0)) "decoded")
 
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
@@ -738,5 +1211,6 @@ let () =
    must (fun () -> Group.close consumer);
    must (fun () -> Producer.close producer));
 
+  coverage address;
   Printf.printf "\n%d passed, %d failed\n%!" !passed !failed;
   exit (if !failed > 0 then 1 else 0)

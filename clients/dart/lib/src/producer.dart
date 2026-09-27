@@ -78,8 +78,7 @@ class ProducerConfig {
   Duration socketRequestTimeout;
 }
 
-int _asInt(Object value) =>
-    value is int ? value : int.parse(value.toString());
+int _asInt(Object value) => value is int ? value : int.parse(value.toString());
 
 class _Buffered {
   _Buffered(this.record, this.createdMs);
@@ -139,9 +138,13 @@ class Producer {
   /// list is an empty value. Without [partition], a [key] picks the
   /// partition by murmur2 and no key goes round-robin. Completes once the
   /// record is buffered (or sent, with linger.ms=0 or a full batch); call
-  /// [flush] to await delivery.
+  /// [flush] to await delivery. [timestamp] is unix milliseconds and
+  /// defaults to now.
   Future<void> send(String topic, List<int>? value,
-      {List<int>? key, int? partition, List<RecordHeader> headers = const []}) async {
+      {List<int>? key,
+      int? partition,
+      List<RecordHeader> headers = const [],
+      int? timestamp}) async {
     if (_closed) throw BrahmaputraException('producer is closed');
     final target = partition ?? await _choosePartition(topic, key);
     final record = Record(key: key, value: value, headers: headers);
@@ -153,7 +156,8 @@ class Producer {
 
     final slot =
         _slots.putIfAbsent('$topic\u0000$target', () => _Slot(topic, target));
-    slot.records.add(_Buffered(record, DateTime.now().millisecondsSinceEpoch));
+    slot.records.add(
+        _Buffered(record, timestamp ?? DateTime.now().millisecondsSinceEpoch));
     slot.size += size;
     if (config.lingerMs == 0 || slot.size >= config.batchSize) {
       await _flushSlot(slot);
@@ -161,12 +165,16 @@ class Producer {
   }
 
   /// Send one record on its own and return its offset. Slow by design.
+  /// [timestamp] is unix milliseconds and defaults to now.
   Future<int> sendSync(String topic, List<int>? value,
-      {List<int>? key, int? partition, List<RecordHeader> headers = const []}) async {
+      {List<int>? key,
+      int? partition,
+      List<RecordHeader> headers = const [],
+      int? timestamp}) async {
     final target = partition ?? await _choosePartition(topic, key);
     return _produce(topic, target, [
       _Buffered(Record(key: key, value: value, headers: headers),
-          DateTime.now().millisecondsSinceEpoch)
+          timestamp ?? DateTime.now().millisecondsSinceEpoch)
     ]);
   }
 
@@ -219,8 +227,7 @@ class Producer {
       _bufferedBytes += size;
       return;
     }
-    final deadline =
-        DateTime.now().millisecondsSinceEpoch + config.maxBlockMs;
+    final deadline = DateTime.now().millisecondsSinceEpoch + config.maxBlockMs;
     while (_bufferedBytes + size > limit) {
       if (DateTime.now().millisecondsSinceEpoch >= deadline) {
         throw BrahmaputraException(
@@ -251,7 +258,8 @@ class Producer {
     await _produce(slot.topic, slot.partition, batch);
   }
 
-  Future<int> _produce(String topic, int partition, List<_Buffered> batch) async {
+  Future<int> _produce(
+      String topic, int partition, List<_Buffered> batch) async {
     if (batch.isEmpty) return -1;
     // One base timestamp per batch and a delta per record.
     var maxTimestamp = batch.first.createdMs;
@@ -259,7 +267,8 @@ class Producer {
       if (b.createdMs > maxTimestamp) maxTimestamp = b.createdMs;
     }
     final records = [
-      for (final b in batch) b.record..timestampDelta = b.createdMs - maxTimestamp
+      for (final b in batch)
+        b.record..timestampDelta = b.createdMs - maxTimestamp
     ];
     final encoded = encodeRecordBatch(records, maxTimestamp, _codec);
     final w = bodyWriter()
@@ -290,7 +299,9 @@ class Producer {
       r.int64(); // log_append_time_ms
       if (code == ErrorCode.none) return baseOffset;
       final outOfTime = DateTime.now().millisecondsSinceEpoch >= deadline;
-      if (!ErrorCode.retriable.contains(code) || attemptsLeft <= 0 || outOfTime) {
+      if (!ErrorCode.retriable.contains(code) ||
+          attemptsLeft <= 0 ||
+          outOfTime) {
         throw ServerException(code, 'produce to $topic-$partition');
       }
       attemptsLeft--;

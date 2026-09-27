@@ -37,6 +37,7 @@ class GroupConfig {
   GroupConfig({
     this.clientId = 'brahmaputra-dart',
     this.sessionTimeoutMs = 10000,
+    this.heartbeatIntervalMs = 0,
     this.rebalanceTimeoutMs = 3000,
     this.maxPollIntervalMs = 300000,
     this.autoCommitIntervalMs = 5000,
@@ -52,11 +53,11 @@ class GroupConfig {
   factory GroupConfig.fromProperties(Map<String, Object> props) {
     int i(String k, int d) =>
         props.containsKey(k) ? int.parse(props[k].toString()) : d;
-    final enableAutoCommit =
-        props['enable.auto.commit']?.toString() != 'false';
+    final enableAutoCommit = props['enable.auto.commit']?.toString() != 'false';
     return GroupConfig(
       clientId: props['client.id']?.toString() ?? 'brahmaputra-dart',
       sessionTimeoutMs: i('session.timeout.ms', 10000),
+      heartbeatIntervalMs: i('heartbeat.interval.ms', 0),
       rebalanceTimeoutMs: i('rebalance.timeout.ms', 3000),
       maxPollIntervalMs: i('max.poll.interval.ms', 300000),
       autoCommitIntervalMs:
@@ -76,6 +77,10 @@ class GroupConfig {
   /// `session.timeout.ms`: the coordinator evicts a silent member after this.
   /// Defaults to 10 s (Kafka: 45 s).
   int sessionTimeoutMs;
+
+  /// `heartbeat.interval.ms`: how often this member heartbeats, and so how
+  /// soon it notices a rebalance. 0 means a third of [sessionTimeoutMs].
+  int heartbeatIntervalMs;
 
   /// `rebalance.timeout.ms`.
   int rebalanceTimeoutMs;
@@ -121,9 +126,12 @@ class GroupConsumer {
   GroupConsumer._(this.consumer, this.groupId, this.config) {
     // One timer enforces two deadlines, so it fires often enough for the
     // shorter of them.
-    final heartbeatEvery = config.sessionTimeoutMs ~/ 3;
+    final heartbeatEvery = config.heartbeatIntervalMs > 0
+        ? config.heartbeatIntervalMs
+        : config.sessionTimeoutMs ~/ 3;
     final pollCheckEvery = config.maxPollIntervalMs ~/ 3;
-    var every = heartbeatEvery < pollCheckEvery ? heartbeatEvery : pollCheckEvery;
+    var every =
+        heartbeatEvery < pollCheckEvery ? heartbeatEvery : pollCheckEvery;
     if (every < 1) every = 1;
     _timer = Timer.periodic(Duration(milliseconds: every), (_) {
       if (_ticking) return; // one heartbeat at a time
@@ -262,10 +270,10 @@ class GroupConsumer {
   }
 
   List<ConsumedRecord> _takeBuffered() {
-    final limit = config.maxPollRecords > 0 &&
-            config.maxPollRecords < _buffered.length
-        ? config.maxPollRecords
-        : _buffered.length;
+    final limit =
+        config.maxPollRecords > 0 && config.maxPollRecords < _buffered.length
+            ? config.maxPollRecords
+            : _buffered.length;
     final delivered = _buffered.sublist(0, limit);
     _buffered = _buffered.sublist(limit);
     for (final r in delivered) {
@@ -291,8 +299,8 @@ class GroupConsumer {
         ..int32(e.key.partition)
         ..int64(e.value);
     }
-    final r = bodyReader(
-        await _coordinatorRequest(ApiKey.offsetCommit, w.bytes()));
+    final r =
+        bodyReader(await _coordinatorRequest(ApiKey.offsetCommit, w.bytes()));
     final code = r.int32();
     if (code != ErrorCode.none) throw ServerException(code, 'offset_commit');
     _lastCommitMs = _now();
@@ -413,7 +421,8 @@ class GroupConsumer {
           ..int32(p.partition);
       }
     }
-    final r = bodyReader(await _coordinatorRequest(ApiKey.syncGroup, w.bytes()));
+    final r =
+        bodyReader(await _coordinatorRequest(ApiKey.syncGroup, w.bytes()));
     final code = r.int32();
     if (code == ErrorCode.rebalanceInProgress ||
         code == ErrorCode.illegalGeneration) {
@@ -505,7 +514,8 @@ class GroupConsumer {
       ..string(groupId)
       ..int32(generation)
       ..string(memberId);
-    final r = bodyReader(await _coordinatorRequest(ApiKey.heartbeat, w.bytes()));
+    final r =
+        bodyReader(await _coordinatorRequest(ApiKey.heartbeat, w.bytes()));
     final code = r.int32();
     if ((code == ErrorCode.rebalanceInProgress ||
             code == ErrorCode.unknownMemberId ||
@@ -631,7 +641,8 @@ Map<String, List<TopicPartition>> stickyAssign(
       final slot = TopicPartition(topic, p);
       String? holder;
       for (final id in previousIds) {
-        if ((previous[id] ?? const []).contains(slot) && subscribes(id, topic)) {
+        if ((previous[id] ?? const []).contains(slot) &&
+            subscribes(id, topic)) {
           holder = id;
           break;
         }

@@ -4,9 +4,13 @@ OCaml ≥ 4.14 with `unix`, `threads.posix` and camlzip (for gzip). No other
 dependencies. The library is `brahmaputra`, with the modules `Protocol`,
 `Connection`, `Router`, `Producer`, `Consumer`, `Group` and `Assignor`.
 
-Verified end to end against a live broker: **54/54 checks**, the same checks
-as the Go suite (`clients/go/cmd/manualtest`). Run them with
-`./test.sh HOST PORT`.
+Verified end to end against a live broker: **85/85 checks**: the 54 checks
+of the Go suite (`clients/go/cmd/manualtest`) plus 31 coverage checks for
+every setting below (batch.size, linger.ms, retries/backoff/delivery timeout
+against a fake refusing broker, fetch.max/min bytes, list offsets by
+timestamp, max.poll.records, auto commit, static membership, LeaveGroup,
+session timeout, generation fencing, a registered codec, decoder bounds).
+Run them with `./test.sh HOST PORT`.
 
 ## Build
 
@@ -154,7 +158,8 @@ no committed offset, `poll` raises `Protocol.No_offset_for_partition`.
 (`client.rack`), `isolation_level` (`Protocol.read_uncommitted`),
 `client_id`, `dial_timeout_ms`, `socket_timeout_ms`.
 
-**`Group.config`**: `session_timeout_ms` (10000l), `rebalance_timeout_ms`
+**`Group.config`**: `session_timeout_ms` (10000l), `heartbeat_interval_ms`
+(0, meaning a third of the session timeout), `rebalance_timeout_ms`
 (3000l), `max_poll_interval_ms` (300000), `auto_commit_interval_ms` (5000,
 where 0 disables auto commit), `auto_offset_reset` (`` `Earliest `` /
 `` `Latest `` / `` `None ``), `assignor` (`` `Range `` / `` `Roundrobin `` /
@@ -188,7 +193,8 @@ brahmaputra-server --data-dir ./data --default-partitions 4
 clients/ocaml/test.sh 127.0.0.1 9092     # builds, then runs build/manual_test.exe
 ```
 
-The script works from any directory and exits non-zero on any failed check.
+The script works from any directory, prints `85 passed, 0 failed`, and
+exits non-zero on any failed check.
 
 ## Not implemented
 

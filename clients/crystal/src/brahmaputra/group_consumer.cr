@@ -8,6 +8,9 @@ module Brahmaputra
     # `session.timeout.ms`: the coordinator evicts a member that stops
     # heartbeating for this long.
     property session_timeout_ms : Int32 = 10_000
+    # `heartbeat.interval.ms`: how often this member heartbeats, and so how
+    # soon it notices a rebalance; 0 means a third of the session timeout.
+    property heartbeat_interval_ms : Int32 = 0
     # `rebalance.timeout.ms`: how long the coordinator waits for rejoins.
     property rebalance_timeout_ms : Int32 = 3_000
     # `max.poll.interval.ms`: the longest gap *between* polls before this
@@ -361,7 +364,8 @@ module Brahmaputra
 
     private def heartbeat_loop : Nil
       # Wakes often enough for the shorter of the two deadlines it enforces.
-      heartbeat_every = Math.max(@config.session_timeout_ms // 3, 1)
+      heartbeat_every = @config.heartbeat_interval_ms
+      heartbeat_every = Math.max(@config.session_timeout_ms // 3, 1) if heartbeat_every <= 0
       poll_check_every = Math.max(@config.max_poll_interval_ms // 3, 1)
       interval = Math.min(heartbeat_every, poll_check_every).milliseconds
       left_for_slow_poll = false

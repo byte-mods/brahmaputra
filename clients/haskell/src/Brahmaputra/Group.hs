@@ -69,6 +69,8 @@ data AutoOffsetReset
 data GroupConfig = GroupConfig
   { gcClientId :: !Text
   , gcSessionTimeoutMs :: !Int32        -- ^ @session.timeout.ms@ (10 s)
+  , gcHeartbeatIntervalMs :: !Int       -- ^ @heartbeat.interval.ms@: how often to heartbeat, and so how
+                                        --   soon a rebalance is noticed; 0 means a third of the session timeout
   , gcRebalanceTimeoutMs :: !Int32      -- ^ @rebalance.timeout.ms@ (3 s)
   , gcMaxPollIntervalMs :: !Int         -- ^ @max.poll.interval.ms@ (300 s)
   , gcAutoCommitIntervalMs :: !Int      -- ^ @auto.commit.interval.ms@; 0 disables auto-commit (5 s)
@@ -85,6 +87,7 @@ defaultGroupConfig :: GroupConfig
 defaultGroupConfig = GroupConfig
   { gcClientId = "brahmaputra-haskell"
   , gcSessionTimeoutMs = 10000
+  , gcHeartbeatIntervalMs = 0
   , gcRebalanceTimeoutMs = 3000
   , gcMaxPollIntervalMs = 300000
   , gcAutoCommitIntervalMs = 5000
@@ -401,7 +404,10 @@ heartbeatLoop g = loop False
     config = gConfig g
     maxPoll = gcMaxPollIntervalMs config
     -- Two independent deadlines, so wake often enough for the shorter.
-    interval = max 1 (min (fromIntegral (gcSessionTimeoutMs config) `div` 3) (maxPoll `div` 3))
+    heartbeatEvery
+      | gcHeartbeatIntervalMs config > 0 = gcHeartbeatIntervalMs config
+      | otherwise = fromIntegral (gcSessionTimeoutMs config) `div` 3
+    interval = max 1 (min heartbeatEvery (maxPoll `div` 3))
     loop leftForSlowPoll = do
       stop <- timeout (interval * 1000) (atomically (readTVar (gClosed g) >>= check))
       case stop of

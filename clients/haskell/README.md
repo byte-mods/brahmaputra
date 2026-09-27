@@ -3,7 +3,7 @@
 A native Haskell driver: it speaks Brahmaputra's wire protocol directly
 over `network` sockets, with no FFI and no sidecar.
 
-Verified end to end against a live broker: **54/54 checks**
+Verified end to end against a live broker: **85/85 checks**
 (`./test.sh HOST PORT`, which compiles the library and the suite with
 `ghc -threaded -O1 -Wall -Werror` and runs it).
 
@@ -172,6 +172,7 @@ setRequestTimeout conn 300
 |---|---|---|
 | `gcClientId` | `client.id` | `"brahmaputra-haskell"` |
 | `gcSessionTimeoutMs` | `session.timeout.ms` | 10000 |
+| `gcHeartbeatIntervalMs` | `heartbeat.interval.ms` (0 = a third of the session timeout) | 0 |
 | `gcRebalanceTimeoutMs` | `rebalance.timeout.ms` | 3000 |
 | `gcMaxPollIntervalMs` | `max.poll.interval.ms` | 300000 |
 | `gcAutoCommitIntervalMs` | `auto.commit.interval.ms` (0 disables) | 5000 |
@@ -201,9 +202,14 @@ brahmaputra-server --data-dir ./data --default-partitions 4
 clients/haskell/test.sh 127.0.0.1 9092
 ```
 
-`test/ManualTest.hs` is a port of the Go suite with the same 19 sections
-and 54 checks, including a silent broker and a TCP proxy that drops
-connections, both written inside the test. It prints `54 passed, 0 failed`
+`test/ManualTest.hs` is a port of the Go suite's 19 sections and 54 checks,
+including a silent broker and a TCP proxy that drops connections, both
+written inside the test, followed by six coverage sections (31 checks) for
+every other setting above: batch.size, linger.ms, retries/backoff/delivery
+timeout against a fake refusing broker, fetch.max/min bytes, list offsets by
+timestamp, max.poll.records, auto-commit, static membership, LeaveGroup,
+session timeout, generation fencing, a registered codec and decoder bounds.
+It prints `85 passed, 0 failed`
 and exits non-zero on any failure. Set `GHC=` to pick a compiler, or
 `GHC_FLAGS=` to override `-Wall -Werror`.
 

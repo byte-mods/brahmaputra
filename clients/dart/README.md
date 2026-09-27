@@ -11,7 +11,7 @@ dependencies:
     path: path/to/brahmaputra/clients/dart
 ```
 
-Verified end to end against a live broker: **54/54 checks**
+Verified end to end against a live broker: **86/86 checks**
 (`./test.sh HOST PORT`, which runs `dart analyze --fatal-infos` and then
 `dart run bin/manual_test.dart HOST PORT`).
 
@@ -34,6 +34,10 @@ await producer.send('orders', utf8.encode('{"id":1}'),
 
 // A null value is a tombstone; an empty list is an empty value.
 await producer.send('orders', null, key: utf8.encode('user-7'));
+
+// Explicit partition and explicit timestamp (unix ms; defaults to now).
+await producer.send('orders', utf8.encode('{"id":3}'),
+    partition: 2, timestamp: 1700000000000);
 
 // Or wait for one record's offset. A full round trip — correct, and slow.
 final offset = await producer.sendSync('orders', utf8.encode('{"id":2}'));
@@ -111,7 +115,8 @@ GroupConfig.fromProperties({'enable.auto.commit': 'false',
 | `isolation.level` | `isolationLevel` | `readUncommitted` | |
 | `client.rack` | `clientRack` | `''` | |
 | **Group** | | | |
-| `session.timeout.ms` | `sessionTimeoutMs` | 10000 | heartbeat every third of it |
+| `session.timeout.ms` | `sessionTimeoutMs` | 10000 | coordinator evicts a member silent this long |
+| `heartbeat.interval.ms` | `heartbeatIntervalMs` | 0 | `0` = a third of `sessionTimeoutMs` |
 | `max.poll.interval.ms` | `maxPollIntervalMs` | 300000 | time inside `poll` never counts |
 | `auto.commit.interval.ms` | `autoCommitIntervalMs` | 5000 | `0` disables auto-commit |
 | `auto.offset.reset` | `autoOffsetReset` | `earliest` | `none` throws `NoOffsetForPartitionException` |
@@ -144,6 +149,14 @@ format.
 brahmaputra-server --data-dir ./data --default-partitions 4
 clients/dart/test.sh 127.0.0.1 9092
 ```
+
+The suite runs the Go suite's 54 checks, then coverage checks for every
+setting above (batch.size, linger.ms, explicit partition and timestamp,
+retries/backoff/delivery timeout against a fake refusing broker, fetch.max
+and fetch.min bytes, list offsets by timestamp, max.poll.records, auto
+commit, static membership, LeaveGroup, session timeout, generation fencing,
+a registered codec, a refused redial, decoder bounds), and prints
+`86 passed, 0 failed`; it exits non-zero on any failure.
 
 ## Not implemented
 

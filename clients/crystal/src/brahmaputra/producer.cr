@@ -111,24 +111,27 @@ module Brahmaputra
     end
 
     # Buffers one record, partitioned by murmur2(key), or round-robin when
-    # the key is nil. Call `flush` to await delivery.
+    # the key is nil. `timestamp` is unix milliseconds (default: now). Call
+    # `flush` to await delivery.
     def send(topic : String, value : Bytes | String | Nil, key : Bytes | String | Nil = nil,
-             headers : Array(Header) = [] of Header) : Nil
+             headers : Array(Header) = [] of Header, timestamp : Int64? = nil) : Nil
       key_bytes = Brahmaputra.to_bytes(key)
-      send_to(topic, choose_partition(topic, key_bytes), value, key_bytes, headers)
+      send_to(topic, choose_partition(topic, key_bytes), value, key_bytes, headers, timestamp)
     end
 
     # Buffers one record on an explicit partition. A nil value is a
     # tombstone, distinct from an empty value.
     def send_to(topic : String, partition : Int32, value : Bytes | String | Nil,
-                key : Bytes | String | Nil = nil, headers : Array(Header) = [] of Header) : Nil
+                key : Bytes | String | Nil = nil, headers : Array(Header) = [] of Header,
+                timestamp : Int64? = nil) : Nil
       raise Error.new("producer is closed") if @closed
       record = Record.new(Brahmaputra.to_bytes(key), Brahmaputra.to_bytes(value), 0_i64, headers)
       size = record_size(record)
       reserve(size)
       slot = TopicPartition.new(topic, partition)
+      created_ms = timestamp || Brahmaputra.now_ms
       full = @mutex.synchronize do
-        (@buffers[slot] ||= [] of Pending) << Pending.new(record, Brahmaputra.now_ms)
+        (@buffers[slot] ||= [] of Pending) << Pending.new(record, created_ms)
         @sizes[slot] = (@sizes[slot]? || 0_i64) + size
         @sizes[slot] >= @config.batch_size
       end
@@ -136,15 +139,16 @@ module Brahmaputra
     end
 
     # Sends one record on its own and returns its offset. A full round trip
-    # per record — correct, and slow.
+    # per record — correct, and slow. `partition` bypasses the partitioner.
     def send_sync(topic : String, value : Bytes | String | Nil, key : Bytes | String | Nil = nil,
-                  headers : Array(Header) = [] of Header) : Int64
+                  headers : Array(Header) = [] of Header, partition : Int32? = nil,
+                  timestamp : Int64? = nil) : Int64
       key_bytes = Brahmaputra.to_bytes(key)
-      partition = choose_partition(topic, key_bytes)
+      partition ||= choose_partition(topic, key_bytes)
       record = Record.new(key_bytes, Brahmaputra.to_bytes(value), 0_i64, headers)
       slot = TopicPartition.new(topic, partition)
       send_lock(slot).synchronize do
-        produce(topic, partition, [Pending.new(record, Brahmaputra.now_ms)])
+        produce(topic, partition, [Pending.new(record, timestamp || Brahmaputra.now_ms)])
       end
     end
 

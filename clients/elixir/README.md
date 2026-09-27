@@ -14,7 +14,7 @@ end
 mix compile --warnings-as-errors
 ```
 
-Verified end to end against a live broker: **54/54 checks**
+Verified end to end against a live broker: **85/85 checks**
 (`./test.sh 127.0.0.1 9092`).
 
 ## Processes
@@ -144,6 +144,7 @@ options, plus:
 | Option | Default | Meaning |
 |---|---|---|
 | `session_timeout_ms` | `10000` | coordinator evicts a member silent this long |
+| `heartbeat_interval_ms` | `nil` | heartbeat period (and how soon a rebalance is noticed); nil = a third of the session timeout |
 | `rebalance_timeout_ms` | `3000` | how long the coordinator waits for rejoins |
 | `max_poll_interval_ms` | `300000` | longest gap between polls before this member leaves |
 | `enable_auto_commit` | `true` | commit delivered positions from `poll` |
@@ -175,5 +176,10 @@ Start a broker, then:
 mix run e2e/manual_test.exs 127.0.0.1 9092
 ```
 
-It prints the same sections and checks as the Go suite and ends with
-`54 passed, 0 failed`; it exits 1 on a failed check and 2 on a fatal error.
+It prints the Go suite's sections and checks, then further sections covering
+every producer, consumer and group setting above (batch.size, linger.ms,
+retries against a fake refusing broker, fetch.max/min bytes, list offsets by
+timestamp, max.poll.records, auto-commit, static membership, LeaveGroup,
+session timeout, generation fencing, a registered codec, decoder bounds), and
+ends with `85 passed, 0 failed`; it exits 1 on a failed check and 2 on a
+fatal error.

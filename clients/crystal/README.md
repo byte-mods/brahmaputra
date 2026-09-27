@@ -4,7 +4,7 @@ A native Crystal driver for Brahmaputra's wire protocol: producer,
 partition consumer and consumer groups. Standard library only — no shard
 dependencies (`TCPSocket`, `Compress::Gzip`, fibers, `Channel`, `Mutex`).
 
-Verified end to end against a live broker: **54/54 checks**
+Verified end to end against a live broker: **85/85 checks**
 (`./test.sh HOST PORT`).
 
 ## Install
@@ -38,8 +38,12 @@ producer.send("orders", %({"id":1}), "user-7",
 # Explicit partition; a nil value is a tombstone, distinct from "".
 producer.send_to("orders", 0, nil, "user-7")
 
+# Explicit record timestamp (unix ms; defaults to now).
+producer.send("orders", %({"id":3}), timestamp: 1_700_000_000_000_i64)
+
 # Or wait for one record's offset. A full round trip — correct, and slow.
 offset = producer.send_sync("orders", %({"id":2}))
+offset = producer.send_sync("orders", %({"id":4}), partition: 1, timestamp: Brahmaputra.now_ms)
 
 producer.flush   # also raises the failure of any earlier background flush
 producer.close
@@ -87,7 +91,8 @@ ensure
 end
 ```
 
-A background fiber heartbeats every `session.timeout.ms / 3` and enforces
+A background fiber heartbeats every `heartbeat_interval_ms` (default
+`session.timeout.ms / 3`) and enforces
 `max.poll.interval.ms`: a member whose application goes longer than that
 between polls leaves the group and rejoins on its next `poll`. Time spent
 *inside* `poll` (joining, long-polling) never counts against it.
@@ -116,7 +121,8 @@ between polls leaves the group and rejoins on its next `poll`. Time spent
 `fetch_max_wait_ms` (500), `max_poll_records` (500), `isolation_level`,
 `client_rack`, `connect_timeout_ms`, `socket_timeout_ms`, `client_id`.
 
-`GroupConfig`: `session_timeout_ms` (10000), `rebalance_timeout_ms` (3000),
+`GroupConfig`: `session_timeout_ms` (10000), `heartbeat_interval_ms` (0,
+meaning a third of the session timeout), `rebalance_timeout_ms` (3000),
 `max_poll_interval_ms` (300000), `auto_commit_interval_ms` (5000; 0
 disables), `auto_offset_reset` (`"earliest"`), `partition_assignment_strategy`
 (`"range"`), `group_instance_id` (`""`), `max_poll_records`,
@@ -155,6 +161,11 @@ clients/crystal/test.sh 127.0.0.1 9092
 ```
 
 `test.sh` checks `crystal tool format`, builds `test/manual_test.cr` with
-`--release` into `bin/`, and runs it; it prints `54 passed, 0 failed` and
+`--release` into `bin/`, and runs it: the Go suite's 54 checks plus 31
+coverage checks for every setting above (batch.size, linger.ms, explicit
+timestamps, retries/backoff/delivery timeout against a fake refusing broker,
+fetch.max/min bytes, list offsets by timestamp, max.poll.records, auto
+commit, static membership, LeaveGroup, session timeout, generation fencing,
+a registered codec, decoder bounds). It prints `85 passed, 0 failed` and
 exits non-zero on any failure. Without the build step:
 `crystal run test/manual_test.cr -- 127.0.0.1 9092`.

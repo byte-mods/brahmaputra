@@ -615,5 +615,449 @@ begin
   must { p.close }
 end
 
+# ---------------------------------------------------------------------------
+# Coverage: one check per client feature the Go suite's sections do not
+# already exercise.
+# ---------------------------------------------------------------------------
+
+# The broker's lz4 payload: a little-endian uncompressed length, then a raw
+# LZ4 block. This encoder writes literals only (valid, if uncompressed).
+def lz4_compress(data : Bytes) : Bytes
+  io = IO::Memory.new
+  io.write_bytes(data.size.to_u32, IO::ByteFormat::LittleEndian)
+  if data.size >= 15
+    io.write_byte(0xf0_u8)
+    rest = data.size - 15
+    while rest >= 255
+      io.write_byte(255_u8)
+      rest -= 255
+    end
+    io.write_byte(rest.to_u8)
+  else
+    io.write_byte((data.size << 4).to_u8)
+  end
+  io.write(data)
+  io.to_slice
+end
+
+def lz4_decompress(data : Bytes) : Bytes
+  result = [] of UInt8
+  pos = 4
+  read_len = ->(n : Int32) do
+    if n == 15
+      loop do
+        b = data[pos]
+        pos += 1
+        n += b
+        break if b != 255
+      end
+    end
+    n
+  end
+  while pos < data.size
+    token = data[pos].to_i32
+    pos += 1
+    lits = read_len.call(token >> 4)
+    result.concat(data[pos, lits].to_a)
+    pos += lits
+    break if pos >= data.size
+    offset = data[pos].to_i32 | (data[pos + 1].to_i32 << 8)
+    pos += 2
+    (read_len.call(token & 15) + 4).times { result << result[result.size - offset] }
+  end
+  Slice.new(result.size) { |i| result[i] }
+end
+
+# A broker that answers Metadata with itself as the only broker and refuses
+# every produce: topic "fatal" with a non-retriable code, anything else with
+# NOT_ENOUGH_REPLICAS (retriable). Records {topic, acks, timeout} per produce.
+class FakeBroker
+  getter address : String
+  getter produces = [] of {String, Int32, Int32}
+
+  def initialize
+    @server = TCPServer.new("127.0.0.1", 0)
+    port = @server.local_address.port
+    @address = "127.0.0.1:#{port}"
+    spawn do
+      while client = (@server.accept? rescue nil)
+        spawn serve(client, port)
+      end
+    end
+  end
+
+  private def serve(client : TCPSocket, port : Int32) : Nil
+    loop do
+      size = client.read_bytes(Int32, IO::ByteFormat::BigEndian)
+      payload = Bytes.new(size)
+      client.read_fully(payload)
+      api = IO::ByteFormat::BigEndian.decode(Int16, payload[0, 2])
+      clen = IO::ByteFormat::BigEndian.decode(Int16, payload[8, 2]).to_i32
+      body = answer(api, payload[10 + clen, size - 10 - clen], port)
+      client.write_bytes(10 + clen + body.size, IO::ByteFormat::BigEndian)
+      client.write(payload[0, 10 + clen])
+      client.write(body)
+      client.flush
+    end
+  rescue
+    client.close rescue nil
+  end
+
+  private def answer(api : Int16, req : Bytes, port : Int32) : Bytes
+    w = BP::Protocol::Writer.new
+    r = BP::Protocol::Reader.new(req)
+    case api
+    when 3
+      topics = r.string_array
+      w.int32(0).int32(1).int32(0).string("127.0.0.1").int32(port).string("").int32(0).int32(topics.size)
+      topics.each { |t| w.string(t).int32(0).int32(1).int32(0).int32(0).int32(1).int32(0).int32(1).int32(0).int32(0) }
+    when 0
+      topic = r.string
+      partition = r.int32
+      acks = r.int32
+      timeout = r.int32
+      @produces << {topic, acks, timeout}
+      w.string(topic).int32(partition).int32(topic == "fatal" ? 87 : 10).int64(-1).int64(-1)
+    else
+      w.int32(35)
+    end
+    w.to_slice
+  end
+
+  def close : Nil
+    @server.close rescue nil
+  end
+end
+
+def fails(&) : Bool
+  yield
+  false
+rescue
+  true
+end
+
+def elapsed_ms(started : Time::Span) : Int64
+  (Time.monotonic - started).total_milliseconds.to_i64
+end
+
+# Sizes of successive non-empty polls until `want` records or the deadline.
+def poll_sizes(gc : BP::GroupConsumer, want : Int32, within : Time::Span) : Array(Int32)
+  sizes = [] of Int32
+  deadline = Time.monotonic + within
+  while sizes.sum < want && Time.monotonic < deadline
+    got = gc.poll(300.milliseconds) rescue [] of BP::ConsumedRecord
+    sizes << got.size unless got.empty?
+  end
+  sizes
+end
+
+def poll_until(gc : BP::GroupConsumer, want : Int32, within : Time::Span) : Array(BP::ConsumedRecord)
+  got = [] of BP::ConsumedRecord
+  deadline = Time.monotonic + within
+  while got.size < want && Time.monotonic < deadline
+    got.concat(must { gc.poll(300.milliseconds) })
+  end
+  got
+end
+
+# Polls every group concurrently (a join blocks until every member has
+# rejoined) until the block holds or the deadline passes.
+def settle(groups : Array(BP::GroupConsumer), within : Time::Span, &done : -> Bool) : Bool
+  deadline = Time.monotonic + within
+  loop do
+    finished = Channel(Nil).new(groups.size)
+    groups.each do |g|
+      spawn do
+        g.poll(200.milliseconds) rescue nil
+        finished.send(nil)
+      end
+    end
+    groups.size.times { finished.receive }
+    return true if done.call
+    return false if Time.monotonic >= deadline
+  end
+end
+
+def group_with(address = ADDRESS, group = unique("cr-grp"), &) : BP::GroupConsumer
+  config = BP::GroupConfig.new
+  config.auto_commit_interval_ms = 0
+  yield config
+  must { BP::GroupConsumer.new(address, group, config) }
+end
+
+def run_coverage : Nil
+  section "producer settings"
+  begin
+    c = consumer
+    topic = unique("cr-batchsize")
+    p = producer(60_000) { |cfg| cfg.batch_size = 64 }
+    3.times { |i| must { p.send_to(topic, 0, "b" * 100 + i.to_s) } }
+    got = must { c.fetch(topic, 0, 0_i64, 1000) }
+    check "batch.size sends a full batch without waiting for linger", got.size == 3, "got #{got.size}"
+    p.close rescue nil
+
+    topic = unique("cr-linger")
+    p = producer(50) { |cfg| cfg.batch_size = 1_048_576 }
+    must { p.send_to(topic, 0, "lingering") }
+    sleep 500.milliseconds
+    got = must { c.fetch(topic, 0, 0_i64, 1000) }
+    check "linger.ms flushes a partial batch on its own", got.size == 1, "got #{got.size}"
+    p.close rescue nil
+
+    topic = unique("cr-sync")
+    p = producer
+    stamp = 1_600_000_000_000_i64
+    first = must { p.send_sync(topic, "one", partition: 2, timestamp: stamp) }
+    second = must { p.send_sync(topic, "two", partition: 2, timestamp: stamp + 1000) }
+    check "send_sync returns consecutive offsets", first == 0 && second == 1, "#{first}, #{second}"
+    got = must { c.fetch(topic, 2, 0_i64, 1000) }
+    check "an explicit partition is honoured", got.size == 2, "partition 2 holds #{got.size}"
+    check "an explicit timestamp is stored exactly", got.map(&.timestamp) == [stamp, stamp + 1000], got.map(&.timestamp).inspect
+    rr_topic = unique("cr-roundrobin")
+    parts = must { p.router.partitions(rr_topic) }
+    (2 * parts.size).times { |i| must { p.send(rr_topic, "rr#{i}") } }
+    must { p.flush }
+    counts = parts.map { |part| must { c.fetch(rr_topic, part, 0_i64, 300) }.size }
+    check "keyless records are spread round-robin", counts.all?(2), counts.inspect
+    must { p.close }
+
+    # A codec the driver does not carry, registered by the application: a
+    # valid LZ4 block of literals only, which the broker accepts as-is.
+    BP.register_codec(BP::Compression::Lz4, ->(b : Bytes) { lz4_compress(b) }, ->(b : Bytes) { lz4_decompress(b) })
+    topic = unique("cr-lz4")
+    body = ->(i : Int32) { "registered codec payload " * 20 + i.to_s }
+    p = producer { |cfg| cfg.compression_type = "lz4" }
+    5.times { |i| must { p.send_to(topic, 0, body.call(i)) } }
+    must { p.close }
+    got = must { c.fetch(topic, 0, 0_i64, 1000) }
+    check "a registered codec round-trips through the broker",
+      got.map(&.value_string) == (0...5).map { |i| body.call(i) }, "got #{got.size}"
+    c.close
+  end
+
+  section "retries against a broker that refuses"
+  begin
+    fake = FakeBroker.new
+    config = BP::ProducerConfig.new
+    config.linger_ms = 0
+    config.acks = -1
+    config.request_timeout_ms = 1234
+    config.retries = 2
+    config.retry_backoff_ms = 150
+    p = must { BP::Producer.new(fake.address, config) }
+    started = Time.monotonic
+    failed = fails { p.send_sync("retriable", "x", partition: 0) }
+    took = elapsed_ms(started)
+    attempts = fake.produces.dup
+    check "request.timeout.ms and acks reach the broker",
+      !attempts.empty? && attempts.all? { |a| a[1] == -1 && a[2] == 1234 }, attempts.inspect
+    check "a retriable error is retried `retries` times", failed && attempts.size == 3, "#{attempts.size} attempts"
+    check "retry.backoff.ms spaces the retries", took >= 300, "#{took} ms"
+    fake.produces.clear
+    fatal = fails { p.send_sync("fatal", "x", partition: 0) }
+    check "a non-retriable error is not retried", fatal && fake.produces.size == 1, "#{fake.produces.size} attempts"
+    p.close rescue nil
+    fake.produces.clear
+    config = BP::ProducerConfig.new
+    config.linger_ms = 0
+    config.retries = 1_000_000
+    config.retry_backoff_ms = 50
+    config.delivery_timeout_ms = 400
+    p = must { BP::Producer.new(fake.address, config) }
+    started = Time.monotonic
+    capped = fails { p.send_sync("retriable", "x", partition: 0) }
+    took = elapsed_ms(started)
+    check "delivery.timeout.ms caps the retries", capped && took < 3000, "#{took} ms, #{fake.produces.size} attempts"
+    p.close rescue nil
+    fake.close
+  end
+
+  section "consumer settings"
+  begin
+    topic = unique("cr-fetchcfg")
+    p = producer
+    20.times { |i| must { p.send_to(topic, 0, "f" * 1000 + i.to_s) } }
+    must { p.close }
+    c = consumer
+    records, hw = must { c.fetch_verbose(topic, 0, 0_i64, 500) }
+    check "fetch reports the high watermark", hw == 20, hw.to_s
+    check "a default fetch returns every record", records.size == 20, "got #{records.size}"
+    meta = must { c.router.refresh(topic) }
+    brokers = meta.brokers.map(&.node_id)
+    infos = meta.topics.find { |t| t.name == topic }.try(&.partitions) || [] of BP::PartitionInfo
+    check "metadata names a live leader for every partition",
+      !infos.empty? && infos.all? { |i| brokers.includes?(i.leader) }, infos.inspect
+    c.close
+    small = must { BP::Consumer.new(ADDRESS, BP::ConsumerConfig.new { |cfg| cfg.fetch_max_bytes = 2500 }) }
+    got = must { small.fetch(topic, 0, 0_i64, 500) }
+    check "fetch.max.bytes caps a response", !got.empty? && got.size < 20, "got #{got.size}"
+    small.close
+    patient = must do
+      BP::Consumer.new(ADDRESS, BP::ConsumerConfig.new { |cfg| cfg.fetch_min_bytes = 10_000_000; cfg.fetch_max_wait_ms = 400 })
+    end
+    started = Time.monotonic
+    got = must { patient.fetch(topic, 0, 19_i64, 400) }
+    waited = elapsed_ms(started)
+    check "fetch.min.bytes holds a fetch for up to fetch.max.wait.ms",
+      got.size == 1 && waited >= 300 && waited < 5000, "#{waited} ms, #{got.size} records"
+    patient.close
+
+    topic = unique("cr-bytime")
+    p = producer
+    base = 1_700_000_000_000_i64
+    3.times { |i| must { p.send_to(topic, 0, "t#{i}", timestamp: base + i * 10_000) } }
+    must { p.close }
+    c = consumer
+    at = must { c.list_offsets(topic, 0, base + 5000) }
+    check "list offsets by timestamp finds the first record at or after it", at == 1, at.to_s
+    c.close
+
+    topic = unique("cr-maxpoll")
+    p = producer
+    10.times { |i| must { p.send_to(topic, 0, "m#{i}") } }
+    must { p.close }
+    gc = group_with(group: unique("cr-maxpoll-grp")) { |cfg| cfg.max_poll_records = 3 }
+    gc.subscribe([topic])
+    sizes = poll_sizes(gc, 10, 15.seconds)
+    check "max.poll.records caps a poll", sizes.sum == 10 && sizes.all? { |n| n <= 3 }, sizes.inspect
+    gc.close rescue nil
+  end
+
+  section "consumer group settings"
+  begin
+    p = producer
+    t1 = unique("cr-multi-a")
+    t2 = unique("cr-multi-b")
+    5.times do |i|
+      must { p.send(t1, "a#{i}") }
+      must { p.send(t2, "b#{i}") }
+    end
+    gc = group_with { }
+    gc.subscribe([t1, t2])
+    got = poll_until(gc, 10, 15.seconds)
+    per_topic = got.map(&.topic).tally
+    check "a group consumes every subscribed topic", per_topic == {t1 => 5, t2 => 5}, per_topic.inspect
+    gc.close rescue nil
+
+    topic = unique("cr-autocommit")
+    6.times { |i| must { p.send_to(topic, 0, "c#{i}") } }
+    slot = BP::TopicPartition.new(topic, 0)
+    committed_after = ->(interval : Int32) do
+      g = group_with { |cfg| cfg.auto_commit_interval_ms = interval }
+      g.subscribe([topic])
+      poll_until(g, 6, 15.seconds)
+      sleep 200.milliseconds
+      g.poll(300.milliseconds) rescue nil
+      committed = must { g.committed([slot]) }
+      g.close rescue nil
+      committed[slot]?
+    end
+    auto = committed_after.call(100)
+    check "auto-commit records positions without an explicit commit", auto == 6, auto.inspect
+    manual = committed_after.call(0)
+    check "disabled auto-commit commits nothing", manual.nil? || manual < 0, manual.inspect
+
+    # Static membership: a second instance presenting the same
+    # group.instance.id takes over the first one's partitions at once,
+    # without a rebalance, while the first is still heartbeating.
+    topic = unique("cr-static")
+    must { p.router.partitions(topic) }
+    group = unique("cr-static-grp")
+    first = group_with(group: group) { |cfg| cfg.group_instance_id = "instance-1" }
+    first.subscribe([topic])
+    first.poll(2.seconds) rescue nil
+    first_assignment = first.assignment
+    second = group_with(group: group) { |cfg| cfg.group_instance_id = "instance-1" }
+    second.subscribe([topic])
+    started = Time.monotonic
+    second.poll(200.milliseconds) rescue nil
+    took = elapsed_ms(started)
+    second_assignment = second.assignment
+    check "a static member reclaims its partitions without a rebalance",
+      first_assignment.size == 4 && second_assignment.sort == first_assignment.sort && took < 2000,
+      "first=#{first_assignment} second=#{second_assignment} #{took} ms"
+    second.close rescue nil
+    first.close rescue nil
+
+    # LeaveGroup on close: with a 30 s session and a 200 ms heartbeat, the
+    # survivor takes over within a heartbeat, not a session.
+    topic = unique("cr-leave")
+    must { p.router.partitions(topic) }
+    group = unique("cr-leave-grp")
+    a = group_with(group: group) { |cfg| cfg.session_timeout_ms = 30_000; cfg.heartbeat_interval_ms = 200 }
+    b = group_with(group: group) { |cfg| cfg.session_timeout_ms = 30_000; cfg.heartbeat_interval_ms = 200 }
+    a.subscribe([topic])
+    b.subscribe([topic])
+    split = settle([a, b], 20.seconds) { a.assignment.size == 2 && b.assignment.size == 2 }
+    must { a.close }
+    started = Time.monotonic
+    took_over = settle([b], 15.seconds) { b.assignment.size == 4 }
+    took = elapsed_ms(started)
+    check "closing a member hands its partitions over within a heartbeat",
+      split && took_over && took < 5000, "split=#{split} took_over=#{took_over} #{took} ms"
+    b.close rescue nil
+
+    # session.timeout.ms: a member that goes silent without leaving (its only
+    # route to the broker is a proxy that is shut) is evicted once its session
+    # lapses, and the survivor takes over.
+    topic = unique("cr-session")
+    must { p.router.partitions(topic) }
+    group = unique("cr-session-grp")
+    proxy = Proxy.new(ADDRESS)
+    a = group_with(proxy.address, group) { |cfg| cfg.session_timeout_ms = 2000; cfg.heartbeat_interval_ms = 200 }
+    b = group_with(group: group) { |cfg| cfg.session_timeout_ms = 2000; cfg.heartbeat_interval_ms = 200 }
+    a.subscribe([topic])
+    b.subscribe([topic])
+    split = settle([a, b], 20.seconds) { a.assignment.size == 2 && b.assignment.size == 2 }
+    proxy.close
+    started = Time.monotonic
+    took_over = settle([b], 20.seconds) { b.assignment.size == 4 }
+    took = elapsed_ms(started)
+    check "a silent member is evicted after session.timeout.ms",
+      split && took_over && took >= 1000 && took < 12_000, "split=#{split} took_over=#{took_over} #{took} ms"
+    b.close rescue nil
+    a.close rescue nil
+
+    # Generation fencing: a member whose generation moved on cannot commit.
+    topic = unique("cr-fence")
+    4.times { |i| must { p.send(topic, "f#{i}") } }
+    group = unique("cr-fence-grp")
+    a = group_with(group: group) { }
+    a.subscribe([topic])
+    poll_until(a, 4, 10.seconds)
+    b = group_with(group: group) { }
+    b.subscribe([topic])
+    b.poll(500.milliseconds) rescue nil
+    check "a commit from a stale generation is refused", fails { a.commit }, "commit succeeded"
+    b.close rescue nil
+    a.close rescue nil
+    must { p.close }
+  end
+
+  section "assignors (unit)"
+  begin
+    members = [BP::Assignors::Member.new("a", ["t"]), BP::Assignors::Member.new("b", ["t"])]
+    slots = ->(r : Array(Int32)) { r.map { |i| BP::TopicPartition.new("t", i) } }
+    sticky = BP::Assignors.sticky(members, {"t" => (0..11).to_a}, {"a" => slots.call((0..11).to_a), "b" => [] of BP::TopicPartition})
+    check "sticky keeps partitions in numeric order",
+      sticky["a"] == slots.call((0..5).to_a) && sticky["b"] == slots.call((6..11).to_a), sticky.inspect
+    held = {"a" => slots.call([1, 3]), "b" => slots.call([0, 2])}
+    kept = BP::Assignors.sticky(members, {"t" => [0, 1, 2, 3]}, held)
+    check "sticky keeps what members already hold", kept == held, kept.inspect
+  end
+
+  section "decoder bounds"
+  begin
+    negative = BP::Protocol::Writer.new.int32(-5).to_slice
+    check "a negative length is an error", fails { BP::Protocol::Reader.new(negative).string }
+    oversized = BP::Protocol::Writer.new.int32(1_000_000).raw("short".to_slice).to_slice
+    check "a length past the end of the data is an error", fails { BP::Protocol::Reader.new(oversized).string }
+    batch = Bytes[0, 0, 0, 0, 0, 0, 0, 0, 0x7f, 0xff, 0xff, 0xff, 0, 0, 0, 0]
+    check "a batch longer than its bytes is an error", fails { BP::RecordBatch.decode(batch, 0) }
+  end
+end
+
+run_coverage
+
 puts "\n#{Tally.passed} passed, #{Tally.failed} failed"
 exit(Tally.failed > 0 ? 1 : 0)

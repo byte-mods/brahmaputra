@@ -17,7 +17,10 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.ByteString (ByteString)
 import Data.Int (Int32, Int64)
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.IORef
+import Data.List (sort)
+import Data.Word (Word8)
 import Data.List (isInfixOf)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -578,6 +581,8 @@ main = do
     must (closeGroupConsumer consumer)
     must (closeProducer producer)
 
+  coverage address
+
   (passed, failed) <- readIORef counters
   putStrLn ("\n" ++ show passed ++ " passed, " ++ show failed ++ " failed")
   when (failed > 0) $ exitWith (ExitFailure 1)
@@ -661,3 +666,420 @@ closeProxy :: Proxy -> IO ()
 closeProxy proxy = do
   NS.close (proxyListener proxy) `catch` \(_ :: SomeException) -> pure ()
   dropAll proxy
+
+-- ---------------------------------------------------------------------------
+-- Coverage: one check per client feature the sections above do not
+-- already exercise.
+-- ---------------------------------------------------------------------------
+
+isLeft' :: Either a b -> Bool
+isLeft' = either (const True) (const False)
+
+coverage :: String -> IO ()
+coverage address = do
+  section "producer settings"
+  consumer <- must (newConsumer address defaultConsumerConfig)
+  do
+    -- batch.size: a full partition goes out at once although linger would
+    -- hold it for a minute.
+    topic <- unique "hs-batchsize"
+    producer <- must (newProducer address defaultProducerConfig { pcLingerMs = 60000, pcBatchSize = 64 })
+    forM_ [0 .. 2 :: Int] $ \i -> must (sendTo producer topic 0 (Just (bytes (replicate 100 'b' ++ show i))) Nothing [])
+    got <- must (fetch consumer topic 0 0 1000)
+    check "batch.size sends a full batch without waiting for linger" (length got == 3) ("got " ++ show (length got))
+    void (try (closeProducer producer) :: IO (Either SomeException ()))
+  do
+    topic <- unique "hs-linger"
+    producer <- must (newProducer address defaultProducerConfig { pcLingerMs = 50, pcBatchSize = 1048576 })
+    must (sendTo producer topic 0 (Just "lingering") Nothing [])
+    threadDelay 500000
+    got <- must (fetch consumer topic 0 0 1000)
+    check "linger.ms flushes a partial batch on its own" (length got == 1) ("got " ++ show (length got))
+    void (try (closeProducer producer) :: IO (Either SomeException ()))
+  do
+    topic <- unique "hs-sync"
+    producer <- must (newProducer address noLinger)
+    let stamp = 1600000000000 :: Int64
+        at ts v = (producerRecord topic (Just v)) { prPartition = Just 2, prTimestamp = Just ts }
+    first <- must (sendSync producer (at stamp "one"))
+    second <- must (sendSync producer (at (stamp + 1000) "two"))
+    check "send_sync returns consecutive offsets" (first == 0 && second == 1) (show (first, second))
+    got <- must (fetch consumer topic 2 0 1000)
+    check "an explicit partition is honoured" (length got == 2) ("partition 2 holds " ++ show (length got))
+    check "an explicit timestamp is stored exactly" (map crTimestamp got == [stamp, stamp + 1000])
+      (show (map crTimestamp got))
+    rrTopic <- unique "hs-roundrobin"
+    parts <- must (routerPartitions (producerRouter producer) rrTopic)
+    forM_ [1 .. 2 * length parts] $ \i -> must (sendKeyed producer rrTopic (Just (bytes ("rr" ++ show i))) Nothing)
+    must (flush producer)
+    counts <- forM parts $ \part -> length <$> must (fetch consumer rrTopic part 0 300)
+    check "keyless records are spread round-robin" (all (== 2) counts) (show counts)
+    must (closeProducer producer)
+  do
+    -- A codec the driver does not carry, registered by the application: a
+    -- valid LZ4 block of literals only, which the broker accepts as-is.
+    registerCodec Lz4 (pure . lz4Compress) lz4Decompress
+    topic <- unique "hs-lz4"
+    let body i = bytes (concat (replicate 20 "registered codec payload ") ++ show i)
+    producer <- must (newProducer address noLinger { pcCompression = Lz4 })
+    forM_ [0 .. 4 :: Int] $ \i -> must (sendTo producer topic 0 (Just (body i)) Nothing [])
+    must (closeProducer producer)
+    got <- must (fetch consumer topic 0 0 1000)
+    check "a registered codec round-trips through the broker"
+      (map crValue got == [Just (body i) | i <- [0 .. 4 :: Int]]) ("got " ++ show (length got))
+  closeConsumer consumer
+
+  section "retries against a broker that refuses"
+  do
+    (fakeAddress, produces, stopFake) <- fakeBroker
+    producer <- must (newProducer fakeAddress noLinger
+      { pcAcks = AcksAll, pcRequestTimeoutMs = 1234, pcRetries = 2, pcRetryBackoffMs = 150 })
+    started <- monoMs
+    result <- try (sendSync producer (producerRecord "retriable" (Just "x")) { prPartition = Just 0 })
+    took <- elapsedSince started
+    attempts <- readIORef produces
+    check "request.timeout.ms and acks reach the broker"
+      (not (null attempts) && all (\(_, acks, t) -> acks == -1 && t == 1234) attempts) (show attempts)
+    check "a retriable error is retried `retries` times"
+      (either (\(_ :: BrahmaputraError) -> True) (const False) result && length attempts == 3)
+      (show (length attempts) ++ " attempts")
+    check "retry.backoff.ms spaces the retries" (took >= 300) (show took ++ " ms")
+    writeIORef produces []
+    fatal <- try (sendSync producer (producerRecord "fatal" (Just "x")) { prPartition = Just 0 })
+    fatalAttempts <- readIORef produces
+    check "a non-retriable error is not retried"
+      (either (\(_ :: BrahmaputraError) -> True) (const False) fatal && length fatalAttempts == 1)
+      (show (length fatalAttempts) ++ " attempts")
+    void (try (closeProducer producer) :: IO (Either SomeException ()))
+    writeIORef produces []
+    capped <- must (newProducer fakeAddress noLinger
+      { pcRetries = 1000000, pcRetryBackoffMs = 50, pcDeliveryTimeoutMs = 400 })
+    started' <- monoMs
+    result' <- try (sendSync capped (producerRecord "retriable" (Just "x")) { prPartition = Just 0 })
+    took' <- elapsedSince started'
+    n <- length <$> readIORef produces
+    check "delivery.timeout.ms caps the retries"
+      (either (\(_ :: BrahmaputraError) -> True) (const False) result' && took' < 3000)
+      (show took' ++ " ms, " ++ show n ++ " attempts")
+    void (try (closeProducer capped) :: IO (Either SomeException ()))
+    stopFake
+
+  section "consumer settings"
+  do
+    topic <- unique "hs-fetchcfg"
+    producer <- must (newProducer address noLinger)
+    forM_ [0 .. 19 :: Int] $ \i -> must (sendTo producer topic 0 (Just (bytes (replicate 1000 'f' ++ show i))) Nothing [])
+    must (closeProducer producer)
+    c <- must (newConsumer address defaultConsumerConfig)
+    (records, hw) <- must (fetchVerbose c topic 0 0 500)
+    check "fetch reports the high watermark" (hw == 20) (show hw)
+    check "a default fetch returns every record" (length records == 20) ("got " ++ show (length records))
+    meta <- must (refreshMetadata (consumerRouter c) topic)
+    let brokers = Set.fromList (map brokerNodeId (metaBrokers meta))
+        infos = concat [topicPartitions t | t <- metaTopics meta, topicName t == topic]
+    check "metadata names a live leader for every partition"
+      (not (null infos) && all ((`Set.member` brokers) . piLeader) infos) (show infos)
+    closeConsumer c
+    small <- must (newConsumer address defaultConsumerConfig { ccFetchMaxBytes = 2500 })
+    got <- must (fetch small topic 0 0 500)
+    check "fetch.max.bytes caps a response" (not (null got) && length got < 20) ("got " ++ show (length got))
+    closeConsumer small
+    patient <- must (newConsumer address defaultConsumerConfig { ccFetchMinBytes = 10000000, ccFetchMaxWaitMs = 400 })
+    started <- monoMs
+    tailRecords <- must (fetch patient topic 0 19 400)
+    waited <- elapsedSince started
+    check "fetch.min.bytes holds a fetch for up to fetch.max.wait.ms"
+      (length tailRecords == 1 && waited >= 300 && waited < 5000)
+      (show waited ++ " ms, " ++ show (length tailRecords) ++ " records")
+    closeConsumer patient
+  do
+    topic <- unique "hs-bytime"
+    producer <- must (newProducer address noLinger)
+    let base = 1700000000000 :: Int64
+    forM_ [0 .. 2 :: Int64] $ \i ->
+      must (send producer (producerRecord topic (Just (bytes ("t" ++ show i))))
+              { prPartition = Just 0, prTimestamp = Just (base + i * 10000) })
+    must (closeProducer producer)
+    c <- must (newConsumer address defaultConsumerConfig)
+    at <- must (listOffsets c topic 0 (AtTimestamp (base + 5000)))
+    check "list offsets by timestamp finds the first record at or after it" (at == 1) (show at)
+    closeConsumer c
+  do
+    topic <- unique "hs-maxpoll"
+    producer <- must (newProducer address noLinger)
+    forM_ [0 .. 9 :: Int] $ \i -> must (sendTo producer topic 0 (Just (bytes ("m" ++ show i))) Nothing [])
+    must (closeProducer producer)
+    groupId <- unique "hs-maxpoll-grp"
+    g <- must (newGroupConsumer address groupId noAutoCommit { gcMaxPollRecords = 3 })
+    subscribe g [topic]
+    sizes <- pollSizes g 10 15000
+    check "max.poll.records caps a poll" (sum sizes == 10 && all (<= 3) sizes) (show sizes)
+    must (closeGroupConsumer g)
+
+  section "consumer group settings"
+  producer <- must (newProducer address noLinger)
+  do
+    t1 <- unique "hs-multi-a"
+    t2 <- unique "hs-multi-b"
+    forM_ [0 .. 4 :: Int] $ \i -> must (sendKeyed producer t1 (Just (bytes ("a" ++ show i))) Nothing)
+    forM_ [0 .. 4 :: Int] $ \i -> must (sendKeyed producer t2 (Just (bytes ("b" ++ show i))) Nothing)
+    groupId <- unique "hs-multi-grp"
+    g <- must (newGroupConsumer address groupId noAutoCommit)
+    subscribe g [t1, t2]
+    got <- pollUntil g 10 15000 300
+    let perTopic = Map.fromListWith (+) [(crTopic r, 1 :: Int) | r <- got]
+    check "a group consumes every subscribed topic" (perTopic == Map.fromList [(t1, 5), (t2, 5)]) (show perTopic)
+    must (closeGroupConsumer g)
+  do
+    topic <- unique "hs-autocommit"
+    forM_ [0 .. 5 :: Int] $ \i -> must (sendTo producer topic 0 (Just (bytes ("c" ++ show i))) Nothing [])
+    let slot = TopicPartition topic 0
+    autoGroup <- unique "hs-auto-grp"
+    g <- must (newGroupConsumer address autoGroup defaultGroupConfig { gcAutoCommitIntervalMs = 100 })
+    subscribe g [topic]
+    _ <- pollUntil g 6 15000 300
+    threadDelay 200000
+    _ <- try (poll g 300) :: IO (Either BrahmaputraError [ConsumerRecord])
+    committedAuto <- must (committed g [slot])
+    check "auto-commit records positions without an explicit commit"
+      (Map.lookup slot committedAuto == Just 6) (show committedAuto)
+    must (closeGroupConsumer g)
+    manualGroup <- unique "hs-noauto-grp"
+    g' <- must (newGroupConsumer address manualGroup noAutoCommit)
+    subscribe g' [topic]
+    _ <- pollUntil g' 6 15000 300
+    threadDelay 200000
+    _ <- try (poll g' 300) :: IO (Either BrahmaputraError [ConsumerRecord])
+    committedManual <- must (committed g' [slot])
+    check "disabled auto-commit commits nothing"
+      (maybe True (< 0) (Map.lookup slot committedManual)) (show committedManual)
+    must (closeGroupConsumer g')
+  do
+    -- Static membership: a second instance presenting the same
+    -- group.instance.id takes over the first one's partitions at once,
+    -- without a rebalance, while the first is still heartbeating.
+    topic <- unique "hs-static"
+    _ <- must (routerPartitions (producerRouter producer) topic)
+    groupId <- unique "hs-static-grp"
+    let config = noAutoCommit { gcGroupInstanceId = Just "instance-1" }
+    first <- must (newGroupConsumer address groupId config)
+    subscribe first [topic]
+    _ <- try (poll first 2000) :: IO (Either BrahmaputraError [ConsumerRecord])
+    firstAssignment <- assignment first
+    second <- must (newGroupConsumer address groupId config)
+    subscribe second [topic]
+    started <- monoMs
+    _ <- try (poll second 200) :: IO (Either BrahmaputraError [ConsumerRecord])
+    took <- elapsedSince started
+    secondAssignment <- assignment second
+    check "a static member reclaims its partitions without a rebalance"
+      (length firstAssignment == 4 && sort secondAssignment == sort firstAssignment && took < 2000)
+      ("first=" ++ show firstAssignment ++ " second=" ++ show secondAssignment ++ " " ++ show took ++ " ms")
+    void (try (closeGroupConsumer second) :: IO (Either SomeException ()))
+    void (try (closeGroupConsumer first) :: IO (Either SomeException ()))
+  do
+    -- LeaveGroup on close: with a 30 s session and a 200 ms heartbeat, the
+    -- survivor takes over within a heartbeat, not a session.
+    topic <- unique "hs-leave"
+    _ <- must (routerPartitions (producerRouter producer) topic)
+    groupId <- unique "hs-leave-grp"
+    let config = noAutoCommit { gcSessionTimeoutMs = 30000, gcHeartbeatIntervalMs = 200 }
+    a <- must (newGroupConsumer address groupId config)
+    b <- must (newGroupConsumer address groupId config)
+    subscribe a [topic]
+    subscribe b [topic]
+    split <- settle [a, b] (do { as <- mapM assignment [a, b]; pure (map length as == [2, 2]) }) 20000
+    must (closeGroupConsumer a)
+    started <- monoMs
+    tookOver <- settle [b] ((== 4) . length <$> assignment b) 15000
+    took <- elapsedSince started
+    check "closing a member hands its partitions over within a heartbeat"
+      (split && tookOver && took < 5000)
+      ("split=" ++ show split ++ " took_over=" ++ show tookOver ++ " " ++ show took ++ " ms")
+    must (closeGroupConsumer b)
+  do
+    -- session.timeout.ms: a member that goes silent without leaving (its
+    -- only route to the broker is a proxy that is shut) is evicted once its
+    -- session lapses, and the survivor takes over.
+    topic <- unique "hs-session"
+    _ <- must (routerPartitions (producerRouter producer) topic)
+    groupId <- unique "hs-session-grp"
+    let config = noAutoCommit { gcSessionTimeoutMs = 2000, gcHeartbeatIntervalMs = 200 }
+    proxy <- newProxy address
+    a <- must (newGroupConsumer (proxyAddress proxy) groupId config)
+    b <- must (newGroupConsumer address groupId config)
+    subscribe a [topic]
+    subscribe b [topic]
+    split <- settle [a, b] (do { as <- mapM assignment [a, b]; pure (map length as == [2, 2]) }) 20000
+    closeProxy proxy
+    started <- monoMs
+    tookOver <- settle [b] ((== 4) . length <$> assignment b) 20000
+    took <- elapsedSince started
+    check "a silent member is evicted after session.timeout.ms"
+      (split && tookOver && took >= 1000 && took < 12000)
+      ("split=" ++ show split ++ " took_over=" ++ show tookOver ++ " " ++ show took ++ " ms")
+    must (closeGroupConsumer b)
+    void (try (closeGroupConsumer a) :: IO (Either SomeException ()))
+  do
+    -- Generation fencing: a member whose generation moved on cannot commit.
+    topic <- unique "hs-fence"
+    forM_ [0 .. 3 :: Int] $ \i -> must (sendKeyed producer topic (Just (bytes ("f" ++ show i))) Nothing)
+    groupId <- unique "hs-fence-grp"
+    a <- must (newGroupConsumer address groupId noAutoCommit)
+    subscribe a [topic]
+    _ <- pollUntil a 4 10000 300
+    b <- must (newGroupConsumer address groupId noAutoCommit)
+    subscribe b [topic]
+    _ <- try (poll b 500) :: IO (Either BrahmaputraError [ConsumerRecord])
+    fenced <- try (commit a)
+    check "a commit from a stale generation is refused"
+      (either (\(_ :: BrahmaputraError) -> True) (const False) fenced) "commit succeeded"
+    void (try (closeGroupConsumer b) :: IO (Either SomeException ()))
+    void (try (closeGroupConsumer a) :: IO (Either SomeException ()))
+  must (closeProducer producer)
+
+  section "assignors (unit)"
+  do
+    let members = [AssignorMember "a" ["t"], AssignorMember "b" ["t"]]
+        slots = map (TopicPartition "t")
+        sticky = stickyAssign members (Map.fromList [("t", [0 .. 11])])
+                   (Map.fromList [("a", slots [0 .. 11]), ("b", [])])
+    check "sticky keeps partitions in numeric order"
+      (Map.lookup "a" sticky == Just (slots [0 .. 5]) && Map.lookup "b" sticky == Just (slots [6 .. 11]))
+      (show sticky)
+    let held = Map.fromList [("a", slots [1, 3]), ("b", slots [0, 2])]
+        kept = stickyAssign members (Map.fromList [("t", [0 .. 3])]) held
+    check "sticky keeps what members already hold" (kept == held) (show kept)
+
+  section "decoder bounds"
+  do
+    let negative = decodeBody rString (buildBody [wInt32 (-5)])
+    check "a negative length is an error" (isLeft' negative) (show negative)
+    let oversized = decodeBody rString (buildBody [wInt32 1000000, wRaw "short"])
+    check "a length past the end of the data is an error" (isLeft' oversized) (show oversized)
+    truncated <- try (decodeRecordBatches (BS.pack ([0, 0, 0, 0, 0, 0, 0, 0, 0x7f, 0xff, 0xff, 0xff] ++ replicate 4 0)))
+    check "a batch longer than its bytes is an error"
+      (either (\(_ :: BrahmaputraError) -> True) (const False) truncated) "decoded"
+
+-- | Sizes of successive non-empty polls until @want@ records or the deadline.
+pollSizes :: GroupConsumer -> Int -> Int -> IO [Int]
+pollSizes g want deadlineMs = do
+  start <- monoMs
+  let go acc = do
+        el <- elapsedSince start
+        if sum acc >= want || el >= fromIntegral deadlineMs then pure acc else do
+          r <- try (poll g 300)
+          case r of
+            Right records | not (null records) -> go (acc ++ [length records])
+            Right _ -> go acc
+            Left (_ :: BrahmaputraError) -> go acc
+  go []
+
+-- | Poll every consumer in parallel (a join blocks until every member has
+-- rejoined) until @done@ holds or @ms@ pass.
+settle :: [GroupConsumer] -> IO Bool -> Int -> IO Bool
+settle groups done ms = do
+  start <- monoMs
+  let go = do
+        vars <- forM groups $ \g -> do
+          v <- newEmptyMVar
+          _ <- forkIO ((void (try (poll g 200) :: IO (Either SomeException [ConsumerRecord]))) `finally` putMVar v ())
+          pure v
+        mapM_ takeMVar vars
+        ok <- done
+        el <- elapsedSince start
+        if ok then pure True else if el >= fromIntegral ms then pure False else go
+  go
+
+-- | The broker's lz4 payload: a little-endian uncompressed length, then a
+-- raw LZ4 block. This encoder writes literals only (valid, if uncompressed).
+lz4Compress :: ByteString -> ByteString
+lz4Compress bs = BS.concat [le32 n, token, bs]
+  where
+    n = BS.length bs
+    token
+      | n >= 15 = BS.pack (0xf0 : ext (n - 15))
+      | otherwise = BS.singleton (fromIntegral (n `shiftL` 4))
+    ext k = if k >= 255 then 255 : ext (k - 255) else [fromIntegral k]
+    le32 v = BS.pack [fromIntegral (v `shiftR` s) | s <- [0, 8, 16, 24]]
+
+lz4Decompress :: ByteString -> IO ByteString
+lz4Decompress payload = pure (go (BS.drop 4 payload) BS.empty)
+  where
+    go block out
+      | BS.null block = out
+      | otherwise =
+          let token = BS.head block
+              (lits, rest) = len (fromIntegral (token `shiftR` 4)) (BS.tail block)
+              out' = out <> BS.take lits rest
+              rest' = BS.drop lits rest
+          in if BS.null rest' then out' else
+               let offset = fromIntegral (BS.index rest' 0) .|. (fromIntegral (BS.index rest' 1) `shiftL` 8)
+                   (mlen, rest'') = len (fromIntegral (token .&. 15)) (BS.drop 2 rest')
+               in go rest'' (copy out' offset (mlen + 4))
+    len :: Int -> ByteString -> (Int, ByteString)
+    len 15 bs = more 15 bs
+    len n bs = (n, bs)
+    more acc bs = let b = BS.head bs in
+      if b == 255 then more (acc + 255) (BS.tail bs) else (acc + fromIntegral (b :: Word8), BS.tail bs)
+    copy out _ 0 = out
+    copy out offset k = copy (BS.snoc out (BS.index out (BS.length out - offset))) offset (k - 1 :: Int)
+
+-- | A broker that answers Metadata with itself as the only broker and
+-- refuses every produce: topic "fatal" with a non-retriable code, anything
+-- else with NOT_ENOUGH_REPLICAS (retriable). Records (topic, acks,
+-- timeout) for each produce it sees.
+fakeBroker :: IO (String, IORef [(Text, Int32, Int32)], IO ())
+fakeBroker = do
+  listener <- listenLocal
+  port <- NS.socketPort listener
+  seen <- newIORef []
+  let serve conn = do
+        frame <- recvFrame conn
+        case frame of
+          Nothing -> NS.close conn
+          Just payload -> do
+            let apiKey = fromIntegral (BS.index payload 1) :: Int
+                clen = fromIntegral (BS.index payload 8) * 256 + fromIntegral (BS.index payload 9)
+                header = BS.take (10 + clen) payload
+                req = BS.drop (10 + clen) payload
+            body <- answer apiKey req
+            let resp = header <> body
+                n = BS.length resp
+            NSB.sendAll conn (BS.pack [fromIntegral (n `shiftR` s) | s <- [24, 16, 8, 0]] <> resp)
+            serve conn
+      answer :: Int -> ByteString -> IO ByteString
+      answer 3 req = do
+        let topics = either (const []) id (decodeBody rStringArray req)
+        pure $ buildBody $
+          [ wInt32 0, wInt32 1, wInt32 0, wString "127.0.0.1", wInt32 (fromIntegral port), wString ""
+          , wInt32 0, wInt32 (fromIntegral (length topics)) ]
+          ++ concat [ [ wString t, wInt32 0, wInt32 1, wInt32 0, wInt32 0, wInt32 1, wInt32 0
+                      , wInt32 1, wInt32 0, wInt32 0 ] | t <- topics ]
+      answer 0 req = do
+        let parsed = decodeBody ((,,,) <$> rString <*> rInt32 <*> rInt32 <*> rInt32) req
+        case parsed of
+          Left _ -> pure (buildBody [wInt32 35])
+          Right (topic, partition, acks, t) -> do
+            modifyIORef' seen (++ [(topic, acks, t)])
+            let code = if topic == "fatal" then 87 else 10
+            pure (buildBody [wString topic, wInt32 partition, wInt32 code, wInt64 (-1), wInt64 (-1)])
+      answer _ _ = pure (buildBody [wInt32 35])
+  _ <- forkIO $ acceptLoop listener $ \conn ->
+    void (forkIO (serve conn `catch` \(_ :: SomeException) -> NS.close conn))
+  pure ("127.0.0.1:" ++ show port, seen, NS.close listener)
+
+recvExact :: NS.Socket -> Int -> IO (Maybe ByteString)
+recvExact sock n = go n []
+  where
+    go 0 acc = pure (Just (BS.concat (reverse acc)))
+    go left acc = do
+      chunk <- NSB.recv sock left
+      if BS.null chunk then pure Nothing else go (left - BS.length chunk) (chunk : acc)
+
+recvFrame :: NS.Socket -> IO (Maybe ByteString)
+recvFrame sock = do
+  prefix <- recvExact sock 4
+  case prefix of
+    Nothing -> pure Nothing
+    Just p -> recvExact sock (foldl (\acc b -> acc * 256 + fromIntegral b) 0 (BS.unpack p))

@@ -28,6 +28,9 @@ type
     sessionTimeoutMs*: int32
       ## `session.timeout.ms`: evicted after this long without a heartbeat.
       ## Kafka defaults to 45 s; this to 10 s as the Rust client does.
+    heartbeatIntervalMs*: int
+      ## `heartbeat.interval.ms`: how often this member heartbeats, and so
+      ## how soon it notices a rebalance; 0 means a third of the session timeout.
     rebalanceTimeoutMs*: int32  ## How long the coordinator waits for rejoins.
     maxPollIntervalMs*: int
       ## `max.poll.interval.ms`: the longest gap between polls before this
@@ -128,8 +131,9 @@ proc leaveRequest(router: Router, groupId, memberId: string) =
 proc heartbeatLoop(g: ptr GroupConsumerObj) {.thread.} =
   # This loop enforces two independent deadlines, so it wakes often enough
   # for the shorter of them.
-  let interval = int64(max(1, min(int(g.config.sessionTimeoutMs) div 3,
-                                  g.config.maxPollIntervalMs div 3)))
+  let heartbeatEvery = if g.config.heartbeatIntervalMs > 0: g.config.heartbeatIntervalMs
+                       else: int(g.config.sessionTimeoutMs) div 3
+  let interval = int64(max(1, min(heartbeatEvery, g.config.maxPollIntervalMs div 3)))
   var router: Router = nil
   var nextBeat = monoMillis() + interval
   var leftForSlowPoll = false
