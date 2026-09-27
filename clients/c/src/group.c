@@ -35,6 +35,10 @@ struct brp_group_consumer {
     bool joined;
     bool closed;
     int64_t last_poll_ms;
+    /* True while poll runs. max.poll.interval.ms bounds the gap *between*
+     * polls; time spent inside one (joining, long-polling) is the consumer
+     * working normally and must not count against it. */
+    bool in_poll;
 
     /* Poll-thread only. */
     tpo_t *assignment;
@@ -909,7 +913,7 @@ static void *heartbeat_main(void *arg) {
         while (!g->closed && pthread_cond_timedwait(&g->cond, &g->mu, &deadline) != ETIMEDOUT) {
         }
         if (g->closed) break;
-        int64_t idle = brp_now_ms() - g->last_poll_ms;
+        int64_t idle = g->in_poll ? 0 : brp_now_ms() - g->last_poll_ms;
         bool joined = g->joined;
         int32_t generation = g->generation;
         char *member_id = brp_strdup(g->member_id);
@@ -974,18 +978,31 @@ static brp_err_t take_buffered(brp_group_consumer_t *g, brp_record_t **out, size
     return BRP_OK;
 }
 
+static brp_err_t poll_inner(brp_group_consumer_t *g, int timeout_ms, brp_record_t **out,
+                            size_t *count);
+
 brp_err_t brp_group_consumer_poll(brp_group_consumer_t *g, int timeout_ms,
                                   brp_record_t **out, size_t *count) {
     *out = NULL;
     *count = 0;
     if (g->sub_count == 0)
         return brp_set_error(BRP_ERR_STATE, "subscribe to at least one topic before polling");
-    /* Stamped on entry: max.poll.interval.ms bounds how long the
-     * application goes without asking, and a poll that blocks for its full
-     * timeout is the consumer working normally. */
+    /* Stamped on entry and on exit, and flagged in between: the interval
+     * measures the application's time between polls, never the poll's own. */
     pthread_mutex_lock(&g->mu);
     g->last_poll_ms = brp_now_ms();
+    g->in_poll = true;
     pthread_mutex_unlock(&g->mu);
+    brp_err_t err = poll_inner(g, timeout_ms, out, count);
+    pthread_mutex_lock(&g->mu);
+    g->last_poll_ms = brp_now_ms();
+    g->in_poll = false;
+    pthread_mutex_unlock(&g->mu);
+    return err;
+}
+
+static brp_err_t poll_inner(brp_group_consumer_t *g, int timeout_ms, brp_record_t **out,
+                            size_t *count) {
 
     int64_t deadline = brp_now_ms() + (timeout_ms > 0 ? timeout_ms : 0);
     for (;;) {

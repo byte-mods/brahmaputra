@@ -356,6 +356,27 @@ static void fetch_all(brp_consumer_t *consumer, const char *topic, size_t want, 
     }
 }
 
+typedef struct delayed_send {
+    brp_producer_t *producer;
+    const char *topic;
+} delayed_send_t;
+
+static void *delayed_send_main(void *arg) {
+    delayed_send_t *d = arg;
+    sleep_ms(2000);
+    for (int i = 0; i < 10; i++) {
+        char value[32];
+        snprintf(value, sizeof value, "j%d", i);
+        brp_message_t m;
+        brp_message_init(&m);
+        m.topic = d->topic;
+        m.value = value;
+        m.value_len = strlen(value);
+        brp_producer_send(d->producer, &m);
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     const char *host = argc > 1 ? argv[1] : "127.0.0.1";
     const char *port = argc > 2 ? argv[2] : "9092";
@@ -1078,6 +1099,44 @@ int main(int argc, char **argv) {
         seen_free(&first);
         seen_free(&second);
         must(brp_group_consumer_close(consumer), "group close");
+    }
+
+    section("consumer group: time inside poll does not count against max.poll.interval");
+    {
+        char join_topic[128], join_group[128];
+        unique(join_topic, sizeof join_topic, "c-inpoll");
+        unique(join_group, sizeof join_group, "c-inpoll-grp");
+        brp_producer_t *producer = immediate_producer();
+        int32_t *partitions;
+        size_t pcount;
+        must(brp_client_partitions(brp_producer_client(producer), join_topic, &partitions, &pcount),
+             "partitions");
+        brp_free(partitions);
+        brp_group_config_t config;
+        group_config(&config);
+        /* Far shorter than the first poll below, which spends ~1s joining
+         * (the broker's initial rebalance delay) and then waits for data. */
+        config.max_poll_interval_ms = 600;
+        brp_group_consumer_t *consumer = new_group(join_group, &config, join_topic);
+        delayed_send_t delayed = {producer, join_topic};
+        pthread_t sender;
+        pthread_create(&sender, NULL, delayed_send_main, &delayed);
+        /* One long poll: it joins, then waits for the records above. */
+        brp_record_t *records = NULL;
+        size_t n = 0;
+        brp_err_t poll_err = brp_group_consumer_poll(consumer, 4000, &records, &n);
+        char poll_msg[512] = "";
+        if (poll_err) snprintf(poll_msg, sizeof poll_msg, "%s", brp_last_error());
+        /* Committed straight away, before another poll could quietly
+         * rejoin: this fails if the member left the group mid-poll. */
+        brp_err_t commit_err = brp_group_consumer_commit(consumer);
+        check("a member is still in its group after a long poll",
+              poll_err == BRP_OK && n > 0 && commit_err == BRP_OK, "got=%zu poll=%s commit=%s (%s)",
+              n, poll_msg, brp_err_name(commit_err), commit_err ? brp_last_error() : "");
+        if (poll_err == BRP_OK) brp_records_free(records, n);
+        pthread_join(sender, NULL);
+        must(brp_group_consumer_close(consumer), "group close");
+        must(brp_producer_close(producer), "close");
     }
 
     printf("\n%d passed, %d failed\n", passed, failed);

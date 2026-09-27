@@ -3,7 +3,7 @@
 C11 + POSIX (pthreads, BSD sockets). No dependencies beyond libc, plus
 zlib when gzip is wanted (on by default, one compile flag to drop it).
 
-Verified end to end against a live broker: **53/53 checks**
+Verified end to end against a live broker: **54/54 checks**
 (`./test.sh 127.0.0.1 9092`), also clean under
 `-fsanitize=address,undefined` (with leak detection) and
 `-fsanitize=thread`.
