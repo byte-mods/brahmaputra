@@ -203,7 +203,7 @@ assert_eq "$(api_status 1 DELETE /api/v1/users/admin '' "$ADMIN_TOKEN")" "400" \
   "an admin cannot delete their own account and lock the cluster out"
 
 USERS="$(api 1 GET /api/v1/users '' "$ADMIN_TOKEN")"
-printf '%s' "$USERS" | grep -q 'password_hash' \
+grep -q 'password_hash' <<<"$USERS" \
   && die "the users endpoint leaked a password hash"
 pass "no endpoint returns a password hash, even to an admin"
 
@@ -230,9 +230,9 @@ wait_until "produce metrics to rise" 30 metrics_rose
 pass "produce counters rose after real traffic ($BEFORE -> $(curl -sS "http://127.0.0.1:${HTTP_PORT[1]}/metrics" | awk '/^brahmaputra_produce_records_total /{print $2}'))"
 
 PROM="$(curl -sS "http://127.0.0.1:${HTTP_PORT[1]}/metrics")"
-printf '%s' "$PROM" | grep -q '^# TYPE brahmaputra_produce_records_total counter' \
+grep -q '^# TYPE brahmaputra_produce_records_total counter' <<<"$PROM" \
   || die "Prometheus output is missing TYPE metadata"
-printf '%s' "$PROM" | grep -q '^# HELP brahmaputra_produce_records_total ' \
+grep -q '^# HELP brahmaputra_produce_records_total ' <<<"$PROM" \
   || die "Prometheus output is missing HELP metadata"
 pass "the Prometheus endpoint emits well-formed HELP/TYPE metadata"
 assert_eq "$(api_status 1 GET /metrics)" "200" \
@@ -295,10 +295,10 @@ pass "under-replicated partitions are surfaced after the failure"
 
 stage "The dashboard page itself"
 PAGE="$(curl -sS "http://127.0.0.1:${HTTP_PORT[1]}/")"
-printf '%s' "$PAGE" | grep -q '<title>Brahmaputra</title>' || die "the dashboard page did not render"
-printf '%s' "$PAGE" | grep -q 'api/v1/auth/login' || die "the dashboard has no login form"
+grep -q '<title>Brahmaputra</title>' <<<"$PAGE" || die "the dashboard page did not render"
+grep -q 'api/v1/auth/login' <<<"$PAGE" || die "the dashboard has no login form"
 pass "the dashboard is served from the binary with no external assets"
-printf '%s' "$PAGE" | grep -Eq 'https?://[^"]*(cdn|googleapis|unpkg|jsdelivr)' \
+grep -Eq 'https?://[^"]*(cdn|googleapis|unpkg|jsdelivr)' <<<"$PAGE" \
   && die "the dashboard references an external asset; it must work air-gapped"
 pass "the dashboard loads nothing from the network"
 for feature in 'id="analytics"' 'id="health"' 'id="feedstatus"' 'exportAnalytics()' 'toggleAnalytics()'; do

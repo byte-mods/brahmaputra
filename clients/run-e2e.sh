@@ -47,7 +47,9 @@ else
     (cd "$ROOT" && cargo build --release -p brahmaputra-server) || exit 1
   fi
   DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/brahmaputra-clients-e2e.XXXXXX")"
-  "$SERVER" --data-dir "$DATA_DIR/data" --default-partitions 4 \
+  # BROKER_LOG sets the broker's tracing filter, e.g.
+  # "info,brahmaputra_broker::group=debug" to trace consumer-group state.
+  RUST_LOG="${BROKER_LOG:-info}" "$SERVER" --data-dir "$DATA_DIR/data" --default-partitions 4 \
     --port "$PORT" --http-port "$HTTP_PORT" > "$DATA_DIR/broker.log" 2>&1 &
   BROKER_PID=$!
   for _ in $(seq 1 50); do
@@ -89,6 +91,10 @@ for lang in "${SELECTED[@]}"; do
   else
     RESULT[$lang]=FAIL
     failed=1
+    if [[ -n "${DATA_DIR:-}" && -f "$DATA_DIR/broker.log" ]]; then
+      echo "---- last 150 broker log lines ----"
+      tail -n 150 "$DATA_DIR/broker.log"
+    fi
   fi
   SUMMARY[$lang]="$(grep -E '[0-9]+ passed, [0-9]+ failed' "$log" | tail -1)"
   rm -f "$log"

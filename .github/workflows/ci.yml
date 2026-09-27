@@ -173,6 +173,11 @@ jobs:
         run: cargo build --locked --release -p brahmaputra-server
       - name: ${{ matrix.driver }} end-to-end suite
         run: bash clients/run-e2e.sh ${{ matrix.driver }}
+        env:
+          # Trace the consumer-group protocol on both sides; printed only
+          # when a suite fails, and by the C driver's rebalance checks.
+          BROKER_LOG: info,brahmaputra_broker::group=debug
+          BRP_DEBUG: ${{ matrix.driver == 'c' && '1' || '' }}
 
   # BitPacker conformance: every generator target encodes the fixtures
   # byte-identically and rejects hostile input. Targets whose toolchain the

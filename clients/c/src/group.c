@@ -16,6 +16,26 @@
 /* Bounds join+sync rounds for a group that will not settle. */
 #define JOIN_ATTEMPTS 4
 
+/* BRP_DEBUG=1 traces the group protocol (join, sync, heartbeat results) to
+ * stderr: rebalances are timing-dependent, and a trace is the only way to
+ * see why one went wrong on a machine you cannot attach to. */
+static int group_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("BRP_DEBUG");
+        enabled = v && *v && strcmp(v, "0") != 0;
+    }
+    return enabled;
+}
+#define GDEBUG(g, ...)                                                                   \
+    do {                                                                                 \
+        if (group_debug_enabled()) {                                                     \
+            fprintf(stderr, "[brp %lld %s] ", (long long)brp_now_ms(), (g)->group_id);   \
+            fprintf(stderr, __VA_ARGS__);                                                \
+            fputc('\n', stderr);                                                        \
+        }                                                                                \
+    } while (0)
+
 typedef brp_partition_offset_t tpo_t; /* topic, partition, offset */
 
 struct brp_group_consumer {
@@ -822,6 +842,7 @@ static brp_err_t join_group(brp_group_consumer_t *g) {
             return err;
         }
         int32_t code = bpr_i32(&r);
+        GDEBUG(g, "join attempt %d -> code %d", attempt, (int)code);
         if (code == BRP_ERR_REBALANCE_IN_PROGRESS) {
             free(resp);
             brp_sleep_ms(100);
@@ -884,6 +905,8 @@ static brp_err_t join_group(brp_group_consumer_t *g) {
         pthread_mutex_unlock(&g->mu);
 
         bool leader = strcmp(member_id, leader_id) == 0;
+        GDEBUG(g, "joined generation %d as %s (%s, %zu members)", (int)generation, member_id,
+               leader ? "leader" : "follower", mn);
         free(leader_id);
         if (leader) {
             err = compute_assignment(g, members, mn);
@@ -895,6 +918,8 @@ static brp_err_t join_group(brp_group_consumer_t *g) {
         }
         bool settled = false;
         if (!err) err = sync_group(g, members, mn, &settled);
+        GDEBUG(g, "sync generation %d -> err %d settled %d", (int)generation, (int)err,
+               (int)settled);
         members_free(members, mn);
         if (err) return err;
         if (settled) {
@@ -964,7 +989,10 @@ static void *heartbeat_main(void *arg) {
                 bp_i32(&w, generation);
                 bp_str(&w, member_id);
                 int32_t code = 0;
-                simple_request(g, API_HEARTBEAT, &w, "heartbeat", &code);
+                brp_err_t hb = simple_request(g, API_HEARTBEAT, &w, "heartbeat", &code);
+                if (code != 0 || hb != BRP_OK)
+                    GDEBUG(g, "heartbeat %s generation %d -> err %d code %d", member_id,
+                           (int)generation, (int)hb, (int)code);
                 if (code == BRP_ERR_REBALANCE_IN_PROGRESS || code == BRP_ERR_UNKNOWN_MEMBER_ID ||
                     code == BRP_ERR_ILLEGAL_GENERATION) {
                     pthread_mutex_lock(&g->mu);
