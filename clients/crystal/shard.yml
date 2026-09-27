@@ -1,0 +1,17 @@
+name: brahmaputra
+version: 0.1.0
+
+description: |
+  Native client for the Brahmaputra log streaming platform: producer,
+  consumer and consumer groups. Standard library only.
+
+authors:
+  - Brahmaputra contributors
+
+crystal: ">= 1.11.0"
+
+targets:
+  manual_test:
+    main: test/manual_test.cr
+
+license: Apache-2.0
