@@ -1,0 +1,4 @@
+bin/
+/manualtest
+*.test
+*.out

@@ -466,6 +466,30 @@ function putUvarint(bytes, value) {
   bytes.push(Number(remaining));
 }
 
+/** A plain (non-zigzag) varint as its own small Buffer. */
+function uvarintBuffer(value) {
+  const bytes = [];
+  putUvarint(bytes, value);
+  return Buffer.from(bytes);
+}
+
+/**
+ * Normalise a key, value or header value to bytes. null/undefined stay
+ * null (a null key, a tombstone, a null header value); a string is UTF-8,
+ * as a Buffer made from it would be; any other typed array is viewed as
+ * bytes. Anything else is refused rather than silently encoded as garbage.
+ */
+function toBytes(value, what = 'value') {
+  if (value === null || value === undefined) return null;
+  if (Buffer.isBuffer(value)) return value;
+  if (typeof value === 'string') return Buffer.from(value, 'utf8');
+  if (ArrayBuffer.isView(value)) {
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (value instanceof ArrayBuffer) return Buffer.from(value);
+  throw new TypeError(`${what} must be a Buffer, typed array, string or null`);
+}
+
 function getUvarint(data, pos) {
   let result = 0n;
   let shift = 0n;
@@ -496,46 +520,46 @@ function encodeRecordBatch(records, maxTimestamp, codec = Compression.NONE) {
     (record) => record.value === null || record.value === undefined,
   );
 
+  // Built from Buffer chunks rather than spreading bytes into an array:
+  // `array.push(...buffer)` passes every byte as a function argument and
+  // overflows the call stack for a value of a few hundred kilobytes.
   const payloadParts = [];
   for (const record of records) {
-    const rec = [];
-    if (record.key === null || record.key === undefined) {
-      putUvarint(rec, 0);
+    const parts = [];
+    const key = toBytes(record.key, 'key');
+    if (key === null) {
+      parts.push(uvarintBuffer(0));
     } else {
-      putUvarint(rec, record.key.length + 1);
-      rec.push(...record.key);
+      parts.push(uvarintBuffer(key.length + 1), key);
     }
+    const value = toBytes(record.value);
     if (hasNullValues) {
-      if (record.value === null || record.value === undefined) {
-        putUvarint(rec, 0);
+      if (value === null) {
+        parts.push(uvarintBuffer(0));
       } else {
-        putUvarint(rec, record.value.length + 1);
-        rec.push(...record.value);
+        parts.push(uvarintBuffer(value.length + 1), value);
       }
     } else {
-      putUvarint(rec, record.value.length);
-      rec.push(...record.value);
+      parts.push(uvarintBuffer(value.length), value);
     }
     const delta = BigInt.asIntN(64, BigInt(record.timestampDelta || 0));
-    putUvarint(rec, BigInt.asUintN(64, (delta << 1n) ^ (delta >> 63n)));
+    parts.push(uvarintBuffer(BigInt.asUintN(64, (delta << 1n) ^ (delta >> 63n))));
     if (hasHeaders) {
       const headers = record.headers || [];
-      putUvarint(rec, headers.length);
+      parts.push(uvarintBuffer(headers.length));
       for (const header of headers) {
-        const key = Buffer.from(header.key, 'utf8');
-        putUvarint(rec, key.length);
-        rec.push(...key);
-        if (header.value === null || header.value === undefined) {
-          putUvarint(rec, 0);
+        const headerKey = Buffer.from(header.key, 'utf8');
+        parts.push(uvarintBuffer(headerKey.length), headerKey);
+        const headerValue = toBytes(header.value, 'header value');
+        if (headerValue === null) {
+          parts.push(uvarintBuffer(0));
         } else {
-          putUvarint(rec, header.value.length + 1);
-          rec.push(...header.value);
+          parts.push(uvarintBuffer(headerValue.length + 1), headerValue);
         }
       }
     }
-    const lengthPrefix = [];
-    putUvarint(lengthPrefix, rec.length);
-    payloadParts.push(Buffer.from(lengthPrefix), Buffer.from(rec));
+    const length = parts.reduce((sum, part) => sum + part.length, 0);
+    payloadParts.push(uvarintBuffer(length), ...parts);
   }
 
   const compressed = compress(codec, Buffer.concat(payloadParts));
@@ -730,7 +754,7 @@ function murmur2(data) {
 
 /** murmur2(key) % partitions, matching Kafka's default partitioner. */
 function partitionForKey(key, partitions) {
-  return partitions[(murmur2(key) & 0x7fffffff) % partitions.length];
+  return partitions[(murmur2(toBytes(key, 'key')) & 0x7fffffff) % partitions.length];
 }
 
 module.exports = {
@@ -762,4 +786,5 @@ module.exports = {
   parseCompression,
   partitionForKey,
   registerCodec,
+  toBytes,
 };

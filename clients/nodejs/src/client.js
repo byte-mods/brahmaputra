@@ -29,6 +29,7 @@ const {
   encodeRecordBatch,
   parseCompression,
   partitionForKey,
+  toBytes,
 } = require('./protocol');
 
 const EARLIEST = -2n;
@@ -85,24 +86,42 @@ function scramClientProof(password, salt, iterations, authMessage) {
   return proof.toString('base64');
 }
 
+/**
+ * How long one request may wait for its response. It must exceed the
+ * longest the broker may legitimately hold a request (a fetch long-poll, an
+ * acks=all wait, a JoinGroup waiting out a rebalance); its job is to turn a
+ * wedged broker into a rejection instead of a promise that never settles.
+ * A response that arrives after its request timed out is simply dropped:
+ * responses are matched by correlation id, so it cannot be mistaken for
+ * the answer to a later request.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 120000;
+
 class Connection {
-  constructor(socket, clientId) {
+  constructor(socket, clientId, requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
     this.socket = socket;
     this.clientId = clientId;
+    this.requestTimeoutMs = requestTimeoutMs;
     this.correlation = 0;
     this.pending = new Map();
     this.buffer = Buffer.alloc(0);
     this.closed = false;
 
     socket.on('data', (chunk) => this._onData(chunk));
-    socket.on('error', (error) => this._failAll(error));
-    socket.on('close', () => {
-      this.closed = true;
-      this._failAll(new BrahmaputraError('connection closed by broker'));
-    });
+    // Any socket failure ends the connection: after it the byte stream is
+    // at an unknown position, and the Router must redial rather than reuse
+    // it.
+    socket.on('error', (error) => this._fatal(error));
+    socket.on('close', () => this._fatal(new BrahmaputraError('connection closed by broker')));
   }
 
-  static connect(host, port, clientId = 'brahmaputra-node', timeoutMs = 30000) {
+  static connect(
+    host,
+    port,
+    clientId = 'brahmaputra-node',
+    timeoutMs = 30000,
+    requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
+  ) {
     return new Promise((resolve, reject) => {
       const socket = net.createConnection({ host, port });
       // Responses are small and latency matters more than packet count;
@@ -114,7 +133,7 @@ class Connection {
       }, timeoutMs);
       socket.once('connect', () => {
         clearTimeout(timer);
-        resolve(new Connection(socket, clientId));
+        resolve(new Connection(socket, clientId, requestTimeoutMs));
       });
       socket.once('error', (error) => {
         clearTimeout(timer);
@@ -126,18 +145,47 @@ class Connection {
   close() {
     this.closed = true;
     this.socket.destroy();
+    this._failAll(new BrahmaputraError('connection closed'));
+  }
+
+  _fatal(error) {
+    this.closed = true;
+    this.socket.destroy();
+    this._failAll(error);
+  }
+
+  _nextCorrelationId() {
+    // Wrapped inside int32: writeInt32BE throws past 2^31-1, which would
+    // kill a long-lived connection after two billion requests.
+    this.correlation = this.correlation >= 0x7fffffff ? 1 : this.correlation + 1;
+    return this.correlation;
   }
 
   request(apiKey, body) {
     if (this.closed) return Promise.reject(new BrahmaputraError('connection is closed'));
-    this.correlation += 1;
-    const correlationId = this.correlation;
+    const correlationId = this._nextCorrelationId();
     return new Promise((resolve, reject) => {
-      this.pending.set(correlationId, { resolve, reject });
+      let timer = null;
+      const settle = (fn) => (value) => {
+        if (timer) clearTimeout(timer);
+        this.pending.delete(correlationId);
+        fn(value);
+      };
+      this.pending.set(correlationId, { resolve: settle(resolve), reject: settle(reject) });
+      if (this.requestTimeoutMs > 0) {
+        timer = setTimeout(() => {
+          const waiter = this.pending.get(correlationId);
+          if (waiter) {
+            waiter.reject(
+              new BrahmaputraError(`request timed out after ${this.requestTimeoutMs} ms`)
+            );
+          }
+        }, this.requestTimeoutMs);
+      }
       this.socket.write(encodeFrame(apiKey, correlationId, this.clientId, body), (error) => {
         if (error) {
-          this.pending.delete(correlationId);
-          reject(error);
+          const waiter = this.pending.get(correlationId);
+          if (waiter) waiter.reject(error);
         }
       });
     });
@@ -145,7 +193,8 @@ class Connection {
 
   /** Send without awaiting a response (acks=0). */
   sendOneway(apiKey, body) {
-    this.correlation += 1;
+    if (this.closed) return Promise.reject(new BrahmaputraError('connection is closed'));
+    this._nextCorrelationId();
     return new Promise((resolve, reject) => {
       this.socket.write(encodeFrame(apiKey, this.correlation, this.clientId, body), (error) =>
         error ? reject(error) : resolve()
@@ -159,7 +208,7 @@ class Connection {
       if (this.buffer.length < 4) return;
       const length = this.buffer.readInt32BE(0);
       if (length < 0) {
-        this._failAll(new ProtocolError(`negative frame length ${length}`));
+        this._fatal(new ProtocolError(`negative frame length ${length}`));
         return;
       }
       if (this.buffer.length < 4 + length) return;
@@ -168,20 +217,18 @@ class Connection {
       try {
         const { correlationId, body } = decodeFramePayload(payload);
         const waiter = this.pending.get(correlationId);
-        if (waiter) {
-          this.pending.delete(correlationId);
-          waiter.resolve(Buffer.from(body));
-        }
+        if (waiter) waiter.resolve(Buffer.from(body));
       } catch (error) {
-        this._failAll(error);
+        this._fatal(error);
         return;
       }
     }
   }
 
   _failAll(error) {
-    for (const waiter of this.pending.values()) waiter.reject(error);
+    const waiters = [...this.pending.values()];
     this.pending.clear();
+    for (const waiter of waiters) waiter.reject(error);
   }
 
   /**
@@ -327,6 +374,10 @@ class Router {
     this.seed = null;
     this.connections = new Map();
     this.metadata = null;
+    // In-progress dials, so concurrent callers that all find a dead
+    // connection share one replacement instead of opening one each.
+    this.dialing = new Map();
+    this.closed = false;
   }
 
   static async connect(host, port, clientId, timeoutMs = 30000) {
@@ -336,6 +387,7 @@ class Router {
   }
 
   close() {
+    this.closed = true;
     for (const connection of this.connections.values()) {
       if (connection !== this.seed) connection.close();
     }
@@ -343,10 +395,41 @@ class Router {
     this.seed.close();
   }
 
+  /**
+   * Dial `host:port` once for all concurrent callers. A connection that
+   * failed is replaced on its next use rather than kept: without that, one
+   * dropped socket — a broker restart, a load balancer's idle timeout —
+   * would fail every later request for the life of the client.
+   */
+  _dial(key, host, port) {
+    if (this.closed) return Promise.reject(new BrahmaputraError('router is closed'));
+    let pending = this.dialing.get(key);
+    if (!pending) {
+      pending = Connection.connect(host, port, this.clientId, this.timeoutMs).finally(() =>
+        this.dialing.delete(key)
+      );
+      this.dialing.set(key, pending);
+    }
+    return pending;
+  }
+
+  /** The seed connection, redialled if it has failed. */
+  async liveSeed() {
+    if (!this.seed.closed) return this.seed;
+    const old = this.seed;
+    const fresh = await this._dial(`seed ${this.host}:${this.port}`, this.host, this.port);
+    if (this.seed === old) this.seed = fresh;
+    for (const [leader, connection] of this.connections) {
+      if (connection === old) this.connections.set(leader, this.seed);
+    }
+    return this.seed;
+  }
+
   async getMetadata(topics = [], refresh = false) {
     if (!refresh && this.metadata) return this.metadata;
     const writer = bodyWriter().stringArray(topics);
-    const reader = bodyReader(await this.seed.request(ApiKey.METADATA, writer.bytes()));
+    const seed = await this.liveSeed();
+    const reader = bodyReader(await seed.request(ApiKey.METADATA, writer.bytes()));
     this.metadata = decodeMetadata(reader);
     return this.metadata;
   }
@@ -380,7 +463,8 @@ class Router {
     if (leader < 0) throw new BrahmaputraError(`no leader for ${topic}-${partition}`);
 
     const existing = this.connections.get(leader);
-    if (existing) return existing;
+    if (existing && !existing.closed) return existing;
+    if (existing) this.connections.delete(leader);
 
     const broker = metadata.brokers.find((entry) => entry.nodeId === leader);
     if (!broker) throw new BrahmaputraError(`broker ${leader} is not in the metadata`);
@@ -388,15 +472,16 @@ class Router {
     // with, which may not be the one we dialled; reuse the seed rather
     // than opening a second connection to ourselves.
     if (metadata.brokers.length === 1) {
-      this.connections.set(leader, this.seed);
-      return this.seed;
+      const seed = await this.liveSeed();
+      this.connections.set(leader, seed);
+      return seed;
     }
-    const connection = await Connection.connect(
-      broker.host,
-      broker.port,
-      this.clientId,
-      this.timeoutMs
-    );
+    const connection = await this._dial(`broker ${leader}`, broker.host, broker.port);
+    const current = this.connections.get(leader);
+    if (current && !current.closed) {
+      if (current !== connection) connection.close();
+      return current;
+    }
     this.connections.set(leader, connection);
     return connection;
   }
@@ -458,13 +543,25 @@ class Producer {
     this.waiters = [];
     this.roundRobin = 0;
     this.closed = false;
+    // Per partition, the tail of the chain of sends to it. Every flush of a
+    // partition waits for the previous one, so a partition has one batch in
+    // flight and batches reach the broker in the order they were taken.
+    // Without this the ticker and a send that fills a batch both put a
+    // batch for the same partition on the wire, the broker handles them
+    // concurrently, and the log ends up in a different order from the one
+    // the application sent.
+    this.sendChains = new Map();
+    // The first failure of a ticker-driven flush. Those records have left
+    // the buffer, so this is the only trace of them; the next flush() or
+    // close() rejects with it instead of reporting a success.
+    this.backgroundError = null;
     this.ticker =
       config.lingerMs > 0
         ? setInterval(() => {
-            // A background flush that fails must not kill the ticker; the
-            // next explicit flush surfaces the error to a caller who can
-            // act on it.
-            this.flush().catch(() => {});
+            // A background flush that fails must not kill the ticker.
+            this._flushAll().catch((error) => {
+              if (!this.backgroundError) this.backgroundError = error;
+            });
           }, config.lingerMs)
         : null;
   }
@@ -475,15 +572,24 @@ class Producer {
     return new Producer(router, config);
   }
 
+  /** Flush, then release the ticker and sockets — even if the flush fails. */
   async close() {
-    await this.flush();
-    this.closed = true;
-    if (this.ticker) clearInterval(this.ticker);
-    this.router.close();
+    try {
+      await this.flush();
+    } finally {
+      this.closed = true;
+      if (this.ticker) clearInterval(this.ticker);
+      this.ticker = null;
+      this.router.close();
+    }
   }
 
   /** Buffer one record. Call flush() to await delivery. */
   async send(topic, value, { key = null, partition = null, headers = [] } = {}) {
+    // Strings travel as UTF-8; null stays null (a tombstone, a null key).
+    value = toBytes(value);
+    key = toBytes(key, 'key');
+    headers = headers.map((header) => new RecordHeader(header.key, toBytes(header.value)));
     let target = partition;
     if (target === null) {
       const partitions = await this.router.partitions(topic);
@@ -515,27 +621,42 @@ class Producer {
 
   /** Send one record on its own and return its offset. Slow by design. */
   async sendSync(topic, value, options = {}) {
+    const key = toBytes(options.key, 'key');
     const partitions = await this.router.partitions(topic);
     const partition =
       options.partition !== undefined && options.partition !== null
         ? options.partition
-        : options.key
-          ? partitionForKey(options.key, partitions)
+        : key !== null
+          ? partitionForKey(key, partitions)
           : partitions[this.roundRobin++ % partitions.length];
     return this._produce(topic, partition, [
       {
         record: {
-          key: options.key || null,
-          value,
+          key,
+          value: toBytes(value),
           timestampDelta: 0,
-          headers: options.headers || [],
+          headers: (options.headers || []).map(
+            (header) => new RecordHeader(header.key, toBytes(header.value))
+          ),
         },
         createdMs: nowMs(),
       },
     ]);
   }
 
+  /**
+   * Send every buffered record and wait for acknowledgement. Also rejects
+   * with the failure of any ticker-driven flush since the last call,
+   * because those records are gone and nothing else would say so.
+   */
   async flush() {
+    await this._flushAll();
+    const background = this.backgroundError;
+    this.backgroundError = null;
+    if (background) throw background;
+  }
+
+  async _flushAll() {
     const slots = [...this.buffers.keys()].filter((slot) => this.buffers.get(slot).length > 0);
     for (const slot of slots) {
       await this._flushSlot(slot);
@@ -581,7 +702,20 @@ class Producer {
     for (const resolve of waiters) resolve();
   }
 
-  async _flushSlot(slot) {
+  _flushSlot(slot) {
+    const previous = this.sendChains.get(slot) || Promise.resolve();
+    // The batch is taken when this flush's turn comes, not now, so a batch
+    // never overtakes records buffered before it.
+    const run = previous.then(() => this._sendSlot(slot));
+    const tail = run.catch(() => {});
+    this.sendChains.set(slot, tail);
+    tail.then(() => {
+      if (this.sendChains.get(slot) === tail) this.sendChains.delete(slot);
+    });
+    return run;
+  }
+
+  async _sendSlot(slot) {
     const batch = this.buffers.get(slot);
     if (!batch || batch.length === 0) return;
     this.buffers.set(slot, []);

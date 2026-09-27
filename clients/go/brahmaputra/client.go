@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,18 +30,32 @@ func nowMillis() int64 { return time.Now().UnixMilli() }
 // Connection
 // ---------------------------------------------------------------------------
 
-// Conn is one TCP connection to one broker, multiplexed by correlation id.
+// Conn is one TCP connection to one broker.
 //
-// The broker may answer out of order, so responses are matched by
-// correlation id. A mutex serialises request/response pairs; this is
-// enough for a producer that batches, and matches how the Rust client
-// behaves.
+// A mutex serialises request/response pairs, so there is at most one
+// request in flight per connection; this is enough for a producer that
+// batches, and it is what keeps a partition's appends in order.
+//
+// Any I/O failure, timeout or correlation mismatch leaves the byte stream
+// at an unknown position — a partial frame may have been written, or a
+// late response may still arrive — so the connection is closed and marked
+// broken rather than reused. The Router notices and redials.
 type Conn struct {
 	conn     net.Conn
+	address  string
 	clientID string
+	timeout  time.Duration
 	mu       sync.Mutex
 	next     int32
+	broken   atomic.Bool
 }
+
+// DefaultRequestTimeout bounds one request/response round trip on the
+// socket. It must exceed the longest the broker may legitimately hold a
+// request (a fetch long-poll, an acks=all wait, a JoinGroup waiting out a
+// rebalance), so it is generous; its job is to turn a wedged broker into
+// an error instead of a goroutine blocked forever.
+const DefaultRequestTimeout = 2 * time.Minute
 
 // Dial opens a connection to one broker.
 func Dial(address, clientID string, timeout time.Duration) (*Conn, error) {
@@ -53,33 +68,79 @@ func Dial(address, clientID string, timeout time.Duration) (*Conn, error) {
 		// without this every request pays Nagle plus the peer's delayed ACK.
 		_ = tcp.SetNoDelay(true)
 	}
-	return &Conn{conn: conn, clientID: clientID}, nil
+	return &Conn{
+		conn:     conn,
+		address:  address,
+		clientID: clientID,
+		timeout:  DefaultRequestTimeout,
+	}, nil
 }
 
-func (c *Conn) Close() error { return c.conn.Close() }
+// SetRequestTimeout changes how long one round trip may take before the
+// connection is abandoned. Zero or negative disables the bound.
+func (c *Conn) SetRequestTimeout(timeout time.Duration) {
+	c.mu.Lock()
+	c.timeout = timeout
+	c.mu.Unlock()
+}
+
+// Broken reports whether this connection failed and must not be reused.
+func (c *Conn) Broken() bool { return c.broken.Load() }
+
+// Address is the host:port this connection was dialled to.
+func (c *Conn) Address() string { return c.address }
+
+func (c *Conn) Close() error {
+	c.broken.Store(true)
+	return c.conn.Close()
+}
+
+// fail marks the connection unusable. Called with c.mu held.
+func (c *Conn) fail(err error) error {
+	c.broken.Store(true)
+	_ = c.conn.Close()
+	return err
+}
+
+func (c *Conn) armDeadline() {
+	if c.timeout > 0 {
+		_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
+	} else {
+		_ = c.conn.SetDeadline(time.Time{})
+	}
+}
+
+var errConnBroken = errors.New("connection is broken; the router will redial")
 
 // Request sends one request and returns the matching response body.
 func (c *Conn) Request(apiKey int16, body []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.broken.Load() {
+		return nil, errConnBroken
+	}
 	c.next++
 	correlationID := c.next
+	c.armDeadline()
 	if _, err := c.conn.Write(EncodeFrame(apiKey, correlationID, c.clientID, body)); err != nil {
-		return nil, err
+		return nil, c.fail(err)
 	}
 	payload, err := c.readFrame()
 	if err != nil {
-		return nil, err
+		// Includes a timeout: the response may still be on its way, and
+		// reading on from here would pair it with the next request.
+		return nil, c.fail(err)
 	}
 	got, responseBody, err := DecodeFramePayload(payload)
 	if err != nil {
-		return nil, err
+		return nil, c.fail(err)
 	}
 	if got != correlationID {
 		// A response for a request we are not waiting on can only mean the
 		// stream has desynchronised; continuing would pair every later
 		// response with the wrong request.
-		return nil, fmt.Errorf("correlation id mismatch: expected %d, got %d", correlationID, got)
+		return nil, c.fail(fmt.Errorf(
+			"correlation id mismatch: expected %d, got %d", correlationID, got))
 	}
 	return responseBody, nil
 }
@@ -88,9 +149,15 @@ func (c *Conn) Request(apiKey int16, body []byte) ([]byte, error) {
 func (c *Conn) SendOneway(apiKey int16, body []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.broken.Load() {
+		return errConnBroken
+	}
 	c.next++
-	_, err := c.conn.Write(EncodeFrame(apiKey, c.next, c.clientID, body))
-	return err
+	c.armDeadline()
+	if _, err := c.conn.Write(EncodeFrame(apiKey, c.next, c.clientID, body)); err != nil {
+		return c.fail(err)
+	}
+	return nil
 }
 
 func (c *Conn) readFrame() ([]byte, error) {
@@ -412,13 +479,19 @@ func decodeMetadata(r *Reader) (*ClusterMetadata, error) {
 // Metadata is cached and refreshed only when a request comes back saying
 // the route was stale, because refreshing per request would put the
 // control plane on the data path.
+//
+// A connection that failed is replaced on its next use rather than kept:
+// without that, one dropped socket — a broker restart, an idle timeout on
+// a load balancer — would fail every later request for the life of the
+// client.
 type Router struct {
-	clientID string
-	timeout  time.Duration
-	seed     *Conn
-	mu       sync.Mutex
-	conns    map[int32]*Conn
-	metadata *ClusterMetadata
+	clientID    string
+	timeout     time.Duration
+	seedAddress string
+	seed        *Conn
+	mu          sync.Mutex
+	conns       map[int32]*Conn
+	metadata    *ClusterMetadata
 }
 
 func NewRouter(address, clientID string, timeout time.Duration) (*Router, error) {
@@ -427,10 +500,11 @@ func NewRouter(address, clientID string, timeout time.Duration) (*Router, error)
 		return nil, err
 	}
 	return &Router{
-		clientID: clientID,
-		timeout:  timeout,
-		seed:     seed,
-		conns:    map[int32]*Conn{},
+		clientID:    clientID,
+		timeout:     timeout,
+		seedAddress: address,
+		seed:        seed,
+		conns:       map[int32]*Conn{},
 	}, nil
 }
 
@@ -446,8 +520,34 @@ func (router *Router) Close() error {
 	return router.seed.Close()
 }
 
-// Seed returns the connection this router was opened with.
-func (router *Router) Seed() *Conn { return router.seed }
+// Seed returns the connection this router was opened with, redialled if
+// it has failed.
+func (router *Router) Seed() *Conn {
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	seed, _ := router.liveSeedLocked()
+	return seed
+}
+
+// liveSeedLocked returns the seed connection, redialling it if it broke.
+// Called with router.mu held.
+func (router *Router) liveSeedLocked() (*Conn, error) {
+	if !router.seed.Broken() {
+		return router.seed, nil
+	}
+	conn, err := Dial(router.seedAddress, router.clientID, router.timeout)
+	if err != nil {
+		return router.seed, err
+	}
+	old := router.seed
+	router.seed = conn
+	for id, cached := range router.conns {
+		if cached == old {
+			router.conns[id] = conn
+		}
+	}
+	return conn, nil
+}
 
 func (router *Router) Metadata(topics []string, refresh bool) (*ClusterMetadata, error) {
 	router.mu.Lock()
@@ -455,9 +555,13 @@ func (router *Router) Metadata(topics []string, refresh bool) (*ClusterMetadata,
 	if !refresh && router.metadata != nil {
 		return router.metadata, nil
 	}
+	seed, err := router.liveSeedLocked()
+	if err != nil {
+		return nil, err
+	}
 	w := NewBodyWriter()
 	w.StringArray(topics)
-	body, err := router.seed.Request(APIMetadata, w.Bytes())
+	body, err := seed.Request(APIMetadata, w.Bytes())
 	if err != nil {
 		return nil, err
 	}
@@ -519,7 +623,13 @@ func (router *Router) ConnFor(topic string, partition int32) (*Conn, error) {
 	router.mu.Lock()
 	defer router.mu.Unlock()
 	if conn, ok := router.conns[leader]; ok {
-		return conn, nil
+		if !conn.Broken() {
+			return conn, nil
+		}
+		delete(router.conns, leader)
+		if conn != router.seed {
+			_ = conn.Close()
+		}
 	}
 	for _, broker := range metadata.Brokers {
 		if broker.NodeID != leader {
@@ -529,8 +639,12 @@ func (router *Router) ConnFor(topic string, partition int32) (*Conn, error) {
 		// with, which may not be the one we dialled; reuse the seed rather
 		// than opening a second connection to ourselves.
 		if len(metadata.Brokers) == 1 {
-			router.conns[leader] = router.seed
-			return router.seed, nil
+			seed, err := router.liveSeedLocked()
+			if err != nil {
+				return nil, err
+			}
+			router.conns[leader] = seed
+			return seed, nil
 		}
 		conn, err := Dial(
 			fmt.Sprintf("%s:%d", broker.Host, broker.Port), router.clientID, router.timeout)
@@ -628,6 +742,17 @@ type Producer struct {
 	roundRobin    int
 	closed        bool
 	done          chan struct{}
+	// sendLocks serialises sends per partition. Without it the linger
+	// ticker and a Send that fills a batch can each take a batch for the
+	// same partition and race to the connection, and a batch waiting out a
+	// retry backoff is overtaken by the next one — either way the log ends
+	// up in a different order from the one the application sent.
+	sendLocks map[topicPartition]*sync.Mutex
+	// backgroundErr is the first failure of a linger-driven flush. Those
+	// records have already left the buffer, so the error is the only trace
+	// of them; the next Flush or Close returns it rather than reporting a
+	// success that did not happen.
+	backgroundErr error
 }
 
 // NewProducer connects and starts the linger ticker.
@@ -641,12 +766,13 @@ func NewProducer(address string, config ProducerConfig) (*Producer, error) {
 		return nil, err
 	}
 	producer := &Producer{
-		config:  config,
-		codec:   codec,
-		router:  router,
-		buffers: map[topicPartition][]buffered{},
-		sizes:   map[topicPartition]int{},
-		done:    make(chan struct{}),
+		config:    config,
+		codec:     codec,
+		router:    router,
+		buffers:   map[topicPartition][]buffered{},
+		sizes:     map[topicPartition]int{},
+		done:      make(chan struct{}),
+		sendLocks: map[topicPartition]*sync.Mutex{},
 	}
 	producer.cond = sync.NewCond(&producer.mu)
 	if config.LingerMs > 0 {
@@ -658,11 +784,11 @@ func NewProducer(address string, config ProducerConfig) (*Producer, error) {
 // Router exposes the routing layer, for callers that need metadata.
 func (p *Producer) Router() *Router { return p.router }
 
-// Close flushes, stops the ticker and releases connections.
+// Close flushes, stops the ticker and releases connections. The ticker
+// and connections are released even when the final flush fails; that
+// failure is still returned.
 func (p *Producer) Close() error {
-	if err := p.Flush(); err != nil {
-		return err
-	}
+	flushErr := p.Flush()
 	p.mu.Lock()
 	p.closed = true
 	p.cond.Broadcast()
@@ -673,7 +799,11 @@ func (p *Producer) Close() error {
 		case <-time.After(2 * time.Second):
 		}
 	}
-	return p.router.Close()
+	closeErr := p.router.Close()
+	if flushErr != nil {
+		return flushErr
+	}
+	return closeErr
 }
 
 // Send buffers one record. Call Flush to await delivery.
@@ -728,8 +858,22 @@ func (p *Producer) SendSync(
 	return p.produce(topic, partition, []buffered{{Record{key, value, 0, headers}, nowMillis()}})
 }
 
-// Flush sends every buffered record and waits for acknowledgement.
+// Flush sends every buffered record and waits for acknowledgement. It also
+// reports a failure of any background (linger) flush since the last call,
+// because those records are gone and no other call would say so.
 func (p *Producer) Flush() error {
+	err := p.flushAll()
+	p.mu.Lock()
+	background := p.backgroundErr
+	p.backgroundErr = nil
+	p.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return background
+}
+
+func (p *Producer) flushAll() error {
 	p.mu.Lock()
 	slots := make([]topicPartition, 0, len(p.buffers))
 	for slot, records := range p.buffers {
@@ -821,11 +965,29 @@ func (p *Producer) lingerLoop() {
 		}
 		// A background flush that fails must not kill the ticker; the next
 		// explicit Flush surfaces the error to a caller who can act on it.
-		_ = p.Flush()
+		if err := p.flushAll(); err != nil {
+			p.mu.Lock()
+			if p.backgroundErr == nil {
+				p.backgroundErr = err
+			}
+			p.mu.Unlock()
+		}
 	}
 }
 
 func (p *Producer) flushPartition(slot topicPartition) error {
+	p.mu.Lock()
+	lock, ok := p.sendLocks[slot]
+	if !ok {
+		lock = &sync.Mutex{}
+		p.sendLocks[slot] = lock
+	}
+	p.mu.Unlock()
+	// Held across the round trip (and any retries): a partition has at most
+	// one batch in flight, and batches leave in the order they were taken.
+	lock.Lock()
+	defer lock.Unlock()
+
 	p.mu.Lock()
 	batch := p.buffers[slot]
 	if len(batch) == 0 {
@@ -999,7 +1161,7 @@ func NewConsumer(address string, config ConsumerConfig) (*Consumer, error) {
 	return &Consumer{config: config, router: router}, nil
 }
 
-func (c *Consumer) Close() error   { return c.router.Close() }
+func (c *Consumer) Close() error    { return c.router.Close() }
 func (c *Consumer) Router() *Router { return c.router }
 
 func (c *Consumer) Partitions(topic string) ([]int32, error) {
@@ -1138,7 +1300,7 @@ func (c *Consumer) fetchOnce(
 		return 0, 0, nil, r.Err()
 	}
 	trailing := r.Rest()
-	if batchesLength > int64(len(trailing)) {
+	if batchesLength < 0 || batchesLength > int64(len(trailing)) {
 		return 0, 0, nil, errors.New("fetch response claims more batch bytes than it carries")
 	}
 	raw := trailing[:batchesLength]

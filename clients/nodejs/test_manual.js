@@ -13,9 +13,12 @@
  * commit. Exits non-zero on any failure.
  */
 
+const net = require('net');
+
 const {
   Assignor,
   AutoOffsetReset,
+  Connection,
   Consumer,
   EARLIEST,
   GroupConsumer,
@@ -25,6 +28,7 @@ const {
   RecordHeader,
   murmur2,
   partitionForKey,
+  stickyAssign,
 } = require('./src/index');
 
 const HOST = process.argv[2] || '127.0.0.1';
@@ -379,8 +383,316 @@ async function main() {
     producer.router.close();
   }
 
+
+  section('wire edge cases');
+  {
+    const edgeTopic = unique('node-edge');
+    const producer = await Producer.connect(HOST, PORT, { lingerMs: 0 });
+    const large = Buffer.alloc(1 << 20);
+    for (let i = 0; i < large.length; i += 1) large[i] = (i * 7) & 0xff;
+    const unicodeKey = Buffer.from('ключ-✓-🔑', 'utf8');
+    const unicodeValue = Buffer.from('значение — 数据 — 🚀', 'utf8');
+    let largeError = null;
+    try {
+      await producer.send(edgeTopic, large, { partition: 0 });
+    } catch (error) {
+      largeError = error;
+    }
+    await producer.send(edgeTopic, unicodeValue, {
+      partition: 0,
+      key: unicodeKey,
+      headers: [new RecordHeader('ünïcødé-🏷', Buffer.from('✓'))],
+    });
+    // An empty key and an empty header value are values, not nulls.
+    await producer.send(edgeTopic, Buffer.from('empty-key'), {
+      partition: 0,
+      key: Buffer.alloc(0),
+      headers: [new RecordHeader('empty', Buffer.alloc(0)), new RecordHeader('null', null)],
+    });
+    // Strings are accepted and travel as UTF-8, as Buffers do.
+    await producer.send(edgeTopic, 'héllo ✓ 🚀', {
+      partition: 0,
+      key: 'kéy',
+      headers: [new RecordHeader('h', 'välue')],
+    });
+    await producer.close();
+
+    const consumer = await Consumer.connect(HOST, PORT);
+    const got = [];
+    for (let offset = 0n; got.length < 4; ) {
+      const batch = await consumer.fetch(edgeTopic, 0, offset, 500);
+      if (batch.length === 0) break;
+      got.push(...batch);
+      offset = batch[batch.length - 1].offset + 1n;
+    }
+    check('a 1 MiB value is accepted', largeError === null, String(largeError));
+    const offsetOf = largeError === null ? 1 : 0;
+    const expected = offsetOf + 3;
+    check('edge records all arrive', got.length === expected, `got ${got.length}`);
+    if (largeError === null && got.length > 0) {
+      check('a 1 MiB value round-trips byte-identical', got[0].value.equals(large),
+        `${got[0].value.length} bytes`);
+    }
+    if (got.length === expected) {
+      const [uni, empty, str] = got.slice(offsetOf);
+      check('unicode key, value and header key round-trip',
+        uni.key.equals(unicodeKey) && uni.value.equals(unicodeValue) &&
+          uni.headers.length === 1 && uni.headers[0].key === 'ünïcødé-🏷');
+      check('an empty key stays empty, not null', empty.key !== null && empty.key.length === 0);
+      check('an empty header value stays empty, not null',
+        empty.headers.length === 2 && empty.headers[0].value !== null &&
+          empty.headers[0].value.length === 0 && empty.headers[1].value === null);
+      check('string key, value and header value travel as UTF-8',
+        str.value.toString('utf8') === 'héllo ✓ 🚀' && str.key.toString('utf8') === 'kéy' &&
+          str.headers[0].value.toString('utf8') === 'välue',
+        `${str.value.toString()} / ${str.key}`);
+    }
+    consumer.close();
+  }
+
+  section('ordering under linger flushes');
+  {
+    const orderTopic = unique('node-order');
+    const producer = await Producer.connect(HOST, PORT, { lingerMs: 1, batchSize: 256 });
+    const total = 5000;
+    const sends = [];
+    for (let i = 0; i < total; i += 1) {
+      sends.push(producer.send(orderTopic, Buffer.from(String(i)), { partition: 0 }));
+    }
+    await Promise.all(sends);
+    await producer.close();
+    const consumer = await Consumer.connect(HOST, PORT);
+    const values = [];
+    for (let offset = 0n; values.length < total; ) {
+      const batch = await consumer.fetch(orderTopic, 0, offset, 500);
+      if (batch.length === 0) break;
+      for (const record of batch) values.push(Number(record.value.toString()));
+      offset = batch[batch.length - 1].offset + 1n;
+    }
+    let inversions = 0;
+    for (let i = 1; i < values.length; i += 1) if (values[i] < values[i - 1]) inversions += 1;
+    check('every record of a partition arrives', values.length === total, `got ${values.length}`);
+    check("a partition's records keep send order", inversions === 0, `${inversions} inversions`);
+    consumer.close();
+  }
+
+  section('background flush failures are reported');
+  {
+    const producer = await Producer.connect(HOST, PORT, { lingerMs: 20 });
+    let sendError = null;
+    try {
+      // Partition 999 does not exist, so the linger ticker's flush fails.
+      await producer.send(unique('node-bgfail'), Buffer.from('lost'), { partition: 999 });
+    } catch (error) {
+      sendError = error;
+    }
+    await sleep(300);
+    let flushError = null;
+    try {
+      await producer.flush();
+    } catch (error) {
+      flushError = error;
+    }
+    check('a failed linger flush surfaces on the next flush',
+      sendError === null && flushError !== null, `send=${sendError} flush=${flushError}`);
+    try {
+      await producer.close();
+    } catch {
+      // Reported above; close must still release everything.
+    }
+    check('close releases the ticker and sockets', producer.router.seed.closed &&
+      !(producer.ticker && producer.ticker.hasRef && producer.ticker.hasRef()));
+  }
+
+  section('connection failures');
+  {
+    // A broker that accepts and never answers must cost an error, not a
+    // promise that never settles.
+    const silent = net.createServer((socket) => socket.on('data', () => {}));
+    await new Promise((resolve) => silent.listen(0, '127.0.0.1', resolve));
+    const connection = await Connection.connect('127.0.0.1', silent.address().port, 'node-test',
+      2000, 300);
+    const started = Date.now();
+    let timedOut = null;
+    try {
+      await connection.apiVersions();
+    } catch (error) {
+      timedOut = error;
+    }
+    check('a request to an unresponsive broker times out',
+      timedOut !== null && Date.now() - started < 3000, String(timedOut));
+    connection.close();
+    silent.close();
+
+    // A connection the broker drops is redialled, not kept forever.
+    const proxy = await startProxy(HOST, PORT);
+    const dropTopic = unique('node-drop');
+    const producer = await Producer.connect('127.0.0.1', proxy.port, { lingerMs: 0 });
+    await producer.send(dropTopic, Buffer.from('before'), { partition: 0 });
+    await proxy.dropAll();
+    let recovered = new Error('not attempted');
+    for (let attempt = 0; attempt < 3 && recovered; attempt += 1) {
+      try {
+        await producer.send(dropTopic, Buffer.from('after'), { partition: 0 });
+        recovered = null;
+      } catch (error) {
+        recovered = error;
+      }
+    }
+    check('a producer recovers after its connection drops', recovered === null, String(recovered));
+    await producer.close().catch(() => {});
+    const consumer = await Consumer.connect('127.0.0.1', proxy.port);
+    await consumer.fetch(dropTopic, 0, 0n, 100);
+    await proxy.dropAll();
+    let fetchError = new Error('not attempted');
+    let fetched = [];
+    for (let attempt = 0; attempt < 3 && fetchError; attempt += 1) {
+      try {
+        fetched = await consumer.fetch(dropTopic, 0, 0n, 100);
+        fetchError = null;
+      } catch (error) {
+        fetchError = error;
+      }
+    }
+    check('a consumer recovers after its connection drops',
+      fetchError === null && fetched.length >= 1, String(fetchError));
+    consumer.close();
+    await proxy.close();
+  }
+
+  section('consumer group: max.poll.interval and rejoin');
+  {
+    const slowTopic = unique('node-slow');
+    const producer = await Producer.connect(HOST, PORT, { lingerMs: 0 });
+    for (let i = 0; i < 10; i += 1) await producer.send(slowTopic, Buffer.from(`s${i}`));
+    const consumer = await GroupConsumer.connect(HOST, PORT, unique('node-slow-grp'), {
+      autoCommitIntervalMs: 0,
+      maxPollIntervalMs: 1500,
+      // 0 means no cap, as in the Go driver, not "return nothing".
+      maxPollRecords: 0,
+    });
+    consumer.subscribe([slowTopic]);
+    const first = [];
+    let deadline = Date.now() + 15000;
+    while (first.length < 10 && Date.now() < deadline) first.push(...(await consumer.poll(300)));
+    await consumer.commit();
+    // Stall past max.poll.interval.ms: the member leaves the group.
+    await sleep(2500);
+    for (let i = 10; i < 20; i += 1) await producer.send(slowTopic, Buffer.from(`s${i}`));
+    await producer.close();
+    const second = [];
+    let pollError = null;
+    deadline = Date.now() + 15000;
+    while (second.length < 10 && Date.now() < deadline) {
+      try {
+        second.push(...(await consumer.poll(300)));
+      } catch (error) {
+        pollError = error;
+        break;
+      }
+    }
+    check('a member that stalled rejoins on its next poll',
+      first.length === 10 && second.length === 10 && pollError === null,
+      `first=${first.length} second=${second.length} err=${pollError}`);
+    await consumer.close();
+  }
+
+  section('sticky assignor agrees with the Go and Rust drivers');
+  {
+    // With ten or more partitions a string sort puts "t 10" before "t 2";
+    // every driver must order partitions numerically or a mixed-language
+    // group reshuffles whenever leadership changes hands.
+    const topics = new Map([['t', Array.from({ length: 12 }, (_, i) => i)]]);
+    const previous = new Map([
+      ['a', Array.from({ length: 12 }, (_, i) => ({ topic: 't', partition: i }))],
+      ['b', []],
+    ]);
+    const result = stickyAssign([{ id: 'a', topics: ['t'] }, { id: 'b', topics: ['t'] }], topics,
+      previous);
+    const kept = result.get('a').map((slot) => slot.partition).join(',');
+    const moved = result.get('b').map((slot) => slot.partition).join(',');
+    check('the member over quota keeps its lowest partitions', kept === '0,1,2,3,4,5', kept);
+    check('assignments are listed in numeric order', moved === '6,7,8,9,10,11', moved);
+  }
+
+
+  section('consumer group: time inside poll does not count against max.poll.interval');
+  {
+    const joinTopic = unique('node-inpoll');
+    const producer = await Producer.connect(HOST, PORT, { lingerMs: 0 });
+    await producer.router.partitions(joinTopic);
+    const consumer = await GroupConsumer.connect(HOST, PORT, unique('node-inpoll-grp'), {
+      autoCommitIntervalMs: 0,
+      // Far shorter than the poll below, which spends ~1s joining (the
+      // broker's initial rebalance delay) and then waits for data.
+      maxPollIntervalMs: 600,
+    });
+    consumer.subscribe([joinTopic]);
+    const producing = (async () => {
+      await sleep(2000);
+      for (let i = 0; i < 10; i += 1) await producer.send(joinTopic, Buffer.from(`j${i}`));
+    })();
+    let got = [];
+    let pollError = null;
+    try {
+      got = await consumer.poll(4000);
+    } catch (error) {
+      pollError = error;
+    }
+    // Committed straight away, before another poll could quietly rejoin:
+    // this fails if the member left the group mid-poll.
+    let commitError = null;
+    try {
+      await consumer.commit();
+    } catch (error) {
+      commitError = error;
+    }
+    check('a member is still in its group after a long poll',
+      pollError === null && got.length > 0 && commitError === null,
+      `got=${got.length} poll=${pollError} commit=${commitError}`);
+    await producing;
+    await producer.close();
+    await consumer.close();
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
+}
+
+/** A TCP forwarder that can sever every live connection, which is how a
+ * broker restart or an idle timeout looks to a client. */
+async function startProxy(host, port) {
+  const live = new Set();
+  const server = net.createServer((client) => {
+    const upstream = net.connect(port, host);
+    live.add(client);
+    live.add(upstream);
+    client.pipe(upstream);
+    upstream.pipe(client);
+    const drop = () => {
+      client.destroy();
+      upstream.destroy();
+      live.delete(client);
+      live.delete(upstream);
+    };
+    client.on('error', drop);
+    upstream.on('error', drop);
+    client.on('close', drop);
+    upstream.on('close', drop);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    port: server.address().port,
+    async dropAll() {
+      for (const socket of live) socket.destroy();
+      live.clear();
+      await sleep(50);
+    },
+    async close() {
+      await this.dropAll();
+      server.close();
+    },
+  };
 }
 
 main().catch((error) => {

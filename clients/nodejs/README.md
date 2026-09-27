@@ -1,7 +1,7 @@
 # Brahmaputra client for Node.js
 
-Requires Node 18+. Verified end to end against a live broker: **34/34
-checks** (`node test_manual.js`).
+Requires Node 18+. Verified end to end against a live broker: **57/57
+checks** (`./test.sh HOST PORT`, i.e. `node test_manual.js HOST PORT`).
 
 ## Produce
 

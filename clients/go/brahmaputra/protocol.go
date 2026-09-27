@@ -713,7 +713,9 @@ func decodeRecords(payload []byte, hasHeaders, hasNullValues bool) ([]Record, er
 			return nil, err
 		}
 		pos = next
-		if pos+int(length) > len(payload) {
+		// Compared as uint64 so a length near 2^64 cannot wrap negative
+		// and slip past the check into a slice panic.
+		if length > uint64(len(payload)-pos) {
 			return nil, errors.New("truncated record")
 		}
 		end := pos + int(length)
@@ -725,8 +727,12 @@ func decodeRecords(payload []byte, hasHeaders, hasNullValues bool) ([]Record, er
 		}
 		pos = next
 		if keyLenPlusOne > 0 {
+			if keyLenPlusOne-1 > uint64(end-pos) {
+				return nil, errors.New("truncated record key")
+			}
 			size := int(keyLenPlusOne - 1)
-			record.Key = append([]byte(nil), payload[pos:pos+size]...)
+			// Non-nil even when empty: an empty key is not a null key.
+			record.Key = append([]byte{}, payload[pos:pos+size]...)
 			pos += size
 		}
 
@@ -740,13 +746,13 @@ func decodeRecords(payload []byte, hasHeaders, hasNullValues bool) ([]Record, er
 			// record whose value is merely empty.
 			record.Value = nil
 		} else {
-			valueLen := int(rawValueLen)
 			if hasNullValues {
-				valueLen = int(rawValueLen - 1)
+				rawValueLen--
 			}
-			if pos+valueLen > len(payload) {
+			if rawValueLen > uint64(end-pos) {
 				return nil, errors.New("truncated record value")
 			}
+			valueLen := int(rawValueLen)
 			record.Value = append([]byte{}, payload[pos:pos+valueLen]...)
 			pos += valueLen
 		}
@@ -776,6 +782,9 @@ func decodeRecords(payload []byte, hasHeaders, hasNullValues bool) ([]Record, er
 					return nil, err
 				}
 				pos = next
+				if keyLen > uint64(end-pos) {
+					return nil, errors.New("truncated record header key")
+				}
 				header := RecordHeader{Key: string(payload[pos : pos+int(keyLen)])}
 				pos += int(keyLen)
 				valuePlusOne, next, err := getUvarint(payload, pos)
@@ -784,8 +793,13 @@ func decodeRecords(payload []byte, hasHeaders, hasNullValues bool) ([]Record, er
 				}
 				pos = next
 				if valuePlusOne > 0 {
+					if valuePlusOne-1 > uint64(end-pos) {
+						return nil, errors.New("truncated record header value")
+					}
 					size := int(valuePlusOne - 1)
-					header.Value = append([]byte(nil), payload[pos:pos+size]...)
+					// Non-nil even when empty: only a zero length prefix
+					// means a null header value.
+					header.Value = append([]byte{}, payload[pos:pos+size]...)
 					pos += size
 				}
 				record.Headers = append(record.Headers, header)

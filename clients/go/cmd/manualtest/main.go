@@ -11,7 +11,11 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"net"
 	"os"
+	"strconv"
+	"sync"
 	"time"
 
 	bp "github.com/byte-mods/brahmaputra/clients/go/brahmaputra"
@@ -423,8 +427,304 @@ func main() {
 		check("a full buffer blocks and then reports", blocked, "")
 	}
 
+	section("wire edge cases")
+	{
+		edgeTopic := unique("go-edge")
+		config := bp.DefaultProducerConfig()
+		config.LingerMs = 0
+		producer := must(bp.NewProducer(address, config))
+		large := make([]byte, 1<<20)
+		for i := range large {
+			large[i] = byte(i * 7)
+		}
+		unicodeKey := []byte("ключ-✓-🔑")
+		unicodeValue := []byte("значение — 数据 — 🚀")
+		must(0, producer.SendTo(edgeTopic, 0, large, nil))
+		must(0, producer.SendTo(edgeTopic, 0, unicodeValue, unicodeKey,
+			bp.RecordHeader{Key: "ünïcødé-🏷", Value: []byte("✓")}))
+		// An empty key and an empty header value are values, not nulls.
+		must(0, producer.SendTo(edgeTopic, 0, []byte("empty-key"), []byte{},
+			bp.RecordHeader{Key: "empty", Value: []byte{}},
+			bp.RecordHeader{Key: "null", Value: nil}))
+		must(0, producer.SendTo(edgeTopic, 0, []byte("null-key"), nil))
+		must(0, producer.Close())
+
+		consumer := must(bp.NewConsumer(address, bp.DefaultConsumerConfig()))
+		var got []bp.ConsumedRecord
+		for offset := int64(0); len(got) < 4; {
+			batch, err := consumer.Fetch(edgeTopic, 0, offset, 500)
+			if err != nil || len(batch) == 0 {
+				break
+			}
+			got = append(got, batch...)
+			offset = batch[len(batch)-1].Offset + 1
+		}
+		check("edge records all arrive", len(got) == 4, fmt.Sprintf("got %d", len(got)))
+		if len(got) == 4 {
+			check("a 1 MiB value round-trips byte-identical", bytes.Equal(got[0].Value, large),
+				fmt.Sprintf("%d bytes", len(got[0].Value)))
+			check("unicode key, value and header key round-trip",
+				bytes.Equal(got[1].Key, unicodeKey) && bytes.Equal(got[1].Value, unicodeValue) &&
+					len(got[1].Headers) == 1 && got[1].Headers[0].Key == "ünïcødé-🏷", "")
+			check("an empty key stays empty, not null",
+				got[2].Key != nil && len(got[2].Key) == 0, fmt.Sprintf("%#v", got[2].Key))
+			check("an empty header value stays empty, not null",
+				len(got[2].Headers) == 2 && got[2].Headers[0].Value != nil &&
+					len(got[2].Headers[0].Value) == 0 && got[2].Headers[1].Value == nil,
+				fmt.Sprintf("%#v", got[2].Headers))
+			check("a null key stays null", got[3].Key == nil, fmt.Sprintf("%#v", got[3].Key))
+		}
+		consumer.Close()
+	}
+
+	section("ordering under linger flushes")
+	{
+		orderTopic := unique("go-order")
+		config := bp.DefaultProducerConfig()
+		config.LingerMs = 1
+		config.BatchSize = 256
+		producer := must(bp.NewProducer(address, config))
+		const total = 5000
+		for i := 0; i < total; i++ {
+			must(0, producer.SendTo(orderTopic, 0, []byte(strconv.Itoa(i)), nil))
+		}
+		must(0, producer.Close())
+		consumer := must(bp.NewConsumer(address, bp.DefaultConsumerConfig()))
+		var values []int
+		for offset := int64(0); len(values) < total; {
+			batch, err := consumer.Fetch(orderTopic, 0, offset, 500)
+			if err != nil || len(batch) == 0 {
+				break
+			}
+			for _, record := range batch {
+				value, _ := strconv.Atoi(string(record.Value))
+				values = append(values, value)
+			}
+			offset = batch[len(batch)-1].Offset + 1
+		}
+		inversions := 0
+		for i := 1; i < len(values); i++ {
+			if values[i] < values[i-1] {
+				inversions++
+			}
+		}
+		check("every record of a partition arrives", len(values) == total,
+			fmt.Sprintf("got %d", len(values)))
+		check("a partition's records keep send order", inversions == 0,
+			fmt.Sprintf("%d inversions", inversions))
+		consumer.Close()
+	}
+
+	section("background flush failures are reported")
+	{
+		config := bp.DefaultProducerConfig()
+		config.LingerMs = 20
+		producer := must(bp.NewProducer(address, config))
+		// Partition 999 does not exist, so the linger ticker's flush fails.
+		sendErr := producer.SendTo(unique("go-bgfail"), 999, []byte("lost"), nil)
+		time.Sleep(300 * time.Millisecond)
+		flushErr := producer.Flush()
+		check("a failed linger flush surfaces on the next Flush",
+			sendErr == nil && flushErr != nil, fmt.Sprintf("send=%v flush=%v", sendErr, flushErr))
+		closed := make(chan error, 1)
+		go func() { closed <- producer.Close() }()
+		select {
+		case <-closed:
+			check("Close returns after a failed flush", true, "")
+		case <-time.After(5 * time.Second):
+			check("Close returns after a failed flush", false, "hung")
+		}
+	}
+
+	section("connection failures")
+	{
+		// A broker that accepts and never answers must cost an error, not a
+		// goroutine blocked forever.
+		silent, err := net.Listen("tcp", "127.0.0.1:0")
+		if err == nil {
+			go func() {
+				for {
+					conn, err := silent.Accept()
+					if err != nil {
+						return
+					}
+					go func() { _, _ = io.Copy(io.Discard, conn) }()
+				}
+			}()
+			conn := must(bp.Dial(silent.Addr().String(), "go-test", time.Second))
+			conn.SetRequestTimeout(300 * time.Millisecond)
+			started := time.Now()
+			_, _, requestErr := conn.APIVersions()
+			check("a request to an unresponsive broker times out",
+				requestErr != nil && time.Since(started) < 3*time.Second,
+				fmt.Sprint(requestErr))
+			check("a timed-out connection is not reused", conn.Broken(), "")
+			conn.Close()
+			silent.Close()
+		}
+
+		// A connection the broker drops is redialled, not kept forever.
+		proxy := newProxy(address)
+		dropTopic := unique("go-drop")
+		config := bp.DefaultProducerConfig()
+		config.LingerMs = 0
+		producer := must(bp.NewProducer(proxy.address, config))
+		must(0, producer.SendTo(dropTopic, 0, []byte("before"), nil))
+		proxy.dropAll()
+		var recovered error = fmt.Errorf("not attempted")
+		for attempt := 0; attempt < 3 && recovered != nil; attempt++ {
+			recovered = producer.SendTo(dropTopic, 0, []byte("after"), nil)
+		}
+		check("a producer recovers after its connection drops", recovered == nil,
+			fmt.Sprint(recovered))
+		producer.Close()
+		consumer := must(bp.NewConsumer(proxy.address, bp.DefaultConsumerConfig()))
+		must(consumer.Fetch(dropTopic, 0, 0, 100))
+		proxy.dropAll()
+		var fetchErr error = fmt.Errorf("not attempted")
+		var fetched []bp.ConsumedRecord
+		for attempt := 0; attempt < 3 && fetchErr != nil; attempt++ {
+			fetched, fetchErr = consumer.Fetch(dropTopic, 0, 0, 100)
+		}
+		check("a consumer recovers after its connection drops",
+			fetchErr == nil && len(fetched) >= 1, fmt.Sprint(fetchErr))
+		consumer.Close()
+		proxy.close()
+	}
+
+	section("consumer group: max.poll.interval and rejoin")
+	{
+		slowTopic := unique("go-slow")
+		config := bp.DefaultProducerConfig()
+		config.LingerMs = 0
+		producer := must(bp.NewProducer(address, config))
+		for i := 0; i < 10; i++ {
+			must(0, producer.Send(slowTopic, []byte(fmt.Sprintf("s%d", i)), nil))
+		}
+		groupConfig := bp.DefaultGroupConfig()
+		groupConfig.AutoCommitIntervalMs = 0
+		groupConfig.MaxPollIntervalMs = 1500
+		consumer := must(bp.NewGroupConsumer(address, unique("go-slow-grp"), groupConfig))
+		consumer.Subscribe([]string{slowTopic})
+		var first []bp.ConsumedRecord
+		deadline := time.Now().Add(15 * time.Second)
+		for len(first) < 10 && time.Now().Before(deadline) {
+			records, err := consumer.Poll(300 * time.Millisecond)
+			if err != nil {
+				break
+			}
+			first = append(first, records...)
+		}
+		must(0, consumer.Commit())
+		// Stall past max.poll.interval.ms: the member leaves the group.
+		time.Sleep(2500 * time.Millisecond)
+		for i := 10; i < 20; i++ {
+			must(0, producer.Send(slowTopic, []byte(fmt.Sprintf("s%d", i)), nil))
+		}
+		must(0, producer.Close())
+		var second []bp.ConsumedRecord
+		var pollErr error
+		deadline = time.Now().Add(15 * time.Second)
+		for len(second) < 10 && time.Now().Before(deadline) {
+			records, err := consumer.Poll(300 * time.Millisecond)
+			if err != nil {
+				pollErr = err
+				break
+			}
+			second = append(second, records...)
+		}
+		check("a member that stalled rejoins on its next poll",
+			len(first) == 10 && len(second) == 10 && pollErr == nil,
+			fmt.Sprintf("first=%d second=%d err=%v", len(first), len(second), pollErr))
+		must(0, consumer.Close())
+	}
+
+	section("consumer group: time inside poll does not count against max.poll.interval")
+	{
+		joinTopic := unique("go-inpoll")
+		config := bp.DefaultProducerConfig()
+		config.LingerMs = 0
+		producer := must(bp.NewProducer(address, config))
+		must(producer.Router().Partitions(joinTopic))
+		groupConfig := bp.DefaultGroupConfig()
+		groupConfig.AutoCommitIntervalMs = 0
+		// Far shorter than the first poll below, which spends ~1s joining
+		// (the broker's initial rebalance delay) and then waits for data.
+		groupConfig.MaxPollIntervalMs = 600
+		consumer := must(bp.NewGroupConsumer(address, unique("go-inpoll-grp"), groupConfig))
+		consumer.Subscribe([]string{joinTopic})
+		go func() {
+			time.Sleep(2 * time.Second)
+			for i := 0; i < 10; i++ {
+				_ = producer.Send(joinTopic, []byte(fmt.Sprintf("j%d", i)), nil)
+			}
+		}()
+		// One long poll: it joins, then waits for the records above.
+		got, pollErr := consumer.Poll(4 * time.Second)
+		// Committed straight away, before another poll could quietly
+		// rejoin: this fails if the member left the group mid-poll.
+		commitErr := consumer.Commit()
+		check("a member is still in its group after a long poll",
+			pollErr == nil && len(got) > 0 && commitErr == nil,
+			fmt.Sprintf("got=%d poll=%v commit=%v", len(got), pollErr, commitErr))
+		must(0, consumer.Close())
+		must(0, producer.Close())
+	}
+
 	fmt.Printf("\n%d passed, %d failed\n", passed, failed)
 	if failed > 0 {
 		os.Exit(1)
 	}
+}
+
+// proxy forwards TCP to the broker and can sever every live connection,
+// which is how a broker restart or an idle-timeout looks to a client.
+type proxy struct {
+	address  string
+	listener net.Listener
+	mu       sync.Mutex
+	live     []net.Conn
+}
+
+func newProxy(target string) *proxy {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Printf("  FATAL proxy: %v\n", err)
+		os.Exit(2)
+	}
+	p := &proxy{address: listener.Addr().String(), listener: listener}
+	go func() {
+		for {
+			client, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			upstream, err := net.Dial("tcp", target)
+			if err != nil {
+				client.Close()
+				continue
+			}
+			p.mu.Lock()
+			p.live = append(p.live, client, upstream)
+			p.mu.Unlock()
+			go func() { _, _ = io.Copy(upstream, client); upstream.Close() }()
+			go func() { _, _ = io.Copy(client, upstream); client.Close() }()
+		}
+	}()
+	return p
+}
+
+func (p *proxy) dropAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, conn := range p.live {
+		conn.Close()
+	}
+	p.live = nil
+	time.Sleep(50 * time.Millisecond)
+}
+
+func (p *proxy) close() {
+	p.listener.Close()
+	p.dropAll()
 }

@@ -109,6 +109,11 @@ class GroupConsumer {
     this.lastCommitMs = nowMs();
     this.closed = false;
     this.leftForSlowPoll = false;
+    // True while poll() runs. max.poll.interval.ms bounds the gap *between*
+    // polls — time the application spends processing — so a poll that is
+    // itself busy joining a slow rebalance must not count against it.
+    this.inPoll = false;
+    this.ticking = false;
 
     // This timer enforces two independent deadlines, so it has to fire
     // often enough for the shorter of them. Deriving the tick from the
@@ -116,10 +121,17 @@ class GroupConsumer {
     // interval unchecked until long after it stalled.
     const heartbeatEvery = Math.max(Math.floor(config.sessionTimeoutMs / 3), 1);
     const pollCheckEvery = Math.max(Math.floor(config.maxPollIntervalMs / 3), 1);
-    this.timer = setInterval(
-      () => this._tick().catch(() => {}),
-      Math.min(heartbeatEvery, pollCheckEvery)
-    );
+    this.timer = setInterval(() => {
+      // One heartbeat at a time: a slow coordinator must not pile up
+      // overlapping ticks that each send their own.
+      if (this.ticking) return;
+      this.ticking = true;
+      this._tick()
+        .catch(() => {})
+        .finally(() => {
+          this.ticking = false;
+        });
+    }, Math.min(heartbeatEvery, pollCheckEvery));
   }
 
   static async connect(host, port, groupId, overrides = {}) {
@@ -167,15 +179,27 @@ class GroupConsumer {
     if (this.subscribed.length === 0) {
       throw new BrahmaputraError('subscribe to at least one topic before polling');
     }
-    // Stamped on entry, not on return: the interval bounds how long the
-    // *application* may go without asking for records, and a poll that
-    // blocks for its full timeout is the consumer working normally.
+    // Stamped on entry and again on return, and not enforced in between:
+    // the interval bounds how long the *application* may go without asking
+    // for records, and a poll that blocks — for its timeout, or on a slow
+    // rebalance — is the consumer working normally.
     this.lastPollMs = nowMs();
+    this.inPoll = true;
+    try {
+      return await this._poll(timeoutMs);
+    } finally {
+      this.inPoll = false;
+      this.lastPollMs = nowMs();
+    }
+  }
 
-    if (!this.joined) await this._join();
-
+  async _poll(timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
+      // Checked every sweep, not only on entry: a rebalance the heartbeat
+      // learns of mid-poll must stop this member fetching partitions it may
+      // no longer own, rather than carrying on until the timeout.
+      if (!this.joined) await this._join();
       if (this.buffered.length > 0) return this._takeBuffered();
       if (this.assignment.length === 0) {
         if (Date.now() >= deadline) return [];
@@ -229,7 +253,10 @@ class GroupConsumer {
   }
 
   _takeBuffered() {
-    const limit = this.config.maxPollRecords;
+    // 0 (or less) means no cap, as in the Go driver; slice(0, 0) would
+    // otherwise hand back nothing forever while the buffer never drains.
+    const limit =
+      this.config.maxPollRecords > 0 ? this.config.maxPollRecords : this.buffered.length;
     const delivered = this.buffered.slice(0, limit);
     this.buffered = this.buffered.slice(limit);
     for (const record of delivered) {
@@ -316,6 +343,12 @@ class GroupConsumer {
         await sleep(100);
         continue;
       }
+      if (code === ErrorCode.UNKNOWN_MEMBER_ID) {
+        // The coordinator dropped this member (session expiry, or removed
+        // while it waited): join again as a new one.
+        this.memberId = '';
+        continue;
+      }
       if (code !== ErrorCode.NONE) throw new ServerError(code, 'join_group');
 
       const generation = reader.int32();
@@ -363,6 +396,10 @@ class GroupConsumer {
     const reader = bodyReader(await this._coordinatorRequest(ApiKey.SYNC_GROUP, writer.bytes()));
     const code = reader.int32();
     if (code === ErrorCode.REBALANCE_IN_PROGRESS || code === ErrorCode.ILLEGAL_GENERATION) {
+      return false;
+    }
+    if (code === ErrorCode.UNKNOWN_MEMBER_ID) {
+      this.memberId = '';
       return false;
     }
     if (code !== ErrorCode.NONE) throw new ServerError(code, 'sync_group');
@@ -442,7 +479,7 @@ class GroupConsumer {
     if (this.closed || !this.joined || !this.memberId) return;
 
     const idleMs = nowMs() - this.lastPollMs;
-    if (idleMs >= this.config.maxPollIntervalMs) {
+    if (!this.inPoll && idleMs >= this.config.maxPollIntervalMs) {
       // The application has stopped consuming even though the process is
       // alive. Continuing to heartbeat would assert a liveness this member
       // no longer has, holding its partitions away from a consumer that
@@ -456,16 +493,18 @@ class GroupConsumer {
     }
     this.leftForSlowPoll = false;
 
-    const writer = bodyWriter()
-      .string(this.groupId)
-      .int32(this.generation)
-      .string(this.memberId);
+    const { generation, memberId } = this;
+    const writer = bodyWriter().string(this.groupId).int32(generation).string(memberId);
     const reader = bodyReader(await this._coordinatorRequest(ApiKey.HEARTBEAT, writer.bytes()));
     const code = reader.int32();
     if (
-      code === ErrorCode.REBALANCE_IN_PROGRESS ||
-      code === ErrorCode.UNKNOWN_MEMBER_ID ||
-      code === ErrorCode.ILLEGAL_GENERATION
+      (code === ErrorCode.REBALANCE_IN_PROGRESS ||
+        code === ErrorCode.UNKNOWN_MEMBER_ID ||
+        code === ErrorCode.ILLEGAL_GENERATION) &&
+      // Only if nothing changed meanwhile: an answer about a generation
+      // this member has already moved past must not send it round again.
+      this.generation === generation &&
+      this.memberId === memberId
     ) {
       this.joined = false;
     }
@@ -513,6 +552,17 @@ function peekErrorCode(body) {
 }
 
 const key = (slot) => `${slot.topic} ${slot.partition}`;
+
+/**
+ * (topic, partition) order, partition compared as a number — the order the
+ * Go and Rust drivers use. A string sort of `key()` would put "t 10" before
+ * "t 2", and a sticky leader must decide exactly as the other drivers do or
+ * a mixed-language group reshuffles every time leadership changes hands.
+ */
+function compareSlots(a, b) {
+  if (a.topic !== b.topic) return a.topic < b.topic ? -1 : 1;
+  return a.partition - b.partition;
+}
 
 function splitKey(slotKey) {
   const index = slotKey.lastIndexOf(' ');
@@ -625,9 +675,13 @@ function stickyAssign(members, topicPartitions, previous) {
   );
 
   const kept = new Map();
-  for (const slotKey of [...claimed.keys()].sort()) {
-    const memberId = claimed.get(slotKey);
+  const claimedSlots = [...claimed.keys()].map((slotKey) => {
     const [topic, partition] = splitKey(slotKey);
+    return { topic, partition, slotKey };
+  });
+  claimedSlots.sort(compareSlots);
+  for (const { topic, partition, slotKey } of claimedSlots) {
+    const memberId = claimed.get(slotKey);
     const held = kept.get(memberId) || [];
     if (held.length < (quota.get(memberId) || 0)) {
       held.push({ topic, partition });
@@ -640,7 +694,7 @@ function stickyAssign(members, topicPartitions, previous) {
     if (assignment.has(memberId)) assignment.set(memberId, held);
   }
 
-  unassigned.sort((a, b) => (key(a) < key(b) ? -1 : 1));
+  unassigned.sort(compareSlots);
   for (const slot of unassigned) {
     let taker = eligible.find(
       (memberId) =>
@@ -657,7 +711,7 @@ function stickyAssign(members, topicPartitions, previous) {
   }
 
   for (const held of assignment.values()) {
-    held.sort((a, b) => (key(a) < key(b) ? -1 : 1));
+    held.sort(compareSlots);
   }
   return assignment;
 }

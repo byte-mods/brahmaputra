@@ -4,8 +4,9 @@
 go get github.com/byte-mods/brahmaputra/clients/go
 ```
 
-Verified end to end against a live broker: **34/34 checks**
-(`go run ./cmd/manualtest`).
+Verified end to end against a live broker: **54/54 checks**
+(`./test.sh HOST PORT`, which vets and runs `go run ./cmd/manualtest HOST:PORT`
+under the race detector when cgo is available).
 
 ## Produce
 

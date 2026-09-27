@@ -97,6 +97,9 @@ type GroupConsumer struct {
 	consumer *Consumer
 
 	subscribed []string
+	// memberID, generation and joined are shared with the heartbeat
+	// goroutine, which reads them every tick and clears joined when the
+	// coordinator asks for a rejoin; every access goes through mu.
 	memberID   string
 	generation int32
 	joined     bool
@@ -110,8 +113,12 @@ type GroupConsumer struct {
 	fetchPositions map[topicPartition]int64
 	buffered       []ConsumedRecord
 
-	mu           sync.Mutex
-	lastPollMs   int64
+	mu         sync.Mutex
+	lastPollMs int64
+	// inPoll is true while Poll runs. MaxPollIntervalMs bounds the gap
+	// *between* polls — time the application spends processing — so a poll
+	// that is itself busy joining a slow rebalance must not count against it.
+	inPoll       bool
 	lastCommitMs int64
 	closed       bool
 	done         chan struct{}
@@ -147,7 +154,20 @@ func NewGroupConsumer(address, groupID string, config GroupConfig) (*GroupConsum
 // Subscribe sets the topics this member wants a share of.
 func (g *GroupConsumer) Subscribe(topics []string) {
 	g.subscribed = append([]string(nil), topics...)
-	g.joined = false
+	g.setJoined(false)
+}
+
+// membership snapshots the fields the heartbeat goroutine shares.
+func (g *GroupConsumer) membership() (memberID string, generation int32, joined bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.memberID, g.generation, g.joined
+}
+
+func (g *GroupConsumer) setJoined(joined bool) {
+	g.mu.Lock()
+	g.joined = joined
+	g.mu.Unlock()
 }
 
 // Close commits, leaves the group, then stops.
@@ -161,10 +181,11 @@ func (g *GroupConsumer) Close() error {
 	g.closed = true
 	g.mu.Unlock()
 
-	if g.joined {
+	memberID, _, joined := g.membership()
+	if joined {
 		_ = g.Commit()
 	}
-	if g.memberID != "" {
+	if memberID != "" {
 		// Best effort: the caller is shutting down, and failing here costs
 		// only the session timeout it was trying to avoid.
 		_ = g.leave()
@@ -181,21 +202,31 @@ func (g *GroupConsumer) Poll(timeout time.Duration) ([]ConsumedRecord, error) {
 	if len(g.subscribed) == 0 {
 		return nil, fmt.Errorf("subscribe to at least one topic before polling")
 	}
-	// Stamped on entry, not on return: the interval bounds how long the
-	// *application* may go without asking for records, and a poll that
-	// blocks for its full timeout is the consumer working normally.
+	// Stamped on entry and again on return, and not enforced in between:
+	// the interval bounds how long the *application* may go without asking
+	// for records, and a poll that blocks — for its timeout, or on a slow
+	// rebalance — is the consumer working normally.
 	g.mu.Lock()
 	g.lastPollMs = nowMillis()
+	g.inPoll = true
 	g.mu.Unlock()
-
-	if !g.joined {
-		if err := g.join(); err != nil {
-			return nil, err
-		}
-	}
+	defer func() {
+		g.mu.Lock()
+		g.lastPollMs = nowMillis()
+		g.inPoll = false
+		g.mu.Unlock()
+	}()
 
 	deadline := time.Now().Add(timeout)
 	for {
+		// Checked every sweep, not only on entry: a rebalance the heartbeat
+		// learns of mid-poll must stop this member fetching partitions it
+		// may no longer own, rather than carrying on until the timeout.
+		if _, _, joined := g.membership(); !joined {
+			if err := g.join(); err != nil {
+				return nil, err
+			}
+		}
 		if len(g.buffered) > 0 {
 			return g.takeBuffered(), nil
 		}
@@ -290,10 +321,11 @@ func (g *GroupConsumer) Commit() error {
 		return slots[a].partition < slots[b].partition
 	})
 
+	memberID, generation, _ := g.membership()
 	w := NewBodyWriter()
 	w.String(g.groupID)
-	w.Int32(g.generation)
-	w.String(g.memberID)
+	w.Int32(generation)
+	w.String(memberID)
 	w.Int32(int32(len(slots)))
 	for _, slot := range slots {
 		w.String(slot.topic)
@@ -383,7 +415,8 @@ func (g *GroupConsumer) join() error {
 		w.String(g.groupID)
 		w.Int32(g.config.SessionTimeoutMs)
 		w.Int32(g.config.RebalanceTimeoutMs)
-		w.String(g.memberID)
+		currentMemberID, _, _ := g.membership()
+		w.String(currentMemberID)
 		w.StringArray(g.subscribed)
 		w.String(g.config.GroupInstanceID)
 
@@ -398,6 +431,14 @@ func (g *GroupConsumer) join() error {
 		code := r.Int32()
 		if code == ErrRebalanceInProgress {
 			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if code == ErrUnknownMemberID {
+			// The coordinator dropped this member (session expiry, or
+			// removed while it waited): join again as a new one.
+			g.mu.Lock()
+			g.memberID = ""
+			g.mu.Unlock()
 			continue
 		}
 		if code != ErrNone {
@@ -425,8 +466,10 @@ func (g *GroupConsumer) join() error {
 			return r.Err()
 		}
 
+		g.mu.Lock()
 		g.memberID = memberID
 		g.generation = generation
+		g.mu.Unlock()
 
 		var assignments []memberAssignment
 		if memberID == leaderID {
@@ -461,7 +504,7 @@ func (g *GroupConsumer) join() error {
 			return err
 		}
 		if ok {
-			g.joined = true
+			g.setJoined(true)
 			return nil
 		}
 	}
@@ -474,10 +517,11 @@ type memberAssignment struct {
 }
 
 func (g *GroupConsumer) sync(assignments []memberAssignment) (bool, error) {
+	memberID, generation, _ := g.membership()
 	w := NewBodyWriter()
 	w.String(g.groupID)
-	w.Int32(g.generation)
-	w.String(g.memberID)
+	w.Int32(generation)
+	w.String(memberID)
 	w.Int32(int32(len(assignments)))
 	for _, assignment := range assignments {
 		w.String(assignment.memberID)
@@ -498,6 +542,12 @@ func (g *GroupConsumer) sync(assignments []memberAssignment) (bool, error) {
 	}
 	code := r.Int32()
 	if code == ErrRebalanceInProgress || code == ErrIllegalGeneration {
+		return false, nil
+	}
+	if code == ErrUnknownMemberID {
+		g.mu.Lock()
+		g.memberID = ""
+		g.mu.Unlock()
 		return false, nil
 	}
 	if code != ErrNone {
@@ -557,9 +607,10 @@ func (g *GroupConsumer) applyAssignment(assignment []topicPartition) error {
 }
 
 func (g *GroupConsumer) leave() error {
+	memberID, _, _ := g.membership()
 	w := NewBodyWriter()
 	w.String(g.groupID)
-	w.String(g.memberID)
+	w.String(memberID)
 	response, err := g.coordinatorRequest(APILeaveGroup, w.Bytes())
 	if err != nil {
 		return err
@@ -571,7 +622,7 @@ func (g *GroupConsumer) leave() error {
 	if code := r.Int32(); code != ErrNone {
 		return serverError(code, "leave_group")
 	}
-	g.joined = false
+	g.setJoined(false)
 	return nil
 }
 
@@ -602,15 +653,17 @@ func (g *GroupConsumer) heartbeatLoop() {
 		g.mu.Lock()
 		closed := g.closed
 		idleMs := nowMillis() - g.lastPollMs
+		inPoll := g.inPoll
 		g.mu.Unlock()
 		if closed {
 			return
 		}
-		if !g.joined || g.memberID == "" {
+		memberID, generation, joined := g.membership()
+		if !joined || memberID == "" {
 			continue
 		}
 
-		if idleMs >= int64(g.config.MaxPollIntervalMs) {
+		if !inPoll && idleMs >= int64(g.config.MaxPollIntervalMs) {
 			// The application has stopped consuming even though the process
 			// is alive. Continuing to heartbeat would assert a liveness this
 			// member no longer has, holding its partitions away from a
@@ -618,7 +671,7 @@ func (g *GroupConsumer) heartbeatLoop() {
 			if !leftForSlowPoll {
 				_ = g.leave()
 				leftForSlowPoll = true
-				g.joined = false
+				g.setJoined(false)
 			}
 			continue
 		}
@@ -626,8 +679,8 @@ func (g *GroupConsumer) heartbeatLoop() {
 
 		w := NewBodyWriter()
 		w.String(g.groupID)
-		w.Int32(g.generation)
-		w.String(g.memberID)
+		w.Int32(generation)
+		w.String(memberID)
 		response, err := g.coordinatorRequest(APIHeartbeat, w.Bytes())
 		if err != nil {
 			continue // transient: retry next tick
@@ -638,7 +691,14 @@ func (g *GroupConsumer) heartbeatLoop() {
 		}
 		switch r.Int32() {
 		case ErrRebalanceInProgress, ErrUnknownMemberID, ErrIllegalGeneration:
-			g.joined = false
+			// Only if nothing has changed since the snapshot: a heartbeat
+			// for an old generation answering after the member already
+			// rejoined must not send it round again.
+			g.mu.Lock()
+			if g.generation == generation && g.memberID == memberID {
+				g.joined = false
+			}
+			g.mu.Unlock()
 		}
 	}
 }
