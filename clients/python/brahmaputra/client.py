@@ -17,7 +17,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from .protocol import (
     API_VERSION,
@@ -49,13 +49,6 @@ LATEST = -1
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-# --------------------------------------------------------------------------
-# Connection
-# --------------------------------------------------------------------------
-
-
 
 
 SCRAM_MECHANISM = "SCRAM-SHA-256"
@@ -132,17 +125,16 @@ class Connection:
             self._correlation += 1
             correlation_id = self._correlation
             self._sock.sendall(encode_frame(api_key, correlation_id, self.client_id, body))
-            while True:
-                payload = self._read_frame()
-                _key, got, response_body = decode_frame_payload(payload)
-                if got == correlation_id:
-                    return response_body
+            payload = self._read_frame()
+            _key, got, response_body = decode_frame_payload(payload)
+            if got != correlation_id:
                 # A response for a request we are no longer waiting on can
                 # only mean the stream has desynchronised; continuing would
                 # pair every later response with the wrong request.
                 raise ProtocolError(
                     f"correlation id mismatch: expected {correlation_id}, got {got}"
                 )
+            return response_body
 
     def send_oneway(self, api_key: int, body: bytes) -> None:
         """Send without awaiting a response (`acks=0`)."""
@@ -233,7 +225,12 @@ class Connection:
             raise ServerError(code, "authenticate")
         return principal, role, response_payload, done
 
-    def api_versions(self) -> Dict[int, Tuple[int, int]]:
+    def api_versions(self) -> Tuple[Dict[int, Tuple[int, int]], str]:
+        """Ask the broker what it speaks: ({api_key: (min, max)}, broker_version).
+
+        This is the one call that works across a version mismatch, so it is
+        what a client uses to decide whether it can talk to a broker at all.
+        """
         writer = body_writer()
         writer.string("brahmaputra-python")
         writer.string("0.1.0")
@@ -246,8 +243,8 @@ class Connection:
         for _ in range(count):
             api_key = reader.i32()
             out[api_key] = (reader.i32(), reader.i32())
-        reader.string()  # broker_version
-        return out
+        broker_version = reader.string()
+        return out, broker_version
 
     def metadata(self, topics: Sequence[str] = ()) -> "ClusterMetadata":
         writer = body_writer()
@@ -365,9 +362,11 @@ class BrokerRouter:
         self._lock = threading.Lock()
 
     def close(self) -> None:
-        for connection in self._connections.values():
-            connection.close()
-        self._connections.clear()
+        with self._lock:
+            for connection in self._connections.values():
+                if connection is not self._seed:
+                    connection.close()
+            self._connections.clear()
         self._seed.close()
 
     @property
@@ -435,16 +434,17 @@ class ProducerConfig:
     """Producer settings, named as Kafka names them."""
 
     client_id: str = "brahmaputra-python"
-    #: 0 fire-and-forget, 1 leader append, -1/"all" every in-sync replica.
-    acks: int = 1
+    #: 0 fire-and-forget, 1 leader append, -1 or "all" every in-sync replica.
+    acks: Union[int, str] = 1
     #: Flush a partition buffer once it holds this many bytes.
     batch_size: int = 16 * 1024
     #: Flush every non-empty buffer at least this often. 0 sends each
     #: record immediately. Kafka defaults to 0; this defaults to 5 because
     #: an unbatched producer is slow enough to look broken.
     linger_ms: int = 5
-    #: none, lz4, zstd, snappy or gzip. Kafka defaults to none.
-    compression_type: str = "lz4"
+    #: none, gzip, lz4, zstd or snappy. none and gzip are built in; the
+    #: others need `register_codec` or their optional package.
+    compression_type: str = "none"
     #: Broker-side wait for the requested acknowledgements.
     request_timeout_ms: int = 30_000
     #: Retries of a send the broker refused with a *retriable* error —
@@ -457,14 +457,32 @@ class ProducerConfig:
     buffer_memory: int = 32 * 1024 * 1024
     #: How long `send` may block on a full buffer before failing.
     max_block_ms: int = 60_000
+    #: Connect and socket timeout, in seconds.
+    socket_timeout_s: float = 30.0
 
     def compression(self) -> int:
         return Compression.parse(self.compression_type)
 
     def acks_value(self) -> int:
-        if self.acks in (0, 1, -1):
-            return self.acks
-        raise ValueError(f"acks must be 0, 1 or -1, got {self.acks!r}")
+        """The wire value of `acks`: 0, 1 or -1 (Kafka's "all")."""
+        acks = self.acks
+        if isinstance(acks, str):
+            acks = -1 if acks.strip().lower() == "all" else int(acks)
+        if isinstance(acks, bool) or acks not in (0, 1, -1):
+            raise ValueError(f"acks must be 0, 1, -1 or 'all', got {self.acks!r}")
+        return acks
+
+
+def _record_size(record: Record) -> int:
+    """Bytes a buffered record is charged against `buffer_memory`.
+
+    A tombstone (`value=None`) and a null header value count as zero bytes
+    of payload, not as a crash.
+    """
+    size = 16 + len(record.value or b"") + len(record.key or b"")
+    for header in record.headers:
+        size += len(header.key.encode("utf-8")) + len(header.value or b"") + 4
+    return size
 
 
 @dataclass
@@ -484,7 +502,13 @@ class Producer:
 
     def __init__(self, host: str, port: int, config: Optional[ProducerConfig] = None) -> None:
         self.config = config or ProducerConfig()
-        self._router = BrokerRouter(host, port, self.config.client_id)
+        # Validated up front so a typo fails at construction, not on the
+        # first flush from the background ticker where nobody sees it.
+        self._codec = self.config.compression()
+        self._acks = self.config.acks_value()
+        self._router = BrokerRouter(
+            host, port, self.config.client_id, self.config.socket_timeout_s
+        )
         self._buffers: Dict[Tuple[str, int], List[_Buffered]] = {}
         self._sizes: Dict[Tuple[str, int], int] = {}
         self._buffered_bytes = 0
@@ -492,18 +516,28 @@ class Producer:
         self._round_robin = 0
         self._closed = False
         self._ticker: Optional[threading.Thread] = None
+        self._background_error: Optional[BaseException] = None
+        self._stop = threading.Event()
         if self.config.linger_ms > 0:
             self._ticker = threading.Thread(target=self._linger_loop, daemon=True)
             self._ticker.start()
 
     def close(self) -> None:
-        self.flush()
-        with self._lock:
-            self._closed = True
-            self._lock.notify_all()
-        if self._ticker is not None:
-            self._ticker.join(timeout=2.0)
-        self._router.close()
+        """Flush, stop the linger ticker and release connections.
+
+        Connections are released even when the final flush fails; the
+        flush error is still raised.
+        """
+        try:
+            self.flush()
+        finally:
+            with self._lock:
+                self._closed = True
+                self._lock.notify_all()
+            self._stop.set()
+            if self._ticker is not None:
+                self._ticker.join(timeout=2.0)
+            self._router.close()
 
     def __enter__(self) -> "Producer":
         return self
@@ -511,38 +545,35 @@ class Producer:
     def __exit__(self, *_exc) -> None:
         self.close()
 
+    @property
+    def router(self) -> BrokerRouter:
+        """The routing layer, for callers that need metadata."""
+        return self._router
+
     def send(
         self,
         topic: str,
-        value: bytes,
+        value: Optional[bytes],
         key: Optional[bytes] = None,
         partition: Optional[int] = None,
         headers: Optional[List[RecordHeader]] = None,
     ) -> None:
         """Buffer one record. Call `flush` to await delivery.
 
+        `value=None` is a tombstone, distinct from `b""`. With `partition`
+        set the partitioner is bypassed; otherwise a keyed record goes to
+        `murmur2(key) % partitions` and an unkeyed one round-robins.
+
         Returning without an offset is deliberate: with batching the offset
         is not known until the batch goes out, and pretending otherwise
         would mean a synchronous round trip per record.
         """
-        headers = headers or []
+        headers = list(headers or [])
         if partition is None:
-            partitions = self._router.partitions(topic)
-            if key is None:
-                with self._lock:
-                    index = self._round_robin % len(partitions)
-                    self._round_robin += 1
-                partition = partitions[index]
-            else:
-                partition = partition_for_key(key, partitions)
+            partition = self._choose_partition(topic, key)
 
         record = Record(value=value, key=key, headers=headers)
-        size = (
-            len(value)
-            + (len(key) if key else 0)
-            + sum(len(h.key) + (len(h.value) if h.value else 0) + 4 for h in headers)
-            + 16
-        )
+        size = _record_size(record)
         self._reserve(size)
 
         with self._lock:
@@ -551,13 +582,13 @@ class Producer:
             self._sizes[slot] = self._sizes.get(slot, 0) + size
             full = self._sizes[slot] >= self.config.batch_size
 
-        if self.config.linger_ms == 0 or full:
+        if self.config.linger_ms <= 0 or full:
             self._flush_partition(topic, partition)
 
     def send_and_wait(
         self,
         topic: str,
-        value: bytes,
+        value: Optional[bytes],
         key: Optional[bytes] = None,
         partition: Optional[int] = None,
         headers: Optional[List[RecordHeader]] = None,
@@ -565,27 +596,36 @@ class Producer:
         """Send one record on its own and return its offset.
 
         A full round trip per record — correct, and slow. Use `send` plus
-        `flush` for anything with throughput requirements.
+        `flush` for anything with throughput requirements. Returns -1 with
+        `acks=0`, where no offset comes back.
         """
-        headers = headers or []
         if partition is None:
-            partitions = self._router.partitions(topic)
-            partition = (
-                partition_for_key(key, partitions)
-                if key is not None
-                else partitions[self._round_robin % len(partitions)]
-            )
-            self._round_robin += 1
-        record = Record(value=value, key=key, headers=headers)
+            partition = self._choose_partition(topic, key)
+        record = Record(value=value, key=key, headers=list(headers or []))
         return self._produce(topic, partition, [_Buffered(record, _now_ms())])
 
     def flush(self) -> None:
+        """Send every buffered record and wait for acknowledgement."""
         with self._lock:
             slots = [slot for slot, records in self._buffers.items() if records]
+            error, self._background_error = self._background_error, None
         for topic, partition in slots:
             self._flush_partition(topic, partition)
+        if error is not None:
+            # A linger-driven flush failed with nobody to tell; this caller
+            # asked for delivery, so it is the one that hears about it.
+            raise error
 
     # -- internals --------------------------------------------------------
+
+    def _choose_partition(self, topic: str, key: Optional[bytes]) -> int:
+        partitions = self._router.partitions(topic)
+        if key is not None:
+            return partition_for_key(key, partitions)
+        with self._lock:
+            index = self._round_robin % len(partitions)
+            self._round_robin += 1
+        return partitions[index]
 
     def _reserve(self, size: int) -> None:
         """Block until `size` more bytes may be buffered.
@@ -621,20 +661,22 @@ class Producer:
 
     def _linger_loop(self) -> None:
         interval = self.config.linger_ms / 1000.0
-        while True:
-            with self._lock:
-                if self._closed:
-                    return
-                self._lock.wait(interval)
-                if self._closed:
-                    return
+        # Waits on its own event, not on the buffer condition: that one is
+        # notified on every release, which would turn the linger into a
+        # flush-after-every-flush loop.
+        while not self._stop.wait(interval):
             try:
-                self.flush()
-            except BrahmaputraError:
+                with self._lock:
+                    slots = [slot for slot, records in self._buffers.items() if records]
+                for topic, partition in slots:
+                    self._flush_partition(topic, partition)
+            except Exception as error:  # noqa: BLE001
                 # A background flush that fails must not kill the ticker;
                 # the next explicit flush surfaces the error to a caller
                 # who can actually act on it.
-                pass
+                with self._lock:
+                    if self._background_error is None:
+                        self._background_error = error
 
     def _flush_partition(self, topic: str, partition: int) -> None:
         slot = (topic, partition)
@@ -663,17 +705,17 @@ class Producer:
         encoded = encode_record_batch(
             records,
             max_timestamp=max_timestamp,
-            compression=self.config.compression(),
+            compression=self._codec,
         )
         writer = body_writer()
         writer.string(topic)
         writer.i32(partition)
-        writer.i32(self.config.acks_value())
+        writer.i32(self._acks)
         writer.i32(self.config.request_timeout_ms)
         writer.i64(len(encoded))
         body = writer.bytes() + encoded
 
-        if self.config.acks_value() == 0:
+        if self._acks == 0:
             self._router.connection_for(topic, partition).send_oneway(ApiKey.PRODUCE, body)
             return -1
 
@@ -700,7 +742,10 @@ class Producer:
             ):
                 # A stale route is the most common retriable cause, and
                 # resending to the same broker would just repeat it.
-                self._router.refresh(topic)
+                try:
+                    self._router.refresh(topic)
+                except BrahmaputraError:
+                    pass
             time.sleep(min(self.config.retry_backoff_ms / 1000.0, max(remaining, 0)))
 
 
@@ -715,7 +760,8 @@ class ConsumedRecord:
     partition: int
     offset: int
     key: Optional[bytes]
-    value: bytes
+    #: None for a tombstone, distinct from b"".
+    value: Optional[bytes]
     timestamp: int
     headers: List[RecordHeader] = field(default_factory=list)
 
@@ -742,6 +788,8 @@ class ConsumerConfig:
     rack: str = ""
     #: Records returned per poll; the rest stay buffered and uncommitted.
     max_poll_records: int = 500
+    #: Connect and socket timeout, in seconds. Must exceed fetch_max_wait_ms.
+    socket_timeout_s: float = 30.0
 
 
 class Consumer:
@@ -749,7 +797,9 @@ class Consumer:
 
     def __init__(self, host: str, port: int, config: Optional[ConsumerConfig] = None) -> None:
         self.config = config or ConsumerConfig()
-        self._router = BrokerRouter(host, port, self.config.client_id)
+        self._router = BrokerRouter(
+            host, port, self.config.client_id, self.config.socket_timeout_s
+        )
 
     def close(self) -> None:
         self._router.close()

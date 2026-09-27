@@ -30,11 +30,13 @@ from .protocol import (
     crc32c,
     murmur2,
     partition_for_key,
+    register_codec,
 )
 from .client import (
     EARLIEST,
     LATEST,
     BrokerInfo,
+    BrokerRouter,
     ClusterMetadata,
     ConsumedRecord,
     Connection,
@@ -63,6 +65,7 @@ __all__ = [
     "AutoOffsetReset",
     "BrahmaputraError",
     "BrokerInfo",
+    "BrokerRouter",
     "ClusterMetadata",
     "Compression",
     "Connection",
@@ -87,4 +90,5 @@ __all__ = [
     "crc32c",
     "murmur2",
     "partition_for_key",
+    "register_codec",
 ]

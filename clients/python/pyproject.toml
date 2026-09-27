@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brahmaputra"
+version = "0.1.0"
+description = "Native Python client for the Brahmaputra log streaming broker"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+lz4 = ["lz4"]
+zstd = ["zstandard"]
+snappy = ["python-snappy"]
+all = ["lz4", "zstandard", "python-snappy"]
+
+[tool.setuptools]
+packages = ["brahmaputra"]

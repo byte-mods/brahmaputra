@@ -2,28 +2,30 @@
 """Manual end-to-end check of the Python driver against a live broker.
 
     brahmaputra-server --data-dir ./data --default-partitions 4
-    python test_manual.py [host] [port]
+    python3 test_manual.py [host] [port]
 
 Every check asserts a property of the *system*, not that a function ran:
 records come back byte-identical, keys pin partitions, headers survive,
 offsets are contiguous, a group splits partitions and resumes from its
-commit. It exits non-zero on the first failure.
+commit. It exits non-zero if any check fails.
+
+The sections and checks mirror clients/go/cmd/manualtest/main.go one for one.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 import uuid
 
-sys.path.insert(0, ".")
+# Import the package next to this file, whatever the current directory is.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from brahmaputra import (  # noqa: E402
     Assignor,
     AutoOffsetReset,
-    Compression,
     Consumer,
-    ConsumerConfig,
     EARLIEST,
     GroupConfig,
     GroupConsumer,
@@ -64,10 +66,15 @@ def unique(prefix: str) -> str:
 def main() -> int:
     section("connection and metadata")
     with Consumer(HOST, PORT) as consumer:
-        versions = consumer.router.seed.api_versions()
+        versions, broker_version = consumer.router.seed.api_versions()
         check("ApiVersions answers", len(versions) > 0, f"got {len(versions)} apis")
-        metadata = consumer.router.metadata()
-        check("metadata lists brokers", len(metadata.brokers) >= 1)
+        check("broker reports a version", broker_version != "", repr(broker_version))
+        metadata = consumer.router.metadata(refresh=True)
+        check(
+            "metadata lists brokers",
+            len(metadata.brokers) >= 1,
+            f"{len(metadata.brokers)} brokers",
+        )
 
     section("produce and consume round trip")
     topic = unique("py-roundtrip")
@@ -81,47 +88,39 @@ def main() -> int:
         got = consumer.fetch(topic, 0, 0)
         check("every record comes back", len(got) == len(payloads), f"got {len(got)}")
         check(
-            "values are byte-identical",
-            [r.value for r in got] == payloads,
-            "payload mismatch",
-        )
-        check(
-            "offsets are contiguous from zero",
-            [r.offset for r in got] == list(range(len(payloads))),
+            "values byte-identical and offsets contiguous",
+            [r.value for r in got] == payloads
+            and [r.offset for r in got] == list(range(len(payloads))),
         )
 
     section("compression codecs")
-    for codec in ["none", "lz4", "zstd", "snappy", "gzip"]:
+    # Only none and gzip ship in the driver; lz4/zstd/snappy are opt-in via
+    # register_codec (or their optional package) so applications that do
+    # not want those dependencies do not carry them.
+    for codec in ["none", "gzip"]:
         codec_topic = unique(f"py-{codec}")
         # Repetitive payload, so a codec that silently does nothing still
         # round-trips but a broken one corrupts.
-        body = (b"the same line over and over. " * 40)
-        try:
-            with Producer(
-                HOST, PORT, ProducerConfig(linger_ms=0, compression_type=codec)
-            ) as producer:
-                for index in range(20):
-                    producer.send(codec_topic, body + str(index).encode(), partition=0)
-                producer.flush()
-            with Consumer(HOST, PORT) as consumer:
-                got = consumer.fetch(codec_topic, 0, 0)
-            check(
-                f"{codec}: round trips",
-                len(got) == 20 and got[0].value == body + b"0",
-                f"got {len(got)} records",
-            )
-        except Exception as error:  # noqa: BLE001
-            # A missing optional dependency is a skip, not a failure: the
-            # driver is correct, the environment just lacks the codec.
-            if "pip install" in str(error):
-                print(f"  skip {codec}: {error}")
-            else:
-                check(f"{codec}: round trips", False, str(error))
+        body = b"the same line over and over. " * 40
+        with Producer(
+            HOST, PORT, ProducerConfig(linger_ms=0, compression_type=codec)
+        ) as producer:
+            for index in range(20):
+                producer.send(codec_topic, body + str(index % 10).encode(), partition=0)
+            producer.flush()
+        with Consumer(HOST, PORT) as consumer:
+            got = consumer.fetch(codec_topic, 0, 0)
+        check(
+            f"{codec}: round trips",
+            len(got) == 20
+            and all(r.value == body + str(i % 10).encode() for i, r in enumerate(got)),
+            f"got {len(got)} records",
+        )
 
     section("keys, partitioning and ordering")
     key_topic = unique("py-keys")
     with Producer(HOST, PORT, ProducerConfig(linger_ms=0, compression_type="none")) as producer:
-        partitions = producer._router.partitions(key_topic)
+        partitions = producer.router.partitions(key_topic)
         for index in range(30):
             producer.send(key_topic, f"v{index}".encode(), key=b"user-7")
         producer.flush()
@@ -179,15 +178,20 @@ def main() -> int:
     check("both records arrive", len(got) == 2, f"got {len(got)}")
     if len(got) == 2:
         annotated, plain = got
-        check("headers survive the round trip", len(annotated.headers) == 3)
+        check(
+            "headers survive the round trip",
+            len(annotated.headers) == 3,
+            f"{len(annotated.headers)} headers",
+        )
         check("header values are exact", annotated.header("trace-id") == b"abc-123")
         check(
             "a null header value stays null",
-            annotated.headers[2].value is None,
+            len(annotated.headers) == 3 and annotated.headers[2].value is None,
         )
         check(
             "a record with no headers gains none from its batch",
             plain.headers == [],
+            f"{len(plain.headers)} headers",
         )
         check(
             "timestamps are real wall-clock values",
@@ -232,7 +236,7 @@ def main() -> int:
         ) as producer:
             producer.send(acks_topic, b"durable", partition=0)
             producer.flush()
-        time.sleep(0.3)
+        time.sleep(0.4)
         with Consumer(HOST, PORT) as consumer:
             got = consumer.fetch(acks_topic, 0, 0)
         check(f"acks={acks} stores the record", len(got) == 1, f"got {len(got)}")
@@ -314,12 +318,12 @@ def main() -> int:
     ) as consumer:
         consumer.subscribe([reset_topic])
         raised = False
-        try:
-            deadline = time.time() + 5
-            while time.time() < deadline:
+        deadline = time.time() + 5
+        while time.time() < deadline and not raised:
+            try:
                 consumer.poll(300)
-        except NoOffsetForPartition:
-            raised = True
+            except NoOffsetForPartition:
+                raised = True
         check("none refuses to guess a position", raised)
 
     section("assignors")
@@ -347,19 +351,24 @@ def main() -> int:
     section("bounded client buffer")
     small_topic = unique("py-buffer")
     tiny = ProducerConfig(
-        linger_ms=1000,  # never flush on time during this check
+        linger_ms=10_000,  # never flush on time during this check
         buffer_memory=2048,
         max_block_ms=300,
         compression_type="none",
     )
     with Producer(HOST, PORT, tiny) as producer:
         blocked = False
-        try:
-            for index in range(500):
+        started = time.monotonic()
+        waited = 0.0
+        for _ in range(500):
+            try:
                 producer.send(small_topic, b"x" * 256, partition=0)
-        except Exception as error:  # noqa: BLE001
-            blocked = "buffer full" in str(error)
-        check("a full buffer blocks and then reports", blocked)
+            except Exception as error:  # noqa: BLE001
+                blocked = "buffer full" in str(error)
+                waited = time.monotonic() - started
+                break
+        check("a full buffer blocks and then reports", blocked and waited >= 0.25,
+              f"blocked={blocked} after {waited:.3f}s")
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     return 1 if FAILED else 0

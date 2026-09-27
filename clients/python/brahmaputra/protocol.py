@@ -19,9 +19,12 @@ so each encoder here is deliberately explicit about which one it is.
 
 from __future__ import annotations
 
+import gzip
+import importlib
 import struct
+import zlib
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 # The BitPacker schema version every body carries as its first field.
 SCHEMA_VERSION = "1.0.0"
@@ -327,6 +330,8 @@ def decode_frame_payload(payload: bytes) -> Tuple[int, int, bytes]:
     offset += 2
     if client_len >= 0:
         offset += client_len
+    if offset > len(payload):
+        raise ProtocolError("frame client id runs past the payload")
     return api_key, correlation_id, payload[offset:]
 
 
@@ -395,16 +400,52 @@ class Compression:
         return f"unknown({value})"
 
 
+#: Cap on a decompressed batch, so a corrupt or hostile batch cannot name
+#: gigabytes of output that this process allocates before rejecting it.
+MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
+
+_compressors: Dict[int, Callable[[bytes], bytes]] = {}
+_decompressors: Dict[int, Callable[[bytes], bytes]] = {}
+
+
+def register_codec(
+    codec: Union[int, str],
+    compress_fn: Callable[[bytes], bytes],
+    decompress_fn: Callable[[bytes], bytes],
+) -> None:
+    """Plug in a codec this package does not carry itself.
+
+    `none` and `gzip` are built in. lz4, zstd and snappy are opt-in so an
+    application that does not want those dependencies does not acquire
+    them. A registered codec takes precedence over the optional-package
+    fallback below.
+
+    The lz4 payload the broker expects is a little-endian u32 of the
+    uncompressed length followed by a raw LZ4 *block* — not the LZ4 frame
+    format — and snappy is raw (unframed) snappy.
+    """
+    if isinstance(codec, str):
+        codec = Compression.parse(codec)
+    if codec in (Compression.NONE, Compression.GZIP):
+        raise ValueError("none and gzip are built in and cannot be replaced")
+    _compressors[codec] = compress_fn
+    _decompressors[codec] = decompress_fn
+
+
 def compress(codec: int, payload: bytes) -> bytes:
     """Compress a records payload.
 
-    Only the codecs whose libraries are installed can be used. Rather than
-    failing at import time and making every user of this client install
-    four compression libraries, each one is imported where it is needed and
-    the error names what to install.
+    Codecs other than none/gzip come from :func:`register_codec`, or, as a
+    convenience, from the optional package if it happens to be installed.
+    Nothing is imported at module load, and the error names what to add.
     """
     if codec == Compression.NONE:
         return payload
+    if codec == Compression.GZIP:
+        return gzip.compress(payload)
+    registered = _compressors.get(codec)
+    if registered is not None:
+        return registered(payload)
     if codec == Compression.LZ4:
         return _lz4_compress(payload)
     if codec == Compression.ZSTD:
@@ -413,38 +454,59 @@ def compress(codec: int, payload: bytes) -> bytes:
     if codec == Compression.SNAPPY:
         snappy = _require("snappy", "snappy", pip_name="python-snappy")
         return snappy.compress(payload)
-    if codec == Compression.GZIP:
-        import gzip
-
-        return gzip.compress(payload)
     raise ProtocolError(f"unsupported compression {codec}")
 
 
 def decompress(codec: int, payload: bytes) -> bytes:
     if codec == Compression.NONE:
         return payload
+    if codec == Compression.GZIP:
+        return _gunzip(payload)
+    registered = _decompressors.get(codec)
+    if registered is not None:
+        return registered(payload)
     if codec == Compression.LZ4:
         return _lz4_decompress(payload)
     if codec == Compression.ZSTD:
         zstd = _require("zstandard", "zstd")
-        return zstd.ZstdDecompressor().decompress(payload)
+        # The broker's zstd encoder streams, so its frames need not carry a
+        # content size; a one-shot `decompress` would refuse those.
+        reader = zstd.ZstdDecompressor().decompressobj()
+        return reader.decompress(payload)
     if codec == Compression.SNAPPY:
         snappy = _require("snappy", "snappy", pip_name="python-snappy")
         return snappy.decompress(payload)
-    if codec == Compression.GZIP:
-        import gzip
-
-        return gzip.decompress(payload)
     raise ProtocolError(f"unsupported compression {codec}")
+
+
+def _gunzip(payload: bytes) -> bytes:
+    out = bytearray()
+    inflater = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+    data = payload
+    while data:
+        out += inflater.decompress(data, MAX_DECOMPRESSED_BYTES + 1 - len(out))
+        if len(out) > MAX_DECOMPRESSED_BYTES:
+            raise ProtocolError("gzip batch decompresses past the size cap")
+        data = inflater.unconsumed_tail
+        if inflater.eof:
+            # Concatenated gzip members are legal; carry on with the next.
+            data = inflater.unused_data + data
+            if not data:
+                break
+            inflater = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+        elif not data:
+            break
+    return bytes(out)
 
 
 def _require(module: str, codec: str, pip_name: Optional[str] = None):
     try:
-        return __import__(module)
+        return importlib.import_module(module)
     except ImportError:
         raise BrahmaputraError(
-            f"{codec} compression needs the {pip_name or module!r} package "
-            f"(pip install {pip_name or module})"
+            f"{codec} compression is not registered and the optional "
+            f"{pip_name or module!r} package is missing; call register_codec() "
+            f"or pip install {pip_name or module}"
         ) from None
 
 
@@ -453,20 +515,18 @@ def _lz4_compress(payload: bytes) -> bytes:
     # u32 of the uncompressed length, then a raw LZ4 block. That is *not*
     # the LZ4 frame format, so the frame API in python-lz4 cannot be used.
     lz4_block = _require("lz4.block", "lz4", pip_name="lz4")
-    import lz4.block  # noqa: F401  (imported for its side effect above)
-
-    compressed = lz4.block.compress(payload, store_size=False)
+    compressed = lz4_block.compress(payload, store_size=False)
     return struct.pack("<I", len(payload)) + compressed
 
 
 def _lz4_decompress(payload: bytes) -> bytes:
-    _require("lz4.block", "lz4", pip_name="lz4")
-    import lz4.block
-
+    lz4_block = _require("lz4.block", "lz4", pip_name="lz4")
     if len(payload) < 4:
         raise ProtocolError("lz4 payload shorter than its size prefix")
     (size,) = struct.unpack_from("<I", payload, 0)
-    return lz4.block.decompress(payload[4:], uncompressed_size=size)
+    if size > MAX_DECOMPRESSED_BYTES:
+        raise ProtocolError("lz4 batch claims more than the size cap")
+    return lz4_block.decompress(payload[4:], uncompressed_size=size)
 
 
 # --------------------------------------------------------------------------
@@ -643,6 +703,8 @@ def _decode_records(
             key = None
         else:
             size = key_len_plus_one - 1
+            if pos + size > end:
+                raise ProtocolError("truncated record key")
             key = payload[pos : pos + size]
             pos += size
 
@@ -653,6 +715,8 @@ def _decode_records(
             value = None
         else:
             value_len = raw_value_len - 1 if has_null_values else raw_value_len
+            if pos + value_len > end:
+                raise ProtocolError("truncated record value")
             value = payload[pos : pos + value_len]
             pos += value_len
 
@@ -666,13 +730,17 @@ def _decode_records(
                 raise ProtocolError("record header count exceeds record")
             for _ in range(count):
                 key_len, pos = _get_uvarint(payload, pos)
-                header_key = payload[pos : pos + key_len].decode("utf-8")
+                if pos + key_len > end:
+                    raise ProtocolError("truncated header key")
+                header_key = payload[pos : pos + key_len].decode("utf-8", "replace")
                 pos += key_len
                 value_plus_one, pos = _get_uvarint(payload, pos)
                 if value_plus_one == 0:
                     header_value = None
                 else:
                     size = value_plus_one - 1
+                    if pos + size > end:
+                        raise ProtocolError("truncated header value")
                     header_value = payload[pos : pos + size]
                     pos += size
                 headers.append(RecordHeader(header_key, header_value))
@@ -722,6 +790,8 @@ def _get_uvarint(data: bytes, pos: int) -> Tuple[int, int]:
         if not byte & 0x80:
             return result, pos
         shift += 7
+        if shift > 63:
+            raise ProtocolError("varint overflows 64 bits")
 
 
 # --------------------------------------------------------------------------

@@ -87,6 +87,8 @@ class GroupConfig:
     group_instance_id: str = ""
     max_poll_records: int = 500
     fetch_max_bytes: int = 8 * 1024 * 1024
+    #: Connect and socket timeout, in seconds.
+    socket_timeout_s: float = 30.0
 
 
 class GroupConsumer:
@@ -112,6 +114,7 @@ class GroupConsumer:
                 client_id=self.config.client_id,
                 fetch_max_bytes=self.config.fetch_max_bytes,
                 max_poll_records=self.config.max_poll_records,
+                socket_timeout_s=self.config.socket_timeout_s,
             ),
         )
         self._subscribed: List[str] = []
@@ -130,6 +133,7 @@ class GroupConsumer:
         self._last_commit_ms = _now_ms()
         self._lock = threading.Lock()
         self._closed = False
+        self._stop = threading.Event()
         self._heartbeat = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat.start()
 
@@ -149,6 +153,7 @@ class GroupConsumer:
         """
         with self._lock:
             self._closed = True
+        self._stop.set()
         try:
             if self._joined:
                 self.commit()
@@ -231,6 +236,8 @@ class GroupConsumer:
 
     def _take_buffered(self) -> List[ConsumedRecord]:
         limit = self.config.max_poll_records
+        if limit <= 0:
+            limit = len(self._buffered)
         delivered = self._buffered[:limit]
         self._buffered = self._buffered[limit:]
         for record in delivered:
@@ -315,13 +322,7 @@ class GroupConsumer:
             writer.string_array(self._subscribed)
             writer.string(self.config.group_instance_id)
 
-            try:
-                reader = body_reader(self._coordinator_request(ApiKey.JOIN_GROUP, writer.bytes()))
-            except ServerError as error:
-                if error.code == ErrorCode.REBALANCE_IN_PROGRESS:
-                    time.sleep(0.1)
-                    continue
-                raise
+            reader = body_reader(self._coordinator_request(ApiKey.JOIN_GROUP, writer.bytes()))
             code = reader.i32()
             if code == ErrorCode.REBALANCE_IN_PROGRESS:
                 time.sleep(0.1)
@@ -440,47 +441,51 @@ class GroupConsumer:
         interval = min(heartbeat_every, poll_check_every) / 1000.0
         left_for_slow_poll = False
 
-        while True:
-            time.sleep(interval)
-            with self._lock:
-                if self._closed:
-                    return
-            if not self._joined or not self._member_id:
-                continue
-
-            idle_ms = _now_ms() - self._last_poll_ms
-            if idle_ms >= self.config.max_poll_interval_ms:
-                # The application has stopped consuming even though the
-                # process is alive. Continuing to heartbeat would assert a
-                # liveness this member no longer has, holding its
-                # partitions away from a consumer that could progress.
-                if not left_for_slow_poll:
-                    try:
-                        self._leave()
-                    except BrahmaputraError:
-                        pass
-                    left_for_slow_poll = True
-                    self._joined = False
-                continue
-            left_for_slow_poll = False
-
-            writer = body_writer()
-            writer.string(self.group_id)
-            writer.i32(self._generation)
-            writer.string(self._member_id)
+        while not self._stop.wait(interval):
             try:
-                reader = body_reader(
-                    self._coordinator_request(ApiKey.HEARTBEAT, writer.bytes())
-                )
-                code = reader.i32()
-            except BrahmaputraError:
-                continue  # transient: retry next tick
-            if code in (
-                ErrorCode.REBALANCE_IN_PROGRESS,
-                ErrorCode.UNKNOWN_MEMBER_ID,
-                ErrorCode.ILLEGAL_GENERATION,
-            ):
+                left_for_slow_poll = self._heartbeat_tick(left_for_slow_poll)
+            except Exception:  # noqa: BLE001
+                # Transient (a dropped connection, a coordinator move):
+                # a heartbeat thread that dies silently would get this
+                # member evicted, so it retries on the next tick instead.
+                continue
+
+    def _heartbeat_tick(self, left_for_slow_poll: bool) -> bool:
+        """One heartbeat-loop iteration; returns the new left_for_slow_poll."""
+        with self._lock:
+            if self._closed:
+                return left_for_slow_poll
+        if not self._joined or not self._member_id:
+            return left_for_slow_poll
+
+        idle_ms = _now_ms() - self._last_poll_ms
+        if idle_ms >= self.config.max_poll_interval_ms:
+            # The application has stopped consuming even though the process
+            # is alive. Continuing to heartbeat would assert a liveness this
+            # member no longer has, holding its partitions away from a
+            # consumer that could progress.
+            if not left_for_slow_poll:
+                try:
+                    self._leave()
+                except BrahmaputraError:
+                    pass
                 self._joined = False
+            return True
+
+        writer = body_writer()
+        writer.string(self.group_id)
+        writer.i32(self._generation)
+        writer.string(self._member_id)
+        reader = body_reader(self._coordinator_request(ApiKey.HEARTBEAT, writer.bytes()))
+        if reader.i32() in (
+            ErrorCode.REBALANCE_IN_PROGRESS,
+            ErrorCode.UNKNOWN_MEMBER_ID,
+            ErrorCode.ILLEGAL_GENERATION,
+        ):
+            # Rejoin on the next poll; the generation this member holds is
+            # no longer the group's.
+            self._joined = False
+        return False
 
     # -- coordinator routing ----------------------------------------------
 
@@ -490,7 +495,6 @@ class GroupConsumer:
 
     def _coordinator_request(self, api_key: int, body: bytes) -> bytes:
         """Send to the group's coordinator, following moves and loads."""
-        last: Optional[Exception] = None
         for _ in range(COORDINATOR_ATTEMPTS):
             partition = self._coordinator_partition()
             connection = self._consumer.router.connection_for(OFFSETS_TOPIC, partition)
@@ -505,7 +509,7 @@ class GroupConsumer:
             return response
         raise BrahmaputraError(
             f"group coordinator unavailable after {COORDINATOR_ATTEMPTS} attempts"
-        ) from last
+        )
 
 
 def _peek_error_code(body: bytes) -> int:
