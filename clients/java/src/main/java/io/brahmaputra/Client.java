@@ -1237,9 +1237,10 @@ public final class Client {
             // and every batch after it would fail to decode.
             reader.skipInt32(); // preferred_read_replica
             byte[] trailing = reader.rest();
-            if (batchesLength > trailing.length) {
+            if (batchesLength < 0 || batchesLength > trailing.length) {
                 throw new ProtocolException(
-                        "fetch response claims more batch bytes than it carries");
+                        "fetch response claims " + batchesLength
+                                + " batch bytes but carries " + trailing.length);
             }
             byte[] raw = new byte[(int) batchesLength];
             System.arraycopy(trailing, 0, raw, 0, raw.length);
