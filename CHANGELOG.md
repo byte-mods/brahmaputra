@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.10.0 — 2026-09-27
+
+UIs can now read from Brahmaputra through the WebSocket gateway, not only
+write to it. There are SDKs for React, Vue, Angular, Svelte, Dart and
+Flutter. Built and tested for live dashboards such as a stock price feed.
+
+### Added
+
+- **Gateway subscriptions (fan-out).** Clients send
+  `{"op":"subscribe","topic":...,"keys":[...],"snapshot":true}` and
+  receive `record` frames as they are written.
+  - Each gateway instance reads a subscribed topic from the broker once,
+    over one connection. It encodes each record into its frame once and
+    broadcasts it to every subscribed socket, so broker load follows
+    topics × instances, not sockets.
+  - Snapshots: every feed keeps the latest record per key (warmed from the
+    log when it starts). A subscriber gets it, then the live stream, with
+    no gap and no duplicate. `subscribed` means every record written after
+    it will be delivered, including to partitions that appear later.
+  - Slow subscribers skip to the newest record and receive `lagged` with
+    the count they missed. The feed never waits for them.
+  - Opt-in with `--allow-subscribe`, and narrowed per token by a
+    `subscribe` claim. `mint-token` gains `--subscribe` and `--read-only`.
+  - New flags: `--max-subscriptions`, `--max-subscribe-keys`,
+    `--feed-buffer`, `--snapshot-max-keys`, `--snapshot-warmup-records`,
+    `--feed-idle-secs`. New metrics for subscriptions, feeds, deliveries,
+    lag and snapshots.
+- **UI SDKs** in `clients/ws`, with the same behaviour everywhere:
+  acknowledged publishes that are queued offline and resent across
+  reconnects; subscriptions renewed (with a fresh snapshot) on every
+  reconnect; jittered backoff; a token function called on every
+  reconnect so tokens rotate.
+  - `@brahmaputra/ws-client` for browsers, React Native and Node, with
+    no dependencies, plus `latestByKey` / `recentRecords` stores and a
+    Svelte adapter.
+  - `@brahmaputra/ws-react` (hooks), `@brahmaputra/ws-vue`
+    (composables), and `@brahmaputra/ws-angular` (signals and RxJS, no
+    decorators).
+  - `brahmaputra_ws` (Dart) and `brahmaputra_ws_flutter` (widgets and a
+    stock-ticker example).
+- **End-to-end tests of the whole architecture** (`clients/ws/test.sh`,
+  run by CI for each suite):
+  - React, Vue and Angular trading screens in Chromium, against real
+    gateway processes and a broker: snapshot and live prices, orders
+    landing in Brahmaputra stamped with the user, refusals shown to the
+    user, a gateway restart, and 12 screens across two instances;
+  - the Flutter widgets against a real gateway;
+  - the JS and Dart clients.
+- `ws-loadgen` fan-out mode and `scripts/verify-ws-fanout.sh`:
+  subscribers spread over several gateway instances while ticks are
+  written straight to the broker. The script fails on any lost delivery,
+  more than one feed per instance, or broker connections growing with
+  sockets. 18,000 subscribers on two instances received 3,618,000 of
+  3,618,000 deliveries over 8 broker connections, at about 6 KB per
+  socket.
+
+### Changed
+
+- The gateway's `welcome` frame gains `subscribe` (whether this token may
+  subscribe to anything). Existing publish-only clients are unaffected:
+  a frame without `op` is still a publish.
+
 ## 0.9.2 — 2026-09-27
 
 A fix to the C client's consumer groups. Nothing else changes.

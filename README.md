@@ -32,7 +32,7 @@ open http://localhost:8080                              # dashboard
 | 🧩 **One static binary** | Broker, controller, dashboard and metrics compiled in. No JVM, no ZooKeeper, no Prometheus required. |
 | 🔁 **Kafka semantics, not just Kafka shape** | Leader/ISR replication, leader-epoch truncation (KIP-101), high-watermark visibility, `acks=0/1/all`, idempotent **and transactional** producer, `read_committed` isolation, consumer groups with generation fencing. |
 | 🌐 **Clients in 24 languages** | Rust, Go, Node.js/TypeScript, Python, Java, Kotlin, Scala, C#, F#, C, C++, D, PHP, Ruby, Perl, Lua, Erlang, Elixir, Haskell, OCaml, Crystal, Nim, Dart. Each has the full producer, consumer and group feature set and is verified against a live broker. [Clients →](#client-libraries-in-24-languages) |
-| 📱 **WebSocket gateway for mobile and web** | Authenticated sockets stream into keyed topics through a stateless gateway that scales out without touching the brokers: ~5 KB per socket, and 19,000 sockets cost the broker 3 connections. [Gateway →](#websocket-gateway) |
+| 📱 **WebSocket gateway and UI SDKs** | Phones and browsers publish into keyed topics and subscribe to live ones (a stock price feed, with a snapshot of every symbol's latest price) through a stateless gateway that scales out without touching the brokers. It costs about 5 KB per socket, and each instance reads a topic once however many screens watch it. SDKs cover React, Vue, Angular, Svelte, Flutter and plain JS/TS. [Gateway →](#websocket-gateway) |
 | 🔌 **Three transports, one flag** | Plain TCP, TLS 1.3, or QUIC — same wire format, same correctness suite. |
 | 🧪 **Verified by killing things** | Live scripts start real brokers, `kill -9` them mid-write, and audit what survived. Not only unit tests. |
 | 📊 **Operations built in** | Browse and live-tail messages, add partitions, change topic config, consumer lag, Prometheus endpoint, login and RBAC — [in one container](#docker). |
@@ -93,10 +93,21 @@ open http://localhost:8080                              # dashboard
 | M14 | Surviving a controller outage, topic incarnations, hostile-input decoding | ✅ complete |
 | M15 | Review release: transactions and groups under leader change, fetch-path race, hot-path costs | ✅ complete |
 | M16 | Client libraries in 24 languages with a shared feature contract, WebSocket gateway, BitPacker for 24 languages | ✅ complete |
+| M17 | Gateway subscriptions (fan-out with snapshots), UI SDKs for React, Vue, Angular, Svelte, Dart and Flutter, tested in real browsers | ✅ complete |
 
 Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
+
+### Upgrading to 0.10.0
+
+A drop-in upgrade: publish-only clients and deployments behave exactly as
+before. Subscriptions stay off until you pass `--allow-subscribe`. Then
+issue tokens with a `subscribe` claim (or none, to allow whatever the
+gateway allows), and use the [UI SDKs](clients/ws) or send
+`{"op":"subscribe",...}` yourself. Each gateway instance opens one extra
+broker connection per subscribed topic. See the
+[changelog](CHANGELOG.md#0100--2026-09-27).
 
 ### Upgrading to 0.9.2
 
@@ -819,64 +830,122 @@ output: `tools/bit-packer/cross_lang_test/run_all.sh`.
 Phones and browsers should not hold broker connections.
 **[`brahmaputra-ws-gateway`](crates/gateway)** is a stateless service
 between them and the cluster. A client connects over WebSocket and
-authenticates once. Every message it sends becomes a record, whose
-partition is chosen by its key.
+authenticates once. After that it can **publish**: every message becomes a
+record, and its key chooses the partition. It can also **subscribe** to
+topics and receive their records live, starting from a snapshot of the
+latest record per key. That snapshot is what a stock price screen needs.
 
 ```
- phones, browsers ──wss──▶ L4 load balancer ──▶ gateway × N ──(2 producer conns each)──▶ brokers
-                                                 stateless        batched produce
+ market data, order service ──▶ Brahmaputra ◀─────────────────────────────┐
+                                   │ one fetch per topic per instance     │ batched produce
+                                   ▼                                      │
+ phones, browsers ◀──wss──▶ L4 load balancer ◀──▶ brahmaputra-ws-gateway × N (stateless)
 ```
 
 ```bash
-brahmaputra-ws-gateway --broker 127.0.0.1:9092 --jwt-secret "$SECRET" --default-topic events
-TOKEN=$(brahmaputra-ws-gateway mint-token --secret "$SECRET" --sub user-42)   # testing only
+brahmaputra-ws-gateway --broker 127.0.0.1:9092 --jwt-secret "$SECRET" \
+    --allow-topic 'orders.*' --allow-subscribe 'prices.*'
+# Testing only; real tokens come from your identity provider:
+TOKEN=$(brahmaputra-ws-gateway mint-token --secret "$SECRET" --sub trader-7 \
+          --topic 'orders.*' --subscribe 'prices.*')
 ```
 
+With the [UI SDKs](clients/ws), a live price board and an order button in
+React:
+
+```tsx
+<BrahmaputraProvider options={{ url: "wss://gw.example.com/ws", token: getToken }}>
+  <Board />
+</BrahmaputraProvider>
+
+function Board() {
+  const { data: prices } = useLatestByKey("prices.us");   // snapshot, then live
+  const publish = usePublish();
+  return [...prices].map(([symbol, r]) => (
+    <p key={symbol}>{symbol} {r.json().price}
+      <button onClick={() => publish({ topic: "orders.us", value: JSON.stringify({ symbol, qty: 1 }) })}>Buy</button>
+    </p>));
+}
+```
+
+Vue (`useLatestByKey`), Angular (`injectLatestByKey`, a signal), Svelte
+(`$prices`) and Flutter (`LatestByKeyBuilder`) look the same, and so does
+plain JS (`latestByKey(client, topic)`).
+
+| SDK | Package | Folder |
+|---|---|---|
+| Browsers, React Native, Node | `@brahmaputra/ws-client` (no dependencies; Svelte adapter included) | [clients/ws/js](clients/ws/js) |
+| React | `@brahmaputra/ws-react` | [clients/ws/react](clients/ws/react) |
+| Vue 3 | `@brahmaputra/ws-vue` | [clients/ws/vue](clients/ws/vue) |
+| Angular | `@brahmaputra/ws-angular` (signals and RxJS) | [clients/ws/angular](clients/ws/angular) |
+| Dart, Flutter | `brahmaputra_ws`, `brahmaputra_ws_flutter` | [clients/ws/dart](clients/ws/dart), [clients/ws/flutter](clients/ws/flutter) |
+
+The raw protocol needs no SDK:
+
 ```js
-// Browser: the token rides in a subprotocol, since browsers cannot set
-// WebSocket headers. Native apps can send Authorization: Bearer instead.
-const ws = new WebSocket("wss://gw.example.com/ws?topic=orders",
-                         ["brahmaputra.v1", `bearer.${token}`]);
-ws.onopen = () => ws.send(JSON.stringify({ id: 1, key: "cart-7", value: '{"sku":1}' }));
+const ws = new WebSocket("wss://gw.example.com/ws", ["brahmaputra.v1", `bearer.${token}`]);
+ws.onopen = () => {
+  ws.send(JSON.stringify({ op: "subscribe", topic: "prices.us", keys: ["AAPL"], snapshot: true }));
+  ws.send(JSON.stringify({ id: 1, topic: "orders.us", value: '{"symbol":"AAPL","qty":1}' }));
+};
 ws.onmessage = (e) => console.log(JSON.parse(e.data));
-// {"type":"ack","id":1,"topic":"orders","partition":5,"offset":1841}
+// {"type":"subscribed","topic":"prices.us","snapshot":1}
+// {"type":"record","topic":"prices.us","partition":3,"offset":88,"key":"AAPL","value":"{\"price\":189.1}",...}
+// {"type":"ack","id":1,"topic":"orders.us","partition":0,"offset":17}
 ```
 
 - **Authentication:** HS256 JWTs, in a bearer header, the query string or
-  the subprotocol. The algorithm is never taken from the token; secrets
-  rotate with `kid`. A `topics` claim narrows where a token may write.
-- **Partitioning:** `murmur2(key) % partitions`, identical to every
-  client. The default key is the authenticated user, so each user's stream
-  stays ordered in one partition. Records carry an `x-gw-user` header that
+  the subprotocol. The algorithm is never taken from the token, and
+  secrets rotate with `kid`. The SDKs take a token *function* and call it
+  on every reconnect.
+- **Authorization:** `--allow-topic` and a `topics` claim govern
+  publishing (`[]` is a read-only token). `--allow-subscribe` (off by
+  default) and a `subscribe` claim govern subscriptions. Claims only ever
+  narrow. Every published record carries an `x-gw-user` header that
   clients cannot forge.
-- **Messages:** JSON text frames (`value`, `value_b64`, `"value": null`
-  for tombstones, headers), or binary frames for high-rate telemetry.
-  Per-message acks with partition and offset, and error codes marked
-  retryable or not.
-- **Cannot overload the broker:** a fixed producer pool (the broker sees
-  2 connections per instance whatever the socket count), per-partition
-  batching, a bounded buffer that fails fast with `OVERLOADED`, TCP
-  backpressure past `--max-inflight`, per-socket rate limits, readiness
-  that drops when the broker is unreachable, and broker quotas keyed on
-  the gateway's client id.
-- **Operations:** `/healthz`, `/readyz`, Prometheus `/metrics`. SIGTERM
-  drains in-flight messages before closing with 1001. Optional native TLS.
-  [Dockerfile and Kubernetes manifests](deploy/ws-gateway) (HPA, PDB)
-  are included.
+- **Partitioning:** `murmur2(key) % partitions`, identical to every
+  client. The default key is the authenticated user.
+- **Fan-out:** each instance reads a subscribed topic once, encodes each
+  record once and broadcasts it. The broker's load follows topics ×
+  instances, not screens. A slow screen skips ahead and is told how far
+  (`lagged`) instead of holding anyone back.
+- **Cannot overload the broker:**
+  - a fixed producer pool;
+  - per-partition batching;
+  - a bounded buffer that fails fast with `OVERLOADED`;
+  - TCP backpressure past `--max-inflight`;
+  - per-socket rate limits;
+  - readiness that drops while the broker is unreachable;
+  - broker quotas keyed on the gateway's client id.
+- **Operations:**
+  - `/healthz`, `/readyz` and Prometheus `/metrics`;
+  - SIGTERM drains in-flight messages before closing with 1001, and the
+    SDKs then reconnect to another instance at once;
+  - optional native TLS;
+  - [Dockerfile and Kubernetes manifests](deploy/ws-gateway) (HPA, PDB).
 
-Measured with `scripts/verify-ws-gateway.sh` on one 4-core machine,
-gateway and load generator side by side:
+Measured on one 4-core machine, everything side by side:
 
-| | |
-|---|---|
-| Sockets | 19,000, all connected, none dropped (the container's descriptor limit) |
-| Traffic | 19,000 msgs/s, every one acknowledged, 0 errors |
-| Ack latency | p50 4–5 ms, p99 9–12 ms |
-| Memory | ~5 KB per idle socket, so ~5 GiB per million |
-| Broker cost | 3 connections for all 19,000 sockets; ~16 records per produce request |
+| | Publishing (`verify-ws-gateway.sh`) | Subscribing (`verify-ws-fanout.sh`, 2 gateway instances) |
+|---|---|---|
+| Sockets | 19,000, all connected, none dropped | 18,000 subscribed, none dropped |
+| Traffic | 19,000 msgs/s, every one acknowledged | 3,618,000 of 3,618,000 deliveries (≈180,000/s), 0 lost |
+| Latency | ack p50 4–5 ms, p99 9–12 ms | broker write to socket p50 5 ms, p99 7 ms at light load (p50 106 ms with the box saturated) |
+| Memory | ~5 KB per idle socket | ~6 KB per subscribed socket |
+| Broker cost | 3 connections, ~16 records per produce request | 8 connections in total (4 per instance) |
+
+The UI SDKs are tested end to end ([`clients/ws/test.sh`](clients/ws/test.sh)):
+
+- React, Vue and Angular trading screens run in Chromium against real
+  gateway processes and a broker;
+- Flutter widgets run against a real gateway;
+- both cover snapshots, live ticks, orders landing in Brahmaputra,
+  refusals, gateway restarts, and screens spread over two instances.
 
 The protocol, every flag, kernel tuning for a million sockets and the
 deployment guide are in **[crates/gateway/README.md](crates/gateway/README.md)**.
+The SDK guide, including how to build a price feed, is in
+**[clients/ws/README.md](clients/ws/README.md)**.
 
 ## Transactions
 
@@ -1522,6 +1591,9 @@ bash scripts/verify-admin-and-security.sh # 29  admin APIs, quotas, mTLS, SCRAM
 bash scripts/verify-transactions.sh       # 24  commit, abort, in doubt, expiry
 bash scripts/verify-compaction.sh         # 17  tombstones, superseding, horizons
 bash scripts/verify-jbod.sh               # 26  multi-disk placement, failure, moves
+bash scripts/verify-ws-gateway.sh         #     WebSocket publishing: sockets, acks, broker cost, memory
+bash scripts/verify-ws-fanout.sh          #     WebSocket subscriptions: every tick to every socket, 2 instances
+clients/ws/test.sh                        # 29  UI SDKs end to end (JS, React/Vue/Angular in Chromium, Dart, Flutter)
 ```
 
 Each script starts real brokers on real ports, fails loudly on the first
@@ -1706,8 +1778,12 @@ scripts/                    live verification and benchmark harnesses
 scripts/run-cluster.sh      a three-node cluster on one machine, dashboard included
 scripts/load-100k.sh        push 100,000 records at acks=1 and verify they landed
 scripts/consume-follow.sh   tail a topic, printing each record
-crates/gateway/             WebSocket gateway: authenticated mobile/web streams into
-                            keyed topics, stateless and horizontally scalable
+crates/gateway/             WebSocket gateway: authenticated mobile/web publishing
+                            into keyed topics and live subscriptions (fan-out with
+                            snapshots), stateless and horizontally scalable
+clients/ws/                 UI SDKs for the gateway: JS/TS core, React, Vue,
+                            Angular, Svelte, Dart, Flutter; clients/ws/test.sh
+                            runs them end to end (Chromium and Flutter included)
 deploy/ws-gateway/          its Dockerfile and Kubernetes manifests
 clients/                    native drivers: Go, Node.js, Python, Java, .NET, C++, C,
                             PHP, Ruby, Erlang, Elixir (Rust is crates/client);

@@ -3,7 +3,14 @@
 A stateless WebSocket service between mobile/web clients and a
 Brahmaputra cluster. A client connects, authenticates once, and every
 message it sends becomes a record in a Brahmaputra topic. The message's
-key chooses the partition, so records sharing a key stay in order.
+key chooses the partition, so records sharing a key stay in order. A
+client can also **subscribe** to topics and receive their records live,
+for example a stock price feed. The gateway starts it with a snapshot of
+the latest record per key, and each gateway instance reads each topic
+from the broker only once, however many sockets watch it.
+
+UI SDKs for this protocol are in [`clients/ws`](../../clients/ws): a core
+JS/TS client, React, Vue, Angular, Svelte, Dart and Flutter.
 
 ```
  phones, browsers ──wss──▶ L4 load balancer ──▶ gateway × N ──(few TCP conns each)──▶ brokers
@@ -77,7 +84,8 @@ the gateway. Claims read:
 | `sub` | required; the user or device. Bound to the connection for its lifetime |
 | `exp` | required; expiry (a token without one is a password that cannot be rotated) |
 | `nbf`, `iss`, `aud` | checked when present / when `--jwt-issuer` / `--jwt-audience` are set |
-| `topics` | optional patterns (`orders`, `orders.*`, `*`) that narrow what this token may write. Never widens `--allow-topic` |
+| `topics` | optional patterns (`orders`, `orders.*`, `*`) that narrow what this token may write. Never widens `--allow-topic`. `[]` is a read-only token |
+| `subscribe` | optional patterns that narrow what this token may subscribe to. Never widens `--allow-subscribe` |
 
 Only `alg: HS256` is accepted. The algorithm in a token is compared
 against that, never trusted, which closes the `alg: none` and
@@ -113,7 +121,7 @@ path for high-rate telemetry.
 **The gateway answers** with JSON text frames:
 
 ```json
-{"type":"welcome","user":"user-42","topic":"events","key":"user-42","max_message_bytes":1048576,"max_inflight":64}
+{"type":"welcome","user":"user-42","topic":"events","key":"user-42","max_message_bytes":1048576,"max_inflight":64,"subscribe":true}
 {"type":"ack","id":7,"topic":"orders.eu","partition":3,"offset":1841}
 {"type":"error","id":8,"code":"TOPIC_NOT_ALLOWED","message":"not permitted to publish to payments","retryable":false}
 ```
@@ -125,6 +133,7 @@ path for high-rate telemetry.
 | `RATE_LIMITED` | yes | Over `--rate-limit` / `--rate-burst` for this connection |
 | `OVERLOADED` | yes | The cluster is slower than the edge; back off |
 | `BROKER_ERROR` | per `retryable` | The broker or network failed the record |
+| `TOO_MANY_SUBSCRIPTIONS` | no | Over `--max-subscriptions` topics on one connection |
 
 **Partitioning.** A record's partition is `murmur2(key) % partitions`,
 the same function every Brahmaputra client and Kafka's default
@@ -145,6 +154,89 @@ consumers can trust who sent it.
 
 Closing codes: `1000` idle timeout, `1001` server shutting down (resend
 unacked), `1002` protocol error, `1009` message over `--max-message-bytes`.
+
+## Subscriptions (fan-out)
+
+Subscribing is off until the gateway is given topics to allow:
+`--allow-subscribe 'prices.*,orders.*'`. A token's `subscribe` claim
+narrows that list, and topics starting with `__` are never readable.
+`welcome.subscribe` tells a client whether it may subscribe to anything.
+
+```json
+{"op":"subscribe","id":1,"topic":"prices.us","keys":["AAPL","MSFT"],"snapshot":true}
+{"op":"unsubscribe","id":2,"topic":"prices.us"}
+```
+
+| Field | |
+|---|---|
+| `op` | `subscribe` or `unsubscribe` (a frame without `op`, or with `"op":"publish"`, is a publish) |
+| `topic` | required |
+| `keys` | optional: only records with these keys (up to `--max-subscribe-keys`). Subscribing again to a held topic replaces the filter |
+| `snapshot` | optional: first send the latest cached record of each (matching) key |
+
+The gateway answers:
+
+```json
+{"type":"subscribed","id":1,"topic":"prices.us","snapshot":2}
+{"type":"record","topic":"prices.us","partition":3,"offset":1841,"timestamp":1727460000000,"key":"AAPL","value":"{\"price\":189.1}","headers":{"x-gw-user":"feed"}}
+{"type":"lagged","topic":"prices.us","skipped":12}
+{"type":"unsubscribed","id":2,"topic":"prices.us"}
+```
+
+The `snapshot` count says how many `record` frames that follow are the
+snapshot; after them comes the live stream. Records written after
+`subscribed` are all delivered. Keys and values that are not UTF-8 arrive
+as `key_b64`/`value_b64`; `"value": null` is a tombstone. A refusal is an
+`error` frame with the request's `id` (`TOPIC_NOT_ALLOWED`, `BAD_REQUEST`,
+`TOO_MANY_SUBSCRIPTIONS`, `RATE_LIMITED`).
+
+**How it works** (`src/hub.rs`):
+
+- **One feed per topic per instance.** The first subscriber to a topic
+  starts a *feed*: one broker connection that fetches every partition.
+  The feed encodes each record into its frame once and hands that one
+  reference-counted frame to a broadcast channel that every subscribed
+  socket reads. A tick that reaches 100,000 sockets costs the broker one
+  fetch per instance and the gateway one JSON encoding. The feed stops
+  `--feed-idle-secs` after its last subscriber leaves.
+- **Snapshots without gaps.** Each feed keeps the latest record per key
+  (`--snapshot-max-keys`, default 100,000; tombstones remove keys). A new
+  feed first reads back `--snapshot-warmup-records` per partition to fill
+  it. A subscriber takes the snapshot and joins the channel under the lock
+  the feed holds while it publishes, so every record is in the snapshot
+  or on the channel, never both and never neither.
+- **Slow subscribers skip, they never stall.** The channel keeps the
+  last `--feed-buffer` records (default 4096). A socket further behind
+  than that jumps to the newest record and gets a `lagged` frame with the
+  count it missed. The feed never waits for anyone. A socket that stops
+  reading altogether is closed after `--write-timeout-secs`.
+- **Cheap for the broker, and for idle sockets.** A publish-only socket
+  pays one pointer for the feature. Subscriptions cost the broker
+  topics × instances connections, so adding a gateway instance adds
+  sockets and never multiplies broker load per socket.
+
+Measured with `scripts/verify-ws-fanout.sh` (broker, two gateway
+instances and the load generator on one 4-core machine):
+
+| Subscribed sockets | Ticks written | Deliveries | Lost | Broker write → socket | Broker connections | Memory |
+|---|---|---|---|---|---|---|
+| 500 | 20/s | 100,500 of 100,500 | 0 | p50 5 ms, p99 7 ms | 8 | |
+| 10,000 | 20/s | 4,010,000 of 4,010,000 (≈200,000/s) | 0 | p50 58 ms, p99 133 ms | 8 | ~6 KB/socket |
+| 18,000 | 10/s | 3,618,000 of 3,618,000 (≈180,000/s) | 0 | p50 106 ms, p99 256 ms | 8 | ~6 KB/socket |
+
+In the two larger runs the machine has no idle CPU left (the load
+generator alone takes about 1.4 cores), so the latency there reflects the
+shared box. Add instances to add fan-out capacity.
+
+| Flag | Default | |
+|---|---|---|
+| `--allow-subscribe` | *(none)* | topic patterns clients may subscribe to |
+| `--max-subscriptions` | 32 | topics per connection |
+| `--max-subscribe-keys` | 1000 | keys per subscription filter |
+| `--feed-buffer` | 4096 | records kept for subscribers that fall behind |
+| `--snapshot-max-keys` | 100000 | keys cached per topic for snapshots |
+| `--snapshot-warmup-records` | 1000 | records per partition a new feed reads back |
+| `--feed-idle-secs` | 30 | how long a feed without subscribers keeps reading |
 
 ## Why it scales to millions of sockets
 
@@ -220,7 +312,9 @@ didn't budget for:
 - **Metrics:** `GET :8091/metrics` (Prometheus): open connections,
   handshake rejections by reason, messages received/produced/rejected by
   reason, in-flight, produce latency histogram, idle and slow-reader
-  closes, readiness, RSS.
+  closes, readiness, RSS. For subscriptions: active subscriptions and
+  feeds, records read by feeds, frames delivered, records skipped by slow
+  subscribers, snapshot records sent, subscribe refusals.
 
 Every flag has an environment variable (`GW_*`): see `--help`.
 [`deploy/ws-gateway/`](../../deploy/ws-gateway) has a Dockerfile and
@@ -230,8 +324,11 @@ Kubernetes manifests (Deployment, Service, HPA, PodDisruptionBudget).
 
 ```bash
 cargo test -p brahmaputra-ws-gateway          # unit + end-to-end (real broker)
-scripts/verify-ws-gateway.sh                  # real processes + load
+scripts/verify-ws-gateway.sh                  # real processes + publish load
 CONNECTIONS=50000 RATE=2 scripts/verify-ws-gateway.sh
+scripts/verify-ws-fanout.sh                   # real processes + subscribers on 2 instances
+SUBSCRIBERS=50000 GATEWAYS=4 TICK_RATE=50 scripts/verify-ws-fanout.sh
+clients/ws/test.sh                            # the UI SDKs, browsers and Flutter included
 ```
 
 The end-to-end tests assert what reached the log, not only what the
@@ -245,4 +342,9 @@ gateway replied:
 - 1,000 concurrent sockets costing the broker no extra connections and a
   handful of produce requests;
 - graceful shutdown acknowledging every in-flight message before 1001;
-- a broker outage turning into fast retryable errors and readiness 503.
+- a broker outage turning into fast retryable errors and readiness 503;
+- subscriptions: snapshot then live, key filters, tombstones leaving the
+  snapshot, UI publish → broker → every subscribed UI, unsubscribe;
+  authorization by flag and claim; 300 subscribers served by one feed
+  that stops when they leave; a stalled subscriber skipping ahead with
+  received + skipped accounting for every record.
