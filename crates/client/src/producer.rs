@@ -450,11 +450,7 @@ impl Producer {
     /// without one. Lets a caller that must report where a record went (a
     /// gateway acknowledging its own clients) choose once and pass the
     /// result as an explicit partition, rather than re-deriving it.
-    pub async fn partition_for(
-        &self,
-        topic: &str,
-        key: Option<&[u8]>,
-    ) -> Result<i32, ClientError> {
+    pub async fn partition_for(&self, topic: &str, key: Option<&[u8]>) -> Result<i32, ClientError> {
         match key {
             Some(key) => self.key_partition(topic, key).await,
             None => self.round_robin_partition(topic).await,
