@@ -438,14 +438,38 @@ class BrokerRouter:
     client.
     """
 
-    def __init__(self, host: str, port: int, client_id: str, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        client_id: str,
+        timeout: float = 30.0,
+        request_timeout: Optional[float] = DEFAULT_REQUEST_TIMEOUT_S,
+    ) -> None:
         self._client_id = client_id
         self._timeout = timeout
+        self._request_timeout = request_timeout
         self._seed_address = (host, port)
-        self._seed = Connection(host, port, client_id, timeout)
+        self._seed = self._dial(host, port)
         self._connections: Dict[int, Connection] = {}
         self._metadata: Optional[ClusterMetadata] = None
         self._lock = threading.RLock()
+
+    def _dial(self, host: str, port: int) -> Connection:
+        connection = Connection(host, port, self._client_id, self._timeout)
+        connection.set_request_timeout(self._request_timeout)
+        return connection
+
+    def set_request_timeout(self, seconds: Optional[float]) -> None:
+        """Bound one round trip on every connection held now or dialled
+        later. None or <= 0 disables the bound. It must exceed the longest
+        the broker may hold a request: a fetch long-poll, an acks=all wait,
+        a JoinGroup rebalance."""
+        with self._lock:
+            self._request_timeout = seconds
+            self._seed.set_request_timeout(seconds)
+            for connection in self._connections.values():
+                connection.set_request_timeout(seconds)
 
     def close(self) -> None:
         with self._lock:
@@ -467,7 +491,7 @@ class BrokerRouter:
             return self._seed
         old = self._seed
         host, port = self._seed_address
-        self._seed = Connection(host, port, self._client_id, self._timeout)
+        self._seed = self._dial(host, port)
         for node_id, cached in list(self._connections.items()):
             if cached is old:
                 self._connections[node_id] = self._seed
@@ -521,9 +545,7 @@ class BrokerRouter:
                         seed = self._live_seed()
                         self._connections[node_id] = seed
                         return seed
-                    connection = Connection(
-                        broker.host, broker.port, self._client_id, self._timeout
-                    )
+                    connection = self._dial(broker.host, broker.port)
                     self._connections[node_id] = connection
                     return connection
         raise BrahmaputraError(f"broker {node_id} is not in the metadata")
@@ -562,8 +584,12 @@ class ProducerConfig:
     buffer_memory: int = 32 * 1024 * 1024
     #: How long `send` may block on a full buffer before failing.
     max_block_ms: int = 60_000
-    #: Connect and socket timeout, in seconds.
+    #: Connect timeout, in seconds.
     socket_timeout_s: float = 30.0
+    #: Client-side bound on one request/response round trip, in seconds; a
+    #: broker that stops answering costs an error, not a hang. Keep it above
+    #: request_timeout_ms. None disables it.
+    round_trip_timeout_s: Optional[float] = DEFAULT_REQUEST_TIMEOUT_S
 
     def compression(self) -> int:
         return Compression.parse(self.compression_type)
@@ -612,7 +638,11 @@ class Producer:
         self._codec = self.config.compression()
         self._acks = self.config.acks_value()
         self._router = BrokerRouter(
-            host, port, self.config.client_id, self.config.socket_timeout_s
+            host,
+            port,
+            self.config.client_id,
+            self.config.socket_timeout_s,
+            self.config.round_trip_timeout_s,
         )
         self._buffers: Dict[Tuple[str, int], List[_Buffered]] = {}
         self._sizes: Dict[Tuple[str, int], int] = {}
@@ -663,12 +693,15 @@ class Producer:
         key: Optional[bytes] = None,
         partition: Optional[int] = None,
         headers: Optional[List[RecordHeader]] = None,
+        timestamp_ms: Optional[int] = None,
     ) -> None:
         """Buffer one record. Call `flush` to await delivery.
 
         `value=None` is a tombstone, distinct from `b""`. With `partition`
         set the partitioner is bypassed; otherwise a keyed record goes to
         `murmur2(key) % partitions` and an unkeyed one round-robins.
+        `timestamp_ms` (unix milliseconds) overrides the wall-clock record
+        timestamp.
 
         Returning without an offset is deliberate: with batching the offset
         is not known until the batch goes out, and pretending otherwise
@@ -684,7 +717,9 @@ class Producer:
 
         with self._lock:
             slot = (topic, partition)
-            self._buffers.setdefault(slot, []).append(_Buffered(record, _now_ms()))
+            self._buffers.setdefault(slot, []).append(
+                _Buffered(record, _now_ms() if timestamp_ms is None else int(timestamp_ms))
+            )
             self._sizes[slot] = self._sizes.get(slot, 0) + size
             full = self._sizes[slot] >= self.config.batch_size
 
@@ -698,17 +733,22 @@ class Producer:
         key: Optional[bytes] = None,
         partition: Optional[int] = None,
         headers: Optional[List[RecordHeader]] = None,
+        timestamp_ms: Optional[int] = None,
     ) -> int:
         """Send one record on its own and return its offset.
 
         A full round trip per record — correct, and slow. Use `send` plus
         `flush` for anything with throughput requirements. Returns -1 with
-        `acks=0`, where no offset comes back.
+        `acks=0`, where no offset comes back. Records already buffered for
+        the partition go first, so send order is kept.
         """
         if partition is None:
             partition = self._choose_partition(topic, key)
         record = Record(value=value, key=key, headers=list(headers or []))
-        return self._produce(topic, partition, [_Buffered(record, _now_ms())])
+        created = _now_ms() if timestamp_ms is None else int(timestamp_ms)
+        with self._send_lock(topic, partition):
+            self._take_and_send(topic, partition)
+            return self._produce(topic, partition, [_Buffered(record, created)])
 
     def flush(self) -> None:
         """Send every buffered record and wait for acknowledgement.
@@ -802,26 +842,34 @@ class Producer:
                         if self._background_error is None:
                             self._background_error = error
 
-    def _flush_partition(self, topic: str, partition: int) -> None:
+    def _send_lock(self, topic: str, partition: int) -> threading.Lock:
         slot = (topic, partition)
         with self._lock:
             send_lock = self._send_locks.get(slot)
             if send_lock is None:
                 send_lock = self._send_locks[slot] = threading.Lock()
+        return send_lock
+
+    def _flush_partition(self, topic: str, partition: int) -> None:
         # Held across the round trip (and any retries): a partition has at
         # most one batch in flight, and batches leave in the order they were
         # taken. Without it the linger ticker and a send that fills a batch
         # could each take a batch for the same partition and race to the
         # connection, reordering the log.
-        with send_lock:
-            with self._lock:
-                batch = self._buffers.get(slot)
-                if not batch:
-                    return
-                self._buffers[slot] = []
-                size = self._sizes.pop(slot, 0)
-            self._release(size)
-            self._produce(topic, partition, batch)
+        with self._send_lock(topic, partition):
+            self._take_and_send(topic, partition)
+
+    def _take_and_send(self, topic: str, partition: int) -> None:
+        # Called with the partition's send lock held.
+        slot = (topic, partition)
+        with self._lock:
+            batch = self._buffers.get(slot)
+            if not batch:
+                return
+            self._buffers[slot] = []
+            size = self._sizes.pop(slot, 0)
+        self._release(size)
+        self._produce(topic, partition, batch)
 
     def _produce(self, topic: str, partition: int, buffered: List[_Buffered]) -> int:
         if not buffered:
@@ -922,8 +970,11 @@ class ConsumerConfig:
     rack: str = ""
     #: Records returned per poll; the rest stay buffered and uncommitted.
     max_poll_records: int = 500
-    #: Connect and socket timeout, in seconds. Must exceed fetch_max_wait_ms.
+    #: Connect timeout, in seconds.
     socket_timeout_s: float = 30.0
+    #: Client-side bound on one request/response round trip, in seconds.
+    #: Must exceed fetch_max_wait_ms. None disables it.
+    round_trip_timeout_s: Optional[float] = DEFAULT_REQUEST_TIMEOUT_S
 
 
 class Consumer:
@@ -932,7 +983,11 @@ class Consumer:
     def __init__(self, host: str, port: int, config: Optional[ConsumerConfig] = None) -> None:
         self.config = config or ConsumerConfig()
         self._router = BrokerRouter(
-            host, port, self.config.client_id, self.config.socket_timeout_s
+            host,
+            port,
+            self.config.client_id,
+            self.config.socket_timeout_s,
+            self.config.round_trip_timeout_s,
         )
 
     def close(self) -> None:

@@ -628,7 +628,7 @@ function decodeRecords(payload, hasHeaders, hasNullValues) {
     let length;
     [length, pos] = getUvarint(payload, pos);
     const size = Number(length);
-    if (pos + size > payload.length) throw new ProtocolError('truncated record');
+    if (size > payload.length - pos) throw new ProtocolError('truncated record');
     const end = pos + size;
 
     let keyLenPlusOne;
@@ -636,6 +636,7 @@ function decodeRecords(payload, hasHeaders, hasNullValues) {
     let key = null;
     if (keyLenPlusOne > 0n) {
       const keyLen = Number(keyLenPlusOne) - 1;
+      if (keyLen > end - pos) throw new ProtocolError('truncated record key');
       key = Buffer.from(payload.subarray(pos, pos + keyLen));
       pos += keyLen;
     }
@@ -649,6 +650,7 @@ function decodeRecords(payload, hasHeaders, hasNullValues) {
       value = null;
     } else {
       const valueLen = hasNullValues ? Number(rawValueLen) - 1 : Number(rawValueLen);
+      if (valueLen > end - pos) throw new ProtocolError('truncated record value');
       value = Buffer.from(payload.subarray(pos, pos + valueLen));
       pos += valueLen;
     }
@@ -670,6 +672,7 @@ function decodeRecords(payload, hasHeaders, hasNullValues) {
       for (let index = 0n; index < count; index += 1n) {
         let keyLen;
         [keyLen, pos] = getUvarint(payload, pos);
+        if (keyLen > BigInt(end - pos)) throw new ProtocolError('truncated record header key');
         const headerKey = payload.toString('utf8', pos, pos + Number(keyLen));
         pos += Number(keyLen);
         let valuePlusOne;
@@ -677,6 +680,7 @@ function decodeRecords(payload, hasHeaders, hasNullValues) {
         let headerValue = null;
         if (valuePlusOne > 0n) {
           const headerLen = Number(valuePlusOne) - 1;
+          if (headerLen > end - pos) throw new ProtocolError('truncated record header value');
           headerValue = Buffer.from(payload.subarray(pos, pos + headerLen));
           pos += headerLen;
         }

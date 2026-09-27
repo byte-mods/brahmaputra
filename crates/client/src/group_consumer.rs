@@ -865,6 +865,15 @@ impl GroupConsumer {
         self.max_poll_records = max_poll_records.max(1);
     }
 
+    /// Bound every request/response round trip, coordinator and fetch
+    /// alike (`None`, the default, waits as long as the connection stays
+    /// up). Keep it above the rebalance timeout, which a JoinGroup may
+    /// legitimately wait out.
+    pub fn with_request_timeout(self, timeout: Option<Duration>) -> Self {
+        self.coordinator.router.set_request_timeout(timeout);
+        self
+    }
+
     /// Cap on response batch bytes per fetch.
     pub fn with_max_bytes(mut self, max_bytes: i32) -> Self {
         self.configure_consumer(|consumer| consumer.with_max_bytes(max_bytes));

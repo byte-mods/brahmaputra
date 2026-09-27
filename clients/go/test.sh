@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build, vet and run the Go driver's end-to-end suite against a live broker.
+# Build, vet, unit-test and run the Go driver's end-to-end suite against a live broker.
 #
 #   ./test.sh HOST PORT
 #
@@ -13,6 +13,7 @@ if [ $# -ne 2 ]; then
 fi
 cd "$(dirname "$0")"
 go vet ./...
+go test ./brahmaputra/
 race=()
 if [ "$(go env CGO_ENABLED)" = "1" ] && command -v "$(go env CC)" >/dev/null 2>&1; then
   race=(-race)

@@ -16,10 +16,19 @@
 const net = require('net');
 
 const {
+  ApiKey,
   Assignor,
   AutoOffsetReset,
+  Compression,
   Connection,
   Consumer,
+  ErrorCode,
+  ProtocolError,
+  bodyReader,
+  bodyWriter,
+  decodeRecordBatch,
+  encodeRecordBatch,
+  registerCodec,
   EARLIEST,
   GroupConsumer,
   LATEST,
@@ -655,8 +664,520 @@ async function main() {
     await consumer.close();
   }
 
+  await featureChecks();
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
+}
+
+/**
+ * The client feature checklist, item by item: every setting is shown to
+ * change behaviour, not merely to be accepted.
+ */
+async function featureChecks() {
+  const quick = (extra = {}) => Producer.connect(HOST, PORT, { lingerMs: 0, ...extra });
+  const fetchAll = async (topic, partition) => {
+    const consumer = await Consumer.connect(HOST, PORT);
+    const out = [];
+    try {
+      for (let offset = 0n; ;) {
+        const batch = await consumer.fetch(topic, partition, offset, 100);
+        if (batch.length === 0) return out;
+        out.push(...batch);
+        offset = batch[batch.length - 1].offset + 1n;
+      }
+    } finally {
+      consumer.close();
+    }
+  };
+  const failure = async (promise) => {
+    try {
+      await promise;
+      return null;
+    } catch (error) {
+      return error;
+    }
+  };
+
+  section('producer settings');
+  {
+    const topic = unique('node-linger');
+    const producer = await Producer.connect(HOST, PORT, { lingerMs: 50 });
+    await producer.send(topic, 'lingered', { partition: 0 });
+    await sleep(600);
+    const got = await fetchAll(topic, 0);
+    check('linger.ms sends a batch without an explicit flush', got.length === 1,
+      `got ${got.length} before any flush`);
+    await producer.close();
+  }
+  {
+    const topic = unique('node-batchsize');
+    const producer = await Producer.connect(HOST, PORT, { lingerMs: 60000, batchSize: 200 });
+    for (let i = 0; i < 10; i += 1) await producer.send(topic, 'b'.repeat(50), { partition: 0 });
+    const got = await fetchAll(topic, 0);
+    check('batch.size sends a full batch before linger expires', got.length >= 3,
+      `got ${got.length} of 10 with linger 60s`);
+    await producer.close();
+  }
+  {
+    const topic = unique('node-closeflush');
+    const producer = await Producer.connect(HOST, PORT, { lingerMs: 60000 });
+    for (let i = 0; i < 5; i += 1) await producer.send(topic, `c${i}`, { partition: 0 });
+    await producer.close();
+    const got = await fetchAll(topic, 0);
+    check('close flushes buffered records', got.length === 5, `got ${got.length}`);
+  }
+  {
+    const topic = unique('node-sync');
+    const producer = await quick();
+    const first = await producer.sendSync(topic, 's0', { partition: 1 });
+    const second = await producer.sendSync(topic, 's1', { partition: 1 });
+    const keyed = await producer.sendSync(topic, 's2', { key: 'k' });
+    await producer.close();
+    const got = await fetchAll(topic, 1);
+    check("send-and-wait returns the record's offset",
+      first === 0n && second === 1n && keyed >= 0n && got.length >= 2 &&
+        got[1].value.toString() === 's1',
+      `offsets ${first} ${second} ${keyed}`);
+  }
+  {
+    const topic = unique('node-roundrobin');
+    const producer = await quick();
+    const partitions = await producer.router.partitions(topic);
+    for (let i = 0; i < 2 * partitions.length; i += 1) await producer.send(topic, `rr${i}`);
+    await producer.close();
+    let even = partitions.length > 1;
+    for (const partition of partitions) {
+      if ((await fetchAll(topic, partition)).length !== 2) even = false;
+    }
+    check('null keys are spread round-robin', even, `${partitions.length} partitions`);
+  }
+  {
+    const topic = unique('node-timestamp');
+    const producer = await quick();
+    await producer.send(topic, 't1', { partition: 0, timestamp: 1600000001000 });
+    await producer.send(topic, 't2', { partition: 0, timestamp: 1600000002000n });
+    await producer.sendSync(topic, 't3', { partition: 0, timestamp: 1600000003000 });
+    await producer.close();
+    const got = await fetchAll(topic, 0);
+    check('an explicit record timestamp is kept',
+      got.length === 3 && got[0].timestamp === 1600000001000n &&
+        got[2].timestamp === 1600000003000n,
+      got.map((record) => record.timestamp).join(','));
+    const consumer = await Consumer.connect(HOST, PORT);
+    const byTime = await consumer.listOffsets(topic, 0, 1600000001500n);
+    const pastEnd = await consumer.listOffsets(topic, 0, 1700000000000n);
+    check('list offsets by timestamp finds the first record at or after it',
+      byTime === 1n && pastEnd === 3n, `byTime=${byTime} pastEnd=${pastEnd}`);
+    consumer.close();
+  }
+  {
+    const producer = await quick({ acks: -1, requestTimeoutMs: 1500 });
+    const error = await failure(producer.sendSync(unique('node-acksall'), 'durable'));
+    check('acks=all with request.timeout.ms is acknowledged', error === null, `${error}`);
+    await producer.close();
+  }
+  {
+    let compressed = 0;
+    let decompressed = 0;
+    registerCodec(Compression.LZ4, {
+      compress: (payload) => { compressed += 1; return lz4Encode(payload); },
+      decompress: (payload) => { decompressed += 1; return lz4Decode(payload); },
+    });
+    const topic = unique('node-lz4');
+    const producer = await quick({ compressionType: 'lz4' });
+    const body = 'registered codec '.repeat(30);
+    for (let i = 0; i < 5; i += 1) await producer.send(topic, body, { partition: 0, key: `${i}` });
+    await producer.close();
+    const got = await fetchAll(topic, 0);
+    check('a registered lz4 codec round-trips',
+      got.length === 5 && got.every((record) => record.value.toString() === body) &&
+        compressed > 0 && decompressed > 0,
+      `got ${got.length}, compress=${compressed} decompress=${decompressed}`);
+  }
+
+  section('retries (fault-injecting proxy)');
+  {
+    const proxy = await startFaultProxy(HOST, PORT);
+    const topic = unique('node-retry');
+    const viaProxy = async (extra) => {
+      const producer = await Producer.connect('127.0.0.1', proxy.port, { lingerMs: 0, ...extra });
+      await producer.router.partitions(topic);
+      return producer;
+    };
+
+    let producer = await viaProxy({ retries: 5, retryBackoffMs: 50 });
+    proxy.inject(ErrorCode.NOT_LEADER_OR_FOLLOWER, 2);
+    let offset = null;
+    let error = await failure(
+      producer.sendSync(topic, 'eventually', { partition: 0 }).then((value) => { offset = value; })
+    );
+    check('a retriable produce error is retried until it succeeds',
+      error === null && offset === 0n && proxy.produces === 3,
+      `err=${error} offset=${offset} attempts=${proxy.produces}`);
+    await producer.close();
+
+    producer = await viaProxy({ retries: 2, retryBackoffMs: 200 });
+    proxy.inject(ErrorCode.NOT_LEADER_OR_FOLLOWER, -1);
+    let started = Date.now();
+    error = await failure(producer.sendSync(topic, 'never', { partition: 0 }));
+    let elapsed = Date.now() - started;
+    check('retry.backoff.ms spaces the retries',
+      error !== null && proxy.produces === 3 && elapsed >= 400,
+      `attempts=${proxy.produces} elapsed=${elapsed}ms`);
+    await failure(producer.close());
+
+    producer = await viaProxy({ retries: 5, retryBackoffMs: 1000 });
+    proxy.inject(ErrorCode.INVALID_REQUEST, -1);
+    started = Date.now();
+    error = await failure(producer.sendSync(topic, 'rejected', { partition: 0 }));
+    check('a non-retriable produce error is not retried',
+      error !== null && proxy.produces === 1 && Date.now() - started < 1000,
+      `attempts=${proxy.produces}`);
+    await failure(producer.close());
+
+    producer = await viaProxy({ retries: 1000000, retryBackoffMs: 50, deliveryTimeoutMs: 600 });
+    proxy.inject(ErrorCode.NOT_LEADER_OR_FOLLOWER, -1);
+    started = Date.now();
+    error = await failure(producer.sendSync(topic, 'late', { partition: 0 }));
+    elapsed = Date.now() - started;
+    check('delivery.timeout.ms bounds the retries',
+      error !== null && elapsed < 3000 && proxy.produces > 2,
+      `attempts=${proxy.produces} elapsed=${elapsed}ms`);
+    await failure(producer.close());
+    proxy.close();
+  }
+
+  section('consumer settings');
+  {
+    const topic = unique('node-fetch');
+    const producer = await quick();
+    for (let i = 0; i < 10; i += 1) {
+      await producer.send(topic, String.fromCharCode(97 + i).repeat(1000), { partition: 0 });
+    }
+    await producer.close();
+
+    const consumer = await Consumer.connect(HOST, PORT);
+    const { records, highWatermark } = await consumer.fetchVerbose(topic, 0, 0n, 100);
+    check('fetch reports the high watermark', highWatermark === 10n && records.length === 10,
+      `hw=${highWatermark}`);
+    const metadata = await consumer.router.getMetadata([topic], true);
+    const info = metadata.topics.find((entry) => entry.name === topic);
+    check('metadata lists every partition with a leader',
+      info !== undefined && info.partitions.length === 4 &&
+        info.partitions.every((entry) => entry.leader >= 0),
+      JSON.stringify(info && info.partitions.map((entry) => entry.partition)));
+    consumer.close();
+
+    const capped = await Consumer.connect(HOST, PORT, { fetchMaxBytes: 2500 });
+    const got = await capped.fetch(topic, 0, 0n, 100);
+    check('fetch.max.bytes caps a response', got.length >= 1 && got.length < 10,
+      `got ${got.length} of 10`);
+    capped.close();
+
+    const patient = await Consumer.connect(HOST, PORT, {
+      fetchMinBytes: 1 << 20,
+      fetchMaxWaitMs: 400,
+    });
+    const started = Date.now();
+    const waited = await patient.fetch(topic, 0, 0n, 400);
+    const elapsed = Date.now() - started;
+    check('fetch.min.bytes waits up to fetch.max.wait.ms for more data',
+      waited.length === 10 && elapsed >= 300 && elapsed < 3000,
+      `got ${waited.length} after ${elapsed}ms`);
+    patient.close();
+  }
+  {
+    // A length prefix larger than what follows, or negative, is an error —
+    // never a read past the end or a huge allocation.
+    const batch = encodeRecordBatch([{ key: null, value: Buffer.from('x'), headers: [] }], 0);
+    const oversized = Buffer.from(batch);
+    oversized.writeInt32BE(0x7fffffff, 8);
+    const negative = Buffer.from(batch);
+    negative.writeInt32BE(-16, 8);
+    const errors = [
+      await failure((async () => decodeRecordBatch(oversized, 0))()),
+      await failure((async () => decodeRecordBatch(negative, 0))()),
+      await failure((async () => bodyReader(Buffer.from([0x7e, 0x31])))()),
+    ];
+    check('a truncated or oversized length is an error, not a crash',
+      errors.every((error) => error instanceof ProtocolError), errors.join(' / '));
+  }
+
+  section('consumer group settings');
+  const produceN = async (topic, n) => {
+    const producer = await quick();
+    for (let i = 0; i < n; i += 1) await producer.send(topic, `m${i}`);
+    await producer.close();
+  };
+  const group = (groupId, extra = {}) =>
+    GroupConsumer.connect(HOST, PORT, groupId, { autoCommitIntervalMs: 0, ...extra });
+  const pollUntil = async (consumer, want, limitMs) => {
+    const got = [];
+    let largest = 0;
+    const deadline = Date.now() + limitMs;
+    while (got.length < want && Date.now() < deadline) {
+      let records;
+      try {
+        records = await consumer.poll(300);
+      } catch {
+        break;
+      }
+      largest = Math.max(largest, records.length);
+      got.push(...records);
+    }
+    return { got, largest };
+  };
+  const sumCommitted = async (consumer) => {
+    try {
+      let total = 0n;
+      for (const offset of (await consumer.committed()).values()) total += offset;
+      return total;
+    } catch {
+      return -1n;
+    }
+  };
+  const partitionsOf = (consumer, topic) =>
+    consumer.assignment.filter((slot) => slot.topic === topic).map((slot) => slot.partition);
+  {
+    const topic = unique('node-maxpoll');
+    await produceN(topic, 20);
+    const consumer = await group(unique('node-maxpoll-grp'), { maxPollRecords: 5 });
+    consumer.subscribe([topic]);
+    const { got, largest } = await pollUntil(consumer, 20, 20000);
+    check('max.poll.records caps one poll', got.length === 20 && largest <= 5,
+      `got ${got.length}, largest poll ${largest}`);
+    await consumer.close();
+  }
+  {
+    const topic = unique('node-autocommit');
+    await produceN(topic, 12);
+    const consumer = await group(unique('node-autocommit-grp'), { autoCommitIntervalMs: 200 });
+    consumer.subscribe([topic]);
+    await pollUntil(consumer, 12, 20000);
+    await sleep(300);
+    await consumer.poll(300);
+    const total = await sumCommitted(consumer);
+    check('auto-commit commits delivered positions', total === 12n, `${total}`);
+    await consumer.close();
+  }
+  {
+    const topic = unique('node-heartbeat');
+    await produceN(topic, 4);
+    const consumer = await group(unique('node-heartbeat-grp'), {
+      sessionTimeoutMs: 1500,
+      heartbeatIntervalMs: 300,
+    });
+    consumer.subscribe([topic]);
+    await pollUntil(consumer, 4, 20000);
+    const generation = consumer.generation;
+    await sleep(4000); // well past session.timeout.ms, no polls
+    const error = await failure(consumer.commit());
+    check('heartbeats keep an idle member in its group',
+      error === null && consumer.generation === generation, `${error}`);
+    await consumer.close();
+  }
+  {
+    const first = unique('node-multi-a');
+    const second = unique('node-multi-b');
+    await produceN(first, 6);
+    await produceN(second, 7);
+    const consumer = await group(unique('node-multi-grp'));
+    consumer.subscribe([first, second]);
+    const { got } = await pollUntil(consumer, 13, 20000);
+    const a = got.filter((record) => record.topic === first).length;
+    const b = got.filter((record) => record.topic === second).length;
+    check('a member subscribed to two topics consumes both', a === 6 && b === 7, `${a}/${b}`);
+    await consumer.close();
+  }
+  {
+    const topic = unique('node-static');
+    await produceN(topic, 4);
+    const groupId = unique('node-static-grp');
+    const original = await group(groupId, { groupInstanceId: 'instance-1' });
+    original.subscribe([topic]);
+    await pollUntil(original, 4, 20000);
+    const memberId = original.memberId;
+    // The same instance comes back (a restart) before the old session has
+    // expired: it must reclaim the slot, not join as a stranger.
+    const returning = await group(groupId, { groupInstanceId: 'instance-1' });
+    returning.subscribe([topic]);
+    await failure(returning.poll(2000));
+    check('a returning static member reclaims its member id',
+      memberId !== '' && returning.memberId === memberId,
+      `${memberId} then ${returning.memberId}`);
+    await returning.close();
+    await original.close();
+  }
+  {
+    const topic = unique('node-leave');
+    await produceN(topic, 8);
+    const groupId = unique('node-leave-grp');
+    const settings = { sessionTimeoutMs: 30000, rebalanceTimeoutMs: 10000 };
+    const leaving = await group(groupId, settings);
+    leaving.subscribe([topic]);
+    await pollUntil(leaving, 8, 20000);
+    await leaving.close();
+    const successor = await group(groupId, settings);
+    successor.subscribe([topic]);
+    const started = Date.now();
+    while (partitionsOf(successor, topic).length < 4 && Date.now() - started < 15000) {
+      await failure(successor.poll(200));
+    }
+    const elapsed = Date.now() - started;
+    check('close leaves the group so the next member is assigned at once',
+      partitionsOf(successor, topic).length === 4 && elapsed < 6000,
+      `assigned after ${elapsed}ms`);
+    await successor.close();
+  }
+  {
+    const topic = unique('node-fence');
+    await produceN(topic, 8);
+    const groupId = unique('node-fence-grp');
+    const first = await group(groupId, { rebalanceTimeoutMs: 2000 });
+    first.subscribe([topic]);
+    await pollUntil(first, 8, 20000);
+    const oldGeneration = first.generation;
+    // A second member joins while the first stops polling: the group moves
+    // on without it, so its generation is superseded.
+    const second = await group(groupId, { rebalanceTimeoutMs: 2000 });
+    second.subscribe([topic]);
+    const deadline = Date.now() + 15000;
+    while (second.generation <= oldGeneration && Date.now() < deadline) {
+      await failure(second.poll(200));
+    }
+    const error = await failure(first.commit());
+    check('a commit from a superseded generation is fenced', error !== null,
+      `old=${oldGeneration} new=${second.generation}`);
+
+    // Both members polling settle on a split of the partitions.
+    const until = Date.now() + 8000;
+    await Promise.all([first, second].map(async (member) => {
+      while (Date.now() < until) await failure(member.poll(200));
+    }));
+    const a = partitionsOf(first, topic);
+    const b = partitionsOf(second, topic);
+    const union = new Set([...a, ...b]);
+    check('two members share the partitions without overlap',
+      union.size === 4 && a.length + b.length === 4 && a.length > 0 && b.length > 0,
+      `${a} / ${b}`);
+    await second.close();
+    await first.close();
+  }
+}
+
+/** LZ4 block codec for the registration check: a size-prefixed block whose
+ * encoder emits one literal-only sequence (valid, just uncompressed) and
+ * whose decoder handles any block. */
+function lz4Encode(src) {
+  const parts = [Buffer.alloc(4)];
+  parts[0].writeUInt32LE(src.length, 0);
+  const n = src.length;
+  if (n < 15) {
+    parts.push(Buffer.from([n << 4]));
+  } else {
+    const lengths = [0xf0];
+    let rest = n - 15;
+    for (; rest >= 255; rest -= 255) lengths.push(255);
+    lengths.push(rest);
+    parts.push(Buffer.from(lengths));
+  }
+  parts.push(src);
+  return Buffer.concat(parts);
+}
+
+function lz4Decode(src) {
+  const size = src.readUInt32LE(0);
+  const out = Buffer.alloc(size);
+  let pos = 4;
+  let written = 0;
+  const readLength = (base) => {
+    let n = base;
+    if (base === 15) {
+      for (;;) {
+        const b = src[pos++];
+        n += b;
+        if (b !== 255) break;
+      }
+    }
+    return n;
+  };
+  while (pos < src.length) {
+    const token = src[pos++];
+    const literals = readLength(token >> 4);
+    src.copy(out, written, pos, pos + literals);
+    pos += literals;
+    written += literals;
+    if (pos >= src.length) break;
+    const offset = src.readUInt16LE(pos);
+    pos += 2;
+    const match = readLength(token & 15) + 4;
+    if (offset === 0 || offset > written) throw new Error('lz4: bad offset');
+    for (let i = 0; i < match; i += 1, written += 1) out[written] = out[written - offset];
+  }
+  if (written !== size) throw new Error('lz4: size mismatch');
+  return out;
+}
+
+/**
+ * Forwards frames to the broker one request at a time, but can answer
+ * Produce requests itself with an injected error code — the only way to
+ * make a healthy single broker return a retriable error on demand.
+ */
+async function startFaultProxy(host, port) {
+  const state = { code: 0, failures: 0, produces: 0 };
+  const sockets = new Set();
+  const server = net.createServer((client) => {
+    const upstream = net.connect(port, host);
+    sockets.add(client);
+    sockets.add(upstream);
+    const drop = () => {
+      client.destroy();
+      upstream.destroy();
+    };
+    for (const socket of [client, upstream]) {
+      socket.on('error', drop);
+      socket.on('close', drop);
+    }
+    upstream.on('data', (chunk) => client.write(chunk));
+    let pending = Buffer.alloc(0);
+    client.on('data', (chunk) => {
+      pending = Buffer.concat([pending, chunk]);
+      while (pending.length >= 4 && pending.length >= 4 + pending.readUInt32BE(0)) {
+        const frame = pending.subarray(0, 4 + pending.readUInt32BE(0));
+        pending = pending.subarray(frame.length);
+        if (frame.readInt16BE(4) === ApiKey.PRODUCE) {
+          state.produces += 1;
+          if (state.failures !== 0) {
+            if (state.failures > 0) state.failures -= 1;
+            const header = frame.subarray(4, 14 + frame.readUInt16BE(12));
+            const body = bodyWriter().string('').int32(0).int32(state.code).int64(-1).int64(-1).bytes();
+            const length = Buffer.alloc(4);
+            length.writeUInt32BE(header.length + body.length, 0);
+            client.write(Buffer.concat([length, header, body]));
+            continue;
+          }
+        }
+        upstream.write(frame);
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    port: server.address().port,
+    get produces() {
+      return state.produces;
+    },
+    inject(code, failures) {
+      state.code = code;
+      state.failures = failures;
+      state.produces = 0;
+    },
+    close() {
+      for (const socket of sockets) socket.destroy();
+      server.close();
+    },
+  };
 }
 
 /** A TCP forwarder that can sever every live connection, which is how a

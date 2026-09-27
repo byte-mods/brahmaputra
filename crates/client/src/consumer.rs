@@ -117,6 +117,15 @@ impl Consumer {
         self
     }
 
+    /// Bound every request/response round trip (`None`, the default, waits
+    /// as long as the connection stays up). A request that exceeds it fails
+    /// with [`ClientError::Timeout`] and its connection is redialled on the
+    /// next request. Keep it above `fetch.max.wait.ms`.
+    pub fn with_request_timeout(self, timeout: Option<std::time::Duration>) -> Self {
+        self.router.set_request_timeout(timeout);
+        self
+    }
+
     /// Wrap an existing router (used by the group consumer to share one
     /// connection pool and metadata cache with its coordinator requests).
     pub(crate) fn from_router(router: BrokerRouter, max_bytes: i32) -> Consumer {

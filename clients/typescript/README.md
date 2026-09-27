@@ -6,7 +6,7 @@ There is no separate TypeScript driver. The Node.js driver in
 its `package.json`) that describe every export exactly as the JavaScript
 behaves at runtime. This directory holds the proof:
 
-- `src/test_manual.ts` — the Node end-to-end suite (57 checks, same sections
+- `src/test_manual.ts` — the Node end-to-end suite (83 checks, same sections
   and names as `../nodejs/test_manual.js`) ported to strict TypeScript and
   compiled against the typings.
 - `tests/types.test-d.ts` — compile-time tests of the typings: statements that
@@ -14,7 +14,7 @@ behaves at runtime. This directory holds the proof:
   `acks`, a missing group id, a dotted Kafka option name, an unnarrowed
   tombstone value, ...) that must fail. It is type-checked, never run.
 
-Verified against a live broker: **57 passed, 0 failed**.
+Verified against a live broker: **83 passed, 0 failed**.
 
 ## Install
 
@@ -53,6 +53,7 @@ await producer.send('orders', Buffer.from('{"id":1}'), {
   headers: [new RecordHeader('trace-id', 'abc-123'), new RecordHeader('empty', null)],
 });
 await producer.send('orders', null, { key: 'user-7' });   // tombstone
+await producer.send('orders', 'replayed', { timestamp: 1_700_000_000_000 });  // unix ms; default now
 const offset: bigint = await producer.sendSync('orders', 'one at a time');
 await producer.close();   // flushes; rejects if a background flush failed
 ```
@@ -122,10 +123,15 @@ Option names are the camelCase forms of Kafka's, exactly as the JS reads them
 | `retryBackoffMs`    | 100            |                   |         | `groupInstanceId`      | `''`       |
 | `deliveryTimeoutMs` | 120000         |                   |         | `maxPollRecords`       | 500 (<=0 = no cap) |
 | `bufferMemory`      | 32 MiB         |                   |         | `fetchMaxBytes`        | 8 MiB      |
-| `maxBlockMs`        | 60000          |                   |         |                        |            |
+| `maxBlockMs`        | 60000          | `socketTimeoutMs` | 120000  | `heartbeatIntervalMs`  | 0 (= session / 3) |
+| `socketTimeoutMs`   | 120000         |                   |         | `socketTimeoutMs`      | 120000     |
 
-The per-request round-trip timeout (default 120 s) is the fifth argument of
+`socketTimeoutMs` is the client-side per-request round-trip timeout on every
+connection the client opens (0 disables it); `router.setRequestTimeout(ms)`
+changes it later, and it is also the fifth argument of
 `Connection.connect(host, port, clientId, connectTimeoutMs, requestTimeoutMs)`.
+Per record, `send()`/`sendSync()` take `key`, `partition`, `headers` and
+`timestamp` (unix ms, `number | bigint`).
 
 Other codecs: `registerCodec(Compression.LZ4, { compress, decompress })`,
 both `(payload: Buffer) => Buffer`.

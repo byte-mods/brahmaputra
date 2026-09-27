@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import socket
+import struct
 import sys
 import threading
 import time
@@ -25,7 +26,13 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from brahmaputra import (  # noqa: E402
+    ApiKey,
     Assignor,
+    Compression,
+    ConsumerConfig,
+    ErrorCode,
+    ProtocolError,
+    Record,
     AutoOffsetReset,
     Connection,
     Consumer,
@@ -39,6 +46,14 @@ from brahmaputra import (  # noqa: E402
     RecordHeader,
     murmur2,
     partition_for_key,
+)
+from brahmaputra.group import _sticky_assign  # noqa: E402
+from brahmaputra.protocol import (  # noqa: E402
+    body_reader,
+    body_writer,
+    decode_record_batch,
+    encode_record_batch,
+    register_codec,
 )
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
@@ -617,8 +632,522 @@ def main() -> int:
     feeder.join()
     producer.close()
 
+    feature_checks()
+
     print(f"\n{PASSED} passed, {FAILED} failed")
     return 1 if FAILED else 0
+
+
+def _quick(**overrides) -> Producer:
+    return Producer(HOST, PORT, ProducerConfig(linger_ms=0, **overrides))
+
+
+def _fetch_all(topic: str, partition: int) -> list:
+    out = []
+    with Consumer(HOST, PORT) as consumer:
+        offset = 0
+        while True:
+            batch = consumer.fetch(topic, partition, offset, 100)
+            if not batch:
+                return out
+            out.extend(batch)
+            offset = batch[-1].offset + 1
+
+
+def _failure(fn):
+    try:
+        fn()
+        return None
+    except Exception as error:  # noqa: BLE001
+        return error
+
+
+def feature_checks() -> None:
+    """The client feature checklist, item by item: every setting is shown
+    to change behaviour, not merely to be accepted."""
+    section("producer settings")
+    topic = unique("py-linger")
+    producer = Producer(HOST, PORT, ProducerConfig(linger_ms=50))
+    producer.send(topic, b"lingered", partition=0)
+    time.sleep(0.6)
+    got = _fetch_all(topic, 0)
+    check("linger.ms sends a batch without an explicit flush", len(got) == 1,
+          f"got {len(got)} before any flush")
+    producer.close()
+
+    topic = unique("py-batchsize")
+    producer = Producer(HOST, PORT, ProducerConfig(linger_ms=60_000, batch_size=200))
+    for _ in range(10):
+        producer.send(topic, b"b" * 50, partition=0)
+    got = _fetch_all(topic, 0)
+    check("batch.size sends a full batch before linger expires", len(got) >= 3,
+          f"got {len(got)} of 10 with linger 60s")
+    producer.close()
+
+    topic = unique("py-closeflush")
+    producer = Producer(HOST, PORT, ProducerConfig(linger_ms=60_000))
+    for i in range(5):
+        producer.send(topic, f"c{i}".encode(), partition=0)
+    producer.close()
+    got = _fetch_all(topic, 0)
+    check("close flushes buffered records", len(got) == 5, f"got {len(got)}")
+
+    topic = unique("py-sync")
+    producer = _quick()
+    first = producer.send_and_wait(topic, b"s0", partition=1)
+    second = producer.send_and_wait(topic, b"s1", partition=1)
+    keyed = producer.send_and_wait(topic, b"s2", key=b"k")
+    producer.close()
+    got = _fetch_all(topic, 1)
+    check("send-and-wait returns the record's offset",
+          first == 0 and second == 1 and keyed >= 0 and len(got) >= 2 and got[1].value == b"s1",
+          f"offsets {first} {second} {keyed}")
+
+    topic = unique("py-roundrobin")
+    producer = _quick()
+    partitions = producer.router.partitions(topic)
+    for i in range(2 * len(partitions)):
+        producer.send(topic, f"rr{i}".encode())
+    producer.close()
+    counts = [len(_fetch_all(topic, p)) for p in partitions]
+    check("null keys are spread round-robin", len(partitions) > 1 and all(c == 2 for c in counts),
+          str(counts))
+
+    topic = unique("py-timestamp")
+    producer = _quick()
+    producer.send(topic, b"t1", partition=0, timestamp_ms=1_600_000_001_000)
+    producer.send(topic, b"t2", partition=0, timestamp_ms=1_600_000_002_000)
+    producer.send_and_wait(topic, b"t3", partition=0, timestamp_ms=1_600_000_003_000)
+    producer.close()
+    got = _fetch_all(topic, 0)
+    check("an explicit record timestamp is kept",
+          len(got) == 3 and got[0].timestamp == 1_600_000_001_000
+          and got[2].timestamp == 1_600_000_003_000,
+          str([r.timestamp for r in got]))
+    with Consumer(HOST, PORT) as consumer:
+        by_time = consumer.list_offsets(topic, 0, 1_600_000_001_500)
+        past_end = consumer.list_offsets(topic, 0, 1_700_000_000_000)
+    check("list offsets by timestamp finds the first record at or after it",
+          by_time == 1 and past_end == 3, f"by_time={by_time} past_end={past_end}")
+
+    producer = _quick(acks="all", request_timeout_ms=1500)
+    error = _failure(lambda: producer.send_and_wait(unique("py-acksall"), b"durable"))
+    check("acks=all with request.timeout.ms is acknowledged", error is None, repr(error))
+    producer.close()
+
+    calls = {"compress": 0, "decompress": 0}
+
+    def counted(name, fn):
+        def wrapper(payload: bytes) -> bytes:
+            calls[name] += 1
+            return fn(payload)
+        return wrapper
+
+    register_codec(Compression.LZ4, counted("compress", _lz4_encode),
+                   counted("decompress", _lz4_decode))
+    topic = unique("py-lz4")
+    producer = _quick(compression_type="lz4")
+    body = b"registered codec " * 30
+    for i in range(5):
+        producer.send(topic, body, key=str(i).encode(), partition=0)
+    producer.close()
+    got = _fetch_all(topic, 0)
+    check("a registered lz4 codec round-trips",
+          len(got) == 5 and all(r.value == body for r in got)
+          and calls["compress"] > 0 and calls["decompress"] > 0,
+          f"got {len(got)}, calls={calls}")
+
+    section("retries (fault-injecting proxy)")
+    proxy = _FaultProxy(HOST, PORT)
+    topic = unique("py-retry")
+
+    def via_proxy(**overrides) -> Producer:
+        producer = Producer("127.0.0.1", proxy.port, ProducerConfig(linger_ms=0, **overrides))
+        producer.router.partitions(topic)
+        return producer
+
+    producer = via_proxy(retries=5, retry_backoff_ms=50)
+    proxy.inject(ErrorCode.NOT_LEADER_OR_FOLLOWER, 2)
+    result = {}
+    error = _failure(lambda: result.update(offset=producer.send_and_wait(
+        topic, b"eventually", partition=0)))
+    check("a retriable produce error is retried until it succeeds",
+          error is None and result.get("offset") == 0 and proxy.produces == 3,
+          f"err={error!r} result={result} attempts={proxy.produces}")
+    producer.close()
+
+    producer = via_proxy(retries=2, retry_backoff_ms=200)
+    proxy.inject(ErrorCode.NOT_LEADER_OR_FOLLOWER, -1)
+    started = time.monotonic()
+    error = _failure(lambda: producer.send_and_wait(topic, b"never", partition=0))
+    elapsed = time.monotonic() - started
+    check("retry.backoff.ms spaces the retries",
+          error is not None and proxy.produces == 3 and elapsed >= 0.4,
+          f"attempts={proxy.produces} elapsed={elapsed:.2f}s")
+    _failure(producer.close)
+
+    producer = via_proxy(retries=5, retry_backoff_ms=1000)
+    proxy.inject(ErrorCode.INVALID_REQUEST, -1)
+    started = time.monotonic()
+    error = _failure(lambda: producer.send_and_wait(topic, b"rejected", partition=0))
+    check("a non-retriable produce error is not retried",
+          error is not None and proxy.produces == 1 and time.monotonic() - started < 1.0,
+          f"attempts={proxy.produces}")
+    _failure(producer.close)
+
+    producer = via_proxy(retries=1_000_000, retry_backoff_ms=50, delivery_timeout_ms=600)
+    proxy.inject(ErrorCode.NOT_LEADER_OR_FOLLOWER, -1)
+    started = time.monotonic()
+    error = _failure(lambda: producer.send_and_wait(topic, b"late", partition=0))
+    elapsed = time.monotonic() - started
+    check("delivery.timeout.ms bounds the retries",
+          error is not None and elapsed < 3.0 and proxy.produces > 2,
+          f"attempts={proxy.produces} elapsed={elapsed:.2f}s")
+    _failure(producer.close)
+    proxy.close()
+
+    section("consumer settings")
+    topic = unique("py-fetch")
+    producer = _quick()
+    for i in range(10):
+        producer.send(topic, bytes([97 + i]) * 1000, partition=0)
+    producer.close()
+    with Consumer(HOST, PORT) as consumer:
+        records, high_watermark = consumer.fetch_verbose(topic, 0, 0, 100)
+        check("fetch reports the high watermark", high_watermark == 10 and len(records) == 10,
+              f"hw={high_watermark}")
+        metadata = consumer.router.metadata([topic], refresh=True)
+        partitions = metadata.partitions_of(topic)
+        check("metadata lists every partition with a leader",
+              len(partitions) == 4
+              and all((metadata.leader_of(topic, p) if metadata.leader_of(topic, p) is not None else -1) >= 0
+                      for p in partitions),
+              str(partitions))
+    with Consumer(HOST, PORT, ConsumerConfig(fetch_max_bytes=2500)) as capped:
+        got = capped.fetch(topic, 0, 0, 100)
+    check("fetch.max.bytes caps a response", 1 <= len(got) < 10, f"got {len(got)} of 10")
+    with Consumer(HOST, PORT, ConsumerConfig(fetch_min_bytes=1 << 20,
+                                             fetch_max_wait_ms=400)) as patient:
+        started = time.monotonic()
+        got = patient.fetch(topic, 0, 0, 400)
+        elapsed = time.monotonic() - started
+    check("fetch.min.bytes waits up to fetch.max.wait.ms for more data",
+          len(got) == 10 and 0.3 <= elapsed < 3.0, f"got {len(got)} after {elapsed:.2f}s")
+
+    # A length prefix larger than what follows, or negative, is an error —
+    # never a read past the end or a huge allocation.
+    batch = encode_record_batch([Record(value=b"x")], max_timestamp=0)
+    oversized = batch[:8] + struct.pack(">i", 0x7FFFFFFF) + batch[12:]
+    negative = batch[:8] + struct.pack(">i", -16) + batch[12:]
+    errors = [
+        _failure(lambda: decode_record_batch(oversized, 0)),
+        _failure(lambda: decode_record_batch(negative, 0)),
+        _failure(lambda: body_reader(bytes([0x7E, 0x31]))),
+    ]
+    check("a truncated or oversized length is an error, not a crash",
+          all(isinstance(e, ProtocolError) for e in errors), repr(errors))
+
+    section("consumer group settings")
+
+    def produce_n(topic: str, n: int) -> None:
+        with _quick() as producer:
+            for i in range(n):
+                producer.send(topic, f"m{i}".encode())
+
+    def group(group_id: str, **overrides) -> GroupConsumer:
+        overrides.setdefault("auto_commit_interval_ms", 0)
+        return GroupConsumer(HOST, PORT, group_id, GroupConfig(**overrides))
+
+    def poll_until(consumer: GroupConsumer, want: int, limit_s: float):
+        got, largest = [], 0
+        deadline = time.monotonic() + limit_s
+        while len(got) < want and time.monotonic() < deadline:
+            try:
+                records = consumer.poll(300)
+            except Exception:  # noqa: BLE001
+                break
+            largest = max(largest, len(records))
+            got.extend(records)
+        return got, largest
+
+    def sum_committed(consumer: GroupConsumer) -> int:
+        try:
+            return sum(consumer.committed().values())
+        except Exception:  # noqa: BLE001
+            return -1
+
+    def partitions_of(consumer: GroupConsumer, topic: str) -> list:
+        return sorted(p for t, p in consumer.assignment if t == topic)
+
+    topic = unique("py-maxpoll")
+    produce_n(topic, 20)
+    consumer = group(unique("py-maxpoll-grp"), max_poll_records=5)
+    consumer.subscribe([topic])
+    got, largest = poll_until(consumer, 20, 20)
+    check("max.poll.records caps one poll", len(got) == 20 and largest <= 5,
+          f"got {len(got)}, largest poll {largest}")
+    consumer.close()
+
+    topic = unique("py-autocommit")
+    produce_n(topic, 12)
+    consumer = group(unique("py-autocommit-grp"), auto_commit_interval_ms=200)
+    consumer.subscribe([topic])
+    poll_until(consumer, 12, 20)
+    time.sleep(0.3)
+    consumer.poll(300)
+    total = sum_committed(consumer)
+    check("auto-commit commits delivered positions", total == 12, str(total))
+    consumer.close()
+
+    topic = unique("py-heartbeat")
+    produce_n(topic, 4)
+    consumer = group(unique("py-heartbeat-grp"), session_timeout_ms=1500,
+                     heartbeat_interval_ms=300)
+    consumer.subscribe([topic])
+    poll_until(consumer, 4, 20)
+    generation = consumer.generation
+    time.sleep(4.0)  # well past session.timeout.ms, no polls
+    error = _failure(consumer.commit)
+    check("heartbeats keep an idle member in its group",
+          error is None and consumer.generation == generation, repr(error))
+    consumer.close()
+
+    first_topic, second_topic = unique("py-multi-a"), unique("py-multi-b")
+    produce_n(first_topic, 6)
+    produce_n(second_topic, 7)
+    consumer = group(unique("py-multi-grp"))
+    consumer.subscribe([first_topic, second_topic])
+    got, _ = poll_until(consumer, 13, 20)
+    a = sum(1 for r in got if r.topic == first_topic)
+    b = sum(1 for r in got if r.topic == second_topic)
+    check("a member subscribed to two topics consumes both", a == 6 and b == 7, f"{a}/{b}")
+    consumer.close()
+
+    topic = unique("py-static")
+    produce_n(topic, 4)
+    group_id = unique("py-static-grp")
+    original = group(group_id, group_instance_id="instance-1")
+    original.subscribe([topic])
+    poll_until(original, 4, 20)
+    member_id = original.member_id
+    # The same instance comes back (a restart) before the old session has
+    # expired: it must reclaim the slot, not join as a stranger.
+    returning = group(group_id, group_instance_id="instance-1")
+    returning.subscribe([topic])
+    _failure(lambda: returning.poll(2000))
+    check("a returning static member reclaims its member id",
+          member_id != "" and returning.member_id == member_id,
+          f"{member_id!r} then {returning.member_id!r}")
+    returning.close()
+    original.close()
+
+    topic = unique("py-leave")
+    produce_n(topic, 8)
+    group_id = unique("py-leave-grp")
+    settings = dict(session_timeout_ms=30_000, rebalance_timeout_ms=10_000)
+    leaving = group(group_id, **settings)
+    leaving.subscribe([topic])
+    poll_until(leaving, 8, 20)
+    leaving.close()
+    successor = group(group_id, **settings)
+    successor.subscribe([topic])
+    started = time.monotonic()
+    while len(partitions_of(successor, topic)) < 4 and time.monotonic() - started < 15:
+        _failure(lambda: successor.poll(200))
+    elapsed = time.monotonic() - started
+    check("close leaves the group so the next member is assigned at once",
+          len(partitions_of(successor, topic)) == 4 and elapsed < 6,
+          f"assigned after {elapsed:.2f}s")
+    successor.close()
+
+    topic = unique("py-fence")
+    produce_n(topic, 8)
+    group_id = unique("py-fence-grp")
+    first = group(group_id, rebalance_timeout_ms=2000)
+    first.subscribe([topic])
+    poll_until(first, 8, 20)
+    old_generation = first.generation
+    # A second member joins while the first stops polling: the group moves
+    # on without it, so its generation is superseded.
+    second = group(group_id, rebalance_timeout_ms=2000)
+    second.subscribe([topic])
+    deadline = time.monotonic() + 15
+    while second.generation <= old_generation and time.monotonic() < deadline:
+        _failure(lambda: second.poll(200))
+    error = _failure(first.commit)
+    check("a commit from a superseded generation is fenced", error is not None,
+          f"old={old_generation} new={second.generation}")
+
+    # Both members polling settle on a split of the partitions.
+    until = time.monotonic() + 8
+
+    def keep_polling(member: GroupConsumer) -> None:
+        while time.monotonic() < until:
+            _failure(lambda: member.poll(200))
+
+    workers = [threading.Thread(target=keep_polling, args=(m,)) for m in (first, second)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    a, b = partitions_of(first, topic), partitions_of(second, topic)
+    check("two members share the partitions without overlap",
+          sorted(a + b) == [0, 1, 2, 3] and a and b, f"{a} / {b}")
+    second.close()
+    first.close()
+
+    # Partitions compare as integers: 2 sorts before 10, and the member over
+    # quota keeps its lowest-numbered partitions.
+    held = [("t", p) for p in (10, 2, 11, 3, 0, 1, 9)]
+    assignment = _sticky_assign([("a", ["t"]), ("b", ["t"])], {"t": list(range(12))},
+                                {"a": held})
+    check("sticky compares partitions as integers",
+          assignment["a"] == [("t", p) for p in (0, 1, 2, 3, 9, 10)]
+          and len(assignment["b"]) == 6, str(assignment))
+
+
+def _lz4_encode(src: bytes) -> bytes:
+    """A size-prefixed LZ4 block holding one literal-only sequence: valid
+    LZ4, just uncompressed."""
+    n = len(src)
+    if n < 15:
+        head = bytes([n << 4])
+    else:
+        rest = n - 15
+        head = bytes([0xF0]) + b"\xff" * (rest // 255) + bytes([rest % 255])
+    return struct.pack("<I", n) + head + src
+
+
+def _lz4_decode(src: bytes) -> bytes:
+    """Decode any size-prefixed LZ4 block."""
+    (size,) = struct.unpack_from("<I", src, 0)
+    out = bytearray()
+    pos = 4
+
+    def length(base: int) -> int:
+        nonlocal pos
+        n = base
+        if base == 15:
+            while True:
+                b = src[pos]
+                pos += 1
+                n += b
+                if b != 255:
+                    break
+        return n
+
+    while pos < len(src):
+        token = src[pos]
+        pos += 1
+        literals = length(token >> 4)
+        out += src[pos : pos + literals]
+        pos += literals
+        if pos >= len(src):
+            break
+        (offset,) = struct.unpack_from("<H", src, pos)
+        pos += 2
+        match = length(token & 15) + 4
+        if offset == 0 or offset > len(out):
+            raise ValueError("lz4: bad offset")
+        for _ in range(match):
+            out.append(out[-offset])
+    if len(out) != size:
+        raise ValueError("lz4: size mismatch")
+    return bytes(out)
+
+
+class _FaultProxy:
+    """Forwards frames to the broker one request at a time, but can answer
+    Produce requests itself with an injected error code — the only way to
+    make a healthy single broker return a retriable error on demand."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self._target = (host, port)
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(("127.0.0.1", 0))
+        self._server.listen(16)
+        self.port = self._server.getsockname()[1]
+        self._lock = threading.Lock()
+        self._code = 0
+        self._failures = 0
+        self._produces = 0
+        self._sockets: list = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    @property
+    def produces(self) -> int:
+        with self._lock:
+            return self._produces
+
+    def inject(self, code: int, failures: int) -> None:
+        with self._lock:
+            self._code, self._failures, self._produces = code, failures, 0
+
+    def close(self) -> None:
+        _quietly(self._server.close)
+        for sock in self._sockets:
+            _quietly(sock.close)
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                client, _ = self._server.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(client,), daemon=True).start()
+
+    @staticmethod
+    def _read_frame(sock: socket.socket) -> bytes:
+        def exact(n: int) -> bytes:
+            data = b""
+            while len(data) < n:
+                chunk = sock.recv(n - len(data))
+                if not chunk:
+                    raise OSError("closed")
+                data += chunk
+            return data
+
+        head = exact(4)
+        return head + exact(struct.unpack(">I", head)[0])
+
+    def _serve(self, client: socket.socket) -> None:
+        try:
+            upstream = socket.create_connection(self._target)
+        except OSError:
+            client.close()
+            return
+        self._sockets += [client, upstream]
+        try:
+            while True:
+                frame = self._read_frame(client)
+                (api_key,) = struct.unpack_from(">h", frame, 4)
+                if api_key == ApiKey.PRODUCE:
+                    with self._lock:
+                        self._produces += 1
+                        fail = self._failures != 0
+                        if self._failures > 0:
+                            self._failures -= 1
+                        code = self._code
+                    if fail:
+                        (client_len,) = struct.unpack_from(">H", frame, 12)
+                        header = frame[4 : 14 + client_len]
+                        writer = body_writer()
+                        writer.string("")
+                        writer.i32(0)
+                        writer.i32(code)
+                        writer.i64(-1)
+                        writer.i64(-1)
+                        body = header + writer.bytes()
+                        client.sendall(struct.pack(">I", len(body)) + body)
+                        continue
+                upstream.sendall(frame)
+                client.sendall(self._read_frame(upstream))
+        except OSError:
+            pass
+        finally:
+            _quietly(client.close)
+            _quietly(upstream.close)
 
 
 def _quietly(fn) -> None:

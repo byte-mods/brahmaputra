@@ -13,9 +13,10 @@ implementation otherwise. No Composer? Require the bundled autoloader:
 require '/path/to/clients/php/autoload.php';
 ```
 
-Verified end to end against a live broker: **54/54 checks**
+Verified end to end against a live broker: **81/81 checks**
 (`./test.sh 127.0.0.1 9092`, a port of the Go suite with the same
-sections and checks).
+sections and checks, plus a section per configuration area showing each
+setting change behaviour).
 
 ## No threads: what that changes
 
@@ -173,7 +174,7 @@ Kafka's names, passed as a flat array. Unknown keys are rejected.
 | `batch.size` | `16384` | bytes per partition batch before it is sent |
 | `linger.ms` | `5` | Kafka defaults to 0 |
 | `compression.type` | `none` | `none`, `gzip`, or a registered codec |
-| `request.timeout.ms` | `30000` | |
+| `request.timeout.ms` | `30000` | broker-side ack wait, and the client-side round-trip deadline |
 | `retries` | `5` | retriable broker errors and connection failures |
 | `retry.backoff.ms` | `100` | |
 | `delivery.timeout.ms` | `120000` | caps a batch from its oldest record's send() to its last retry |
@@ -193,7 +194,8 @@ Kafka's names, passed as a flat array. Unknown keys are rejected.
 | `max.poll.records` | `500` |
 | `isolation.level` | `read_uncommitted` (`read_committed`) |
 | `client.rack` | `''` |
-| `request.timeout.ms` | `30000` |
+| `request.timeout.ms` | `30000` (round-trip deadline; a fetch adds its wait) |
+| `socket.connection.setup.timeout.ms` | `10000` |
 
 **Group consumer**: all consumer keys, plus
 
@@ -234,11 +236,13 @@ Start a broker, then:
 php test_manual.php 127.0.0.1 9092
 ```
 
-It prints one line per check and ends with `54 passed, 0 failed`; the exit
+It prints one line per check and ends with `81 passed, 0 failed`; the exit
 status is non-zero on any failure. The suite (not the driver) needs the
 `pcntl` and `posix` extensions of the PHP CLI: the connection-failure
-section runs a small TCP proxy in a forked child, and the long-poll group
-section produces from a forked child while the parent polls.
+section runs a small TCP proxy in a forked child, the retry section runs a
+fault-injecting proxy (it answers Produce with a chosen error code) in a
+forked child, and the long-poll and generation-fencing group sections run
+the second party in a forked child while the parent polls.
 
 ## Not implemented
 

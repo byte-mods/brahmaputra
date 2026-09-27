@@ -8,11 +8,15 @@ pip install ./clients/python              # core, no dependencies
 pip install "./clients/python[zstd]"      # plus an optional codec (lz4, zstd, snappy, all)
 ```
 
-Verified end to end against a live broker: **54/54 checks**
+Verified end to end against a live broker: **81/81 checks**
 (`./test.sh 127.0.0.1 9092`). The suite mirrors the Go driver's
 `cmd/manualtest` section for section and check for check, and the wire
 encodings (frames, BitPacker bodies, record batches, CRC32C, murmur2) and
 the three assignors were cross-checked byte for byte against the Go driver.
+Beyond the Go suite's 54 checks it shows every setting below changing
+behaviour (linger, batch size, timestamps, retries against a
+fault-injecting proxy, fetch limits, heartbeats, static membership, leave
+on close, generation fencing, a registered codec).
 
 ## Produce
 
@@ -39,7 +43,11 @@ with Producer("127.0.0.1", 9092, ProducerConfig(
     # distinct from b"", which is an ordinary record with an empty value.
     producer.send("orders", None, key=b"user-7")
 
+    # An explicit record timestamp (unix ms) instead of the wall clock.
+    producer.send("orders", b'{"id":4}', timestamp_ms=1_700_000_000_000)
+
     # Or wait for one record's offset. A full round trip — correct, and slow.
+    # Records already buffered for that partition go out first.
     offset = producer.send_and_wait("orders", b'{"id":3}')
 
     producer.flush()      # close() also flushes
@@ -54,8 +62,10 @@ flight, so linger-driven and batch-full flushes never reorder a partition.
 
 ## Connections
 
-Each request has a round-trip deadline (`Connection.request_timeout`,
-default 120 s, generous enough for long-polls and rebalances). A timeout,
+Each request has a round-trip deadline (`round_trip_timeout_s` in every
+config, default 120 s, generous enough for long-polls and rebalances;
+`BrokerRouter.set_request_timeout` / `Connection.set_request_timeout`
+change it later). A timeout,
 I/O error or correlation mismatch closes the connection and marks it
 `broken` — it is never reused, since the byte stream is at an unknown
 position — and raises `BrokerConnectionError`. The router redials a broken
@@ -121,7 +131,13 @@ rejoins as a new member.
 | `delivery_timeout_ms` | `delivery.timeout.ms` | 120000 |
 | `buffer_memory` | `buffer.memory` | 33554432 |
 | `max_block_ms` | `max.block.ms` | 60000 |
-| `client_id` / `socket_timeout_s` | `client.id` | `"brahmaputra-python"` / 30.0 |
+| `client_id` | `client.id` | `"brahmaputra-python"` |
+| `socket_timeout_s` | connect timeout | 30.0 s |
+| `round_trip_timeout_s` | client-side request deadline | 120.0 s (`None` disables) |
+
+Per record: `key` (murmur2 partitioning; `None` round-robins), `partition`
+(explicit), `headers` (a `RecordHeader` value may be `None`), `value=None`
+(tombstone) and `timestamp_ms` (default: now).
 
 `ConsumerConfig`
 
@@ -133,12 +149,14 @@ rejoins as a new member.
 | `max_poll_records` | `max.poll.records` | 500 |
 | `isolation_level` | `isolation.level` | `READ_UNCOMMITTED` |
 | `rack` | `client.rack` | `""` |
+| `socket_timeout_s` / `round_trip_timeout_s` | | 30.0 / 120.0 s |
 
 `GroupConfig`
 
 | Field | Kafka name | Default |
 |---|---|---|
 | `session_timeout_ms` | `session.timeout.ms` | 10000 |
+| `heartbeat_interval_ms` | `heartbeat.interval.ms` | 0 (session timeout / 3) |
 | `rebalance_timeout_ms` | `rebalance.timeout.ms` | 3000 |
 | `max_poll_interval_ms` | `max.poll.interval.ms` | 300000 |
 | `auto_commit_interval_ms` | `auto.commit.interval.ms` | 5000 (0 disables) |
@@ -146,6 +164,10 @@ rejoins as a new member.
 | `assignor` | `partition.assignment.strategy` | `"range"` (`"roundrobin"`, `"sticky"`) |
 | `group_instance_id` | `group.instance.id` | `""` (dynamic member) |
 | `max_poll_records`, `fetch_max_bytes` | | 500, 8388608 |
+| `socket_timeout_s` / `round_trip_timeout_s` | | 30.0 / 120.0 s |
+
+`member_id`, `generation` and `assignment` report the member's current
+state; `committed()` reads the group's committed offsets.
 
 ## Compression
 
@@ -179,4 +201,4 @@ brahmaputra-server --data-dir ./data --default-partitions 4
 # equivalently: python3 clients/python/test_manual.py 127.0.0.1 9092
 ```
 
-It prints `54 passed, 0 failed` and exits non-zero on any failure.
+It prints `81 passed, 0 failed` and exits non-zero on any failure.

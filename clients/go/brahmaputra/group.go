@@ -52,6 +52,10 @@ type GroupConfig struct {
 	// heartbeating for this long. Kafka defaults to 45s; this defaults to
 	// 10s as the Rust client does.
 	SessionTimeoutMs int32
+	// HeartbeatIntervalMs is how often the background goroutine heartbeats.
+	// 0 means SessionTimeoutMs/3, Kafka's rule of thumb; it must stay well
+	// below SessionTimeoutMs or a single late heartbeat evicts the member.
+	HeartbeatIntervalMs int32
 	// RebalanceTimeoutMs is how long the coordinator waits for rejoins.
 	RebalanceTimeoutMs int32
 	// MaxPollIntervalMs is the longest gap between Poll calls before this
@@ -70,6 +74,10 @@ type GroupConfig struct {
 	MaxPollRecords  int
 	FetchMaxBytes   int32
 	DialTimeout     time.Duration
+	// SocketTimeout bounds one round trip client-side (0 = default). It
+	// must exceed RebalanceTimeoutMs, which a JoinGroup may legitimately
+	// wait out.
+	SocketTimeout time.Duration
 }
 
 func DefaultGroupConfig() GroupConfig {
@@ -131,6 +139,7 @@ func NewGroupConsumer(address, groupID string, config GroupConfig) (*GroupConsum
 	consumerConfig.FetchMaxBytes = config.FetchMaxBytes
 	consumerConfig.MaxPollRecords = config.MaxPollRecords
 	consumerConfig.DialTimeout = config.DialTimeout
+	consumerConfig.SocketTimeout = config.SocketTimeout
 
 	consumer, err := NewConsumer(address, consumerConfig)
 	if err != nil {
@@ -155,6 +164,33 @@ func NewGroupConsumer(address, groupID string, config GroupConfig) (*GroupConsum
 func (g *GroupConsumer) Subscribe(topics []string) {
 	g.subscribed = append([]string(nil), topics...)
 	g.setJoined(false)
+}
+
+// MemberID is the id the coordinator gave this member, empty before the
+// first join.
+func (g *GroupConsumer) MemberID() string {
+	memberID, _, _ := g.membership()
+	return memberID
+}
+
+// Generation is the group generation this member last joined, -1 before
+// the first join.
+func (g *GroupConsumer) Generation() int32 {
+	_, generation, _ := g.membership()
+	return generation
+}
+
+// Assignment returns the partitions this member currently owns, as
+// "topic" -> partitions in ascending order.
+func (g *GroupConsumer) Assignment() map[string][]int32 {
+	out := map[string][]int32{}
+	for _, slot := range g.assignment {
+		out[slot.topic] = append(out[slot.topic], slot.partition)
+	}
+	for topic := range out {
+		sort.Slice(out[topic], func(a, b int) bool { return out[topic][a] < out[topic][b] })
+	}
+	return out
 }
 
 // membership snapshots the fields the heartbeat goroutine shares.
@@ -633,6 +669,9 @@ func (g *GroupConsumer) heartbeatLoop() {
 	// timeout alone would leave a long session with a short poll interval
 	// unchecked until long after it stalled.
 	heartbeatEvery := int(g.config.SessionTimeoutMs) / 3
+	if g.config.HeartbeatIntervalMs > 0 {
+		heartbeatEvery = int(g.config.HeartbeatIntervalMs)
+	}
 	if heartbeatEvery < 1 {
 		heartbeatEvery = 1
 	}

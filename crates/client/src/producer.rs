@@ -385,7 +385,62 @@ impl Producer {
         value: impl Into<Option<Bytes>>,
         headers: Vec<RecordHeader>,
     ) -> Result<i64, ClientError> {
-        let value = value.into();
+        self.send_at(topic, partition, key, value.into(), headers, now_ms())
+            .await
+    }
+
+    /// As [`send_with_headers`](Self::send_with_headers), with an explicit
+    /// record timestamp in unix milliseconds (Kafka's `ProducerRecord`
+    /// timestamp) instead of the wall clock at the time of the call.
+    ///
+    /// The timestamp is what [`Consumer::list_offsets`] searches and what
+    /// time-based retention measures, so an application replaying events
+    /// with their original times should pass them here.
+    ///
+    /// [`Consumer::list_offsets`]: crate::Consumer::list_offsets
+    pub async fn send_with_timestamp(
+        &self,
+        topic: &str,
+        partition: Option<i32>,
+        key: Option<Bytes>,
+        value: impl Into<Option<Bytes>>,
+        headers: Vec<RecordHeader>,
+        timestamp_ms: i64,
+    ) -> Result<i64, ClientError> {
+        self.send_at(topic, partition, key, value.into(), headers, timestamp_ms)
+            .await
+    }
+
+    /// Bound every request/response round trip this producer makes
+    /// (`None`, the default, waits as long as the connection stays up).
+    /// A request that exceeds it fails with [`ClientError::Timeout`] and
+    /// its connection is replaced on the next send. Keep it above
+    /// `timeout_ms`, which the broker may legitimately spend on `acks=all`.
+    pub fn set_request_timeout(&self, timeout: Option<Duration>) {
+        self.inner.router.set_request_timeout(timeout);
+    }
+
+    /// Flush whatever is buffered, then stop the linger ticker and release
+    /// the producer. Every `send` resolves with its own batch's outcome, so
+    /// a failure is reported to the caller that sent the record, never
+    /// lost with the producer.
+    pub async fn close(mut self) -> Result<(), ClientError> {
+        self.inner.flush_all().await;
+        if let Some(ticker) = self.ticker.take() {
+            ticker.abort();
+        }
+        Ok(())
+    }
+
+    async fn send_at(
+        &self,
+        topic: &str,
+        partition: Option<i32>,
+        key: Option<Bytes>,
+        value: Option<Bytes>,
+        headers: Vec<RecordHeader>,
+        created_ms: i64,
+    ) -> Result<i64, ClientError> {
         let partition = match (partition, key.as_ref()) {
             (Some(p), _) => p,
             (None, Some(key)) => self.key_partition(topic, key).await?,
@@ -400,7 +455,6 @@ impl Producer {
             headers,
         };
         let approx_size = approx_record_size(&record);
-        let created_ms = now_ms();
         // Admission control before the record enters a buffer: past this
         // point the producer owns it and the caller cannot take it back, so
         // the waiting has to happen here.

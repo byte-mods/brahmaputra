@@ -23,6 +23,7 @@ from .protocol import (
     crc32c,
 )
 from .client import (
+    DEFAULT_REQUEST_TIMEOUT_S,
     EARLIEST,
     LATEST,
     ConsumedRecord,
@@ -73,6 +74,9 @@ class GroupConfig:
     session_timeout_ms: int = 10_000
     #: How long the coordinator waits for members to rejoin.
     rebalance_timeout_ms: int = 3_000
+    #: How often the background thread heartbeats. 0 means
+    #: session_timeout_ms / 3, Kafka's rule of thumb.
+    heartbeat_interval_ms: int = 0
     #: Longest gap between `poll` calls before this member is presumed
     #: stuck and leaves the group. Separate from the session timeout on
     #: purpose: heartbeats prove the process is alive, this proves the
@@ -89,6 +93,9 @@ class GroupConfig:
     fetch_max_bytes: int = 8 * 1024 * 1024
     #: Connect and socket timeout, in seconds.
     socket_timeout_s: float = 30.0
+    #: Client-side bound on one round trip, in seconds. Must exceed
+    #: rebalance_timeout_ms, which a JoinGroup may legitimately wait out.
+    round_trip_timeout_s: Optional[float] = DEFAULT_REQUEST_TIMEOUT_S
 
 
 class GroupConsumer:
@@ -115,6 +122,7 @@ class GroupConsumer:
                 fetch_max_bytes=self.config.fetch_max_bytes,
                 max_poll_records=self.config.max_poll_records,
                 socket_timeout_s=self.config.socket_timeout_s,
+                round_trip_timeout_s=self.config.round_trip_timeout_s,
             ),
         )
         self._subscribed: List[str] = []
@@ -148,6 +156,21 @@ class GroupConsumer:
     def subscribe(self, topics: Sequence[str]) -> None:
         self._subscribed = list(topics)
         self._set_joined(False)
+
+    @property
+    def member_id(self) -> str:
+        """The id the coordinator gave this member; empty before joining."""
+        return self._membership()[0]
+
+    @property
+    def generation(self) -> int:
+        """The generation this member last joined; -1 before joining."""
+        return self._membership()[1]
+
+    @property
+    def assignment(self) -> List[Tuple[str, int]]:
+        """The (topic, partition) pairs this member currently owns."""
+        return list(self._assignment)
 
     def _membership(self) -> Tuple[str, int, bool]:
         with self._lock:
@@ -476,7 +499,9 @@ class GroupConsumer:
         # often enough for the shorter of them. Deriving the tick from the
         # session timeout alone would leave a long session with a short
         # poll interval unchecked until long after it stalled.
-        heartbeat_every = max(self.config.session_timeout_ms // 3, 1)
+        heartbeat_every = max(
+            self.config.heartbeat_interval_ms or self.config.session_timeout_ms // 3, 1
+        )
         poll_check_every = max(self.config.max_poll_interval_ms // 3, 1)
         interval = min(heartbeat_every, poll_check_every) / 1000.0
         left_for_slow_poll = False

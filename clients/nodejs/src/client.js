@@ -39,6 +39,16 @@ const COORDINATOR_ATTEMPTS = 4;
 const JOIN_ATTEMPTS = 4;
 
 const nowMs = () => Date.now();
+
+/** A record's timestamp: explicit unix ms (number or bigint), else now. */
+function recordTimestamp(timestamp) {
+  if (timestamp === null || timestamp === undefined) return nowMs();
+  const value = Number(timestamp);
+  if (!Number.isSafeInteger(value)) {
+    throw new TypeError(`timestamp must be integer unix milliseconds, got ${timestamp}`);
+  }
+  return value;
+}
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------
@@ -366,11 +376,12 @@ function decodeMetadata(reader) {
  * data path.
  */
 class Router {
-  constructor(host, port, clientId, timeoutMs) {
+  constructor(host, port, clientId, timeoutMs, requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
     this.host = host;
     this.port = port;
     this.clientId = clientId;
     this.timeoutMs = timeoutMs;
+    this.requestTimeoutMs = requestTimeoutMs;
     this.seed = null;
     this.connections = new Map();
     this.metadata = null;
@@ -380,10 +391,30 @@ class Router {
     this.closed = false;
   }
 
-  static async connect(host, port, clientId, timeoutMs = 30000) {
-    const router = new Router(host, port, clientId, timeoutMs);
-    router.seed = await Connection.connect(host, port, clientId, timeoutMs);
+  static async connect(
+    host,
+    port,
+    clientId,
+    timeoutMs = 30000,
+    requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
+  ) {
+    const router = new Router(host, port, clientId, timeoutMs, requestTimeoutMs);
+    router.seed = await Connection.connect(host, port, clientId, timeoutMs, requestTimeoutMs);
     return router;
+  }
+
+  /**
+   * Bound one request/response round trip on every connection this router
+   * holds now or dials later; 0 disables the bound. It must exceed the
+   * longest the broker may hold a request (fetch long-poll, acks=all wait,
+   * a JoinGroup rebalance).
+   */
+  setRequestTimeout(requestTimeoutMs) {
+    this.requestTimeoutMs = requestTimeoutMs;
+    if (this.seed) this.seed.requestTimeoutMs = requestTimeoutMs;
+    for (const connection of this.connections.values()) {
+      connection.requestTimeoutMs = requestTimeoutMs;
+    }
   }
 
   close() {
@@ -405,9 +436,13 @@ class Router {
     if (this.closed) return Promise.reject(new BrahmaputraError('router is closed'));
     let pending = this.dialing.get(key);
     if (!pending) {
-      pending = Connection.connect(host, port, this.clientId, this.timeoutMs).finally(() =>
-        this.dialing.delete(key)
-      );
+      pending = Connection.connect(
+        host,
+        port,
+        this.clientId,
+        this.timeoutMs,
+        this.requestTimeoutMs
+      ).finally(() => this.dialing.delete(key));
       this.dialing.set(key, pending);
     }
     return pending;
@@ -526,6 +561,12 @@ const defaultProducerConfig = () => ({
   bufferMemory: 32 * 1024 * 1024,
   /** How long send() may block on a full buffer before rejecting. */
   maxBlockMs: 60000,
+  /**
+   * Client-side bound on one request/response round trip; a broker that
+   * stops answering costs a rejection, not a promise that never settles.
+   * Keep it above requestTimeoutMs. 0 disables it.
+   */
+  socketTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
 });
 
 /**
@@ -568,7 +609,7 @@ class Producer {
 
   static async connect(host, port, overrides = {}) {
     const config = { ...defaultProducerConfig(), ...overrides };
-    const router = await Router.connect(host, port, config.clientId);
+    const router = await Router.connect(host, port, config.clientId, 30000, config.socketTimeoutMs);
     return new Producer(router, config);
   }
 
@@ -585,7 +626,7 @@ class Producer {
   }
 
   /** Buffer one record. Call flush() to await delivery. */
-  async send(topic, value, { key = null, partition = null, headers = [] } = {}) {
+  async send(topic, value, { key = null, partition = null, headers = [], timestamp = null } = {}) {
     // Strings travel as UTF-8; null stays null (a tombstone, a null key).
     value = toBytes(value);
     key = toBytes(key, 'key');
@@ -611,7 +652,12 @@ class Producer {
 
     const slot = `${topic} ${target}`;
     if (!this.buffers.has(slot)) this.buffers.set(slot, []);
-    this.buffers.get(slot).push({ record, createdMs: nowMs(), topic, partition: target });
+    this.buffers.get(slot).push({
+      record,
+      createdMs: recordTimestamp(timestamp),
+      topic,
+      partition: target,
+    });
     this.sizes.set(slot, (this.sizes.get(slot) || 0) + size);
 
     if (this.config.lingerMs === 0 || this.sizes.get(slot) >= this.config.batchSize) {
@@ -629,19 +675,23 @@ class Producer {
         : key !== null
           ? partitionForKey(key, partitions)
           : partitions[this.roundRobin++ % partitions.length];
-    return this._produce(topic, partition, [
-      {
-        record: {
-          key,
-          value: toBytes(value),
-          timestampDelta: 0,
-          headers: (options.headers || []).map(
-            (header) => new RecordHeader(header.key, toBytes(header.value))
-          ),
-        },
-        createdMs: nowMs(),
+    const item = {
+      record: {
+        key,
+        value: toBytes(value),
+        timestampDelta: 0,
+        headers: (options.headers || []).map(
+          (header) => new RecordHeader(header.key, toBytes(header.value))
+        ),
       },
-    ]);
+      createdMs: recordTimestamp(options.timestamp),
+    };
+    // Queued behind the partition's buffered records and in-flight batch,
+    // so a synchronous send never overtakes an earlier asynchronous one.
+    return this._chain(`${topic} ${partition}`, async () => {
+      await this._sendSlot(`${topic} ${partition}`);
+      return this._produce(topic, partition, [item]);
+    });
   }
 
   /**
@@ -703,10 +753,15 @@ class Producer {
   }
 
   _flushSlot(slot) {
-    const previous = this.sendChains.get(slot) || Promise.resolve();
     // The batch is taken when this flush's turn comes, not now, so a batch
     // never overtakes records buffered before it.
-    const run = previous.then(() => this._sendSlot(slot));
+    return this._chain(slot, () => this._sendSlot(slot));
+  }
+
+  /** Run `work` after every earlier send to this partition has settled. */
+  _chain(slot, work) {
+    const previous = this.sendChains.get(slot) || Promise.resolve();
+    const run = previous.then(work);
     const tail = run.catch(() => {});
     this.sendChains.set(slot, tail);
     tail.then(() => {
@@ -798,6 +853,8 @@ const defaultConsumerConfig = () => ({
   // This consumer's failure domain (`client.rack`), empty when it has none.
   rack: "",
   maxPollRecords: 500,
+  /** Client-side bound on one round trip; keep it above fetchMaxWaitMs. */
+  socketTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
 });
 
 /** Reads one partition at a time, with no group coordination. */
@@ -809,7 +866,7 @@ class Consumer {
 
   static async connect(host, port, overrides = {}) {
     const config = { ...defaultConsumerConfig(), ...overrides };
-    const router = await Router.connect(host, port, config.clientId);
+    const router = await Router.connect(host, port, config.clientId, 30000, config.socketTimeoutMs);
     return new Consumer(router, config);
   }
 
@@ -910,7 +967,7 @@ class Consumer {
     // wrong offset and every batch after it would fail to decode.
     reader.skipInt32(); // preferred_read_replica
     const trailing = reader.rest();
-    if (batchesLength > trailing.length) {
+    if (batchesLength < 0 || batchesLength > trailing.length) {
       throw new ProtocolError('fetch response claims more batch bytes than it carries');
     }
     const raw = trailing.subarray(0, batchesLength);
@@ -929,6 +986,7 @@ class Consumer {
 module.exports = {
   COORDINATOR_ATTEMPTS,
   Connection,
+  DEFAULT_REQUEST_TIMEOUT_MS,
   Consumer,
   EARLIEST,
   JOIN_ATTEMPTS,

@@ -307,6 +307,8 @@ export declare const LATEST: -1n;
 export declare const OFFSETS_TOPIC: '__consumer_offsets';
 export declare const COORDINATOR_ATTEMPTS: 4;
 export declare const JOIN_ATTEMPTS: 4;
+/** Default client-side bound on one request/response round trip (ms). */
+export declare const DEFAULT_REQUEST_TIMEOUT_MS: 120000;
 
 /** `Date.now()`. */
 export declare function nowMs(): number;
@@ -399,19 +401,33 @@ export interface ClusterMetadata {
  * leaders, from cached metadata refreshed when a route turns out stale.
  */
 export declare class Router {
-  constructor(host: string, port: number, clientId: string | null | undefined, timeoutMs: number);
-  /** @param timeoutMs connect timeout, default 30000. */
+  constructor(
+    host: string,
+    port: number,
+    clientId: string | null | undefined,
+    timeoutMs: number,
+    requestTimeoutMs?: number
+  );
+  /**
+   * @param timeoutMs connect timeout, default 30000.
+   * @param requestTimeoutMs per-request round-trip timeout for every
+   *   connection the router opens, default 120000; 0 disables it.
+   */
   static connect(
     host: string,
     port: number,
     clientId?: string | null,
-    timeoutMs?: number
+    timeoutMs?: number,
+    requestTimeoutMs?: number
   ): Promise<Router>;
 
   host: string;
   port: number;
   clientId: string | null | undefined;
   timeoutMs: number;
+  requestTimeoutMs: number;
+  /** Apply a round-trip timeout to every current and future connection. */
+  setRequestTimeout(requestTimeoutMs: number): void;
   /** The bootstrap connection (redialled by `liveSeed()` once closed). */
   seed: Connection;
   /** Leader node id -> connection. */
@@ -462,6 +478,8 @@ export interface ProducerConfig {
   bufferMemory: number;
   /** [max.block.ms] how long `send()` waits on a full buffer, default 60000. */
   maxBlockMs: number;
+  /** Client-side round-trip bound per request, default 120000; 0 disables. */
+  socketTimeoutMs: number;
 }
 
 /** What `Producer.connect` accepts: any subset of `ProducerConfig`. */
@@ -475,6 +493,8 @@ export interface SendOptions {
   /** Explicit partition; overrides the key. Default null. */
   partition?: number | null;
   headers?: readonly HeaderInput[];
+  /** Record timestamp in unix milliseconds; default null (the wall clock). */
+  timestamp?: number | bigint | null;
 }
 
 /** A batching producer. Share one; the batching is the point. */
@@ -530,6 +550,8 @@ export interface ConsumerConfig {
   rack: string;
   /** [max.poll.records] default 500 (used by `GroupConsumer`). */
   maxPollRecords: number;
+  /** Client-side round-trip bound per request, default 120000; keep it above fetchMaxWaitMs. */
+  socketTimeoutMs: number;
 }
 
 export type ConsumerOptions = Partial<ConsumerConfig>;
@@ -623,6 +645,10 @@ export interface GroupConfig {
   maxPollRecords: number;
   /** [fetch.max.bytes] default 8 MiB. */
   fetchMaxBytes: number;
+  /** [heartbeat.interval.ms] default 0, meaning sessionTimeoutMs / 3. */
+  heartbeatIntervalMs: number;
+  /** Client-side round-trip bound per request, default 120000; keep it above rebalanceTimeoutMs. */
+  socketTimeoutMs: number;
 }
 
 export type GroupConsumerOptions = Partial<GroupConfig>;

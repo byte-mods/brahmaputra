@@ -485,13 +485,16 @@ func decodeMetadata(r *Reader) (*ClusterMetadata, error) {
 // a load balancer — would fail every later request for the life of the
 // client.
 type Router struct {
-	clientID    string
-	timeout     time.Duration
-	seedAddress string
-	seed        *Conn
-	mu          sync.Mutex
-	conns       map[int32]*Conn
-	metadata    *ClusterMetadata
+	clientID string
+	timeout  time.Duration
+	// requestTimeout bounds each round trip on every connection this router
+	// opens; see Conn.SetRequestTimeout.
+	requestTimeout time.Duration
+	seedAddress    string
+	seed           *Conn
+	mu             sync.Mutex
+	conns          map[int32]*Conn
+	metadata       *ClusterMetadata
 }
 
 func NewRouter(address, clientID string, timeout time.Duration) (*Router, error) {
@@ -500,12 +503,37 @@ func NewRouter(address, clientID string, timeout time.Duration) (*Router, error)
 		return nil, err
 	}
 	return &Router{
-		clientID:    clientID,
-		timeout:     timeout,
-		seedAddress: address,
-		seed:        seed,
-		conns:       map[int32]*Conn{},
+		clientID:       clientID,
+		timeout:        timeout,
+		requestTimeout: DefaultRequestTimeout,
+		seedAddress:    address,
+		seed:           seed,
+		conns:          map[int32]*Conn{},
 	}, nil
+}
+
+// SetRequestTimeout bounds one request/response round trip on every
+// connection this router holds now or dials later. Zero or negative
+// disables the bound. It must exceed the longest the broker may hold a
+// request: a fetch long-poll, an acks=all wait, a JoinGroup rebalance.
+func (router *Router) SetRequestTimeout(timeout time.Duration) {
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	router.requestTimeout = timeout
+	router.seed.SetRequestTimeout(timeout)
+	for _, conn := range router.conns {
+		conn.SetRequestTimeout(timeout)
+	}
+}
+
+// dialLocked opens a connection carrying the router's request timeout.
+func (router *Router) dialLocked(address string) (*Conn, error) {
+	conn, err := Dial(address, router.clientID, router.timeout)
+	if err != nil {
+		return nil, err
+	}
+	conn.timeout = router.requestTimeout
+	return conn, nil
 }
 
 func (router *Router) Close() error {
@@ -535,7 +563,7 @@ func (router *Router) liveSeedLocked() (*Conn, error) {
 	if !router.seed.Broken() {
 		return router.seed, nil
 	}
-	conn, err := Dial(router.seedAddress, router.clientID, router.timeout)
+	conn, err := router.dialLocked(router.seedAddress)
 	if err != nil {
 		return router.seed, err
 	}
@@ -646,8 +674,7 @@ func (router *Router) ConnFor(topic string, partition int32) (*Conn, error) {
 			router.conns[leader] = seed
 			return seed, nil
 		}
-		conn, err := Dial(
-			fmt.Sprintf("%s:%d", broker.Host, broker.Port), router.clientID, router.timeout)
+		conn, err := router.dialLocked(fmt.Sprintf("%s:%d", broker.Host, broker.Port))
 		if err != nil {
 			return nil, err
 		}
@@ -695,6 +722,10 @@ type ProducerConfig struct {
 	MaxBlockMs int
 	// DialTimeout for opening broker connections.
 	DialTimeout time.Duration
+	// SocketTimeout bounds one request/response round trip on the client
+	// side; a broker that stops answering costs an error, not a hang. Zero
+	// means DefaultRequestTimeout. Keep it above RequestTimeoutMs.
+	SocketTimeout time.Duration
 }
 
 // DefaultProducerConfig returns the settings a producer uses unless told
@@ -713,6 +744,7 @@ func DefaultProducerConfig() ProducerConfig {
 		BufferMemory:      32 * 1024 * 1024,
 		MaxBlockMs:        60_000,
 		DialTimeout:       30 * time.Second,
+		SocketTimeout:     DefaultRequestTimeout,
 	}
 }
 
@@ -764,6 +796,9 @@ func NewProducer(address string, config ProducerConfig) (*Producer, error) {
 	router, err := NewRouter(address, config.ClientID, config.DialTimeout)
 	if err != nil {
 		return nil, err
+	}
+	if config.SocketTimeout != 0 {
+		router.SetRequestTimeout(config.SocketTimeout)
 	}
 	producer := &Producer{
 		config:    config,
@@ -824,6 +859,26 @@ func (p *Producer) Send(topic string, value, key []byte, headers ...RecordHeader
 func (p *Producer) SendTo(
 	topic string, partition int32, value, key []byte, headers ...RecordHeader,
 ) error {
+	return p.SendToAt(topic, partition, value, key, nowMillis(), headers...)
+}
+
+// SendAt is Send with an explicit record timestamp in unix milliseconds
+// (Kafka's ProducerRecord timestamp) instead of the wall clock.
+func (p *Producer) SendAt(
+	topic string, value, key []byte, timestampMs int64, headers ...RecordHeader,
+) error {
+	partition, err := p.choosePartition(topic, key)
+	if err != nil {
+		return err
+	}
+	return p.SendToAt(topic, partition, value, key, timestampMs, headers...)
+}
+
+// SendToAt is SendTo with an explicit record timestamp in unix milliseconds.
+func (p *Producer) SendToAt(
+	topic string, partition int32, value, key []byte, timestampMs int64,
+	headers ...RecordHeader,
+) error {
 	record := Record{Key: key, Value: value, Headers: headers}
 	size := len(value) + len(key) + 16
 	for _, header := range headers {
@@ -835,7 +890,7 @@ func (p *Producer) SendTo(
 
 	slot := topicPartition{topic, partition}
 	p.mu.Lock()
-	p.buffers[slot] = append(p.buffers[slot], buffered{record, nowMillis()})
+	p.buffers[slot] = append(p.buffers[slot], buffered{record, timestampMs})
 	p.sizes[slot] += size
 	full := p.sizes[slot] >= p.config.BatchSize
 	p.mu.Unlock()
@@ -855,7 +910,24 @@ func (p *Producer) SendSync(
 	if err != nil {
 		return -1, err
 	}
-	return p.produce(topic, partition, []buffered{{Record{key, value, 0, headers}, nowMillis()}})
+	return p.SendToSync(topic, partition, value, key, nowMillis(), headers...)
+}
+
+// SendToSync sends one record to an explicit partition with an explicit
+// timestamp (unix ms) and returns its offset. Any records already buffered
+// for that partition go first, so send order is kept.
+func (p *Producer) SendToSync(
+	topic string, partition int32, value, key []byte, timestampMs int64,
+	headers ...RecordHeader,
+) (int64, error) {
+	if err := p.flushPartition(topicPartition{topic, partition}); err != nil {
+		return -1, err
+	}
+	slot := topicPartition{topic, partition}
+	lock := p.sendLock(slot)
+	lock.Lock()
+	defer lock.Unlock()
+	return p.produce(topic, partition, []buffered{{Record{key, value, 0, headers}, timestampMs}})
 }
 
 // Flush sends every buffered record and waits for acknowledgement. It also
@@ -975,14 +1047,19 @@ func (p *Producer) lingerLoop() {
 	}
 }
 
-func (p *Producer) flushPartition(slot topicPartition) error {
+func (p *Producer) sendLock(slot topicPartition) *sync.Mutex {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	lock, ok := p.sendLocks[slot]
 	if !ok {
 		lock = &sync.Mutex{}
 		p.sendLocks[slot] = lock
 	}
-	p.mu.Unlock()
+	return lock
+}
+
+func (p *Producer) flushPartition(slot topicPartition) error {
+	lock := p.sendLock(slot)
 	// Held across the round trip (and any retries): a partition has at most
 	// one batch in flight, and batches leave in the order they were taken.
 	lock.Lock()
@@ -1133,6 +1210,9 @@ type ConsumerConfig struct {
 	// buffered and uncommitted.
 	MaxPollRecords int
 	DialTimeout    time.Duration
+	// SocketTimeout bounds one round trip client-side (0 = default). Keep
+	// it above FetchMaxWaitMs.
+	SocketTimeout time.Duration
 }
 
 func DefaultConsumerConfig() ConsumerConfig {
@@ -1157,6 +1237,9 @@ func NewConsumer(address string, config ConsumerConfig) (*Consumer, error) {
 	router, err := NewRouter(address, config.ClientID, config.DialTimeout)
 	if err != nil {
 		return nil, err
+	}
+	if config.SocketTimeout != 0 {
+		router.SetRequestTimeout(config.SocketTimeout)
 	}
 	return &Consumer{config: config, router: router}, nil
 }

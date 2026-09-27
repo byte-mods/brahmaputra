@@ -671,6 +671,8 @@ func main() {
 		must(0, producer.Close())
 	}
 
+	featureChecks(address)
+
 	fmt.Printf("\n%d passed, %d failed\n", passed, failed)
 	if failed > 0 {
 		os.Exit(1)

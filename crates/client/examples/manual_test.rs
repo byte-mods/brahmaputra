@@ -19,12 +19,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brahmaputra_client::{
-    murmur2, Assignor, AutoOffsetReset, ClientError, ConsumedRecord, Consumer, GroupAdmin,
-    GroupConsumer, Producer, ProducerConfig, EARLIEST, LATEST,
+    murmur2, Assignor, AutoOffsetReset, ClientError, ConsumedRecord, Consumer, FetchedRecord,
+    GroupAdmin, GroupConsumer, Producer, ProducerConfig, EARLIEST, LATEST,
 };
-use brahmaputra_protocol::{Compression, RecordHeader};
+use brahmaputra_protocol::error_code as ec;
+use brahmaputra_protocol::gen::{MetadataResponse, ProduceResponse};
+use brahmaputra_protocol::{
+    decode_payload, encode_payload, ApiKey, Compression, Record, RecordBatch, RecordHeader,
+};
 use bytes::Bytes;
 use futures::future::join_all;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -296,6 +301,8 @@ async fn main() {
         ("none", Compression::None),
         ("gzip", Compression::Gzip),
         ("lz4", Compression::Lz4),
+        ("zstd", Compression::Zstd),
+        ("snappy", Compression::Snappy),
     ] {
         let codec_topic = unique(&format!("rust-{name}"));
         let body = "the same line over and over. ".repeat(40);
@@ -1140,8 +1147,720 @@ async fn main() {
         let _ = consumer.close().await;
     }
 
+    feature_checks(addr).await;
+
     let passed = PASSED.load(Ordering::Relaxed);
     let failed = FAILED.load(Ordering::Relaxed);
     println!("\n{passed} passed, {failed} failed");
     std::process::exit(if failed > 0 { 1 } else { 0 });
+}
+
+/// Everything in one partition from offset 0 to the current end.
+async fn fetch_everything(addr: SocketAddr, topic: &str, partition: i32) -> Vec<FetchedRecord> {
+    let consumer = consumer(addr).await;
+    let mut out = Vec::new();
+    let mut offset = 0;
+    loop {
+        let batch = match consumer.fetch(topic, partition, offset, 100).await {
+            Ok(batch) => batch,
+            Err(_) => return out,
+        };
+        let Some(last) = batch.last() else {
+            return out;
+        };
+        offset = last.offset + 1;
+        out.extend(batch);
+    }
+}
+
+async fn produce_n(addr: SocketAddr, topic: &str, n: usize) {
+    let producer = producer(addr, 0).await;
+    for i in 0..n {
+        must(
+            producer.send(topic, None, None, b(&format!("m{i}"))).await,
+            "send",
+        );
+    }
+}
+
+/// Polls until `want` records arrived or `within` passed; also returns the
+/// largest single poll.
+async fn poll_counting(
+    consumer: &mut GroupConsumer,
+    want: usize,
+    within: Duration,
+) -> (Vec<ConsumedRecord>, usize) {
+    let mut seen = Vec::new();
+    let mut largest = 0;
+    let deadline = Instant::now() + within;
+    while seen.len() < want && Instant::now() < deadline {
+        match consumer.poll(Duration::from_millis(300)).await {
+            Ok(records) => {
+                largest = largest.max(records.len());
+                seen.extend(records);
+            }
+            Err(_) => break,
+        }
+    }
+    (seen, largest)
+}
+
+fn partitions_held(consumer: &GroupConsumer, topic: &str) -> Vec<i32> {
+    let mut out: Vec<i32> = consumer
+        .assignment()
+        .iter()
+        .filter(|(held, _)| held == topic)
+        .map(|(_, partition)| *partition)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// The client feature checklist, item by item: every setting is shown to
+/// change behaviour, not merely to be accepted.
+async fn feature_checks(addr: SocketAddr) {
+    section("producer settings");
+    {
+        let topic = unique("rust-linger");
+        let producer = producer(addr, 300).await;
+        let started = Instant::now();
+        let offset = producer.send(&topic, Some(0), None, b("lingered")).await;
+        let waited = started.elapsed();
+        let got = fetch_everything(addr, &topic, 0).await;
+        check(
+            "linger.ms sends a batch without an explicit flush",
+            matches!(offset, Ok(0)) && got.len() == 1 && waited >= Duration::from_millis(250),
+            format!("{offset:?} after {waited:?}, {} stored", got.len()),
+        );
+    }
+    {
+        let topic = unique("rust-batchsize");
+        let producer = Arc::new(must(
+            Producer::connect(
+                addr,
+                ProducerConfig {
+                    batch_size: 200,
+                    ..config(60_000)
+                },
+            )
+            .await,
+            "producer connect",
+        ));
+        let sends: Vec<_> = (0..10)
+            .map(|_| {
+                let producer = Arc::clone(&producer);
+                let topic = topic.clone();
+                tokio::spawn(async move {
+                    producer
+                        .send(&topic, Some(0), None, Bytes::from(vec![b'b'; 50]))
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let got = fetch_everything(addr, &topic, 0).await;
+        check(
+            "batch.size sends a full batch before linger expires",
+            got.len() >= 3,
+            format!("got {} of 10 with linger 60s", got.len()),
+        );
+        let _ = producer.flush().await;
+        join_all(sends).await;
+    }
+    {
+        let topic = unique("rust-flush");
+        let producer = Arc::new(producer(addr, 60_000).await);
+        let sends: Vec<_> = (0..5)
+            .map(|i| {
+                let producer = Arc::clone(&producer);
+                let topic = topic.clone();
+                tokio::spawn(async move {
+                    producer
+                        .send(&topic, Some(0), None, b(&format!("c{i}")))
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let flushed = producer.flush().await;
+        let results = join_all(sends).await;
+        let got = fetch_everything(addr, &topic, 0).await;
+        check(
+            "flush sends buffered records before linger expires",
+            flushed.is_ok()
+                && got.len() == 5
+                && results.iter().all(|result| matches!(result, Ok(Ok(_)))),
+            format!("got {}", got.len()),
+        );
+        let producer = Arc::try_unwrap(producer).ok().expect("sole owner");
+        check(
+            "close flushes and releases the producer",
+            producer.close().await.is_ok(),
+            "",
+        );
+    }
+    {
+        let topic = unique("rust-sync");
+        let producer = producer(addr, 0).await;
+        let first = producer.send(&topic, Some(1), None, b("s0")).await;
+        let second = producer.send(&topic, Some(1), None, b("s1")).await;
+        let got = fetch_everything(addr, &topic, 1).await;
+        check(
+            "send-and-wait returns the record's offset",
+            matches!((&first, &second), (Ok(0), Ok(1)))
+                && got.get(1).and_then(|record| record.value.as_deref()) == Some(&b"s1"[..]),
+            format!("{first:?} {second:?}"),
+        );
+    }
+    {
+        let topic = unique("rust-roundrobin");
+        let producer = producer(addr, 0).await;
+        must(producer.send(&topic, None, None, b("rr0")).await, "send");
+        for i in 1..8 {
+            must(
+                producer
+                    .send(&topic, None, None, b(&format!("rr{i}")))
+                    .await,
+                "send",
+            );
+        }
+        let mut counts = Vec::new();
+        for partition in 0..4 {
+            counts.push(fetch_everything(addr, &topic, partition).await.len());
+        }
+        check(
+            "null keys are spread round-robin",
+            counts == vec![2, 2, 2, 2],
+            format!("{counts:?}"),
+        );
+    }
+    {
+        let topic = unique("rust-timestamp");
+        let producer = producer(addr, 0).await;
+        for (value, timestamp) in [
+            ("t1", 1_600_000_001_000),
+            ("t2", 1_600_000_002_000),
+            ("t3", 1_600_000_003_000),
+        ] {
+            must(
+                producer
+                    .send_with_timestamp(&topic, Some(0), None, b(value), Vec::new(), timestamp)
+                    .await,
+                "send",
+            );
+        }
+        let got = fetch_everything(addr, &topic, 0).await;
+        let stamps: Vec<i64> = got.iter().map(|record| record.timestamp).collect();
+        check(
+            "an explicit record timestamp is kept",
+            stamps == vec![1_600_000_001_000, 1_600_000_002_000, 1_600_000_003_000],
+            format!("{stamps:?}"),
+        );
+        let consumer = consumer(addr).await;
+        let by_time = consumer.list_offsets(&topic, 0, 1_600_000_001_500).await;
+        let past_end = consumer.list_offsets(&topic, 0, 1_700_000_000_000).await;
+        check(
+            "list offsets by timestamp finds the first record at or after it",
+            matches!((&by_time, &past_end), (Ok(1), Ok(3))),
+            format!("{by_time:?} {past_end:?}"),
+        );
+    }
+    {
+        let producer = must(
+            Producer::connect(
+                addr,
+                ProducerConfig {
+                    acks: -1,
+                    timeout_ms: 1500,
+                    ..config(0)
+                },
+            )
+            .await,
+            "producer connect",
+        );
+        let result = producer
+            .send(&unique("rust-acksall"), None, None, b("durable"))
+            .await;
+        check(
+            "acks=all with request.timeout.ms is acknowledged",
+            result.is_ok(),
+            format!("{result:?}"),
+        );
+    }
+
+    section("retries (fault-injecting proxy)");
+    {
+        let proxy = FaultProxy::start(addr).await;
+        let topic = unique("rust-retry");
+        let via_proxy = |retries: u32, retry_backoff_ms: u64, delivery_timeout_ms: u64| {
+            let topic = topic.clone();
+            async move {
+                let producer = must(
+                    Producer::connect(
+                        proxy.addr,
+                        ProducerConfig {
+                            retries,
+                            retry_backoff_ms,
+                            delivery_timeout_ms,
+                            batch_partitions: false,
+                            ..config(0)
+                        },
+                    )
+                    .await,
+                    "producer connect",
+                );
+                must(producer.partition_for(&topic, None).await, "metadata");
+                producer
+            }
+        };
+
+        let producer = via_proxy(5, 50, 120_000).await;
+        proxy.inject(ec::NOT_LEADER_OR_FOLLOWER, 2);
+        let result = producer.send(&topic, Some(0), None, b("eventually")).await;
+        check(
+            "a retriable produce error is retried until it succeeds",
+            matches!(result, Ok(0)) && proxy.produces() == 3,
+            format!("{result:?} attempts={}", proxy.produces()),
+        );
+
+        let producer = via_proxy(2, 200, 120_000).await;
+        proxy.inject(ec::NOT_LEADER_OR_FOLLOWER, -1);
+        let started = Instant::now();
+        let result = producer.send(&topic, Some(0), None, b("never")).await;
+        let elapsed = started.elapsed();
+        check(
+            "retry.backoff.ms spaces the retries",
+            result.is_err() && proxy.produces() == 3 && elapsed >= Duration::from_millis(400),
+            format!("attempts={} elapsed={elapsed:?}", proxy.produces()),
+        );
+
+        let producer = via_proxy(5, 1000, 120_000).await;
+        proxy.inject(ec::INVALID_REQUEST, -1);
+        let started = Instant::now();
+        let result = producer.send(&topic, Some(0), None, b("rejected")).await;
+        check(
+            "a non-retriable produce error is not retried",
+            result.is_err() && proxy.produces() == 1 && started.elapsed() < Duration::from_secs(1),
+            format!("attempts={}", proxy.produces()),
+        );
+
+        let producer = via_proxy(1_000_000, 50, 600).await;
+        proxy.inject(ec::NOT_LEADER_OR_FOLLOWER, -1);
+        let started = Instant::now();
+        let result = producer.send(&topic, Some(0), None, b("late")).await;
+        let elapsed = started.elapsed();
+        check(
+            "delivery.timeout.ms bounds the retries",
+            result.is_err() && elapsed < Duration::from_secs(3) && proxy.produces() > 2,
+            format!("attempts={} elapsed={elapsed:?}", proxy.produces()),
+        );
+        proxy.close();
+    }
+
+    section("consumer settings");
+    {
+        let topic = unique("rust-fetch");
+        let producer = producer(addr, 0).await;
+        for i in 0..10u8 {
+            must(
+                producer
+                    .send(&topic, Some(0), None, Bytes::from(vec![b'a' + i; 1000]))
+                    .await,
+                "send",
+            );
+        }
+        let reader = consumer(addr).await;
+        let verbose = reader.fetch_verbose(&topic, 0, 0, 100).await;
+        check(
+            "fetch reports the high watermark",
+            matches!(&verbose, Ok((records, 10)) if records.len() == 10),
+            format!(
+                "{:?}",
+                verbose.as_ref().map(|(records, hw)| (records.len(), *hw))
+            ),
+        );
+        let metadata = must(
+            reader.metadata(std::slice::from_ref(&topic)).await,
+            "metadata",
+        );
+        let led: Vec<(i32, i32)> = metadata
+            .topics
+            .iter()
+            .filter(|entry| entry.name == topic)
+            .flat_map(|entry| {
+                entry
+                    .partitions
+                    .iter()
+                    .map(|info| (info.partition, info.leader))
+            })
+            .collect();
+        check(
+            "metadata lists every partition with a leader",
+            led.len() == 4 && led.iter().all(|(_, leader)| *leader >= 0),
+            format!("{led:?}"),
+        );
+
+        let capped = consumer(addr).await.with_max_bytes(2500);
+        let got = must(capped.fetch(&topic, 0, 0, 100).await, "fetch");
+        check(
+            "fetch.max.bytes caps a response",
+            !got.is_empty() && got.len() < 10,
+            format!("got {} of 10", got.len()),
+        );
+
+        let patient = consumer(addr)
+            .await
+            .with_fetch_min_bytes(1 << 20)
+            .with_fetch_max_wait_ms(400);
+        let started = Instant::now();
+        let got = must(patient.fetch(&topic, 0, 0, 400).await, "fetch");
+        let elapsed = started.elapsed();
+        check(
+            "fetch.min.bytes waits up to fetch.max.wait.ms for more data",
+            got.len() == 10
+                && elapsed >= Duration::from_millis(300)
+                && elapsed < Duration::from_secs(3),
+            format!("got {} after {elapsed:?}", got.len()),
+        );
+    }
+    {
+        // A broker that accepts and never answers must cost an error once
+        // the request timeout passes, not a task parked forever.
+        let silent = must(TcpListener::bind("127.0.0.1:0").await, "bind");
+        let silent_addr = must(silent.local_addr(), "addr");
+        let accept = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = silent.accept().await {
+                held.push(socket);
+            }
+        });
+        let stuck = consumer(silent_addr)
+            .await
+            .with_request_timeout(Some(Duration::from_millis(300)));
+        let started = Instant::now();
+        let result = stuck.api_versions().await;
+        check(
+            "a request to an unresponsive broker times out",
+            matches!(result, Err(ClientError::Timeout(_)))
+                && started.elapsed() < Duration::from_secs(3),
+            format!("{:?} after {:?}", result.map(|_| ()), started.elapsed()),
+        );
+        accept.abort();
+    }
+    {
+        // A length prefix larger than what follows, or negative, is an
+        // error — never a read past the end or a huge allocation.
+        let batch = RecordBatch::new(0, 0, 0, vec![Record::new(Bytes::from_static(b"x"))]).encode();
+        let corrupt = |length: i32| {
+            let mut bytes = batch.to_vec();
+            bytes[8..12].copy_from_slice(&length.to_be_bytes());
+            RecordBatch::decode(&mut Bytes::from(bytes))
+        };
+        let oversized = corrupt(i32::MAX);
+        let negative = corrupt(-16);
+        check(
+            "a truncated or oversized length is an error, not a crash",
+            oversized.is_err() && negative.is_err(),
+            format!("{:?} / {:?}", oversized.is_err(), negative.is_err()),
+        );
+    }
+
+    section("consumer group settings");
+    {
+        let topic = unique("rust-maxpoll");
+        produce_n(addr, &topic, 20).await;
+        let mut consumer = group(addr, &unique("rust-maxpoll-grp"))
+            .await
+            .with_max_poll_records(5);
+        consumer.subscribe(&[&topic]);
+        let (got, largest) = poll_counting(&mut consumer, 20, Duration::from_secs(20)).await;
+        check(
+            "max.poll.records caps one poll",
+            got.len() == 20 && largest <= 5,
+            format!("got {}, largest poll {largest}", got.len()),
+        );
+        let _ = consumer.close().await;
+    }
+    {
+        let topic = unique("rust-autocommit");
+        produce_n(addr, &topic, 12).await;
+        let group_id = unique("rust-autocommit-grp");
+        let mut consumer = group(addr, &group_id)
+            .await
+            .with_auto_commit(Some(Duration::from_millis(200)));
+        consumer.subscribe(&[&topic]);
+        poll_counting(&mut consumer, 12, Duration::from_secs(20)).await;
+        // The timer commits what the application has come back for, so one
+        // more poll marks the batch processed.
+        let _ = consumer.poll(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let total = committed_total(addr, &group_id).await;
+        check(
+            "auto-commit commits delivered positions",
+            total == 12,
+            total,
+        );
+        let _ = consumer.close().await;
+    }
+    {
+        let topic = unique("rust-heartbeat");
+        produce_n(addr, &topic, 4).await;
+        let mut consumer = group(addr, &unique("rust-heartbeat-grp"))
+            .await
+            .with_session_timeout(1500)
+            .with_heartbeat_interval(300);
+        consumer.subscribe(&[&topic]);
+        poll_counting(&mut consumer, 4, Duration::from_secs(20)).await;
+        let generation = consumer.generation();
+        tokio::time::sleep(Duration::from_secs(4)).await; // well past the session timeout
+        let commit = consumer.commit_sync().await;
+        check(
+            "heartbeats keep an idle member in its group",
+            commit.is_ok() && consumer.generation() == generation,
+            format!("{commit:?}"),
+        );
+        let _ = consumer.close().await;
+    }
+    {
+        let first = unique("rust-multi-a");
+        let second = unique("rust-multi-b");
+        produce_n(addr, &first, 6).await;
+        produce_n(addr, &second, 7).await;
+        let mut consumer = group(addr, &unique("rust-multi-grp")).await;
+        consumer.subscribe(&[&first, &second]);
+        let (got, _) = poll_counting(&mut consumer, 13, Duration::from_secs(20)).await;
+        let a = got.iter().filter(|record| record.topic == first).count();
+        let c = got.iter().filter(|record| record.topic == second).count();
+        check(
+            "a member subscribed to two topics consumes both",
+            a == 6 && c == 7,
+            format!("{a}/{c}"),
+        );
+        let _ = consumer.close().await;
+    }
+    {
+        let topic = unique("rust-static");
+        produce_n(addr, &topic, 4).await;
+        let group_id = unique("rust-static-grp");
+        let mut original = group(addr, &group_id)
+            .await
+            .with_group_instance_id("instance-1");
+        original.subscribe(&[&topic]);
+        poll_counting(&mut original, 4, Duration::from_secs(20)).await;
+        let member_id = original.member_id();
+        // The same instance comes back (a restart) before the old session
+        // has expired: it must reclaim the slot, not join as a stranger.
+        let mut returning = group(addr, &group_id)
+            .await
+            .with_group_instance_id("instance-1");
+        returning.subscribe(&[&topic]);
+        let _ = returning.poll(Duration::from_secs(2)).await;
+        check(
+            "a returning static member reclaims its member id",
+            !member_id.is_empty() && returning.member_id() == member_id,
+            format!("{member_id} then {}", returning.member_id()),
+        );
+        let _ = returning.close().await;
+        let _ = original.close().await;
+    }
+    {
+        let topic = unique("rust-leave");
+        produce_n(addr, &topic, 8).await;
+        let group_id = unique("rust-leave-grp");
+        let mut leaving = group(addr, &group_id)
+            .await
+            .with_session_timeout(30_000)
+            .with_rebalance_timeout(10_000);
+        leaving.subscribe(&[&topic]);
+        poll_counting(&mut leaving, 8, Duration::from_secs(20)).await;
+        let _ = leaving.close().await;
+        let mut successor = group(addr, &group_id)
+            .await
+            .with_session_timeout(30_000)
+            .with_rebalance_timeout(10_000);
+        successor.subscribe(&[&topic]);
+        let started = Instant::now();
+        while partitions_held(&successor, &topic).len() < 4
+            && started.elapsed() < Duration::from_secs(15)
+        {
+            let _ = successor.poll(Duration::from_millis(200)).await;
+        }
+        let elapsed = started.elapsed();
+        check(
+            "close leaves the group so the next member is assigned at once",
+            partitions_held(&successor, &topic).len() == 4 && elapsed < Duration::from_secs(6),
+            format!("assigned after {elapsed:?}"),
+        );
+        let _ = successor.close().await;
+    }
+    {
+        let topic = unique("rust-fence");
+        produce_n(addr, &topic, 8).await;
+        let group_id = unique("rust-fence-grp");
+        let mut first = group(addr, &group_id).await.with_rebalance_timeout(2000);
+        first.subscribe(&[&topic]);
+        poll_counting(&mut first, 8, Duration::from_secs(20)).await;
+        let old_generation = first.generation();
+        // A second member joins while the first stops polling: the group
+        // moves on without it, so its generation is superseded.
+        let mut second = group(addr, &group_id).await.with_rebalance_timeout(2000);
+        second.subscribe(&[&topic]);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while second.generation() <= old_generation && Instant::now() < deadline {
+            let _ = second.poll(Duration::from_millis(200)).await;
+        }
+        let commit = first.commit_sync().await;
+        check(
+            "a commit from a superseded generation is fenced",
+            commit.is_err(),
+            format!("old={old_generation} new={}", second.generation()),
+        );
+
+        // Both members polling settle on a split of the partitions.
+        let until = Instant::now() + Duration::from_secs(8);
+        let keep_polling = |mut member: GroupConsumer| async move {
+            while Instant::now() < until {
+                let _ = member.poll(Duration::from_millis(200)).await;
+            }
+            member
+        };
+        let (first, second) = tokio::join!(keep_polling(first), keep_polling(second));
+        let a = partitions_held(&first, &topic);
+        let c = partitions_held(&second, &topic);
+        let mut union: Vec<i32> = a.iter().chain(c.iter()).copied().collect();
+        union.sort_unstable();
+        check(
+            "two members share the partitions without overlap",
+            union == vec![0, 1, 2, 3] && !a.is_empty() && !c.is_empty(),
+            format!("{a:?} / {c:?}"),
+        );
+        let _ = second.close().await;
+        let _ = first.close().await;
+    }
+}
+
+/// Forwards frames to the broker one request at a time, but can answer
+/// Produce requests itself with an injected error code — the only way to
+/// make a healthy single broker return a retriable error on demand.
+struct FaultProxy {
+    addr: SocketAddr,
+    state: Arc<Mutex<(i32, i64, usize)>>, // (code, failures left; -1 forever, produces seen)
+    accept: JoinHandle<()>,
+}
+
+impl FaultProxy {
+    async fn start(target: SocketAddr) -> FaultProxy {
+        let listener = must(TcpListener::bind("127.0.0.1:0").await, "proxy bind");
+        let addr = must(listener.local_addr(), "proxy addr");
+        let state: Arc<Mutex<(i32, i64, usize)>> = Arc::new(Mutex::new((0, 0, 0)));
+        let shared = Arc::clone(&state);
+        let accept = tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(upstream) = TcpStream::connect(target).await else {
+                    continue;
+                };
+                tokio::spawn(FaultProxy::serve(
+                    client,
+                    upstream,
+                    addr,
+                    Arc::clone(&shared),
+                ));
+            }
+        });
+        FaultProxy {
+            addr,
+            state,
+            accept,
+        }
+    }
+
+    async fn read_frame(socket: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut head = [0u8; 4];
+        socket.read_exact(&mut head).await?;
+        let mut frame = vec![0u8; 4 + u32::from_be_bytes(head) as usize];
+        frame[..4].copy_from_slice(&head);
+        socket.read_exact(&mut frame[4..]).await?;
+        Ok(frame)
+    }
+
+    async fn serve(
+        mut client: TcpStream,
+        mut upstream: TcpStream,
+        local: SocketAddr,
+        state: Arc<Mutex<(i32, i64, usize)>>,
+    ) -> std::io::Result<()> {
+        loop {
+            let frame = FaultProxy::read_frame(&mut client).await?;
+            if i16::from_be_bytes([frame[4], frame[5]]) == ApiKey::Produce as i16 {
+                let injected = {
+                    let mut state = state.lock().expect("proxy state");
+                    state.2 += 1;
+                    let fail = state.1 != 0;
+                    if state.1 > 0 {
+                        state.1 -= 1;
+                    }
+                    fail.then_some(state.0)
+                };
+                if let Some(code) = injected {
+                    let client_len = u16::from_be_bytes([frame[12], frame[13]]) as usize;
+                    let mut payload = frame[4..14 + client_len].to_vec();
+                    let response = ProduceResponse {
+                        topic: String::new(),
+                        partition: 0,
+                        error_code: code,
+                        base_offset: -1,
+                        log_append_time_ms: -1,
+                    };
+                    payload.extend(response.encode().expect("encode"));
+                    let mut out = (payload.len() as u32).to_be_bytes().to_vec();
+                    out.extend(payload);
+                    client.write_all(&out).await?;
+                    continue;
+                }
+            }
+            let is_metadata = i16::from_be_bytes([frame[4], frame[5]]) == ApiKey::Metadata as i16;
+            upstream.write_all(&frame).await?;
+            let mut response = FaultProxy::read_frame(&mut upstream).await?;
+            if is_metadata {
+                response = FaultProxy::advertise_self(response, local);
+            }
+            client.write_all(&response).await?;
+        }
+    }
+
+    /// Rewrite a Metadata response so every broker is advertised at this
+    /// proxy: this client routes by advertised address, so without it the
+    /// Produce requests would go straight to the broker.
+    fn advertise_self(frame: Vec<u8>, local: SocketAddr) -> Vec<u8> {
+        let mut payload = Bytes::from(frame[4..].to_vec());
+        let Ok(header) = decode_payload(&mut payload) else {
+            return frame;
+        };
+        let Ok(mut metadata) = MetadataResponse::decode(&payload) else {
+            return frame;
+        };
+        for broker in &mut metadata.brokers {
+            broker.host = local.ip().to_string();
+            broker.port = i32::from(local.port());
+        }
+        let Ok(body) = metadata.encode() else {
+            return frame;
+        };
+        let payload = encode_payload(&header, &body);
+        let mut out = (payload.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    fn inject(&self, code: i32, failures: i64) {
+        *self.state.lock().expect("proxy state") = (code, failures, 0);
+    }
+
+    fn produces(&self) -> usize {
+        self.state.lock().expect("proxy state").2
+    }
+
+    fn close(self) {
+        self.accept.abort();
+    }
 }

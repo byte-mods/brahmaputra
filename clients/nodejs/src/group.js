@@ -22,6 +22,7 @@ const {
 const {
   COORDINATOR_ATTEMPTS,
   Consumer,
+  DEFAULT_REQUEST_TIMEOUT_MS,
   EARLIEST,
   JOIN_ATTEMPTS,
   LATEST,
@@ -63,6 +64,11 @@ const defaultGroupConfig = () => ({
    * Kafka defaults to 45s; this defaults to 10s as the Rust client does.
    */
   sessionTimeoutMs: 10000,
+  /**
+   * How often the background timer heartbeats. 0 means sessionTimeoutMs/3,
+   * Kafka's rule of thumb; keep it well below sessionTimeoutMs.
+   */
+  heartbeatIntervalMs: 0,
   rebalanceTimeoutMs: 3000,
   /**
    * Longest gap between poll() calls before this member is presumed stuck
@@ -81,6 +87,8 @@ const defaultGroupConfig = () => ({
   groupInstanceId: '',
   maxPollRecords: 500,
   fetchMaxBytes: 8 * 1024 * 1024,
+  /** Client-side bound on one round trip; keep it above rebalanceTimeoutMs. */
+  socketTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
 });
 
 /**
@@ -119,7 +127,12 @@ class GroupConsumer {
     // often enough for the shorter of them. Deriving the tick from the
     // session timeout alone would leave a long session with a short poll
     // interval unchecked until long after it stalled.
-    const heartbeatEvery = Math.max(Math.floor(config.sessionTimeoutMs / 3), 1);
+    const heartbeatEvery = Math.max(
+      config.heartbeatIntervalMs > 0
+        ? config.heartbeatIntervalMs
+        : Math.floor(config.sessionTimeoutMs / 3),
+      1
+    );
     const pollCheckEvery = Math.max(Math.floor(config.maxPollIntervalMs / 3), 1);
     this.timer = setInterval(() => {
       // One heartbeat at a time: a slow coordinator must not pile up
@@ -140,6 +153,7 @@ class GroupConsumer {
       clientId: config.clientId,
       fetchMaxBytes: config.fetchMaxBytes,
       maxPollRecords: config.maxPollRecords,
+      socketTimeoutMs: config.socketTimeoutMs,
     });
     return new GroupConsumer(consumer, groupId, config);
   }

@@ -17,6 +17,7 @@ import {
   Compression,
   Connection,
   Consumer,
+  DEFAULT_REQUEST_TIMEOUT_MS,
   EARLIEST,
   ErrorCode,
   GroupConsumer,
@@ -108,6 +109,7 @@ async function typings(): Promise<void> {
     deliveryTimeoutMs: 60000,
     bufferMemory: 1 << 20,
     maxBlockMs: 1000,
+    socketTimeoutMs: 60000,
   };
   const p1: Promise<Producer> = Producer.connect('localhost', 9092, kafkaStyle);
   const p2: Promise<Producer> = Producer.connect('localhost', 9092); // every option optional
@@ -136,6 +138,14 @@ async function typings(): Promise<void> {
   expectType<Promise<void>>()(producer.send('t', new Uint8Array([1, 2, 3])));
   expectType<Promise<void>>()(producer.send('t', null, { key: 'k' })); // tombstone
   expectType<Promise<bigint>>()(producer.sendSync('t', buffer, { partition: 2 }));
+  // An explicit record timestamp, unix ms, as a number or a bigint.
+  expectType<Promise<void>>()(producer.send('t', buffer, { timestamp: 1600000000000 }));
+  expectType<Promise<bigint>>()(producer.sendSync('t', buffer, { timestamp: 1600000000000n }));
+  // @ts-expect-error — a timestamp is not a Date
+  await producer.send('t', buffer, { timestamp: new Date() });
+  expectType<void>()(producer.router.setRequestTimeout(5000));
+  expectType<number>()(producer.router.requestTimeoutMs);
+  expectType<120000>()(DEFAULT_REQUEST_TIMEOUT_MS);
   expectType<Promise<void>>()(producer.flush());
   expectType<Promise<void>>()(producer.close());
   await producer.send('t', buffer, {
@@ -219,7 +229,11 @@ async function typings(): Promise<void> {
     assignor: Assignor.ROUNDROBIN,
     groupInstanceId: 'worker-3',
     maxPollRecords: 100,
+    heartbeatIntervalMs: 1000,
+    socketTimeoutMs: 60000,
   });
+  // @ts-expect-error — heartbeatIntervalMs is a number of milliseconds
+  await GroupConsumer.connect('h', 1, 'g', { heartbeatIntervalMs: '1s' });
   // @ts-expect-error — the group id is required
   await GroupConsumer.connect('h', 1);
   // @ts-expect-error — the group id is a string

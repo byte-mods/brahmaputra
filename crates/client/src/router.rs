@@ -134,6 +134,11 @@ struct Inner {
     /// Resolved broker addresses, keyed by the endpoint metadata advertised.
     resolved: Mutex<HashMap<BrokerEndpoint, (SocketAddr, Instant)>>,
     starting: Mutex<HashMap<StartupTarget, Weak<AsyncMutex<()>>>>,
+    /// Client-side bound on one request/response round trip, in
+    /// milliseconds; 0 means unbounded. A request that exceeds it fails
+    /// with [`ClientError::Timeout`] and its connection is evicted, so the
+    /// next request redials instead of queueing behind a wedged broker.
+    request_timeout_ms: AtomicU64,
 }
 
 /// How long a resolved broker address is reused before being looked up
@@ -197,6 +202,7 @@ impl BrokerRouter {
                 refresh: AsyncMutex::new(()),
                 resolved: Mutex::new(HashMap::new()),
                 starting: Mutex::new(HashMap::new()),
+                request_timeout_ms: AtomicU64::new(0),
             }),
         })
     }
@@ -329,7 +335,7 @@ impl BrokerRouter {
         body: &[u8],
     ) -> Result<Bytes, ClientError> {
         let pooled = self.partition_connection(topic, partition).await?;
-        match pooled.connection.request(api_key, body).await {
+        match self.round_trip(&pooled, api_key, body).await {
             Ok(response) => Ok(response),
             Err(error) => {
                 self.invalidate(&pooled);
@@ -374,7 +380,7 @@ impl BrokerRouter {
                     continue;
                 }
             };
-            let response = match pooled.connection.request(api_key, body).await {
+            let response = match self.round_trip(&pooled, api_key, body).await {
                 Ok(response) => Ok(response),
                 Err(error) => {
                     self.invalidate(&pooled);
@@ -395,7 +401,7 @@ impl BrokerRouter {
         body: &[u8],
     ) -> Result<Bytes, ClientError> {
         let pooled = self.connection(self.inner.seed).await?;
-        match pooled.connection.request(api_key, body).await {
+        match self.round_trip(&pooled, api_key, body).await {
             Ok(response) => Ok(response),
             Err(error) => {
                 self.invalidate(&pooled);
@@ -462,7 +468,7 @@ impl BrokerRouter {
         };
         let address = self.resolve(&endpoint).await?;
         let pooled = self.connection(address).await?;
-        match pooled.connection.request(api_key, body).await {
+        match self.round_trip(&pooled, api_key, body).await {
             Ok(response) => Ok(response),
             Err(error) => {
                 self.invalidate(&pooled);
@@ -498,7 +504,7 @@ impl BrokerRouter {
                     continue;
                 }
             };
-            match pooled.connection.request(ApiKey::Metadata, &body).await {
+            match self.round_trip(&pooled, ApiKey::Metadata, &body).await {
                 Ok(response) => {
                     let response = MetadataResponse::decode(&response).map_err(message_error)?;
                     if let Err(error) = ClientError::from_error_code(response.error_code) {
@@ -590,6 +596,43 @@ impl BrokerRouter {
             .expect("connections")
             .get(&address)
             .cloned()
+    }
+
+    /// Bound every later request/response round trip on every connection
+    /// this router holds or opens; `None` (the default) waits as long as
+    /// the connection stays up. The bound must exceed the longest the
+    /// broker may legitimately hold a request: a fetch long-poll, an
+    /// `acks=all` wait, a JoinGroup rebalance.
+    pub(crate) fn set_request_timeout(&self, timeout: Option<Duration>) {
+        let millis = timeout.map_or(0, |timeout| (timeout.as_millis() as u64).max(1));
+        self.inner
+            .request_timeout_ms
+            .store(millis, Ordering::Relaxed);
+    }
+
+    /// One request on a pooled connection, under the request timeout.
+    async fn round_trip(
+        &self,
+        pooled: &PooledConnection,
+        api_key: ApiKey,
+        body: &[u8],
+    ) -> Result<Bytes, ClientError> {
+        let millis = self.inner.request_timeout_ms.load(Ordering::Relaxed);
+        if millis == 0 {
+            return pooled.connection.request(api_key, body).await;
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(millis),
+            pooled.connection.request(api_key, body),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ClientError::Timeout(format!(
+                "no response from {} within {millis} ms",
+                pooled.address
+            ))),
+        }
     }
 
     fn invalidate(&self, failed: &PooledConnection) {
@@ -710,7 +753,7 @@ impl BrokerRouter {
         body: &[u8],
     ) -> Result<Bytes, ClientError> {
         let pooled = self.connection(address).await?;
-        match pooled.connection.request(api_key, body).await {
+        match self.round_trip(&pooled, api_key, body).await {
             Ok(response) => Ok(response),
             Err(error) => {
                 self.invalidate(&pooled);
