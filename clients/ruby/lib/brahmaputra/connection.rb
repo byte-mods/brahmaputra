@@ -16,6 +16,9 @@ module Brahmaputra
     ApiVersion = Struct.new(:api_key, :min_version, :max_version)
 
     attr_reader :host, :port
+    # Client-side bound on each reply. A request that exceeds it breaks the
+    # connection: a late reply would otherwise pair with the next request.
+    attr_accessor :request_timeout_ms
 
     def initialize(host, port, client_id: "brahmaputra-ruby", connect_timeout_ms: 30_000,
                    request_timeout_ms: 30_000)
@@ -39,6 +42,10 @@ module Brahmaputra
     def address = "#{@host}:#{@port}"
 
     def closed? = @closed
+
+    # True once a request failed or the connection was closed. The router
+    # never hands out a broken connection; it redials instead.
+    alias broken? closed?
 
     def close
       @closed = true

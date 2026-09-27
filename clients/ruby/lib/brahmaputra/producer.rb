@@ -123,6 +123,9 @@ module Brahmaputra
       @buffered_bytes = 0
       @round_robin = 0
       @closed = false
+      # First delivery failure since the last flush, so a batch the sender
+      # thread failed in the background still surfaces on flush/close.
+      @unreported_error = nil
       @sender = Thread.new { sender_loop }
       @sender.name = "brahmaputra-sender" if @sender.respond_to?(:name=)
       @sender.report_on_exception = false
@@ -197,7 +200,13 @@ module Brahmaputra
       rescue Error, StandardError => e
         first_error ||= e
       end
+      background = @lock.synchronize do
+        error = @unreported_error
+        @unreported_error = nil
+        error
+      end
       raise first_error if first_error
+      raise background if background
 
       nil
     end
@@ -351,6 +360,7 @@ module Brahmaputra
         item.future.complete(RecordMetadata.new(batch.topic, batch.partition, offset, item.timestamp), nil)
       end
     rescue StandardError => e
+      @lock.synchronize { @unreported_error ||= e }
       batch.items.each { |item| item.future.complete(nil, e) }
     ensure
       @lock.synchronize { @inflight.delete(batch) }

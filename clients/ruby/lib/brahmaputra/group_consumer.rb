@@ -72,6 +72,7 @@ module Brahmaputra
       @fetch_positions = {}
       @buffered = []
       @last_poll = monotonic
+      @in_poll = false
       @last_commit = monotonic
       @closed = false
       @heartbeat_error = nil
@@ -99,11 +100,25 @@ module Brahmaputra
       raise Error, "consumer is closed" if @closed
       raise Error, "subscribe to at least one topic before polling" if @subscribed.empty?
 
-      # Stamped on entry: the interval bounds how long the *application* may
-      # go without asking, and a poll that blocks is the consumer working.
-      @lock.synchronize { @last_poll = monotonic }
-      deadline = monotonic + timeout_ms / 1000.0
+      # The interval bounds how long the *application* may go between polls.
+      # Time spent inside poll (a slow join, a long wait for data) is the
+      # consumer working, so it is excluded: stamped on entry and exit, and
+      # not enforced at all while a poll is running.
+      @lock.synchronize do
+        @last_poll = monotonic
+        @in_poll = true
+      end
+      begin
+        poll_loop(monotonic + timeout_ms / 1000.0)
+      ensure
+        @lock.synchronize do
+          @last_poll = monotonic
+          @in_poll = false
+        end
+      end
+    end
 
+    private def poll_loop(deadline)
       loop do
         join unless joined?
         return take_buffered unless @buffered.empty?
@@ -318,6 +333,11 @@ module Brahmaputra
                                                         timeout_ms: join_timeout_ms))
       code = reader.int32
       return false if [ErrorCode::REBALANCE_IN_PROGRESS, ErrorCode::ILLEGAL_GENERATION].include?(code)
+      if code == ErrorCode::UNKNOWN_MEMBER_ID
+        # Evicted between join and sync; rejoin as a new member.
+        @lock.synchronize { @member_id = "" }
+        return false
+      end
       raise ServerError.new(code, "sync_group") unless code == ErrorCode::NONE
 
       assigned = Array.new(reader.int32) { TopicPartition.new(reader.string, reader.int32) }
@@ -374,7 +394,7 @@ module Brahmaputra
           @tick.wait(interval)
           break nil if @closed
 
-          [@joined, @member_id, @generation, monotonic - @last_poll]
+          [@joined, @member_id, @generation, @in_poll ? 0 : monotonic - @last_poll]
         end
         break if state.nil?
 
@@ -395,7 +415,13 @@ module Brahmaputra
           code = Protocol.body_reader(coordinator_request(Protocol::ApiKey::HEARTBEAT, body)).int32
           if [ErrorCode::REBALANCE_IN_PROGRESS, ErrorCode::UNKNOWN_MEMBER_ID,
               ErrorCode::ILLEGAL_GENERATION].include?(code)
-            @lock.synchronize { @joined = false if @generation == generation }
+            @lock.synchronize do
+              if @generation == generation
+                @joined = false
+                # The coordinator forgot this member; its id is dead.
+                @member_id = "" if code == ErrorCode::UNKNOWN_MEMBER_ID
+              end
+            end
           end
         rescue StandardError => e
           # A failed heartbeat is retried next tick; the session timeout is

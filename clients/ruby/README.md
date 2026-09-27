@@ -14,8 +14,12 @@ or build and install the gem:
 cd clients/ruby && gem build brahmaputra.gemspec && gem install brahmaputra-0.1.0.gem
 ```
 
-Verified end to end against a live broker: **38/38 checks**. These are the
-Go suite's checks plus its tombstone section. Run them with `./test.sh HOST PORT`.
+Verified end to end against a live broker: **54/54 checks**, the same
+checks as the Go suite (`clients/go/cmd/manualtest`). They include wire
+edge cases (1 MiB values, empty vs null keys and header values, unicode),
+per-partition ordering under linger flushes, background flush failures,
+unresponsive and dropped connections, and `max.poll.interval.ms`
+behaviour. Run them with `./test.sh HOST PORT`.
 
 ## Produce
 
