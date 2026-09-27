@@ -98,6 +98,15 @@ Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
 
+### Upgrading to 0.9.1
+
+A drop-in patch for 0.9.0; no data, wire or configuration changes.
+Upgrade the CLI and any application using the Rust `GroupConsumer`. In
+0.9.0 a poll that had to join its group could spend its whole wait on the
+join and return empty, so `brahmaputra-cli consume --group` sometimes
+exited without reading. The minimum supported Rust is now 1.88. See the
+[changelog](CHANGELOG.md#091--2026-09-27).
+
 ### Upgrading to 0.9.0
 
 The broker, its wire format (BitPacker wire version 4) and the disk format
