@@ -1,0 +1,6 @@
+ebin/
+_build/
+test/*.beam
+*.beam
+erl_crash.dump
+rebar3.crashdump
