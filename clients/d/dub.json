@@ -1,0 +1,24 @@
+{
+    "name": "brahmaputra",
+    "description": "Native D client for the Brahmaputra log broker: producer, consumer and consumer groups over its own wire protocol.",
+    "license": "Apache-2.0",
+    "authors": ["Brahmaputra contributors"],
+    "targetType": "library",
+    "sourcePaths": ["source"],
+    "importPaths": ["source"],
+    "buildRequirements": ["warningsAsErrors"],
+    "configurations": [
+        {
+            "name": "library",
+            "targetType": "library"
+        },
+        {
+            "name": "manual-test",
+            "targetType": "executable",
+            "targetName": "manual_test",
+            "targetPath": "build",
+            "sourcePaths": ["source", "test"],
+            "mainSourceFile": "test/manual_test.d"
+        }
+    ]
+}

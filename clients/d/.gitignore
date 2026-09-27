@@ -1,0 +1,6 @@
+build/
+.dub/
+dub.selections.json
+*.o
+*.a
+manual_test
