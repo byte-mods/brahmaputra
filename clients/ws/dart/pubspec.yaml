@@ -1,0 +1,20 @@
+name: brahmaputra_ws
+description: >-
+  Client for the Brahmaputra WebSocket gateway, for Flutter (iOS, Android,
+  web, desktop) and Dart: publish with acknowledgements, subscribe to live
+  topics such as price feeds with snapshots, automatic reconnect.
+version: 0.10.0
+publish_to: none
+
+environment:
+  sdk: ^3.4.0
+
+dependencies:
+  web_socket_channel: ^3.0.0
+
+dev_dependencies:
+  brahmaputra:
+    path: ../../dart
+  crypto: ^3.0.3
+  lints: ^5.0.0
+  test: ^1.25.0

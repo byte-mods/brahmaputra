@@ -1,0 +1,25 @@
+name: brahmaputra_ws_flutter
+description: >-
+  Flutter widgets for the Brahmaputra WebSocket gateway: a scope that owns
+  the connection and builders that rebuild on live data (price boards,
+  tapes, connection state).
+version: 0.10.0
+publish_to: none
+
+environment:
+  sdk: ^3.4.0
+  flutter: ">=3.22.0"
+
+dependencies:
+  brahmaputra_ws:
+    path: ../dart
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  brahmaputra:
+    path: ../../dart
+  crypto: ^3.0.3
+  flutter_lints: ^5.0.0
+  flutter_test:
+    sdk: flutter
