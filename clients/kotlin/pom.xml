@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.brahmaputra</groupId>
+  <artifactId>brahmaputra-kotlin</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <name>Brahmaputra Kotlin client</name>
+  <description>
+    Idiomatic Kotlin (coroutines, Flow, config DSL, data classes) over the Brahmaputra Java
+    driver, which is compiled from ../java/src/main/java into the same jar.
+  </description>
+
+  <properties>
+    <kotlin.version>2.4.20</kotlin.version>
+    <coroutines.version>1.11.0</coroutines.version>
+    <maven.compiler.release>17</maven.compiler.release>
+    <kotlin.compiler.jvmTarget>17</kotlin.compiler.jvmTarget>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <java.driver.sources>${project.basedir}/../java/src/main/java</java.driver.sources>
+    <!-- Where the end-to-end suite (exec:exec) finds a broker. -->
+    <broker.host>127.0.0.1</broker.host>
+    <broker.port>9092</broker.port>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.jetbrains.kotlin</groupId>
+      <artifactId>kotlin-stdlib</artifactId>
+      <version>${kotlin.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.jetbrains.kotlinx</groupId>
+      <artifactId>kotlinx-coroutines-core-jvm</artifactId>
+      <version>${coroutines.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <sourceDirectory>src/main/kotlin</sourceDirectory>
+    <testSourceDirectory>src/test/kotlin</testSourceDirectory>
+    <plugins>
+      <!-- The Java driver's sources join this module's main source set; nothing is copied. -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <id>java-driver-sources</id>
+            <phase>generate-sources</phase>
+            <goals><goal>add-source</goal></goals>
+            <configuration>
+              <sources><source>${java.driver.sources}</source></sources>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- Kotlin first (it reads the Java sources for their types), then javac. -->
+      <plugin>
+        <groupId>org.jetbrains.kotlin</groupId>
+        <artifactId>kotlin-maven-plugin</artifactId>
+        <version>${kotlin.version}</version>
+        <configuration>
+          <args><arg>-Werror</arg></args>
+        </configuration>
+        <executions>
+          <execution>
+            <id>compile</id>
+            <goals><goal>compile</goal></goals>
+            <configuration>
+              <sourceDirs>
+                <sourceDir>${project.basedir}/src/main/kotlin</sourceDir>
+                <sourceDir>${java.driver.sources}</sourceDir>
+              </sourceDirs>
+            </configuration>
+          </execution>
+          <execution>
+            <id>test-compile</id>
+            <goals><goal>test-compile</goal></goals>
+            <configuration>
+              <sourceDirs>
+                <sourceDir>${project.basedir}/src/test/kotlin</sourceDir>
+              </sourceDirs>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <release>17</release>
+        </configuration>
+        <executions>
+          <!-- Replace the defaults so javac runs after kotlinc, not before. -->
+          <execution>
+            <id>default-compile</id>
+            <phase>none</phase>
+          </execution>
+          <execution>
+            <id>default-testCompile</id>
+            <phase>none</phase>
+          </execution>
+          <execution>
+            <id>java-compile</id>
+            <phase>compile</phase>
+            <goals><goal>compile</goal></goals>
+          </execution>
+          <execution>
+            <id>java-test-compile</id>
+            <phase>test-compile</phase>
+            <goals><goal>testCompile</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!--
+        ManualTest is an end-to-end suite that needs a live broker, not a unit test. Run it with:
+          mvn test-compile exec:exec -Dbroker.host=127.0.0.1 -Dbroker.port=9092
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+        <configuration>
+          <failIfNoTests>false</failIfNoTests>
+          <excludes><exclude>**/ManualTest*</exclude></excludes>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <configuration>
+          <executable>java</executable>
+          <classpathScope>test</classpathScope>
+          <arguments>
+            <argument>-classpath</argument>
+            <classpath/>
+            <argument>io.brahmaputra.kt.ManualTestKt</argument>
+            <argument>${broker.host}</argument>
+            <argument>${broker.port}</argument>
+          </arguments>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
