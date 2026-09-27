@@ -445,6 +445,22 @@ impl Producer {
             .map(|session| (session.producer_id, session.producer_epoch))
     }
 
+    /// The partition [`send`](Self::send) would pick with `partition: None`:
+    /// `murmur2(key) % partitions` for a key, the next round-robin slot
+    /// without one. Lets a caller that must report where a record went (a
+    /// gateway acknowledging its own clients) choose once and pass the
+    /// result as an explicit partition, rather than re-deriving it.
+    pub async fn partition_for(
+        &self,
+        topic: &str,
+        key: Option<&[u8]>,
+    ) -> Result<i32, ClientError> {
+        match key {
+            Some(key) => self.key_partition(topic, key).await,
+            None => self.round_robin_partition(topic).await,
+        }
+    }
+
     async fn round_robin_partition(&self, topic: &str) -> Result<i32, ClientError> {
         let partitions = self.inner.router.partitions(topic).await?;
         let index = self.inner.rr_counter.fetch_add(1, Ordering::Relaxed) % partitions.len();
