@@ -101,7 +101,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        driver: [rust, go, nodejs, python, java, dotnet, cpp, c, php, ruby, erlang, elixir]
+        driver: [rust, go, nodejs, typescript, python, java, kotlin, scala,
+                 dotnet, fsharp, cpp, c, d, php, ruby, perl, lua, erlang,
+                 elixir, haskell, ocaml, crystal, nim, dart]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -111,7 +113,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: stable
-      - if: matrix.driver == 'nodejs'
+      - if: matrix.driver == 'nodejs' || matrix.driver == 'typescript'
         uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -119,17 +121,36 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - if: matrix.driver == 'java'
+      - if: matrix.driver == 'java' || matrix.driver == 'kotlin' || matrix.driver == 'scala'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - if: matrix.driver == 'dotnet'
+      - if: matrix.driver == 'dotnet' || matrix.driver == 'fsharp'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
       - if: matrix.driver == 'cpp' || matrix.driver == 'c'
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cmake
+      # Toolchains Ubuntu packages directly (the versions these drivers
+      # were verified with: LDC 1.36, Lua 5.4, GHC 9.4, OCaml 4.14,
+      # Crystal 1.11, Nim 1.6).
+      - if: matrix.driver == 'd'
+        run: sudo apt-get update && sudo apt-get install -y ldc
+      - if: matrix.driver == 'lua'
+        run: sudo apt-get update && sudo apt-get install -y lua5.4 lua-socket lua-zlib
+      - if: matrix.driver == 'haskell'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ghc libghc-network-dev libghc-zlib-dev libghc-stm-dev libghc-async-dev
+      - if: matrix.driver == 'ocaml'
+        run: sudo apt-get update && sudo apt-get install -y ocaml ocaml-findlib libzip-ocaml-dev
+      - if: matrix.driver == 'crystal'
+        run: sudo apt-get update && sudo apt-get install -y crystal
+      - if: matrix.driver == 'nim'
+        run: sudo apt-get update && sudo apt-get install -y nim
+      - if: matrix.driver == 'dart'
+        uses: dart-lang/setup-dart@v1
       - if: matrix.driver == 'php'
         uses: shivammathur/setup-php@v2
         with:
@@ -149,6 +170,36 @@ jobs:
         run: cargo build --locked --release -p brahmaputra-server
       - name: ${{ matrix.driver }} end-to-end suite
         run: bash clients/run-e2e.sh ${{ matrix.driver }}
+
+  # BitPacker conformance: every generator target encodes the fixtures
+  # byte-identically and rejects hostile input. Targets whose toolchain the
+  # runner lacks report SKIP; the per-driver jobs above cover the rest.
+  bitpacker:
+    name: BitPacker cross-language conformance
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Extra toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-dev lua5.4 ghc ocaml ocaml-findlib erlang-nox elixir ldc nim crystal
+      - name: run_all.sh
+        run: bash tools/bit-packer/cross_lang_test/run_all.sh
 
   # Chaos is slower and deliberately randomised, so it runs on demand and on
   # main rather than on every pull request.

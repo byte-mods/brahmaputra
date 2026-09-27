@@ -13,7 +13,8 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLIENTS="$ROOT/clients"
-ALL=(rust go nodejs python java dotnet cpp c php ruby erlang elixir)
+ALL=(rust go nodejs typescript python java kotlin scala dotnet fsharp cpp c d
+     php ruby perl lua erlang elixir haskell ocaml crystal nim dart)
 SELECTED=("$@")
 [[ ${#SELECTED[@]} -eq 0 ]] && SELECTED=("${ALL[@]}")
 
@@ -21,7 +22,9 @@ SELECTED=("$@")
 declare -A NEEDS=(
   [rust]=cargo [go]=go [nodejs]=node [python]=python3 [java]=javac
   [dotnet]=dotnet [cpp]=cmake [c]=cc [php]=php [ruby]=ruby
-  [erlang]=erlc [elixir]=mix
+  [erlang]=erlc [elixir]=mix [typescript]=npm [kotlin]=java [scala]=java
+  [fsharp]=dotnet [d]=ldc2 [perl]=perl [lua]=lua5.4 [haskell]=ghc
+  [ocaml]=ocamlfind [crystal]=crystal [nim]=nim [dart]=dart
 )
 
 BROKER_PID=""

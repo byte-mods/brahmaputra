@@ -1,30 +1,52 @@
 # Client drivers
 
-Native clients for Brahmaputra in twelve languages. The Rust client is the
-[`brahmaputra-client`](../crates/client) crate; every other driver speaks
-the wire protocol directly rather than wrapping it, so there is no FFI, no
-sidecar and no shared native library to ship.
+Clients for Brahmaputra in twenty-four languages. The Rust client is the
+[`brahmaputra-client`](../crates/client) crate. Eighteen more speak the
+wire protocol natively: no FFI, no sidecar, no shared native library to
+ship. Kotlin, Scala and F# are idiomatic libraries over the verified Java
+and .NET drivers, the way Kafka's JVM users share one engine. TypeScript
+ships as type declarations for the Node.js driver.
 
 | Language | Directory | Build | End-to-end suite, live broker |
 |---|---|---|---|
 | Rust | [../crates/client](../crates/client) | `cargo`, clippy clean | ✅ **56/56** (`examples/manual_test.rs`) |
 | Go | [go/](go) | `go vet` clean, suite runs under `-race` | ✅ **54/54** |
 | Node.js | [nodejs/](nodejs) | Node 22, no dependencies | ✅ **57/57** |
+| TypeScript | [typescript/](typescript) | typings in `nodejs/src/index.d.ts`, strict `tsc` | ✅ **57/57** |
 | Python | [python/](python) | Python ≥ 3.9, no dependencies | ✅ **54/54** |
 | Java | [java/](java) | Java 17, `javac -Xlint:all -Werror`; Maven `pom.xml` | ✅ **54/54** |
+| Kotlin | [kotlin/](kotlin) | over the Java driver; coroutines, DSL, Flow | ✅ **54/54** |
+| Scala | [scala/](scala) | over the Java driver; Scala 3, Try/Future | ✅ **54/54** |
 | C# / .NET | [dotnet/](dotnet) | .NET 8, warnings as errors, no NuGet packages | ✅ **54/54** |
+| F# | [fsharp/](fsharp) | over the .NET driver; Result/Async/Task | ✅ **54/54** |
 | C++ | [cpp/](cpp) | C++17, CMake, `-Wall -Wextra -Wpedantic` clean, TSan clean | ✅ **54/54** |
 | C | [c/](c) | C11, Make or CMake, `-Werror` clean, ASan/UBSan/TSan clean | ✅ **54/54** |
+| D | [d/](d) | LDC, `-w`; dub.json | ✅ **54/54** |
 | PHP | [php/](php) | PHP 8, Composer package with a no-Composer autoloader | ✅ **54/54** |
 | Ruby | [ruby/](ruby) | Ruby 3, gem, stdlib only | ✅ **54/54** |
+| Perl | [perl/](perl) | Perl 5.38, core modules only | ✅ **54/54** |
+| Lua | [lua/](lua) | Lua 5.4, LuaSocket (+ lua-zlib for gzip) | ✅ **54/54** |
 | Erlang | [erlang/](erlang) | OTP 25+, rebar3 layout, `erlc -Werror` | ✅ **54/54** |
 | Elixir | [elixir/](elixir) | Elixir 1.14+, `mix compile --warnings-as-errors`, no deps | ✅ **54/54** |
+| Haskell | [haskell/](haskell) | GHC 9.4, `-Wall -Werror`, boot packages + network/zlib | ✅ **54/54** |
+| OCaml | [ocaml/](ocaml) | OCaml 4.14, camlzip; dune/opam files shipped | ✅ **54/54** |
+| Crystal | [crystal/](crystal) | Crystal 1.11 shard, stdlib only | ✅ **54/54** |
+| Nim | [nim/](nim) | Nim 1.6, stdlib + system zlib | ✅ **54/54** |
+| Dart | [dart/](dart) | Dart 3, `dart analyze` clean, no packages | ✅ **54/54** |
 
 Every suite is a port of the Go suite
 ([go/cmd/manualtest](go/cmd/manualtest/main.go)) with the same sections
-and checks, so the numbers are comparable; Node and Rust carry a few
-extra checks of their own. CI runs every suite against a live broker on
-each push (the `clients` job).
+and checks, so the numbers are comparable; Node, TypeScript and Rust carry
+a few extra checks of their own. CI runs every suite against a live broker
+on each push (the `clients` job).
+
+Single-threaded runtimes (PHP, Perl, Lua) batch inside
+`send`/`poll`/`flush` and heartbeat from `poll`, documented in each README.
+The rest use background threads, tasks or processes for linger and
+heartbeats.
+
+For mobile and browser clients, which should not hold broker
+connections, see the [WebSocket gateway](../crates/gateway).
 
 ## What every driver implements
 
@@ -93,6 +115,15 @@ dependency does not acquire one by using this client.
 | Ruby | `none`, `gzip` | others via `Brahmaputra.register_codec` |
 | Erlang | `none`, `gzip` (`zlib`) | others via `brahmaputra_protocol:register_codec/3` |
 | Elixir | `none`, `gzip` (`:zlib`) | others via `Brahmaputra.register_codec/3` |
+| D | `none`, `gzip` (`std.zlib`) | others via `registerCodec` |
+| Perl | `none`, `gzip` (core IO::Compress) | others via `Brahmaputra::Compression::register` |
+| Lua | `none`, `gzip` (with lua-zlib) | others via `register_codec` |
+| Haskell | `none`, `gzip` (`zlib` package) | others via `registerCodec` |
+| OCaml | `none`, `gzip` (camlzip) | others via the codec registry |
+| Crystal | `none`, `gzip` (`Compress::Gzip`) | others via `Brahmaputra.register_codec` |
+| Nim | `none`, `gzip` (system zlib) | others via the codec registry |
+| Dart | `none`, `gzip` (`dart:io`) | others via `registerCodec` |
+| Kotlin, Scala, F#, TypeScript | as the Java / .NET / Node driver underneath | |
 
 If you register lz4 yourself, note that the broker uses
 `lz4_flex::compress_prepend_size`: a little-endian `u32` of the
@@ -107,7 +138,7 @@ is installed, then prints a summary. A driver without its toolchain shows
 as SKIP, never as a pass:
 
 ```bash
-clients/run-e2e.sh                  # all twelve
+clients/run-e2e.sh                  # all twenty-four
 clients/run-e2e.sh go python c      # just these
 BROKER_ADDR=127.0.0.1:9092 clients/run-e2e.sh   # against a broker you run
 ```
