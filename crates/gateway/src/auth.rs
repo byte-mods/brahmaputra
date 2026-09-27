@@ -64,6 +64,10 @@ pub struct Claims {
     /// `*`). Narrows the gateway's own allow-list; never widens it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topics: Option<Vec<String>>,
+    /// Topic patterns this token may subscribe to. Narrows the gateway's
+    /// `--allow-subscribe`; never widens it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe: Option<Vec<String>>,
 }
 
 /// `aud` may be one string or an array of them.
@@ -268,6 +272,7 @@ mod tests {
             iss: Some("idp".into()),
             aud: Some(Audience::One("gateway".into())),
             topics: None,
+            subscribe: None,
         }
     }
 

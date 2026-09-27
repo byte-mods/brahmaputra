@@ -5,6 +5,7 @@ pub mod auth;
 pub mod config;
 pub mod gateway;
 pub mod http;
+pub mod hub;
 pub mod metrics;
 pub mod protocol;
 

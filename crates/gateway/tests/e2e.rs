@@ -130,6 +130,7 @@ fn token(sub: &str, topics: Option<&[&str]>, ttl: i64) -> String {
         iss: None,
         aud: None,
         topics: topics.map(|t| t.iter().map(|s| s.to_string()).collect()),
+        subscribe: None,
     };
     sign_hs256(&claims, None, SECRET.as_bytes())
 }
@@ -203,6 +204,7 @@ async fn handshakes_without_valid_credentials_are_refused() {
             iss: None,
             aud: None,
             topics: None,
+            subscribe: None,
         },
         None,
         b"some-other-secret-entirely",
@@ -879,4 +881,551 @@ where
             _ => continue,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subscriptions: broker topics fanned out to sockets (e.g. a price feed).
+// ---------------------------------------------------------------------------
+
+/// A token with explicit publish (`topics`) and `subscribe` claims.
+fn token_with(sub: &str, topics: Option<&[&str]>, subscribe: Option<&[&str]>) -> String {
+    let now = brahmaputra_ws_gateway::auth::now_secs();
+    let list = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let claims = Claims {
+        sub: sub.into(),
+        exp: now + 300,
+        nbf: None,
+        iat: Some(now),
+        iss: None,
+        aud: None,
+        topics: topics.map(list),
+        subscribe: subscribe.map(list),
+    };
+    sign_hs256(&claims, None, SECRET.as_bytes())
+}
+
+async fn send_json(ws: &mut Ws, frame: Value) {
+    ws.send(Message::text(frame.to_string())).await.unwrap();
+}
+
+/// Subscribe and return the confirmation plus the snapshot records.
+async fn subscribe(ws: &mut Ws, frame: Value) -> (Value, Vec<Value>) {
+    send_json(ws, frame).await;
+    let confirmed = next_json(ws).await;
+    assert_eq!(confirmed["type"], "subscribed", "{confirmed}");
+    let n = confirmed["snapshot"].as_u64().unwrap();
+    let mut snapshot = Vec::new();
+    for _ in 0..n {
+        let record = next_json(ws).await;
+        assert_eq!(record["type"], "record", "{record}");
+        snapshot.push(record);
+    }
+    (confirmed, snapshot)
+}
+
+async fn next_record(ws: &mut Ws) -> Value {
+    let frame = next_json(ws).await;
+    assert_eq!(frame["type"], "record", "{frame}");
+    frame
+}
+
+/// No frame (other than pings) arrives within `wait`.
+async fn assert_quiet(ws: &mut Ws, wait: Duration) {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Err(_) => return,
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(other) => panic!("expected silence, got {other:?}"),
+        }
+    }
+}
+
+async fn broker_producer(env: &Env) -> brahmaputra_client::Producer {
+    brahmaputra_client::Producer::connect(
+        env.broker_addr,
+        brahmaputra_client::ProducerConfig {
+            linger_ms: 0,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn price(
+    producer: &brahmaputra_client::Producer,
+    topic: &str,
+    symbol: &str,
+    value: &str,
+) -> (i32, i64) {
+    let partition = partition_for(symbol.as_bytes());
+    let offset = producer
+        .send(
+            topic,
+            Some(partition),
+            Some(bytes::Bytes::from(symbol.to_owned())),
+            bytes::Bytes::from(value.to_owned()),
+        )
+        .await
+        .unwrap();
+    (partition, offset)
+}
+
+/// The full loop: a trading back end writes prices to Brahmaputra, a UI
+/// publishes through the gateway, and subscribed UIs receive both, with a
+/// snapshot of the latest price per symbol first and key filters applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribers_get_a_snapshot_then_the_live_feed_filtered_by_key() {
+    let env = Env::start(|c| c.allowed_subscribe = vec!["prices.*".into()]).await;
+    let topic = "prices.us";
+    let producer = broker_producer(&env).await;
+    // History from before anyone subscribed: the latest per key is the
+    // snapshot; AAPL's first price is superseded.
+    price(&producer, topic, "AAPL", "99.00").await;
+    let aapl = price(&producer, topic, "AAPL", "100.00").await;
+    let msft = price(&producer, topic, "MSFT", "200.00").await;
+
+    // A viewer: may subscribe to prices, may publish nowhere.
+    let viewer_token = token_with("viewer-1", Some(&[]), Some(&["prices.*"]));
+    let mut all = connect(&env.url(""), Some(&viewer_token)).await.unwrap();
+    let hello = welcome(&mut all).await;
+    assert_eq!(hello["subscribe"], true);
+    let (confirmed, snapshot) = subscribe(
+        &mut all,
+        json!({"op":"subscribe","id":1,"topic":topic,"snapshot":true}),
+    )
+    .await;
+    assert_eq!(confirmed["id"], 1);
+    assert_eq!(confirmed["topic"], topic);
+    let snap: HashMap<String, (String, i64, i64)> = snapshot
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_str().unwrap().to_owned(),
+                (
+                    r["value"].as_str().unwrap().to_owned(),
+                    r["partition"].as_i64().unwrap(),
+                    r["offset"].as_i64().unwrap(),
+                ),
+            )
+        })
+        .collect();
+    assert_eq!(snap.len(), 2, "latest per key: {snapshot:?}");
+    assert_eq!(snap["AAPL"], ("100.00".into(), aapl.0 as i64, aapl.1));
+    assert_eq!(snap["MSFT"], ("200.00".into(), msft.0 as i64, msft.1));
+
+    // A second viewer watching only AAPL, without a snapshot.
+    let mut one = connect(&env.url(""), Some(&viewer_token)).await.unwrap();
+    welcome(&mut one).await;
+    let (_, snapshot) = subscribe(
+        &mut one,
+        json!({"op":"subscribe","topic":topic,"keys":["AAPL"]}),
+    )
+    .await;
+    assert!(snapshot.is_empty());
+
+    // Live ticks.
+    let ticks = [("AAPL", "101.00"), ("MSFT", "201.00"), ("GOOG", "300.00")];
+    let mut sent = Vec::new();
+    for (symbol, value) in ticks {
+        sent.push((symbol, value, price(&producer, topic, symbol, value).await));
+    }
+    let mut seen = HashMap::new();
+    for _ in 0..ticks.len() {
+        let r = next_record(&mut all).await;
+        seen.insert(r["key"].as_str().unwrap().to_owned(), r);
+    }
+    for (symbol, value, (partition, offset)) in &sent {
+        let r = &seen[*symbol];
+        assert_eq!(r["value"], *value);
+        assert_eq!(r["partition"], *partition);
+        assert_eq!(r["offset"], *offset);
+        assert!(r["timestamp"].as_i64().unwrap() > 0);
+    }
+    let r = next_record(&mut one).await;
+    assert_eq!(
+        (r["key"].as_str(), r["value"].as_str()),
+        (Some("AAPL"), Some("101.00"))
+    );
+    assert_quiet(&mut one, Duration::from_millis(600)).await;
+
+    // The viewer's token forbids publishing.
+    send_json(
+        &mut all,
+        json!({"id":9,"topic":topic,"key":"AAPL","value":"1"}),
+    )
+    .await;
+    let refused = next_json(&mut all).await;
+    assert_eq!(refused["code"], "TOPIC_NOT_ALLOWED", "{refused}");
+
+    // A UI that may publish: its message goes UI -> gateway -> broker ->
+    // gateway -> every subscribed UI, stamped with the publisher's identity.
+    let trader = token_with("trader-7", Some(&["prices.*"]), None);
+    let mut publisher = connect(&env.url(&format!("topic={topic}")), Some(&trader))
+        .await
+        .unwrap();
+    welcome(&mut publisher).await;
+    send_json(
+        &mut publisher,
+        json!({"id":1,"key":"AAPL","value":"102.50"}),
+    )
+    .await;
+    let ack = next_json(&mut publisher).await;
+    assert_eq!(ack["type"], "ack", "{ack}");
+    for ws in [&mut all, &mut one] {
+        let r = next_record(ws).await;
+        assert_eq!(r["value"], "102.50");
+        assert_eq!(r["offset"], ack["offset"]);
+        assert_eq!(r["partition"], ack["partition"]);
+        assert_eq!(r["headers"]["x-gw-user"], "trader-7");
+    }
+
+    // Tombstones travel as null and leave the snapshot.
+    producer
+        .send_tombstone(
+            topic,
+            Some(partition_for(b"MSFT")),
+            bytes::Bytes::from_static(b"MSFT"),
+        )
+        .await
+        .unwrap();
+    let r = next_record(&mut all).await;
+    assert_eq!(r["key"], "MSFT");
+    assert!(r["value"].is_null());
+    let mut late = connect(&env.url(""), Some(&viewer_token)).await.unwrap();
+    welcome(&mut late).await;
+    let (_, snapshot) = subscribe(
+        &mut late,
+        json!({"op":"subscribe","topic":topic,"snapshot":true}),
+    )
+    .await;
+    let keys: Vec<&str> = snapshot
+        .iter()
+        .map(|r| r["key"].as_str().unwrap())
+        .collect();
+    assert!(
+        !keys.contains(&"MSFT"),
+        "deleted key left the snapshot: {keys:?}"
+    );
+    assert!(keys.contains(&"AAPL") && keys.contains(&"GOOG"), "{keys:?}");
+    let aapl_now = snapshot.iter().find(|r| r["key"] == "AAPL").unwrap();
+    assert_eq!(aapl_now["value"], "102.50");
+
+    // Unsubscribing stops delivery.
+    send_json(&mut one, json!({"op":"unsubscribe","id":5,"topic":topic})).await;
+    let bye = next_json(&mut one).await;
+    assert_eq!(
+        (bye["type"].as_str(), bye["id"].as_u64()),
+        (Some("unsubscribed"), Some(5))
+    );
+    price(&producer, topic, "AAPL", "103.00").await;
+    let r = next_record(&mut all).await;
+    assert_eq!(r["value"], "103.00");
+    assert_quiet(&mut one, Duration::from_millis(600)).await;
+
+    assert_eq!(env.gw().feed_count(), 1, "one feed for the topic");
+    for mut ws in [all, one, late, publisher] {
+        let _ = ws.close(None).await;
+    }
+    env.finish().await;
+}
+
+#[tokio::test]
+async fn subscriptions_are_authorized_by_the_gateway_and_the_token() {
+    // Subscriptions are opt-in: a gateway without --allow-subscribe offers none.
+    let env = Env::start(|_| {}).await;
+    let mut ws = connect(&env.url(""), Some(&token("u", None, 60)))
+        .await
+        .unwrap();
+    assert_eq!(welcome(&mut ws).await["subscribe"], false);
+    send_json(
+        &mut ws,
+        json!({"op":"subscribe","id":1,"topic":"prices.us"}),
+    )
+    .await;
+    let refused = next_json(&mut ws).await;
+    assert_eq!(
+        (refused["code"].as_str(), refused["id"].as_u64()),
+        (Some("TOPIC_NOT_ALLOWED"), Some(1))
+    );
+    let _ = ws.close(None).await;
+    env.finish().await;
+
+    let env = Env::start(|c| {
+        c.allowed_subscribe = vec!["prices.*".into(), "news".into()];
+        c.max_subscriptions = 2;
+        c.max_subscribe_keys = 3;
+    })
+    .await;
+    // No subscribe claim: whatever the gateway allows.
+    let mut ws = connect(&env.url(""), Some(&token("u", None, 60)))
+        .await
+        .unwrap();
+    assert_eq!(welcome(&mut ws).await["subscribe"], true);
+    for (topic, allowed) in [
+        ("prices.eu", true),
+        ("orders", false),
+        ("__consumer_offsets", false),
+    ] {
+        send_json(&mut ws, json!({"op":"subscribe","id":2,"topic":topic})).await;
+        let reply = next_json(&mut ws).await;
+        if allowed {
+            assert_eq!(reply["type"], "subscribed", "{topic}: {reply}");
+        } else {
+            assert_eq!(reply["code"], "TOPIC_NOT_ALLOWED", "{topic}: {reply}");
+        }
+    }
+    send_json(
+        &mut ws,
+        json!({"op":"subscribe","id":3,"topic":"news","keys":["a","b","c","d"]}),
+    )
+    .await;
+    assert_eq!(
+        next_json(&mut ws).await["code"],
+        "BAD_REQUEST",
+        "too many keys"
+    );
+    send_json(
+        &mut ws,
+        json!({"op":"subscribe","id":3,"topic":"news","keys":[]}),
+    )
+    .await;
+    assert_eq!(
+        next_json(&mut ws).await["code"],
+        "BAD_REQUEST",
+        "empty key list"
+    );
+    send_json(&mut ws, json!({"op":"subscribe","id":4,"topic":"news"})).await;
+    assert_eq!(next_json(&mut ws).await["type"], "subscribed");
+    send_json(
+        &mut ws,
+        json!({"op":"subscribe","id":5,"topic":"prices.us"}),
+    )
+    .await;
+    let reply = next_json(&mut ws).await;
+    assert_eq!(reply["code"], "TOO_MANY_SUBSCRIPTIONS", "{reply}");
+    // Re-subscribing to a held topic replaces its filter and is not a new one.
+    send_json(
+        &mut ws,
+        json!({"op":"subscribe","id":6,"topic":"news","keys":["a"]}),
+    )
+    .await;
+    assert_eq!(next_json(&mut ws).await["type"], "subscribed");
+    send_json(&mut ws, json!({"op":"subscribe","topic":"x","value":"v"})).await;
+    assert_eq!(
+        next_json(&mut ws).await["code"],
+        "BAD_REQUEST",
+        "record fields on a subscribe"
+    );
+    let _ = ws.close(None).await;
+
+    // A subscribe claim narrows the gateway's list.
+    let narrow = token_with("u2", None, Some(&["prices.eu"]));
+    let mut ws = connect(&env.url(""), Some(&narrow)).await.unwrap();
+    welcome(&mut ws).await;
+    send_json(&mut ws, json!({"op":"subscribe","topic":"prices.eu"})).await;
+    assert_eq!(next_json(&mut ws).await["type"], "subscribed");
+    send_json(&mut ws, json!({"op":"subscribe","topic":"prices.us"})).await;
+    assert_eq!(next_json(&mut ws).await["code"], "TOPIC_NOT_ALLOWED");
+    send_json(&mut ws, json!({"op":"subscribe","topic":"news"})).await;
+    assert_eq!(next_json(&mut ws).await["code"], "TOPIC_NOT_ALLOWED");
+    let _ = ws.close(None).await;
+
+    // An empty claim rules out every topic.
+    let none = token_with("u3", None, Some(&[]));
+    let mut ws = connect(&env.url(""), Some(&none)).await.unwrap();
+    assert_eq!(welcome(&mut ws).await["subscribe"], false);
+    let _ = ws.close(None).await;
+
+    let rejected = env
+        .gw()
+        .metrics()
+        .rejected_subscribe
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(rejected >= 7, "{rejected}");
+    env.finish().await;
+}
+
+/// Many sockets on one topic cost one feed (one broker connection) and one
+/// fetch stream; every subscriber gets every record, in order per
+/// partition. The feed stops once the last subscriber leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_feed_serves_every_subscriber_and_stops_when_they_leave() {
+    let env = Env::start(|c| {
+        c.allowed_subscribe = vec!["*".into()];
+        c.feed_idle_secs = 1;
+    })
+    .await;
+    let broker_port = env.broker_addr.port();
+    let topic = "ticks";
+    const SUBSCRIBERS: usize = 300;
+    const TICKS: usize = 200;
+    let url = env.url("");
+    let mut sockets = Vec::new();
+    for s in 0..SUBSCRIBERS {
+        let mut ws = connect(&url, Some(&token(&format!("viewer-{s}"), None, 60)))
+            .await
+            .unwrap();
+        welcome(&mut ws).await;
+        subscribe(&mut ws, json!({"op":"subscribe","topic":topic})).await;
+        sockets.push(ws);
+    }
+    // Let the feed find the topic's end before the first tick, so every
+    // tick counts as live.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = broker_connections(broker_port);
+    let producer = broker_producer(&env).await;
+    let symbols = [
+        "AAPL", "MSFT", "GOOG", "AMZN", "NVDA", "META", "TSLA", "IBM",
+    ];
+    for i in 0..TICKS {
+        let symbol = symbols[i % symbols.len()];
+        price(&producer, topic, symbol, &format!("{i}")).await;
+    }
+    let started = std::time::Instant::now();
+    let mut readers = Vec::new();
+    for mut ws in sockets {
+        readers.push(tokio::spawn(async move {
+            let mut last: HashMap<i64, i64> = HashMap::new();
+            for _ in 0..TICKS {
+                let r = next_record(&mut ws).await;
+                let partition = r["partition"].as_i64().unwrap();
+                let offset = r["offset"].as_i64().unwrap();
+                if let Some(prev) = last.insert(partition, offset) {
+                    assert!(offset > prev, "per-partition order");
+                }
+            }
+            ws
+        }));
+    }
+    let mut sockets = Vec::new();
+    for r in readers {
+        sockets.push(r.await.unwrap());
+    }
+    let delivered = env
+        .gw()
+        .metrics()
+        .records_delivered
+        .load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "{SUBSCRIBERS} subscribers x {TICKS} ticks delivered in {:?}; broker connections {before}",
+        started.elapsed()
+    );
+    assert_eq!(delivered as usize, SUBSCRIBERS * TICKS);
+    assert_eq!(env.gw().feed_count(), 1);
+    assert_eq!(
+        env.gw()
+            .metrics()
+            .feed_records
+            .load(std::sync::atomic::Ordering::Relaxed) as usize,
+        TICKS,
+        "each record read from the broker once"
+    );
+    // Gateway pool (2 producers + health) + one feed; not one per socket.
+    assert!(before <= 6, "broker connections: {before}");
+
+    for mut ws in sockets {
+        let _ = ws.close(None).await;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while env.gw().feed_count() > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(env.gw().feed_count(), 0, "idle feed stopped");
+    let active = env
+        .gw()
+        .metrics()
+        .subscriptions_active
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(active, 0);
+    env.finish().await;
+}
+
+/// A subscriber that stops reading does not hold the feed back: once it
+/// is further behind than the feed buffer it is told how many records it
+/// skipped, and received + skipped accounts for every record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_subscriber_skips_ahead_and_is_told_how_far() {
+    let env = Env::start(|c| {
+        c.allowed_subscribe = vec!["*".into()];
+        c.feed_buffer = 16;
+        c.write_timeout_secs = 60;
+    })
+    .await;
+    let topic = "fast-feed";
+    let mut slow = connect(&env.url(""), Some(&token("slow", None, 60)))
+        .await
+        .unwrap();
+    welcome(&mut slow).await;
+    subscribe(&mut slow, json!({"op":"subscribe","topic":topic})).await;
+    let mut fast = connect(&env.url(""), Some(&token("fast", None, 60)))
+        .await
+        .unwrap();
+    welcome(&mut fast).await;
+    subscribe(&mut fast, json!({"op":"subscribe","topic":topic})).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Enough data to fill both TCP buffers between the gateway and the
+    // stalled client, so the gateway's writes to it block.
+    const RECORDS: usize = 4000;
+    let value = "x".repeat(8 * 1024);
+    let producer = broker_producer(&env).await;
+    // The fast subscriber may lag too under a burst this size against a
+    // 16-record buffer; what matters is that it is never held back.
+    let fast_reader = tokio::spawn(async move {
+        let mut seen = 0u64;
+        while seen < RECORDS as u64 {
+            let frame = next_json(&mut fast).await;
+            seen += match frame["type"].as_str() {
+                Some("record") => 1,
+                Some("lagged") => frame["skipped"].as_u64().unwrap(),
+                _ => panic!("{frame}"),
+            };
+        }
+        assert_eq!(seen, RECORDS as u64);
+        fast
+    });
+    for i in 0..RECORDS {
+        producer
+            .send(
+                topic,
+                Some((i % PARTITIONS as usize) as i32),
+                None,
+                bytes::Bytes::from(value.clone()),
+            )
+            .await
+            .unwrap();
+    }
+    let fast = tokio::time::timeout(Duration::from_secs(60), fast_reader)
+        .await
+        .expect("the fast subscriber is not held back")
+        .unwrap();
+
+    let (mut received, mut skipped) = (0u64, 0u64);
+    while received + skipped < RECORDS as u64 {
+        let frame = next_json(&mut slow).await;
+        match frame["type"].as_str() {
+            Some("record") => received += 1,
+            Some("lagged") => {
+                assert_eq!(frame["topic"], topic);
+                skipped += frame["skipped"].as_u64().unwrap();
+            }
+            other => panic!("unexpected {other:?}: {frame}"),
+        }
+    }
+    println!("slow subscriber: {received} received, {skipped} skipped");
+    assert!(skipped > 0, "the slow subscriber lagged");
+    assert_eq!(received + skipped, RECORDS as u64);
+    assert!(
+        env.gw()
+            .metrics()
+            .records_lagged
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= skipped
+    );
+    for mut ws in [slow, fast] {
+        let _ = ws.close(None).await;
+    }
+    env.finish().await;
 }

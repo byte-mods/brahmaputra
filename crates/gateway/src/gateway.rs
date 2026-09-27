@@ -17,11 +17,17 @@
 //! unbounded queue or a retry storm aimed at the broker. Broker produce
 //! quotas keyed on `--client-id` cap the whole fleet from the broker side.
 //!
+//! **Subscriptions (fan-out).** Clients may also subscribe to topics, for
+//! example a stock price feed. Each instance reads a subscribed topic once
+//! and broadcasts every record to all of its subscribers (see `hub`), so
+//! the broker's load follows topics × instances, never sockets.
+//!
 //! **Why it scales without touching the broker.** Instances share nothing:
 //! a connection's key picks its partition by the same `murmur2` every
 //! Brahmaputra client uses, so any instance routes any user identically.
 //! Add instances behind an L4 load balancer to add sockets.
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -34,11 +40,14 @@ use brahmaputra_protocol::error_code as ec;
 use brahmaputra_protocol::RecordHeader;
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
-use futures::{Future, SinkExt, StreamExt};
+use futures::{Future, FutureExt, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamMap;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -49,8 +58,12 @@ use tracing::{debug, info, warn};
 
 use crate::auth::{Authenticator, Claims, SigningKey};
 use crate::config::GatewayConfig;
+use crate::hub::{FeedRecord, Hub, HubConfig};
 use crate::metrics::Metrics;
-use crate::protocol::{self, ErrorCode, Publish, ServerFrame, TopicPolicy, USER_HEADER};
+use crate::protocol::{
+    self, ErrorCode, Publish, Request as ClientRequest, ServerFrame, Subscribe, TopicPolicy,
+    USER_HEADER,
+};
 
 /// Subprotocol a browser offers alongside `bearer.<token>`: browsers cannot
 /// set an Authorization header on a WebSocket, and a handshake that offers
@@ -62,8 +75,10 @@ struct Shared {
     config: GatewayConfig,
     auth: Authenticator,
     policy: TopicPolicy,
+    subscribe_policy: TopicPolicy,
     producers: Vec<Arc<Producer>>,
-    metrics: Metrics,
+    hub: Arc<Hub>,
+    metrics: Arc<Metrics>,
     broker_healthy: AtomicBool,
     shutting_down: AtomicBool,
     shutdown: watch::Sender<bool>,
@@ -99,6 +114,11 @@ impl RunningGateway {
 
     pub fn ready(&self) -> bool {
         self.shared.ready()
+    }
+
+    /// Topics this instance is currently reading for its subscribers.
+    pub fn feed_count(&self) -> usize {
+        self.shared.hub.feed_count()
     }
 
     /// Graceful stop: refuse new upgrades and report not-ready at once (so
@@ -147,7 +167,13 @@ pub async fn start(config: GatewayConfig) -> anyhow::Result<RunningGateway> {
             bail!("empty --allow-topic pattern");
         }
     }
+    for pattern in &config.allowed_subscribe {
+        if pattern.is_empty() {
+            bail!("empty --allow-subscribe pattern");
+        }
+    }
     let policy = TopicPolicy::new(config.allowed_topics.clone());
+    let subscribe_policy = TopicPolicy::new(config.allowed_subscribe.clone());
     if let Some(topic) = &config.default_topic {
         protocol::validate_topic_name(topic).map_err(anyhow::Error::msg)?;
         if !policy.allows(topic) {
@@ -206,13 +232,28 @@ pub async fn start(config: GatewayConfig) -> anyhow::Result<RunningGateway> {
         .with_context(|| format!("binding {}", config.http_listen))?;
     let http_addr = http_listener.local_addr()?;
 
+    let metrics = Arc::new(Metrics::default());
+    let hub = Hub::new(
+        HubConfig {
+            broker,
+            client_id: config.client_id.clone(),
+            feed_buffer: config.feed_buffer,
+            snapshot_max_keys: config.snapshot_max_keys,
+            snapshot_warmup_records: config.snapshot_warmup_records,
+            feed_idle: Duration::from_secs(config.feed_idle_secs),
+        },
+        metrics.clone(),
+    );
+
     let (shutdown, _) = watch::channel(false);
     let shared = Arc::new(Shared {
         config,
         auth,
         policy,
+        subscribe_policy,
         producers,
-        metrics: Metrics::default(),
+        hub,
+        metrics,
         broker_healthy: AtomicBool::new(true),
         shutting_down: AtomicBool::new(false),
         shutdown,
@@ -401,6 +442,8 @@ struct Session {
     key: Bytes,
     /// A token's `topics` claim, when present.
     claim_policy: Option<TopicPolicy>,
+    /// A token's `subscribe` claim, when present.
+    subscribe_claim: Option<TopicPolicy>,
     /// `?acks=errors` asks for error frames only.
     acks: bool,
 }
@@ -408,6 +451,21 @@ struct Session {
 impl Session {
     fn may_publish(&self, shared: &Shared, topic: &str) -> bool {
         shared.policy.allows(topic) && self.claim_policy.as_ref().is_none_or(|p| p.allows(topic))
+    }
+
+    fn may_subscribe(&self, shared: &Shared, topic: &str) -> bool {
+        shared.subscribe_policy.allows(topic)
+            && self
+                .subscribe_claim
+                .as_ref()
+                .is_none_or(|p| p.allows(topic))
+    }
+
+    /// Whether any subscription could succeed: the gateway allows some
+    /// topic and the token does not rule out every one.
+    fn can_subscribe(&self, shared: &Shared) -> bool {
+        !shared.config.allowed_subscribe.is_empty()
+            && self.subscribe_claim.as_ref().is_none_or(|p| !p.is_empty())
     }
 }
 
@@ -573,6 +631,7 @@ fn authenticate(
         reject(StatusCode::UNAUTHORIZED, &error.to_string())
     })?;
     let claim_policy = claims.topics.clone().map(TopicPolicy::new);
+    let subscribe_claim = claims.subscribe.clone().map(TopicPolicy::new);
 
     let forbidden = |message: String| {
         m.handshakes_rejected_forbidden.fetch_add(1, Relaxed);
@@ -632,6 +691,7 @@ fn authenticate(
             topic,
             key,
             claim_policy,
+            subscribe_claim,
             acks,
         },
     ))
@@ -695,11 +755,25 @@ impl RateLimit {
     }
 }
 
+/// A connection's subscriptions, allocated on its first subscribe so that
+/// publish-only sockets pay one pointer for the feature.
+#[derive(Default)]
+struct Subscriptions {
+    streams: StreamMap<String, BroadcastStream<Arc<FeedRecord>>>,
+    /// Key filter per topic; `None` passes every record.
+    filters: HashMap<String, Option<HashSet<Bytes>>>,
+}
+
+/// Records written to one subscriber before flushing and going back to
+/// the connection's other work.
+const DELIVERY_BATCH: usize = 64;
+
 struct Connection<S> {
     shared: Arc<Shared>,
     session: Session,
     ws: WebSocketStream<S>,
     inflight: FuturesUnordered<ProduceFuture>,
+    subscriptions: Option<Box<Subscriptions>>,
     limiter: RateLimit,
     binary_seq: u64,
     last_seen: Instant,
@@ -722,6 +796,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             session,
             ws,
             inflight: FuturesUnordered::new(),
+            subscriptions: None,
             limiter,
             binary_seq: 0,
             last_seen: Instant::now(),
@@ -735,6 +810,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             key: std::str::from_utf8(&self.session.key).unwrap_or(""),
             max_message_bytes: self.shared.config.max_message_bytes,
             max_inflight: self.shared.config.max_inflight_per_connection,
+            subscribe: self.session.can_subscribe(&self.shared),
         }
         .to_json();
         if !self.write(Message::text(welcome)).await {
@@ -771,6 +847,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                     self.report(outcome).await
                 }
                 frame = self.ws.next(), if can_read => self.on_frame(frame).await,
+                Some((topic, item)) = next_record(&mut self.subscriptions), if !draining => {
+                    self.deliver(topic, item).await
+                }
                 _ = ping.tick() => {
                     if self.last_seen.elapsed() >= idle_after {
                         self.shared.metrics.closed_idle.fetch_add(1, Relaxed);
@@ -792,6 +871,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 other => break other,
             }
         };
+        if let Some(subs) = self.subscriptions.take() {
+            self.shared
+                .metrics
+                .subscriptions_active
+                .fetch_sub(subs.filters.len() as u64, Relaxed);
+        }
         // Messages still in flight belong to a client that is leaving; let
         // them finish so their inflight accounting is released, without
         // writing acks nobody will read.
@@ -829,8 +914,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         match message {
             Message::Text(text) => {
                 self.count_received(text.len());
-                match protocol::parse_text(&text) {
-                    Ok(publish) => self.publish(publish).await,
+                match protocol::parse_request(&text) {
+                    Ok(ClientRequest::Publish(publish)) => self.publish(publish).await,
+                    Ok(ClientRequest::Subscribe(subscribe)) => self.subscribe(subscribe).await,
+                    Ok(ClientRequest::Unsubscribe { id, topic }) => {
+                        self.unsubscribe(id, topic).await
+                    }
                     Err(message) => {
                         self.shared
                             .metrics
@@ -944,6 +1033,171 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         Step::Continue
     }
 
+    async fn subscribe(&mut self, request: Subscribe) -> Step {
+        let shared = self.shared.clone();
+        let m = &shared.metrics;
+        let id = request.id;
+        let refuse = |code, message: String| {
+            m.rejected_subscribe.fetch_add(1, Relaxed);
+            Refusal::new(code, message)
+        };
+        if !self.limiter.allow() {
+            let refusal = refuse(ErrorCode::RateLimited, "slow down".into());
+            return self.refuse(id, refusal).await;
+        }
+        let topic = request.topic;
+        if !self.session.may_subscribe(&self.shared, &topic) {
+            let refusal = refuse(
+                ErrorCode::TopicNotAllowed,
+                format!("not permitted to subscribe to {topic}"),
+            );
+            return self.refuse(id, refusal).await;
+        }
+        let keys: Option<HashSet<Bytes>> = request.keys.map(|k| k.into_iter().collect());
+        if let Some(keys) = &keys {
+            let max = self.shared.config.max_subscribe_keys;
+            if keys.is_empty() || keys.len() > max {
+                let refusal = refuse(
+                    ErrorCode::BadRequest,
+                    format!("keys must name 1..={max} keys (omit it for every key)"),
+                );
+                return self.refuse(id, refusal).await;
+            }
+        }
+        let subs = self.subscriptions.get_or_insert_with(Default::default);
+        let resubscribe = subs.filters.contains_key(&topic);
+        if !resubscribe && subs.filters.len() >= self.shared.config.max_subscriptions {
+            let max = self.shared.config.max_subscriptions;
+            let refusal = refuse(
+                ErrorCode::TooManySubscriptions,
+                format!("at most {max} subscriptions per connection"),
+            );
+            return self.refuse(id, refusal).await;
+        }
+        let joined = self
+            .shared
+            .hub
+            .subscribe(&topic, keys.as_ref(), request.snapshot)
+            .await;
+        subs.streams
+            .insert(topic.clone(), BroadcastStream::new(joined.receiver));
+        subs.filters.insert(topic.clone(), keys);
+        if !resubscribe {
+            m.subscriptions_active.fetch_add(1, Relaxed);
+        }
+        let confirmed = ServerFrame::Subscribed {
+            id,
+            topic: &topic,
+            snapshot: joined.snapshot.len(),
+        }
+        .to_json();
+        if !self.write_buffered(Message::text(confirmed)).await {
+            return Step::Gone;
+        }
+        for record in &joined.snapshot {
+            if !self
+                .write_buffered(Message::Text(record.frame.clone()))
+                .await
+            {
+                return Step::Gone;
+            }
+        }
+        m.snapshot_records
+            .fetch_add(joined.snapshot.len() as u64, Relaxed);
+        if self.flush().await {
+            Step::Continue
+        } else {
+            Step::Gone
+        }
+    }
+
+    async fn unsubscribe(&mut self, id: Option<u64>, topic: String) -> Step {
+        if let Some(subs) = &mut self.subscriptions {
+            subs.streams.remove(&topic);
+            if subs.filters.remove(&topic).is_some() {
+                self.shared
+                    .metrics
+                    .subscriptions_active
+                    .fetch_sub(1, Relaxed);
+            }
+        }
+        // Idempotent: unsubscribing from a topic not subscribed is confirmed
+        // too, so a client can always reach a known state.
+        let frame = ServerFrame::Unsubscribed {
+            id,
+            topic: &topic,
+            reason: None,
+        }
+        .to_json();
+        if self.write(Message::text(frame)).await {
+            Step::Continue
+        } else {
+            Step::Gone
+        }
+    }
+
+    /// Write one subscription item, then whatever else is already waiting
+    /// (up to a batch), and flush once.
+    async fn deliver(
+        &mut self,
+        topic: String,
+        item: Result<Arc<FeedRecord>, BroadcastStreamRecvError>,
+    ) -> Step {
+        let mut next = Some((topic, item));
+        let mut written = 0;
+        while let Some((topic, item)) = next.take() {
+            let message = match item {
+                Ok(record) => {
+                    let wanted = self
+                        .subscriptions
+                        .as_ref()
+                        .and_then(|s| s.filters.get(&topic))
+                        .is_some_and(|filter| match (filter, &record.key) {
+                            (None, _) => true,
+                            (Some(keys), Some(key)) => keys.contains(key),
+                            (Some(_), None) => false,
+                        });
+                    wanted.then(|| Message::Text(record.frame.clone()))
+                }
+                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                    self.shared
+                        .metrics
+                        .records_lagged
+                        .fetch_add(skipped, Relaxed);
+                    Some(Message::text(
+                        ServerFrame::Lagged {
+                            topic: &topic,
+                            skipped,
+                        }
+                        .to_json(),
+                    ))
+                }
+            };
+            if let Some(message) = message {
+                if !self.write_buffered(message).await {
+                    return Step::Gone;
+                }
+                written += 1;
+            }
+            if written >= DELIVERY_BATCH {
+                break;
+            }
+            next = match &mut self.subscriptions {
+                Some(subs) => subs.streams.next().now_or_never().flatten(),
+                None => None,
+            };
+        }
+        self.shared
+            .metrics
+            .records_delivered
+            .fetch_add(written as u64, Relaxed);
+        if written == 0 || self.flush().await {
+            Step::Continue
+        } else {
+            Step::Gone
+        }
+    }
+
     async fn report(&mut self, outcome: Outcome) -> Step {
         match outcome.result {
             Ok((topic, partition, offset)) => {
@@ -985,6 +1239,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         }
     }
 
+    /// Queue a frame without flushing (the caller flushes after a batch).
+    async fn write_buffered(&mut self, message: Message) -> bool {
+        let timeout = Duration::from_secs(self.shared.config.write_timeout_secs.max(1));
+        match tokio::time::timeout(timeout, self.ws.feed(message)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                self.shared.metrics.closed_slow_reader.fetch_add(1, Relaxed);
+                false
+            }
+        }
+    }
+
+    async fn flush(&mut self) -> bool {
+        let timeout = Duration::from_secs(self.shared.config.write_timeout_secs.max(1));
+        match tokio::time::timeout(timeout, self.ws.flush()).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                self.shared.metrics.closed_slow_reader.fetch_add(1, Relaxed);
+                false
+            }
+        }
+    }
+
     /// Send one frame, or give up on a client that is not reading.
     async fn write(&mut self, message: Message) -> bool {
         let timeout = Duration::from_secs(self.shared.config.write_timeout_secs.max(1));
@@ -996,6 +1275,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 false
             }
         }
+    }
+}
+
+/// The next item from any of a connection's subscriptions; pending forever
+/// when it has none, so the select arm simply never fires.
+async fn next_record(
+    subscriptions: &mut Option<Box<Subscriptions>>,
+) -> Option<(String, Result<Arc<FeedRecord>, BroadcastStreamRecvError>)> {
+    match subscriptions {
+        Some(subs) if !subs.streams.is_empty() => subs.streams.next().await,
+        _ => std::future::pending().await,
     }
 }
 

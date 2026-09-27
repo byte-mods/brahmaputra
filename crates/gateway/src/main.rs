@@ -27,6 +27,13 @@ enum Command {
         /// Restrict the token to these topic patterns.
         #[arg(long = "topic")]
         topics: Vec<String>,
+        /// Topic patterns the token may subscribe to.
+        #[arg(long = "subscribe")]
+        subscribe: Vec<String>,
+        /// A token that may not publish anywhere (`"topics": []`), e.g.
+        /// for a price-feed viewer that only subscribes.
+        #[arg(long, conflicts_with = "topics")]
+        read_only: bool,
         #[arg(long)]
         kid: Option<String>,
         #[arg(long)]
@@ -49,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
         sub,
         ttl_secs,
         topics,
+        subscribe,
+        read_only,
         kid,
         iss,
         aud,
@@ -62,7 +71,12 @@ async fn main() -> anyhow::Result<()> {
             iat: Some(now),
             iss,
             aud: aud.map(auth::Audience::One),
-            topics: (!topics.is_empty()).then_some(topics),
+            topics: if read_only {
+                Some(Vec::new())
+            } else {
+                (!topics.is_empty()).then_some(topics)
+            },
+            subscribe: (!subscribe.is_empty()).then_some(subscribe),
         };
         println!(
             "{}",

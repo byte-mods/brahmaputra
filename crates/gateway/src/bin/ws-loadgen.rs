@@ -108,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
                 iss: None,
                 aud: None,
                 topics: None,
+                subscribe: None,
             },
             None,
             args.secret.as_bytes(),

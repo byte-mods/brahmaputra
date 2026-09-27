@@ -16,9 +16,20 @@
 //! **Binary frames** are the whole value, published to the connection's
 //! topic under its key: the cheap path for high-rate telemetry.
 //!
+//! **Subscriptions** are text frames with an `op`:
+//!
+//! ```json
+//! {"op": "subscribe", "id": 1, "topic": "prices", "keys": ["AAPL"], "snapshot": true}
+//! {"op": "unsubscribe", "id": 2, "topic": "prices"}
+//! ```
+//!
+//! A message with no `op` (or `"op": "publish"`) is a publish, so clients
+//! written before subscriptions existed work unchanged.
+//!
 //! The gateway answers with JSON text frames: `welcome` once, `ack` per
 //! message that carried an `id` (binary frames are numbered 1, 2, 3...),
-//! and `error`.
+//! `error`, and for subscriptions `subscribed`, `record`, `lagged` and
+//! `unsubscribed`.
 
 use std::collections::BTreeMap;
 
@@ -35,9 +46,14 @@ pub const USER_HEADER: &str = "x-gw-user";
 const MAX_TOPIC_LEN: usize = 249;
 const MAX_HEADERS: usize = 64;
 
+/// Every field any client frame may carry; which ones are allowed depends
+/// on `op`. One flat struct parses in one pass and still refuses fields
+/// that belong to no operation.
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
-pub struct PublishFrame {
+pub struct ClientFrame {
+    #[serde(default)]
+    pub op: Option<String>,
     #[serde(default)]
     pub id: Option<u64>,
     #[serde(default)]
@@ -54,6 +70,29 @@ pub struct PublishFrame {
     pub value_b64: Option<String>,
     #[serde(default)]
     pub headers: Option<BTreeMap<String, Option<String>>>,
+    /// Subscribe: only records with one of these keys.
+    #[serde(default)]
+    pub keys: Option<Vec<String>>,
+    /// Subscribe: send the latest cached record of each (matching) key
+    /// before the live stream.
+    #[serde(default)]
+    pub snapshot: Option<bool>,
+}
+
+/// A parsed client frame.
+#[derive(Debug)]
+pub enum Request {
+    Publish(Publish),
+    Subscribe(Subscribe),
+    Unsubscribe { id: Option<u64>, topic: String },
+}
+
+#[derive(Debug)]
+pub struct Subscribe {
+    pub id: Option<u64>,
+    pub topic: String,
+    pub keys: Option<Vec<Bytes>>,
+    pub snapshot: bool,
 }
 
 fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
@@ -82,6 +121,7 @@ pub enum ErrorCode {
     Overloaded,
     BrokerError,
     ShuttingDown,
+    TooManySubscriptions,
 }
 
 impl ErrorCode {
@@ -93,6 +133,7 @@ impl ErrorCode {
             ErrorCode::Overloaded => "OVERLOADED",
             ErrorCode::BrokerError => "BROKER_ERROR",
             ErrorCode::ShuttingDown => "SHUTTING_DOWN",
+            ErrorCode::TooManySubscriptions => "TOO_MANY_SUBSCRIPTIONS",
         }
     }
 
@@ -115,7 +156,25 @@ pub enum ServerFrame<'a> {
         key: &'a str,
         max_message_bytes: usize,
         max_inflight: usize,
+        /// Whether this connection may subscribe to anything at all.
+        subscribe: bool,
     },
+    Subscribed {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        topic: &'a str,
+        /// How many snapshot records follow before the live stream.
+        snapshot: usize,
+    },
+    Unsubscribed {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        topic: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'a str>,
+    },
+    /// This subscriber fell behind the feed and skipped `skipped` records.
+    Lagged { topic: &'a str, skipped: u64 },
     Ack {
         id: u64,
         topic: &'a str,
@@ -137,9 +196,60 @@ impl ServerFrame<'_> {
     }
 }
 
+pub fn parse_request(text: &str) -> Result<Request, String> {
+    let frame: ClientFrame =
+        serde_json::from_str(text).map_err(|e| format!("invalid JSON frame: {e}"))?;
+    match frame.op.as_deref() {
+        None | Some("publish") => {
+            if frame.keys.is_some() || frame.snapshot.is_some() {
+                return Err("keys and snapshot belong to subscribe, not publish".into());
+            }
+            parse_publish(frame).map(Request::Publish)
+        }
+        Some(op @ ("subscribe" | "unsubscribe")) => {
+            if frame.key.is_some()
+                || frame.key_b64.is_some()
+                || frame.value.is_some()
+                || frame.value_b64.is_some()
+                || frame.headers.is_some()
+            {
+                return Err(format!("{op} takes topic, keys and snapshot, not a record"));
+            }
+            let topic = frame.topic.ok_or_else(|| format!("{op} needs a topic"))?;
+            validate_topic_name(&topic)?;
+            if op == "unsubscribe" {
+                if frame.keys.is_some() || frame.snapshot.is_some() {
+                    return Err("unsubscribe takes only id and topic".into());
+                }
+                return Ok(Request::Unsubscribe {
+                    id: frame.id,
+                    topic,
+                });
+            }
+            Ok(Request::Subscribe(Subscribe {
+                id: frame.id,
+                topic,
+                keys: frame
+                    .keys
+                    .map(|keys| keys.into_iter().map(Bytes::from).collect()),
+                snapshot: frame.snapshot.unwrap_or(false),
+            }))
+        }
+        Some(other) => Err(format!(
+            "unknown op {other:?} (publish, subscribe or unsubscribe)"
+        )),
+    }
+}
+
+/// Parse a frame that must be a publish.
 pub fn parse_text(text: &str) -> Result<Publish, String> {
-    let frame: PublishFrame =
-        serde_json::from_str(text).map_err(|e| format!("invalid JSON publish: {e}"))?;
+    match parse_request(text)? {
+        Request::Publish(publish) => Ok(publish),
+        _ => Err("not a publish".into()),
+    }
+}
+
+fn parse_publish(frame: ClientFrame) -> Result<Publish, String> {
     let key = match (frame.key, frame.key_b64) {
         (Some(_), Some(_)) => return Err("send key or key_b64, not both".into()),
         (Some(k), None) => Some(Bytes::from(k)),
@@ -207,6 +317,10 @@ pub struct TopicPolicy {
 impl TopicPolicy {
     pub fn new(patterns: Vec<String>) -> Self {
         TopicPolicy { patterns }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
     }
 
     pub fn allows(&self, topic: &str) -> bool {
@@ -297,6 +411,40 @@ mod tests {
         );
         assert!(parse_text(r#"{"value":"v","topic":"bad topic"}"#).is_err());
         assert!(parse_text("not json").is_err());
+    }
+
+    #[test]
+    fn subscriptions_parse_and_refuse_record_fields() {
+        match parse_request(
+            r#"{"op":"subscribe","id":3,"topic":"prices","keys":["AAPL","MSFT"],"snapshot":true}"#,
+        )
+        .unwrap()
+        {
+            Request::Subscribe(s) => {
+                assert_eq!(s.id, Some(3));
+                assert_eq!(s.topic, "prices");
+                assert_eq!(s.keys.unwrap().len(), 2);
+                assert!(s.snapshot);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_request(r#"{"op":"unsubscribe","topic":"prices"}"#).unwrap() {
+            Request::Unsubscribe { id: None, topic } => assert_eq!(topic, "prices"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_request(r#"{"op":"publish","value":"v"}"#).unwrap(),
+            Request::Publish(_)
+        ));
+        assert!(
+            parse_request(r#"{"op":"subscribe"}"#).is_err(),
+            "needs a topic"
+        );
+        assert!(parse_request(r#"{"op":"subscribe","topic":"t","value":"v"}"#).is_err());
+        assert!(parse_request(r#"{"op":"unsubscribe","topic":"t","snapshot":true}"#).is_err());
+        assert!(parse_request(r#"{"value":"v","keys":["a"]}"#).is_err());
+        assert!(parse_request(r#"{"op":"delete","topic":"t"}"#).is_err());
+        assert!(parse_request(r#"{"op":"subscribe","topic":"bad topic"}"#).is_err());
     }
 
     #[test]

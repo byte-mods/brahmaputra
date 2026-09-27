@@ -29,6 +29,15 @@ pub struct Metrics {
     pub inflight: AtomicU64,
     pub closed_idle: AtomicU64,
     pub closed_slow_reader: AtomicU64,
+    pub subscriptions_active: AtomicU64,
+    pub rejected_subscribe: AtomicU64,
+    pub feeds_active: AtomicU64,
+    pub feed_records: AtomicU64,
+    pub feed_errors: AtomicU64,
+    pub records_delivered: AtomicU64,
+    pub records_lagged: AtomicU64,
+    pub snapshot_records: AtomicU64,
+    pub snapshot_keys_dropped: AtomicU64,
     latency_buckets: [AtomicU64; LATENCY_BUCKETS_MS.len()],
     latency_count: AtomicU64,
     latency_sum_us: AtomicU64,
@@ -141,6 +150,65 @@ impl Metrics {
             "ws_connections_closed_total{{reason=\"slow_reader\"}} {}",
             self.closed_slow_reader.load(Relaxed)
         );
+
+        for (name, help, kind, v) in [
+            (
+                "ws_subscriptions_active",
+                "Open topic subscriptions across all connections.",
+                "gauge",
+                &self.subscriptions_active,
+            ),
+            (
+                "ws_subscribe_rejected_total",
+                "Subscribe requests refused.",
+                "counter",
+                &self.rejected_subscribe,
+            ),
+            (
+                "ws_feeds_active",
+                "Topics this instance reads for its subscribers (one broker fetch loop each).",
+                "gauge",
+                &self.feeds_active,
+            ),
+            (
+                "ws_feed_records_total",
+                "Records the feeds read from the broker and broadcast.",
+                "counter",
+                &self.feed_records,
+            ),
+            (
+                "ws_feed_errors_total",
+                "Feed fetches that failed and were retried.",
+                "counter",
+                &self.feed_errors,
+            ),
+            (
+                "ws_records_delivered_total",
+                "Record frames written to subscribers.",
+                "counter",
+                &self.records_delivered,
+            ),
+            (
+                "ws_records_lagged_total",
+                "Records slow subscribers skipped.",
+                "counter",
+                &self.records_lagged,
+            ),
+            (
+                "ws_snapshot_records_total",
+                "Snapshot records sent to new subscriptions.",
+                "counter",
+                &self.snapshot_records,
+            ),
+            (
+                "ws_snapshot_keys_dropped_total",
+                "Keys not cached because a feed's snapshot was full.",
+                "counter",
+                &self.snapshot_keys_dropped,
+            ),
+        ] {
+            g(&mut out, name, help, kind, v.load(Relaxed));
+        }
 
         let _ = writeln!(out, "# HELP ws_produce_latency_seconds Publish to broker acknowledgement.\n# TYPE ws_produce_latency_seconds histogram");
         let mut cumulative = 0;

@@ -76,6 +76,45 @@ pub struct GatewayConfig {
     )]
     pub allowed_topics: Vec<String>,
 
+    /// Topic patterns clients may subscribe to (`name`, `prefix.*`, `*`).
+    /// Empty, the default, disables subscriptions: reading is opt-in, so
+    /// an existing publish-only deployment exposes nothing new. A token's
+    /// `subscribe` claim can narrow this, never widen it.
+    #[arg(
+        long = "allow-subscribe",
+        env = "GW_ALLOWED_SUBSCRIBE",
+        value_delimiter = ','
+    )]
+    pub allowed_subscribe: Vec<String>,
+
+    /// Topics one connection may subscribe to at once.
+    #[arg(long, env = "GW_MAX_SUBSCRIPTIONS", default_value_t = 32)]
+    pub max_subscriptions: usize,
+
+    /// Keys one subscription may filter on.
+    #[arg(long, env = "GW_MAX_SUBSCRIBE_KEYS", default_value_t = 1000)]
+    pub max_subscribe_keys: usize,
+
+    /// Records a topic's feed keeps for subscribers that fall behind. A
+    /// subscriber further back than this skips ahead and is told how many
+    /// records it missed (`lagged`); the feed never waits for it.
+    #[arg(long, env = "GW_FEED_BUFFER", default_value_t = 4096)]
+    pub feed_buffer: usize,
+
+    /// Keys whose latest record each feed caches for snapshots.
+    #[arg(long, env = "GW_SNAPSHOT_MAX_KEYS", default_value_t = 100_000)]
+    pub snapshot_max_keys: usize,
+
+    /// Records per partition a new feed reads back to fill its snapshot
+    /// cache (never broadcast: they are history, not news).
+    #[arg(long, env = "GW_SNAPSHOT_WARMUP_RECORDS", default_value_t = 1000)]
+    pub snapshot_warmup_records: i64,
+
+    /// How long a feed with no subscribers keeps reading before it stops
+    /// and releases its broker connection.
+    #[arg(long, env = "GW_FEED_IDLE_SECS", default_value_t = 30)]
+    pub feed_idle_secs: u64,
+
     /// Stop accepting upgrades above this many open connections (the
     /// process also needs a file-descriptor limit above it).
     #[arg(long, env = "GW_MAX_CONNECTIONS", default_value_t = 1_000_000)]
