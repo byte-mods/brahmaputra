@@ -383,7 +383,11 @@ pub(crate) async fn describe_log_dirs(broker: &Broker, body: Bytes) -> Bytes {
 /// sentinel rather than as zero matters: zero free bytes is a page, and a
 /// monitoring system cannot tell a genuine "disk full" from "we could not
 /// look" if both are spelled the same way.
+// The `as u64` casts are no-ops on 64-bit Linux, where clippy flags them,
+// but `statvfs` field widths differ across unix platforms (`c_ulong`,
+// `fsblkcnt_t`), so they are what keeps this portable.
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
 fn filesystem_capacity(path: &std::path::Path) -> (i64, i64) {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
