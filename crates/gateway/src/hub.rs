@@ -39,7 +39,7 @@ use base64::Engine;
 use brahmaputra_client::{ClientError, Consumer, FetchedRecord, EARLIEST, LATEST};
 use brahmaputra_protocol::error_code as ec;
 use bytes::Bytes;
-use serde_json::{Map, Value};
+use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tracing::{debug, info, warn};
@@ -378,36 +378,40 @@ async fn discover(
 /// Keys and values that are not UTF-8 travel as `key_b64` / `value_b64`;
 /// `"value": null` is a tombstone.
 pub fn encode(topic: &str, partition: i32, record: &FetchedRecord) -> FeedRecord {
-    let mut frame = Map::with_capacity(8);
-    frame.insert("type".into(), Value::from("record"));
-    frame.insert("topic".into(), Value::from(topic));
-    frame.insert("partition".into(), Value::from(partition));
-    frame.insert("offset".into(), Value::from(record.offset));
-    frame.insert("timestamp".into(), Value::from(record.timestamp));
-    if let Some(key) = &record.key {
-        put_bytes(&mut frame, "key", key);
-    }
-    match &record.value {
-        Some(value) => put_bytes(&mut frame, "value", value),
-        None => {
-            frame.insert("value".into(), Value::Null);
+    let (key, key_b64) = split_bytes(record.key.as_ref());
+    let (value, value_b64) = match &record.value {
+        Some(v) => {
+            let (text, b64) = split_bytes(Some(v));
+            (text.map(Some), b64)
         }
-    }
-    if !record.headers.is_empty() {
-        let headers: Map<String, Value> = record
+        // A tombstone: `"value": null`.
+        None => (Some(None), None),
+    };
+    let headers = (!record.headers.is_empty()).then(|| {
+        record
             .headers
             .iter()
             .map(|h| {
-                let v = match &h.value {
-                    Some(v) => Value::from(String::from_utf8_lossy(v).into_owned()),
-                    None => Value::Null,
-                };
-                (h.key.clone(), v)
+                (
+                    h.key.as_str(),
+                    h.value.as_ref().map(|v| String::from_utf8_lossy(v)),
+                )
             })
-            .collect();
-        frame.insert("headers".into(), Value::Object(headers));
-    }
-    let text = serde_json::to_string(&Value::Object(frame)).expect("record frames serialize");
+            .collect::<Vec<_>>()
+    });
+    let frame = RecordFrame {
+        kind: "record",
+        topic,
+        partition,
+        offset: record.offset,
+        timestamp: record.timestamp,
+        key,
+        key_b64,
+        value,
+        value_b64,
+        headers: headers.as_deref().map(HeaderMap),
+    };
+    let text = serde_json::to_string(&frame).expect("record frames serialize");
     FeedRecord {
         key: record.key.clone(),
         partition,
@@ -417,14 +421,49 @@ pub fn encode(topic: &str, partition: i32, record: &FetchedRecord) -> FeedRecord
     }
 }
 
-fn put_bytes(frame: &mut Map<String, Value>, name: &str, bytes: &Bytes) {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => {
-            frame.insert(name.into(), Value::from(text));
+/// Field order is the wire order: `type` first, for anyone reading frames.
+#[derive(Serialize)]
+struct RecordFrame<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    topic: &'a str,
+    partition: i32,
+    offset: i64,
+    timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_b64: Option<String>,
+    /// `Some(None)` is a tombstone, written as `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<Option<&'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<HeaderMap<'a>>,
+}
+
+struct HeaderMap<'a>(&'a [(&'a str, Option<std::borrow::Cow<'a, str>>)]);
+
+impl Serialize for HeaderMap<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in self.0 {
+            map.serialize_entry(k, v)?;
         }
-        Err(_) => {
-            frame.insert(format!("{name}_b64"), Value::from(STANDARD.encode(bytes)));
-        }
+        map.end()
+    }
+}
+
+/// Text when the bytes are UTF-8, base64 otherwise.
+fn split_bytes(bytes: Option<&Bytes>) -> (Option<&str>, Option<String>) {
+    match bytes {
+        None => (None, None),
+        Some(b) => match std::str::from_utf8(b) {
+            Ok(text) => (Some(text), None),
+            Err(_) => (None, Some(STANDARD.encode(b))),
+        },
     }
 }
 
@@ -432,6 +471,7 @@ fn put_bytes(frame: &mut Map<String, Value>, name: &str, bytes: &Bytes) {
 mod tests {
     use super::*;
     use brahmaputra_protocol::RecordHeader;
+    use serde_json::Value;
 
     fn fetched(offset: i64, key: &str, value: Option<&[u8]>) -> FetchedRecord {
         FetchedRecord {
@@ -449,6 +489,10 @@ mod tests {
     #[test]
     fn records_encode_text_binary_and_tombstones() {
         let r = encode("prices", 2, &fetched(7, "AAPL", Some(b"{\"bid\":1}")));
+        assert!(r
+            .frame
+            .as_str()
+            .starts_with(r#"{"type":"record","topic":"prices""#));
         let v: Value = serde_json::from_str(r.frame.as_str()).unwrap();
         assert_eq!(v["type"], "record");
         assert_eq!(v["partition"], 2);

@@ -67,6 +67,7 @@ jobs:
           - verify-compaction
           - verify-jbod
           - verify-ws-gateway
+          - verify-ws-fanout
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -178,6 +179,37 @@ jobs:
           # when a suite fails, and by the C driver's rebalance checks.
           BROKER_LOG: info,brahmaputra_broker::group=debug
           BRP_DEBUG: ${{ matrix.driver == 'c' && '1' || '' }}
+
+  # The UI SDKs end to end: UI -> WebSocket gateway -> Brahmaputra and
+  # back. `browser` runs React, Vue and Angular apps in Chrome; `flutter`
+  # pumps the Flutter widgets against a real gateway.
+  ws-sdks:
+    name: WebSocket SDK (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [js, browser, dart, flutter]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: matrix.suite == 'js' || matrix.suite == 'browser'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - if: matrix.suite == 'dart'
+        uses: dart-lang/setup-dart@v1
+      - if: matrix.suite == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: ${{ matrix.suite }} suite
+        run: bash clients/ws/test.sh ${{ matrix.suite }}
+        env:
+          # The runner image ships Google Chrome; Playwright drives it.
+          CHROMIUM: /usr/bin/google-chrome
 
   # Manual only (Actions > CI > Run workflow): hammer the C driver's
   # two-member rebalance, which has failed intermittently on runners. Saves
