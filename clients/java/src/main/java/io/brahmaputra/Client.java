@@ -19,9 +19,9 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -161,6 +161,9 @@ public final class Client {
             } catch (NumberFormatException error) {
                 throw new ProtocolException("malformed SCRAM iteration count");
             }
+            if (iterations <= 0) {
+                throw new ProtocolException("malformed SCRAM iteration count");
+            }
             // The server must have kept this client's nonce, which is what makes the exchange this
             // one rather than a replay of an earlier one.
             if (!nonce.startsWith(clientNonce)) {
@@ -204,22 +207,54 @@ public final class Client {
             return new Object[] {principal, role, responsePayload, done};
         }
 
-        /** What the broker speaks — the one call that works across a version mismatch. */
-        public Map<Integer, int[]> apiVersions() {
-            Writer writer = Writer.body().string("brahmaputra-java").string("0.1.0");
+        /**
+         * What the broker speaks. This is the one call that works across a version mismatch, so
+         * it is what a client uses to decide whether it can talk to a broker at all.
+         */
+        public ApiVersions apiVersions() {
+            Writer writer = Writer.body().string("brahmaputra-java").string(CLIENT_VERSION);
             Reader reader = Reader.body(request(ApiKey.API_VERSIONS, writer.bytes()));
             int code = reader.int32();
             if (code != ErrorCode.NONE) {
                 throw new ServerException(code, "api_versions");
             }
             int count = reader.int32();
-            Map<Integer, int[]> versions = new LinkedHashMap<>();
-            for (int index = 0; index < count; index++) {
-                int apiKey = reader.int32();
-                versions.put(apiKey, new int[] {reader.int32(), reader.int32()});
+            if (count < 0 || count > reader.remaining()) {
+                throw new ProtocolException("api_versions count " + count + " exceeds body");
             }
-            reader.skipString(); // broker_version
-            return versions;
+            List<ApiVersionRange> ranges = new ArrayList<>(count);
+            for (int index = 0; index < count; index++) {
+                ranges.add(new ApiVersionRange(reader.int32(), reader.int32(), reader.int32()));
+            }
+            String brokerVersion = reader.string();
+            return new ApiVersions(ranges, brokerVersion);
+        }
+    }
+
+    /** This driver's own version, reported to the broker in ApiVersions. */
+    public static final String CLIENT_VERSION = "0.1.0";
+
+    /** One entry of an ApiVersions response. */
+    public static final class ApiVersionRange {
+        public final int apiKey;
+        public final int minVersion;
+        public final int maxVersion;
+
+        ApiVersionRange(int apiKey, int minVersion, int maxVersion) {
+            this.apiKey = apiKey;
+            this.minVersion = minVersion;
+            this.maxVersion = maxVersion;
+        }
+    }
+
+    /** An ApiVersions response: what the broker speaks, and what it calls itself. */
+    public static final class ApiVersions {
+        public final List<ApiVersionRange> ranges;
+        public final String brokerVersion;
+
+        ApiVersions(List<ApiVersionRange> ranges, String brokerVersion) {
+            this.ranges = Collections.unmodifiableList(ranges);
+            this.brokerVersion = brokerVersion;
         }
     }
 
@@ -434,7 +469,7 @@ public final class Client {
         }
 
         @Override
-        public void close() {
+        public synchronized void close() {
             for (Connection connection : connections.values()) {
                 if (connection != seed) {
                     connection.close();
@@ -589,6 +624,12 @@ public final class Client {
         private final Map<Slot, List<Buffered>> buffers = new HashMap<>();
         private final Map<Slot, Integer> sizes = new HashMap<>();
         private final Object lock = new Object();
+        /**
+         * Held from taking a partition's batch until the broker has answered for it, so two
+         * flushes of one partition (the linger thread and a caller, say) cannot overtake each
+         * other on the wire and reorder a key's records.
+         */
+        private final Object sendLock = new Object();
         private long bufferedBytes;
         private int roundRobin;
         private volatile boolean closed;
@@ -611,44 +652,85 @@ public final class Client {
             return router;
         }
 
+        /**
+         * Flush, stop the linger thread and release connections. The connections are released
+         * even when the final flush fails, and that failure is then rethrown.
+         */
         @Override
         public void close() {
-            flush();
-            closed = true;
-            synchronized (lock) {
-                lock.notifyAll();
+            if (closed) {
+                return;
             }
-            if (ticker != null) {
-                try {
-                    ticker.join(2000);
-                } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
+            try {
+                flush();
+            } finally {
+                closed = true;
+                synchronized (lock) {
+                    lock.notifyAll();
                 }
+                if (ticker != null) {
+                    ticker.interrupt();
+                    try {
+                        ticker.join(2000);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                router.close();
             }
-            router.close();
         }
 
-        /** Buffer one record. Call {@link #flush} to await delivery. */
+        /** Buffer one record with no key and no headers. */
+        public void send(String topic, byte[] value) {
+            send(topic, value, null, Collections.emptyList());
+        }
+
+        /** Buffer one keyed record. A null key round-robins across partitions. */
+        public void send(String topic, byte[] value, byte[] key, RecordHeader... headers) {
+            send(topic, value, key, Arrays.asList(headers));
+        }
+
+        /**
+         * Buffer one record. Call {@link #flush} to await delivery.
+         *
+         * <p>Returning without an offset is deliberate: with batching the offset is not known
+         * until the batch goes out, and pretending otherwise would mean a synchronous round trip
+         * per record. Use {@link #sendSync} when you need one.
+         *
+         * <p>A null {@code value} is a tombstone, distinct from an empty array.
+         */
         public void send(String topic, byte[] value, byte[] key, List<RecordHeader> headers) {
+            sendTo(topic, choosePartition(topic, key), value, key, headers);
+        }
+
+        /** Buffer one record on an explicit partition, bypassing the partitioner. */
+        public void sendTo(String topic, int partition, byte[] value, byte[] key,
+                RecordHeader... headers) {
+            sendTo(topic, partition, value, key, Arrays.asList(headers));
+        }
+
+        private int choosePartition(String topic, byte[] key) {
             List<Integer> partitions = router.partitions(topic);
-            int partition;
             if (key != null) {
-                partition = Protocol.partitionForKey(key, partitions);
-            } else {
-                synchronized (lock) {
-                    partition = partitions.get(roundRobin % partitions.size());
-                    roundRobin++;
-                }
+                return Protocol.partitionForKey(key, partitions);
             }
-            sendTo(topic, partition, value, key, headers);
+            synchronized (lock) {
+                int index = Math.floorMod(roundRobin, partitions.size());
+                roundRobin++;
+                return partitions.get(index);
+            }
         }
 
         /** Buffer one record on an explicit partition, bypassing the partitioner. */
         public void sendTo(String topic, int partition, byte[] value, byte[] key,
                 List<RecordHeader> headers) {
-            List<RecordHeader> effective = headers == null ? new ArrayList<>() : headers;
+            if (closed) {
+                throw new BrahmaputraException("producer is closed");
+            }
+            List<RecordHeader> effective =
+                    headers == null ? new ArrayList<>() : new ArrayList<>(headers);
             Record record = new Record(key, value, effective);
-            int size = value.length + (key == null ? 0 : key.length) + 16;
+            int size = (value == null ? 0 : value.length) + (key == null ? 0 : key.length) + 16;
             for (RecordHeader header : effective) {
                 size += header.key.length() + (header.value == null ? 0 : header.value.length) + 4;
             }
@@ -669,13 +751,13 @@ public final class Client {
 
         /** Send one record on its own and return its offset. Slow by design. */
         public long sendSync(String topic, byte[] value, byte[] key, List<RecordHeader> headers) {
-            List<Integer> partitions = router.partitions(topic);
-            int partition = key != null
-                    ? Protocol.partitionForKey(key, partitions)
-                    : partitions.get(roundRobin++ % partitions.size());
-            Record record = new Record(key, value, headers);
-            return produce(topic, partition, Collections.singletonList(
-                    new Buffered(record, nowMs(), topic, partition)));
+            int partition = choosePartition(topic, key);
+            Record record = new Record(key, value,
+                    headers == null ? new ArrayList<>() : new ArrayList<>(headers));
+            synchronized (sendLock) {
+                return produce(topic, partition, Collections.singletonList(
+                        new Buffered(record, nowMs(), topic, partition)));
+            }
         }
 
         public void flush() {
@@ -749,7 +831,7 @@ public final class Client {
                 }
                 try {
                     flush();
-                } catch (BrahmaputraException ignored) {
+                } catch (RuntimeException ignored) {
                     // A background flush that fails must not kill the ticker; the next explicit
                     // flush surfaces the error to a caller who can act on it.
                 }
@@ -757,19 +839,20 @@ public final class Client {
         }
 
         private void flushSlot(Slot slot) {
-            List<Buffered> batch;
-            int size;
-            synchronized (lock) {
-                batch = buffers.get(slot);
-                if (batch == null || batch.isEmpty()) {
-                    return;
+            synchronized (sendLock) {
+                List<Buffered> batch;
+                int size;
+                synchronized (lock) {
+                    batch = buffers.remove(slot);
+                    if (batch == null || batch.isEmpty()) {
+                        return;
+                    }
+                    Integer held = sizes.remove(slot);
+                    size = held == null ? 0 : held;
                 }
-                buffers.put(slot, new ArrayList<>());
-                size = sizes.getOrDefault(slot, 0);
-                sizes.remove(slot);
+                release(size);
+                produce(slot.topic, slot.partition, batch);
             }
-            release(size);
-            produce(slot.topic, slot.partition, batch);
         }
 
         private long produce(String topic, int partition, List<Buffered> batch) {
@@ -874,6 +957,18 @@ public final class Client {
         }
     }
 
+    /** The records a fetch returned, and the partition's high watermark at the time. */
+    public static final class FetchResult {
+        public final List<ConsumedRecord> records;
+        /** Offset one past the last record every in-sync replica holds. */
+        public final long highWatermark;
+
+        FetchResult(List<ConsumedRecord> records, long highWatermark) {
+            this.records = records;
+            this.highWatermark = highWatermark;
+        }
+    }
+
     /** Consumer settings, named as Kafka names them. */
     public static final class ConsumerConfig {
         public String clientId = "brahmaputra-java";
@@ -932,7 +1027,13 @@ public final class Client {
             return offset;
         }
 
+        /** Read from one partition starting at {@code offset}. */
         public List<ConsumedRecord> fetch(String topic, int partition, long offset, int maxWaitMs) {
+            return fetchVerbose(topic, partition, offset, maxWaitMs).records;
+        }
+
+        /** Like {@link #fetch}, and also returns the partition's high watermark. */
+        public FetchResult fetchVerbose(String topic, int partition, long offset, int maxWaitMs) {
             byte[] body = Writer.body()
                     .string(topic)
                     .int32(partition)
@@ -973,7 +1074,7 @@ public final class Client {
                             record.value, record.timestamp(batch.maxTimestamp), record.headers));
                 }
             }
-            return out;
+            return new FetchResult(out, (Long) result[1]);
         }
 
         /** Returns {@code {errorCode, highWatermark, batches}}. */

@@ -98,6 +98,7 @@ public final class GroupConsumer implements AutoCloseable {
         public String groupInstanceId = "";
         public int maxPollRecords = 500;
         public int fetchMaxBytes = 8 * 1024 * 1024;
+        public int dialTimeoutMs = 30_000;
     }
 
     /** A topic-partition pair. */
@@ -141,8 +142,9 @@ public final class GroupConsumer implements AutoCloseable {
     private final Consumer consumer;
 
     private List<String> subscribed = new ArrayList<>();
-    private String memberId = "";
-    private int generation = -1;
+    // Read by the heartbeat thread, written by the polling one.
+    private volatile String memberId = "";
+    private volatile int generation = -1;
     private volatile boolean joined;
     private List<TopicPartition> assignment = new ArrayList<>();
 
@@ -165,6 +167,7 @@ public final class GroupConsumer implements AutoCloseable {
         consumerConfig.clientId = config.clientId;
         consumerConfig.fetchMaxBytes = config.fetchMaxBytes;
         consumerConfig.maxPollRecords = config.maxPollRecords;
+        consumerConfig.dialTimeoutMs = config.dialTimeoutMs;
         this.consumer = new Consumer(host, port, consumerConfig);
 
         this.heartbeat = new Thread(this::heartbeatLoop, "brahmaputra-heartbeat");
@@ -186,7 +189,13 @@ public final class GroupConsumer implements AutoCloseable {
      */
     @Override
     public void close() {
+        if (closed) {
+            return;
+        }
         closed = true;
+        // Wakes the heartbeat thread from its sleep so it sees `closed` now rather than a
+        // third of a session timeout from now.
+        heartbeat.interrupt();
         try {
             if (joined) {
                 commit();
@@ -210,8 +219,26 @@ public final class GroupConsumer implements AutoCloseable {
         consumer.close();
     }
 
+    /** The partitions this member currently owns; empty before the first poll joins. */
+    public List<TopicPartition> assignment() {
+        return Collections.unmodifiableList(new ArrayList<>(assignment));
+    }
+
+    /** This member's id as the coordinator assigned it; empty before the first join. */
+    public String memberId() {
+        return memberId;
+    }
+
+    /** The group generation this member last joined. */
+    public int generation() {
+        return generation;
+    }
+
     /** Returns up to {@code maxPollRecords} records, joining the group if needed. */
     public List<ConsumedRecord> poll(long timeoutMs) {
+        if (closed) {
+            throw new BrahmaputraException("consumer is closed");
+        }
         if (subscribed.isEmpty()) {
             throw new BrahmaputraException("subscribe to at least one topic before polling");
         }
@@ -279,7 +306,9 @@ public final class GroupConsumer implements AutoCloseable {
     }
 
     private List<ConsumedRecord> takeBuffered() {
-        int limit = Math.min(config.maxPollRecords, buffered.size());
+        int limit = config.maxPollRecords <= 0
+                ? buffered.size()
+                : Math.min(config.maxPollRecords, buffered.size());
         List<ConsumedRecord> delivered = new ArrayList<>(buffered.subList(0, limit));
         buffered.subList(0, limit).clear();
         for (ConsumedRecord record : delivered) {

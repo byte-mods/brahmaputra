@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.brahmaputra</groupId>
+  <artifactId>brahmaputra-client</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <name>Brahmaputra Java client</name>
+  <description>
+    Native Java driver for the Brahmaputra log broker: producer, consumer and consumer
+    groups over Brahmaputra's own wire protocol. Standard library only.
+  </description>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Where the end-to-end suite (exec:exec) finds a broker. -->
+    <broker.host>127.0.0.1</broker.host>
+    <broker.port>9092</broker.port>
+  </properties>
+
+  <!-- Deliberately none. -->
+  <dependencies/>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <release>17</release>
+          <compilerArgs>
+            <arg>-Xlint:all</arg>
+            <arg>-Werror</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+
+      <!--
+        ManualTest is an end-to-end suite that needs a live broker, not a unit test, so the
+        normal test phase leaves it alone. Run it with:
+          mvn test-compile exec:exec -Dbroker.host=127.0.0.1 -Dbroker.port=9092
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+        <configuration>
+          <excludes>
+            <exclude>**/ManualTest.java</exclude>
+          </excludes>
+          <failIfNoTests>false</failIfNoTests>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <configuration>
+          <executable>java</executable>
+          <classpathScope>test</classpathScope>
+          <arguments>
+            <argument>-classpath</argument>
+            <classpath/>
+            <argument>io.brahmaputra.ManualTest</argument>
+            <argument>${broker.host}</argument>
+            <argument>${broker.port}</argument>
+          </arguments>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

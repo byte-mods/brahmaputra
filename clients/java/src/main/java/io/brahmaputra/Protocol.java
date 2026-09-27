@@ -5,9 +5,10 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.EnumSet;
+import java.util.Arrays;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -169,17 +170,23 @@ public final class Protocol {
 
     /** Base class for every error this client raises. */
     public static class BrahmaputraException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
         public BrahmaputraException(String message) { super(message); }
         public BrahmaputraException(String message, Throwable cause) { super(message, cause); }
     }
 
     /** The bytes on the wire were not what the protocol allows. */
     public static class ProtocolException extends BrahmaputraException {
+        private static final long serialVersionUID = 1L;
+
         public ProtocolException(String message) { super(message); }
     }
 
     /** The broker answered with a non-zero error code. */
     public static class ServerException extends BrahmaputraException {
+        private static final long serialVersionUID = 1L;
+
         public final int code;
 
         public ServerException(int code, String context) {
@@ -191,6 +198,8 @@ public final class Protocol {
 
     /** {@code auto.offset.reset=none} and there is no position to resume from. */
     public static class NoOffsetForPartitionException extends BrahmaputraException {
+        private static final long serialVersionUID = 1L;
+
         public NoOffsetForPartitionException(String message) { super(message); }
     }
 
@@ -326,7 +335,7 @@ public final class Protocol {
 
         public String string() {
             int length = int32();
-            if (length < 0 || pos + length > data.length) {
+            if (length < 0 || length > data.length - pos) {
                 throw new ProtocolException("truncated string");
             }
             String value = new String(data, pos, length, StandardCharsets.UTF_8);
@@ -336,7 +345,12 @@ public final class Protocol {
 
         public List<String> stringArray() {
             int count = int32();
-            List<String> out = new ArrayList<>(Math.max(count, 0));
+            // Every string costs at least one byte, so a count beyond what is left is corrupt;
+            // sizing the list on it would let a few bytes ask for gigabytes.
+            if (count < 0 || count > remaining()) {
+                throw new ProtocolException("string array count " + count + " exceeds body");
+            }
+            List<String> out = new ArrayList<>(count);
             for (int index = 0; index < count; index++) {
                 out.add(string());
             }
@@ -430,30 +444,15 @@ public final class Protocol {
     // CRC32C
     // -----------------------------------------------------------------------
 
-    private static final int[] CRC32C_TABLE = buildCrc32cTable();
-
-    private static int[] buildCrc32cTable() {
-        // Castagnoli polynomial, reflected. Record batches use CRC32C rather than the
-        // java.util.zip.CRC32, so the JDK's CRC32 is no help here. (JDK 9+ does ship
-        // CRC32C, but building the table keeps this driver buildable on 8.)
-        int poly = 0x82F63B78;
-        int[] table = new int[256];
-        for (int index = 0; index < 256; index++) {
-            int crc = index;
-            for (int bit = 0; bit < 8; bit++) {
-                crc = (crc & 1) != 0 ? (crc >>> 1) ^ poly : crc >>> 1;
-            }
-            table[index] = crc;
-        }
-        return table;
-    }
-
+    /**
+     * CRC32C (Castagnoli), which record batches carry — not the zlib CRC32 that
+     * {@link java.util.zip.CRC32} computes. {@link java.util.zip.CRC32C} is the right one, and
+     * the JVM accelerates it with the CPU's crc32c instruction.
+     */
     public static int crc32c(byte[] data, int from, int to) {
-        int crc = 0xFFFFFFFF;
-        for (int index = from; index < to; index++) {
-            crc = CRC32C_TABLE[(crc ^ data[index]) & 0xFF] ^ (crc >>> 8);
-        }
-        return crc ^ 0xFFFFFFFF;
+        java.util.zip.CRC32C crc = new java.util.zip.CRC32C();
+        crc.update(data, from, to - from);
+        return (int) crc.getValue();
     }
 
     public static int crc32c(byte[] data) {
@@ -515,11 +514,17 @@ public final class Protocol {
         byte[] decompress(byte[] payload);
     }
 
-    private static final java.util.Map<Compression, Codec> EXTERNAL_CODECS =
-            new java.util.EnumMap<>(Compression.class);
+    private static final Map<Compression, Codec> EXTERNAL_CODECS = new ConcurrentHashMap<>();
 
+    /**
+     * Plug in a codec this driver does not carry itself. {@code none} and {@code gzip} are
+     * built in and cannot be replaced.
+     */
     public static void registerCodec(Compression codec, Codec implementation) {
-        EXTERNAL_CODECS.put(codec, implementation);
+        if (codec == Compression.NONE || codec == Compression.GZIP) {
+            throw new IllegalArgumentException(codec.label + " is built in");
+        }
+        EXTERNAL_CODECS.put(codec, java.util.Objects.requireNonNull(implementation));
     }
 
     static byte[] compress(Compression codec, byte[] payload) {
@@ -750,10 +755,10 @@ public final class Protocol {
             throw new ProtocolException("batch_length too small");
         }
         int bodyAt = offset + BATCH_HEADER_LEN;
-        int end = bodyAt + batchLength;
-        if (end > data.length) {
+        if (batchLength > data.length - bodyAt) {
             throw new ProtocolException("truncated batch body");
         }
+        int end = bodyAt + batchLength;
 
         byte magic = data[bodyAt + 4];
         if (magic != MAGIC_V1 && magic != MAGIC_V2) {
@@ -773,10 +778,12 @@ public final class Protocol {
         cursor += 14;
         if (magic == MAGIC_V2) {
             cursor += PRODUCER_EXTENSION_LEN;
+            if (cursor > end) {
+                throw new ProtocolException("batch_length too small for its producer fields");
+            }
         }
 
-        byte[] region = new byte[end - cursor];
-        System.arraycopy(data, cursor, region, 0, region.length);
+        byte[] region = Arrays.copyOfRange(data, cursor, end);
         byte[] decompressed =
                 decompress(Compression.fromValue(attributes & COMPRESSION_MASK), region);
         List<Record> records =
@@ -793,21 +800,16 @@ public final class Protocol {
         int pos = 0;
         while (pos < payload.length) {
             long[] read = getUvarint(payload, pos);
-            int length = (int) read[0];
             pos = (int) read[1];
-            if (pos + length > payload.length) {
-                throw new ProtocolException("truncated record");
-            }
-            int end = pos + length;
+            int end = bounded(read[0], pos, payload.length, "record");
 
             read = getUvarint(payload, pos);
             long keyLenPlusOne = read[0];
             pos = (int) read[1];
             byte[] key = null;
             if (keyLenPlusOne > 0) {
-                int size = (int) keyLenPlusOne - 1;
-                key = new byte[size];
-                System.arraycopy(payload, pos, key, 0, size);
+                int size = bounded(keyLenPlusOne - 1, pos, end, "record key") - pos;
+                key = Arrays.copyOfRange(payload, pos, pos + size);
                 pos += size;
             }
 
@@ -820,10 +822,10 @@ public final class Protocol {
                 // what distinguishes a deletion from an empty value.
                 value = null;
             } else {
-                int valueLen = (int) (hasNullValues ? rawValueLen - 1 : rawValueLen);
-                value = new byte[valueLen];
-                System.arraycopy(payload, pos, value, 0, valueLen);
-                pos += valueLen;
+                long valueLen = hasNullValues ? rawValueLen - 1 : rawValueLen;
+                int size = bounded(valueLen, pos, end, "record value") - pos;
+                value = Arrays.copyOfRange(payload, pos, pos + size);
+                pos += size;
             }
 
             read = getUvarint(payload, pos);
@@ -838,24 +840,24 @@ public final class Protocol {
                 // A count is a promise about bytes that follow; if it exceeds what is left it
                 // is corrupt, and allocating on it would let a two-byte record ask for
                 // gigabytes.
-                if (count > end - pos) {
+                if (count < 0 || count > end - pos) {
                     throw new ProtocolException("record header count exceeds record");
                 }
                 for (long index = 0; index < count; index++) {
                     read = getUvarint(payload, pos);
-                    int keyLen = (int) read[0];
                     pos = (int) read[1];
-                    String headerKey = new String(payload, pos, keyLen, StandardCharsets.UTF_8);
-                    pos += keyLen;
+                    int keyEnd = bounded(read[0], pos, end, "header key");
+                    String headerKey =
+                            new String(payload, pos, keyEnd - pos, StandardCharsets.UTF_8);
+                    pos = keyEnd;
                     read = getUvarint(payload, pos);
                     long valuePlusOne = read[0];
                     pos = (int) read[1];
                     byte[] headerValue = null;
                     if (valuePlusOne > 0) {
-                        int size = (int) valuePlusOne - 1;
-                        headerValue = new byte[size];
-                        System.arraycopy(payload, pos, headerValue, 0, size);
-                        pos += size;
+                        int valueEnd = bounded(valuePlusOne - 1, pos, end, "header value");
+                        headerValue = Arrays.copyOfRange(payload, pos, valueEnd);
+                        pos = valueEnd;
                     }
                     headers.add(new RecordHeader(headerKey, headerValue));
                 }
@@ -867,8 +869,21 @@ public final class Protocol {
             Record record = new Record(key, value, headers);
             record.timestampDelta = (rawDelta >>> 1) ^ -(rawDelta & 1);
             records.add(record);
+            pos = end;
         }
         return records;
+    }
+
+    /**
+     * {@code pos + length}, provided that lies within {@code limit}. A length is read off the
+     * wire as an unsigned varint, so a corrupt one can be anything up to 2^64 and must be
+     * checked before it is narrowed to an int.
+     */
+    private static int bounded(long length, int pos, int limit, String what) {
+        if (length < 0 || length > limit - pos) {
+            throw new ProtocolException("truncated " + what);
+        }
+        return pos + (int) length;
     }
 
     private static void putUvarint(ByteArrayOutputStream out, long value) {
