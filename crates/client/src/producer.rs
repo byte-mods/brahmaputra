@@ -459,8 +459,10 @@ impl Producer {
 }
 
 /// Kafka's `murmur2` (the 32-bit variant its default partitioner uses), so
-/// a key lands on the same partition here as it would there.
-fn murmur2(data: &[u8]) -> u32 {
+/// a key lands on the same partition here as it would there — and on the
+/// same partition as every other Brahmaputra driver puts it.
+/// `murmur2(b"") == 275646681`.
+pub fn murmur2(data: &[u8]) -> u32 {
     const SEED: u32 = 0x9747b28c;
     const M: u32 = 0x5bd1_e995;
     const R: u32 = 24;

@@ -599,9 +599,15 @@ impl GroupCoordinator {
     }
 }
 
-/// Commit current positions with the current membership. Membership errors
-/// mean a rebalance is needed: flag it and let the next poll rejoin and
-/// recommit instead of failing the caller.
+/// Commit current positions with the current membership.
+///
+/// A membership error means a rebalance is needed, so the next poll is
+/// flagged to rejoin — and the error is still returned. The coordinator did
+/// not store these offsets, and any partition that moves in that rebalance
+/// is never recommitted by this member, so reporting success here would let
+/// a caller that commits after processing believe work was acknowledged
+/// when its new owner is about to redo it. The background auto-commit
+/// ignores the error, as it ignores every failure.
 async fn commit_snapshot(
     coordinator: &GroupCoordinator,
     membership: &Arc<Mutex<Membership>>,
@@ -616,7 +622,12 @@ async fn commit_snapshot(
             membership.joined,
         )
     };
-    if !joined {
+    // Not joined but holding a member id — left for a slow poll, or
+    // re-subscribed and not yet rejoined — still asks the coordinator: it
+    // accepts the commit if the membership is still good and refuses it
+    // otherwise, and either answer is better than a silent `Ok` for offsets
+    // nobody stored.
+    if !joined && member_id.is_empty() {
         return Ok(());
     }
     let offsets: Vec<OffsetCommitEntry> = {
@@ -635,12 +646,14 @@ async fn commit_snapshot(
     }
     match coordinator.commit(generation, &member_id, offsets).await {
         Ok(_) => Ok(()),
-        Err(ClientError::Server {
-            code: ec::UNKNOWN_MEMBER_ID | ec::ILLEGAL_GENERATION | ec::REBALANCE_IN_PROGRESS,
-            ..
-        }) => {
+        Err(
+            error @ ClientError::Server {
+                code: ec::UNKNOWN_MEMBER_ID | ec::ILLEGAL_GENERATION | ec::REBALANCE_IN_PROGRESS,
+                ..
+            },
+        ) => {
             rejoin.store(true, Ordering::Relaxed);
-            Ok(())
+            Err(error)
         }
         Err(error) => Err(error),
     }
@@ -681,6 +694,10 @@ pub struct GroupConsumer {
     /// conflating them is what lets a consumer wedged in a slow handler
     /// keep its partitions indefinitely while faithfully heartbeating.
     last_poll_ms: Arc<AtomicI64>,
+    /// True while `poll` runs. `max.poll.interval.ms` bounds the gap
+    /// *between* polls; a poll that is itself busy joining a slow rebalance
+    /// or waiting for data is the consumer working normally.
+    in_poll: Arc<AtomicBool>,
     max_poll_records: usize,
     subscribed: Vec<String>,
     membership: Arc<Mutex<Membership>>,
@@ -743,6 +760,7 @@ impl GroupConsumer {
             group_instance_id: String::new(),
             max_poll_interval: Duration::from_millis(300_000),
             last_poll_ms: Arc::new(AtomicI64::new(now_ms())),
+            in_poll: Arc::new(AtomicBool::new(false)),
             max_poll_records: DEFAULT_MAX_POLL_RECORDS,
             subscribed: Vec::new(),
             membership: Arc::new(Mutex::new(Membership::default())),
@@ -880,11 +898,12 @@ impl GroupConsumer {
     /// group with it.
     pub fn subscribe(&mut self, topics: &[&str]) {
         self.subscribed = topics.iter().map(|topic| (*topic).to_owned()).collect();
-        {
-            let mut membership = self.membership.lock().expect("membership");
-            membership.member_id = String::new();
-            membership.joined = false;
-        }
+        // The member id is kept: rejoining under it tells the coordinator
+        // this member changed its subscription. Discarding it would join a
+        // second, new member while the old one lingers — the rebalance
+        // then waits out the rebalance timeout for a member that will never
+        // come back, and it is only evicted after its session timeout.
+        self.membership.lock().expect("membership").joined = false;
         self.rejoin.store(true, Ordering::Relaxed);
     }
 
@@ -923,25 +942,17 @@ impl GroupConsumer {
                 "subscribe to at least one topic before polling".into(),
             ));
         }
-        // Stamped on entry, not on return: the interval bounds how long the
+        // Stamped on entry and again on return (the guard), and not
+        // enforced in between: the interval bounds how long the
         // *application* may go without asking for records, and a poll that
-        // blocks for its full `max_wait` is the consumer working normally,
-        // not stalling.
+        // blocks — for its full `max_wait`, or on a slow rebalance — is the
+        // consumer working normally, not stalling.
         self.last_poll_ms.store(now_ms(), Ordering::Relaxed);
-        if !self.is_joined() || self.rejoin.load(Ordering::Relaxed) {
-            tracing::debug!(member = %self.membership.lock().expect("membership").member_id, "poll triggers (re)join");
-            match self.join().await {
-                Err(ClientError::Server {
-                    code: ec::FENCED_BROKER_EPOCH,
-                    ..
-                }) => {
-                    // A suspended broker can resume its lease. Keep the
-                    // group eligible to rejoin on the next poll.
-                    return Ok(Vec::new());
-                }
-                result => result?,
-            }
-        }
+        self.in_poll.store(true, Ordering::Relaxed);
+        let _in_poll = PollGuard {
+            in_poll: Arc::clone(&self.in_poll),
+            last_poll_ms: Arc::clone(&self.last_poll_ms),
+        };
         // Everything handed out before this call is now the application's
         // acknowledged past; the auto-commit timer may commit up to here.
         {
@@ -951,6 +962,24 @@ impl GroupConsumer {
 
         let deadline = Instant::now() + max_wait;
         loop {
+            // Checked every sweep, not only on entry: a rebalance the
+            // heartbeat learns of mid-poll must stop this member fetching
+            // partitions it may no longer own, rather than carrying on
+            // until `max_wait` runs out.
+            if !self.is_joined() || self.rejoin.load(Ordering::Relaxed) {
+                tracing::debug!(member = %self.membership.lock().expect("membership").member_id, "poll triggers (re)join");
+                match self.join().await {
+                    Err(ClientError::Server {
+                        code: ec::FENCED_BROKER_EPOCH,
+                        ..
+                    }) => {
+                        // A suspended broker can resume its lease. Keep the
+                        // group eligible to rejoin on the next poll.
+                        return Ok(Vec::new());
+                    }
+                    result => result?,
+                }
+            }
             if !self.buffered.is_empty() {
                 return Ok(self.take_buffered());
             }
@@ -1160,10 +1189,13 @@ impl GroupConsumer {
             {
                 Ok(response) => response,
                 Err(ClientError::Server { code, .. })
-                    if code == ec::REBALANCE_IN_PROGRESS
-                        || code == ec::UNKNOWN_MEMBER_ID
-                        || code == ec::ILLEGAL_GENERATION =>
+                    if code == ec::REBALANCE_IN_PROGRESS || code == ec::ILLEGAL_GENERATION =>
                 {
+                    continue;
+                }
+                Err(ClientError::Server { code, .. }) if code == ec::UNKNOWN_MEMBER_ID => {
+                    // Removed while the rebalance ran: join as a new member.
+                    self.membership.lock().expect("membership").member_id = String::new();
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1329,6 +1361,7 @@ impl GroupConsumer {
         let membership = Arc::clone(&self.membership);
         let rejoin = Arc::clone(&self.rejoin);
         let last_poll_ms = Arc::clone(&self.last_poll_ms);
+        let in_poll = Arc::clone(&self.in_poll);
         let max_poll_interval = self.max_poll_interval;
         // This loop enforces two independent deadlines, so it has to wake
         // often enough for the shorter of them. Deriving the tick from the
@@ -1375,7 +1408,9 @@ impl GroupConsumer {
                 // could actually make progress. Leaving explicitly hands
                 // them over now instead of after a session timeout.
                 let idle_ms = now_ms().saturating_sub(last_poll_ms.load(Ordering::Relaxed));
-                if idle_ms >= max_poll_interval.as_millis() as i64 {
+                if !in_poll.load(Ordering::Relaxed)
+                    && idle_ms >= max_poll_interval.as_millis() as i64
+                {
                     if !left_for_slow_poll {
                         tracing::warn!(
                             %member_id,
@@ -1400,8 +1435,14 @@ impl GroupConsumer {
                             ec::REBALANCE_IN_PROGRESS | ec::UNKNOWN_MEMBER_ID | ec::ILLEGAL_GENERATION,
                         ..
                     }) => {
-                        tracing::debug!(%member_id, generation, "heartbeat demands rejoin");
-                        rejoin.store(true, Ordering::Relaxed);
+                        // Only if nothing changed meanwhile: an answer about
+                        // a generation this member already moved past must
+                        // not send it round again.
+                        let current = membership.lock().expect("membership");
+                        if current.generation == generation && current.member_id == member_id {
+                            tracing::debug!(%member_id, generation, "heartbeat demands rejoin");
+                            rejoin.store(true, Ordering::Relaxed);
+                        }
                     }
                     Err(_) => {} // transient failure: retry next tick
                 }
@@ -1430,6 +1471,20 @@ impl GroupConsumer {
                 }
             }
         }));
+    }
+}
+
+/// Marks the end of a `poll`, however it ends — returned, failed, or the
+/// future dropped by a caller's timeout.
+struct PollGuard {
+    in_poll: Arc<AtomicBool>,
+    last_poll_ms: Arc<AtomicI64>,
+}
+
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        self.last_poll_ms.store(now_ms(), Ordering::Relaxed);
+        self.in_poll.store(false, Ordering::Relaxed);
     }
 }
 
@@ -1467,6 +1522,34 @@ mod tests {
         list.iter()
             .map(|(name, count)| ((*name).to_owned(), (0..*count).collect()))
             .collect()
+    }
+
+    /// The Go and Node drivers transcribe this algorithm, and a leader in
+    /// any of them must decide exactly as the others would. Twelve
+    /// partitions is the case a string sort gets wrong ("t 10" < "t 2"):
+    /// the member over quota keeps its numerically lowest partitions.
+    #[test]
+    fn sticky_orders_partitions_numerically_like_the_other_drivers() {
+        let members = members(&[("a", &["t"]), ("b", &["t"])]);
+        let topics = topics(&[("t", 12)]);
+        let previous: BTreeMap<String, Vec<TopicPartition>> = [
+            (
+                "a".to_owned(),
+                (0..12).map(|p| ("t".to_owned(), p)).collect(),
+            ),
+            ("b".to_owned(), Vec::new()),
+        ]
+        .into_iter()
+        .collect();
+        let assignment = Assignor::Sticky.assign(&members, &topics, &previous);
+        let partitions = |member: &str| -> Vec<i32> {
+            assignment[member]
+                .iter()
+                .map(|(_, partition)| *partition)
+                .collect()
+        };
+        assert_eq!(partitions("a"), (0..6).collect::<Vec<_>>());
+        assert_eq!(partitions("b"), (6..12).collect::<Vec<_>>());
     }
 
     #[test]

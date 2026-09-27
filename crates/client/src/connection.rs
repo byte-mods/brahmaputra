@@ -25,7 +25,41 @@ use crate::tls::TlsSettings;
 
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
-type Pending = Arc<Mutex<HashMap<i32, oneshot::Sender<Result<Bytes, ClientError>>>>>;
+type Waiter = oneshot::Sender<Result<Bytes, ClientError>>;
+
+/// Requests awaiting a response, plus whether the connection has died.
+///
+/// The flag lives under the same lock as the map so that registering a
+/// request and tearing the connection down cannot interleave: without it a
+/// request registered just after the janitor drained the map would wait
+/// forever for a response no reader task is left to deliver.
+#[derive(Default)]
+struct PendingState {
+    waiters: HashMap<i32, Waiter>,
+    closed: bool,
+}
+
+type Pending = Arc<Mutex<PendingState>>;
+
+/// Removes a request's waiter when the request future is dropped.
+///
+/// A caller that abandons a request — `tokio::time::timeout` around a poll
+/// or a send, a `select!` that picks another branch — would otherwise leave
+/// its entry in the pending map for the life of the connection, one leak
+/// per abandoned request. Removing an entry the reader already took is a
+/// no-op.
+struct PendingGuard {
+    pending: Pending,
+    correlation_id: i32,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.pending.lock() {
+            state.waiters.remove(&self.correlation_id);
+        }
+    }
+}
 
 /// Either a plain or a TLS-wrapped socket: the framing above them is
 /// identical, so the rest of the connection does not care which it has.
@@ -97,7 +131,7 @@ impl TcpConnection {
         let framed = Framed::new(stream, codec);
         let (mut sink, mut stream) = framed.split();
 
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Pending = Arc::new(Mutex::new(PendingState::default()));
         let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(max_in_flight * 2);
 
         let writer = tokio::spawn(async move {
@@ -122,6 +156,7 @@ impl TcpConnection {
                                 let waiter = reader_pending
                                     .lock()
                                     .expect("pending")
+                                    .waiters
                                     .remove(&header.correlation_id);
                                 if let Some(waiter) = waiter {
                                     let _ = waiter.send(Ok(payload));
@@ -159,12 +194,11 @@ impl TcpConnection {
                     writer.abort();
                 }
             }
-            let waiters: Vec<_> = janitor_pending
-                .lock()
-                .expect("pending")
-                .drain()
-                .map(|(_, w)| w)
-                .collect();
+            let waiters: Vec<_> = {
+                let mut state = janitor_pending.lock().expect("pending");
+                state.closed = true;
+                state.waiters.drain().map(|(_, w)| w).collect()
+            };
             for waiter in waiters {
                 let _ = waiter.send(Err(ClientError::ConnectionClosed));
             }
@@ -207,21 +241,94 @@ impl TcpConnection {
         let payload = encode_payload(&header, body);
 
         let (tx, rx) = oneshot::channel();
-        self.inner
-            .pending
-            .lock()
-            .expect("pending")
-            .insert(correlation_id, tx);
+        {
+            let mut state = self.inner.pending.lock().expect("pending");
+            if state.closed {
+                return Err(ClientError::ConnectionClosed);
+            }
+            state.waiters.insert(correlation_id, tx);
+        }
+        let _guard = PendingGuard {
+            pending: Arc::clone(&self.inner.pending),
+            correlation_id,
+        };
         if self.inner.out_tx.send(payload).await.is_err() {
-            self.inner
-                .pending
-                .lock()
-                .expect("pending")
-                .remove(&correlation_id);
             return Err(ClientError::ConnectionClosed);
         }
         let result = rx.await.map_err(|_| ClientError::ConnectionClosed)?;
         drop(permit);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    /// A broker that accepts and reads but never answers.
+    async fn silent_broker() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut sink = [0u8; 1024];
+                    while matches!(socket.read(&mut sink).await, Ok(n) if n > 0) {}
+                });
+            }
+        });
+        addr
+    }
+
+    /// Abandoning a request — the usual way to put a deadline on one —
+    /// must not leave its waiter in the pending map forever.
+    #[tokio::test]
+    async fn an_abandoned_request_does_not_leak_its_waiter() {
+        let addr = silent_broker().await;
+        let connection = TcpConnection::connect(addr, None, 8).await.unwrap();
+        for _ in 0..20 {
+            let attempt = tokio::time::timeout(
+                Duration::from_millis(10),
+                connection.request(ApiKey::ApiVersions, b"body"),
+            )
+            .await;
+            assert!(attempt.is_err(), "the silent broker never answers");
+        }
+        let waiting = connection.inner.pending.lock().unwrap().waiters.len();
+        assert_eq!(
+            waiting, 0,
+            "abandoned requests left {waiting} waiters behind"
+        );
+        // The in-flight permits came back too, or the ninth request would
+        // wait forever for one.
+        assert_eq!(connection.inner.in_flight.available_permits(), 8);
+    }
+
+    /// Once the broker closes the socket every request fails promptly,
+    /// including ones issued after the teardown.
+    #[tokio::test]
+    async fn requests_after_the_peer_closes_fail_instead_of_hanging() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
+        let connection = TcpConnection::connect(addr, None, 8).await.unwrap();
+        for _ in 0..50 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                connection.request(ApiKey::ApiVersions, b"body"),
+            )
+            .await
+            .expect("a request on a dead connection must not hang");
+            assert!(result.is_err());
+        }
     }
 }
