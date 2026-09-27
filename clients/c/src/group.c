@@ -43,6 +43,13 @@ struct brp_group_consumer {
     brp_group_config_t config;
     char *client_id, *auto_offset_reset, *assignor, *group_instance_id;
     brp_consumer_t *consumer;
+    /* Group-protocol traffic (heartbeat, join, sync, commit) has its own
+     * connection. Sharing the fetch connection made a heartbeat wait behind
+     * every fetch long-poll, and with a caller polling in a tight loop the
+     * (unfair) connection mutex could starve the heartbeat thread for
+     * seconds, long enough for the coordinator to evict the member mid-
+     * rebalance while it went on fetching as if nothing had happened. */
+    brp_client_t *coordinator;
 
     char **subscribed;
     size_t sub_count;
@@ -159,6 +166,7 @@ static void *heartbeat_main(void *arg);
 
 static void group_free(brp_group_consumer_t *g) {
     brp_consumer_close(g->consumer);
+    if (g->coordinator) brp_client_destroy(g->coordinator);
     for (size_t i = 0; i < g->sub_count; i++) free(g->subscribed[i]);
     free(g->subscribed);
     brp_offsets_free(g->assignment, g->assign_n);
@@ -228,6 +236,16 @@ brp_err_t brp_group_consumer_new(const char *bootstrap, const char *group_id,
         group_free(g);
         return err;
     }
+    /* A JoinGroup is held by the coordinator for up to the rebalance timeout,
+     * so the socket timeout must outlast it. */
+    int coordinator_io_ms = config->rebalance_timeout_ms + config->session_timeout_ms + 30000;
+    err = brp_client_new_internal(bootstrap, g->client_id,
+                                  config->socket_connection_setup_timeout_ms, coordinator_io_ms,
+                                  &g->coordinator);
+    if (err) {
+        group_free(g);
+        return err;
+    }
     if (pthread_create(&g->heartbeat, NULL, heartbeat_main, g) != 0) {
         group_free(g);
         return brp_set_error(BRP_ERR_STATE, "cannot start heartbeat thread");
@@ -275,7 +293,7 @@ static brp_err_t peek_code(const uint8_t *resp, size_t len, int32_t *code) {
  * which is what makes this generic wrapper possible. */
 static brp_err_t coordinator_request(brp_group_consumer_t *g, int16_t api, const buf_t *body,
                                      uint8_t **resp, size_t *resp_len) {
-    brp_client_t *client = brp_consumer_client(g->consumer);
+    brp_client_t *client = g->coordinator;
     for (int attempt = 0; attempt < COORDINATOR_ATTEMPTS; attempt++) {
         int32_t *partitions;
         size_t count;
@@ -958,6 +976,13 @@ static void *heartbeat_main(void *arg) {
     if (poll_check_every < 1) poll_check_every = 1;
     int interval = heartbeat_every < poll_check_every ? heartbeat_every : poll_check_every;
     bool left_for_slow_poll = false;
+    /* When the coordinator last acknowledged this member (or the member
+     * last changed generation). A heartbeat that cannot reach the
+     * coordinator at all gets no error code to react to, so past the
+     * session timeout the member must assume it was evicted and rejoin,
+     * rather than go on fetching partitions it may no longer own. */
+    int64_t last_ack_ms = brp_now_ms();
+    int32_t acked_generation = -1;
 
     pthread_mutex_lock(&g->mu);
     while (!g->closed) {
@@ -993,6 +1018,19 @@ static void *heartbeat_main(void *arg) {
                 if (code != 0 || hb != BRP_OK)
                     GDEBUG(g, "heartbeat %s generation %d -> err %d code %d", member_id,
                            (int)generation, (int)hb, (int)code);
+                int64_t now = brp_now_ms();
+                if (hb == BRP_OK || generation != acked_generation) {
+                    last_ack_ms = now;
+                    acked_generation = generation;
+                } else if (code == 0 && now - last_ack_ms >= g->config.session_timeout_ms) {
+                    GDEBUG(g, "no heartbeat acknowledged for %lldms; rejoining",
+                           (long long)(now - last_ack_ms));
+                    pthread_mutex_lock(&g->mu);
+                    if (g->generation == generation && strcmp(g->member_id, member_id) == 0)
+                        g->joined = false;
+                    pthread_mutex_unlock(&g->mu);
+                    last_ack_ms = now;
+                }
                 if (code == BRP_ERR_REBALANCE_IN_PROGRESS || code == BRP_ERR_UNKNOWN_MEMBER_ID ||
                     code == BRP_ERR_ILLEGAL_GENERATION) {
                     pthread_mutex_lock(&g->mu);
