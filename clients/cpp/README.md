@@ -3,7 +3,7 @@
 C++17, POSIX sockets, `std::thread`. No dependencies beyond the standard
 library, except zlib for the built-in gzip codec, and that is optional.
 
-This was tested end to end against a live broker and passed all **38/38 checks**
+This was tested end to end against a live broker and passed all **54/54 checks**
 (`./test.sh 127.0.0.1 9092`). With `-Wall -Wextra -Wpedantic` it builds without
 warnings on g++ 13 and clang 18, and it runs clean under ThreadSanitizer.
 
@@ -105,6 +105,13 @@ for (;;) {
 consumer.close();        // commits, then LeaveGroup so partitions move at once
 ```
 
+A connection whose request times out or whose socket drops is marked
+`broken()`, and its socket is discarded. The next request dials a new one, so
+the client recovers from a broker restart without being rebuilt.
+`Connection::setRequestTimeout()` bounds one round trip. The producer allows
+only one batch in flight per partition, so a linger flush and a batch-full
+flush cannot reorder a partition.
+
 A background thread heartbeats every `session.timeout.ms / 3`. If the
 application goes `max.poll.interval.ms` without calling `poll()`, the thread
 sends LeaveGroup, and the next `poll()` rejoins. Time spent inside `poll()`
@@ -186,7 +193,7 @@ Start a broker, then:
 ```
 
 The suite is a port of `clients/go/cmd/manualtest` with the same sections and
-the same checks. It prints `38 passed, 0 failed` and exits non-zero on any
+the same checks. It prints `54 passed, 0 failed` and exits non-zero on any
 failure.
 
 ## Not implemented

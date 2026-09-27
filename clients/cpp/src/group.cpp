@@ -427,6 +427,12 @@ bool GroupConsumer::sync(const std::vector<MemberAssignment>& assignments) {
     BodyReader r(response);
     std::int32_t code = r.int32();
     if (code == errc::RebalanceInProgress || code == errc::IllegalGeneration) return false;
+    if (code == errc::UnknownMemberId) {
+        // Evicted between join and sync: forget the id and join afresh.
+        std::lock_guard<std::mutex> lock(mu_);
+        memberId_.clear();
+        return false;
+    }
     if (code != errc::None) throw ServerError(code, "sync_group");
     std::vector<TopicPartition> assignment;
     for (std::int32_t count = r.int32(); count > 0; --count) {

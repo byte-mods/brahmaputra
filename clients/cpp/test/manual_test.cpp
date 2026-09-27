@@ -10,7 +10,15 @@
 // error.
 #include <brahmaputra/brahmaputra.hpp>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <chrono>
+#include <future>
+#include <mutex>
 #include <cstdio>
 #include <iostream>
 #include <set>
@@ -60,6 +68,137 @@ bp::ProducerConfig immediateProducer() {
 
 bool startsWith(const bp::Bytes& data, const bp::Bytes& prefix) {
     return data.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), data.begin());
+}
+
+// A listening socket on 127.0.0.1 with an ephemeral port. Returns fd, sets port.
+int listenLocal(std::uint16_t& port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) throw bp::Error("socket failed");
+    int one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 || ::listen(fd, 64) != 0) {
+        ::close(fd);
+        throw bp::Error("bind/listen failed");
+    }
+    socklen_t len = sizeof addr;
+    ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len);
+    port = ntohs(addr.sin_port);
+    return fd;
+}
+
+// Forwards TCP to the broker and can sever every live connection, which is
+// how a broker restart or an idle timeout looks to a client.
+class Proxy {
+public:
+    explicit Proxy(const std::string& target) {
+        auto colon = target.rfind(':');
+        targetHost_ = target.substr(0, colon);
+        targetPort_ = static_cast<std::uint16_t>(std::stoi(target.substr(colon + 1)));
+        std::uint16_t port = 0;
+        listenFd_ = listenLocal(port);
+        address = "127.0.0.1:" + std::to_string(port);
+        acceptor_ = std::thread([this] { acceptLoop(); });
+    }
+    ~Proxy() { close(); }
+
+    void dropAll() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            for (int fd : live_) ::shutdown(fd, SHUT_RDWR);
+            live_.clear();
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+
+    void close() {
+        if (listenFd_ < 0) return;
+        ::shutdown(listenFd_, SHUT_RDWR);
+        if (acceptor_.joinable()) acceptor_.join();
+        ::close(listenFd_);
+        listenFd_ = -1;
+        dropAll();
+        for (auto& t : pumps_) t.join();
+        for (int fd : all_) ::close(fd);
+    }
+
+    std::string address;
+
+private:
+    void acceptLoop() {
+        for (;;) {
+            int client = ::accept(listenFd_, nullptr, nullptr);
+            if (client < 0) return;
+            int upstream = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(targetPort_);
+            ::inet_pton(AF_INET, targetHost_ == "localhost" ? "127.0.0.1" : targetHost_.c_str(),
+                        &addr.sin_addr);
+            if (::connect(upstream, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) {
+                ::close(upstream);
+                ::close(client);
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(mu_);
+            live_.push_back(client);
+            live_.push_back(upstream);
+            all_.push_back(client);
+            all_.push_back(upstream);
+            pumps_.emplace_back([client, upstream] { pump(client, upstream); });
+            pumps_.emplace_back([client, upstream] { pump(upstream, client); });
+        }
+    }
+
+    static void pump(int from, int to) {
+        char buf[64 * 1024];
+        for (;;) {
+            ssize_t n = ::recv(from, buf, sizeof buf, 0);
+            if (n <= 0) break;
+            ssize_t off = 0;
+            while (off < n) {
+                ssize_t w = ::send(to, buf + off, static_cast<std::size_t>(n - off), MSG_NOSIGNAL);
+                if (w <= 0) {
+                    off = -1;
+                    break;
+                }
+                off += w;
+            }
+            if (off < 0) break;
+        }
+        ::shutdown(to, SHUT_RDWR);
+        ::shutdown(from, SHUT_RDWR);
+    }
+
+    std::string targetHost_;
+    std::uint16_t targetPort_ = 0;
+    int listenFd_ = -1;
+    std::thread acceptor_;
+    std::mutex mu_;
+    std::vector<int> live_;
+    std::vector<int> all_;
+    std::vector<std::thread> pumps_;
+};
+
+std::vector<bp::ConsumedRecord> fetchAll(bp::Consumer& consumer, const std::string& topic,
+                                         std::size_t want) {
+    std::vector<bp::ConsumedRecord> got;
+    std::int64_t offset = 0;
+    while (got.size() < want) {
+        std::vector<bp::ConsumedRecord> batch;
+        try {
+            batch = consumer.fetch(topic, 0, offset, 500);
+        } catch (const bp::Error&) {
+            break;
+        }
+        if (batch.empty()) break;
+        offset = batch.back().offset + 1;
+        for (auto& r : batch) got.push_back(std::move(r));
+    }
+    return got;
 }
 
 void run(const std::string& address) {
@@ -410,6 +549,241 @@ void run(const std::string& address) {
             }
         }
         check("a full buffer blocks and then reports", blocked);
+    }
+    section("wire edge cases");
+    {
+        std::string edgeTopic = unique("cpp-edge");
+        bp::Producer producer(address, immediateProducer());
+        bp::Bytes large(1 << 20);
+        for (std::size_t i = 0; i < large.size(); ++i) large[i] = static_cast<std::uint8_t>(i * 7);
+        bp::Bytes unicodeKey = B("ключ-✓-🔑");
+        bp::Bytes unicodeValue = B("значение — 数据 — 🚀");
+        producer.sendTo(edgeTopic, 0, large);
+        producer.sendTo(edgeTopic, 0, unicodeValue, unicodeKey, {{"ünïcødé-🏷", B("✓")}});
+        // An empty key and an empty header value are values, not nulls.
+        producer.sendTo(edgeTopic, 0, B("empty-key"), bp::Bytes{},
+                        {{"empty", bp::Bytes{}}, {"null", std::nullopt}});
+        producer.sendTo(edgeTopic, 0, B("null-key"), std::nullopt);
+        producer.close();
+
+        bp::Consumer consumer(address);
+        auto got = fetchAll(consumer, edgeTopic, 4);
+        check("edge records all arrive", got.size() == 4, "got " + std::to_string(got.size()));
+        if (got.size() == 4) {
+            check("a 1 MiB value round-trips byte-identical", got[0].value && *got[0].value == large,
+                  std::to_string(got[0].value ? got[0].value->size() : 0) + " bytes");
+            check("unicode key, value and header key round-trip",
+                  got[1].key && *got[1].key == unicodeKey && got[1].value &&
+                      *got[1].value == unicodeValue && got[1].headers.size() == 1 &&
+                      got[1].headers[0].key == "ünïcødé-🏷");
+            check("an empty key stays empty, not null", got[2].key && got[2].key->empty(),
+                  got[2].key ? std::to_string(got[2].key->size()) + " bytes" : "null");
+            check("an empty header value stays empty, not null",
+                  got[2].headers.size() == 2 && got[2].headers[0].value &&
+                      got[2].headers[0].value->empty() && !got[2].headers[1].value,
+                  std::to_string(got[2].headers.size()) + " headers");
+            check("a null key stays null", !got[3].key);
+        }
+    }
+
+    section("ordering under linger flushes");
+    {
+        std::string orderTopic = unique("cpp-order");
+        bp::ProducerConfig config;
+        config.lingerMs = 1;
+        config.batchSize = 256;
+        bp::Producer producer(address, config);
+        const int total = 5000;
+        for (int i = 0; i < total; ++i) producer.sendTo(orderTopic, 0, B(std::to_string(i)));
+        producer.close();
+
+        bp::Consumer consumer(address);
+        auto got = fetchAll(consumer, orderTopic, total);
+        std::vector<int> values;
+        for (const auto& r : got) values.push_back(r.value ? std::stoi(bp::toString(*r.value)) : -1);
+        int inversions = 0;
+        for (std::size_t i = 1; i < values.size(); ++i) {
+            if (values[i] < values[i - 1]) ++inversions;
+        }
+        check("every record of a partition arrives", values.size() == static_cast<std::size_t>(total),
+              "got " + std::to_string(values.size()));
+        check("a partition's records keep send order", inversions == 0,
+              std::to_string(inversions) + " inversions");
+    }
+
+    section("background flush failures are reported");
+    {
+        bp::ProducerConfig config;
+        config.lingerMs = 20;
+        auto producer = std::make_shared<bp::Producer>(address, config);
+        // Partition 999 does not exist, so the linger thread's flush fails.
+        std::string sendErr, flushErr;
+        try {
+            producer->sendTo(unique("cpp-bgfail"), 999, B("lost"));
+        } catch (const std::exception& e) {
+            sendErr = e.what();
+        }
+        std::this_thread::sleep_for(300ms);
+        try {
+            producer->flush();
+        } catch (const std::exception& e) {
+            flushErr = e.what();
+        }
+        check("a failed linger flush surfaces on the next Flush",
+              sendErr.empty() && !flushErr.empty(), "send=" + sendErr + " flush=" + flushErr);
+        auto closed = std::async(std::launch::async, [producer] {
+            try {
+                producer->close();
+            } catch (const std::exception&) {
+            }
+        });
+        check("Close returns after a failed flush",
+              closed.wait_for(5s) == std::future_status::ready, "hung");
+    }
+
+    section("connection failures");
+    {
+        // A broker that accepts and never answers must cost an error, not a
+        // thread blocked forever. The kernel completes the handshake from the
+        // listen backlog; nothing ever reads or replies.
+        std::uint16_t silentPort = 0;
+        int silent = listenLocal(silentPort);
+        {
+            bp::Connection conn("127.0.0.1", silentPort, "cpp-test", 1000ms, 30000ms);
+            conn.setRequestTimeout(300ms);
+            auto started = Clock::now();
+            std::string requestErr;
+            try {
+                conn.apiVersions();
+            } catch (const std::exception& e) {
+                requestErr = e.what();
+            }
+            check("a request to an unresponsive broker times out",
+                  !requestErr.empty() && Clock::now() - started < 3s, requestErr);
+            check("a timed-out connection is not reused", conn.broken());
+        }
+        ::close(silent);
+
+        // A connection the broker drops is redialled, not kept forever.
+        Proxy proxy(address);
+        std::string dropTopic = unique("cpp-drop");
+        {
+            bp::Producer producer(proxy.address, immediateProducer());
+            producer.sendTo(dropTopic, 0, B("before"));
+            proxy.dropAll();
+            std::string recovered = "not attempted";
+            for (int attempt = 0; attempt < 3 && !recovered.empty(); ++attempt) {
+                try {
+                    producer.sendTo(dropTopic, 0, B("after"));
+                    recovered.clear();
+                } catch (const std::exception& e) {
+                    recovered = e.what();
+                }
+            }
+            check("a producer recovers after its connection drops", recovered.empty(), recovered);
+            try {
+                producer.close();
+            } catch (const std::exception&) {
+            }
+        }
+        {
+            bp::Consumer consumer(proxy.address);
+            consumer.fetch(dropTopic, 0, 0, 100);
+            proxy.dropAll();
+            std::string fetchErr = "not attempted";
+            std::size_t fetched = 0;
+            for (int attempt = 0; attempt < 3 && !fetchErr.empty(); ++attempt) {
+                try {
+                    fetched = consumer.fetch(dropTopic, 0, 0, 100).size();
+                    fetchErr.clear();
+                } catch (const std::exception& e) {
+                    fetchErr = e.what();
+                }
+            }
+            check("a consumer recovers after its connection drops",
+                  fetchErr.empty() && fetched >= 1, fetchErr);
+        }
+        proxy.close();
+    }
+
+    section("consumer group: max.poll.interval and rejoin");
+    {
+        std::string slowTopic = unique("cpp-slow");
+        bp::Producer producer(address, immediateProducer());
+        for (int i = 0; i < 10; ++i) producer.send(slowTopic, B("s" + std::to_string(i)));
+        bp::GroupConfig groupConfig;
+        groupConfig.autoCommitIntervalMs = 0;
+        groupConfig.maxPollIntervalMs = 1500;
+        bp::GroupConsumer consumer(address, unique("cpp-slow-grp"), groupConfig);
+        consumer.subscribe({slowTopic});
+        std::size_t first = 0;
+        auto deadline = Clock::now() + 15s;
+        try {
+            while (first < 10 && Clock::now() < deadline) first += consumer.poll(300ms).size();
+        } catch (const bp::Error&) {
+        }
+        consumer.commit();
+        // Stall past max.poll.interval.ms: the member leaves the group.
+        std::this_thread::sleep_for(2500ms);
+        for (int i = 10; i < 20; ++i) producer.send(slowTopic, B("s" + std::to_string(i)));
+        producer.close();
+        std::size_t second = 0;
+        std::string pollErr;
+        deadline = Clock::now() + 15s;
+        try {
+            while (second < 10 && Clock::now() < deadline) second += consumer.poll(300ms).size();
+        } catch (const std::exception& e) {
+            pollErr = e.what();
+        }
+        check("a member that stalled rejoins on its next poll",
+              first == 10 && second == 10 && pollErr.empty(),
+              "first=" + std::to_string(first) + " second=" + std::to_string(second) +
+                  " err=" + pollErr);
+        consumer.close();
+    }
+
+    section("consumer group: time inside poll does not count against max.poll.interval");
+    {
+        std::string joinTopic = unique("cpp-inpoll");
+        bp::Producer producer(address, immediateProducer());
+        producer.router().partitions(joinTopic);
+        bp::GroupConfig groupConfig;
+        groupConfig.autoCommitIntervalMs = 0;
+        // Far shorter than the first poll below, which spends ~1s joining
+        // (the broker's initial rebalance delay) and then waits for data.
+        groupConfig.maxPollIntervalMs = 600;
+        bp::GroupConsumer consumer(address, unique("cpp-inpoll-grp"), groupConfig);
+        consumer.subscribe({joinTopic});
+        std::thread late([&producer, joinTopic] {
+            std::this_thread::sleep_for(2s);
+            for (int i = 0; i < 10; ++i) {
+                try {
+                    producer.send(joinTopic, B("j" + std::to_string(i)));
+                } catch (const bp::Error&) {
+                }
+            }
+        });
+        // One long poll: it joins, then waits for the records above.
+        std::size_t got = 0;
+        std::string pollErr, commitErr;
+        try {
+            got = consumer.poll(4s).size();
+        } catch (const std::exception& e) {
+            pollErr = e.what();
+        }
+        // Committed straight away, before another poll could quietly rejoin:
+        // this fails if the member left the group mid-poll.
+        try {
+            consumer.commit();
+        } catch (const std::exception& e) {
+            commitErr = e.what();
+        }
+        late.join();
+        check("a member is still in its group after a long poll",
+              pollErr.empty() && got > 0 && commitErr.empty(),
+              "got=" + std::to_string(got) + " poll=" + pollErr + " commit=" + commitErr);
+        consumer.close();
+        producer.close();
     }
 }
 

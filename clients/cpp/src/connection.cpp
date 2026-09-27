@@ -133,10 +133,22 @@ void Connection::closeLocked() {
     }
 }
 
+void Connection::failLocked() {
+    closeLocked();
+    broken_.store(true);
+}
+
 void Connection::ensureOpenLocked() {
     if (fd_ >= 0) return;
     fd_ = dialTcp(host_, port_, connectTimeout_);
     setIoTimeout(fd_, ioTimeout_);
+    broken_.store(false);
+}
+
+void Connection::setRequestTimeout(std::chrono::milliseconds timeout) {
+    std::lock_guard<std::mutex> lock(mu_);
+    ioTimeout_ = timeout;
+    if (fd_ >= 0) setIoTimeout(fd_, ioTimeout_);
 }
 
 void Connection::writeAllLocked(const Bytes& data) {
@@ -148,7 +160,7 @@ void Connection::writeAllLocked(const Bytes& data) {
             std::string msg = (errno == EAGAIN || errno == EWOULDBLOCK)
                                   ? std::string("write timed out")
                                   : errnoText("write");
-            closeLocked();
+            failLocked();
             throw NetworkError(msg + " (" + host_ + ":" + std::to_string(port_) + ")");
         }
         sent += static_cast<std::size_t>(n);
@@ -161,7 +173,7 @@ Bytes Connection::readFrameLocked() {
         while (got < len) {
             ssize_t n = ::recv(fd_, out + got, len - got, 0);
             if (n == 0) {
-                closeLocked();
+                failLocked();
                 throw NetworkError("connection closed by broker (" + host_ + ":" +
                                    std::to_string(port_) + ")");
             }
@@ -172,7 +184,7 @@ Bytes Connection::readFrameLocked() {
                                       : errnoText("read");
                 // A half-read response leaves the stream desynchronised, so
                 // the socket goes; the next request dials again.
-                closeLocked();
+                failLocked();
                 throw NetworkError(msg + " (" + host_ + ":" + std::to_string(port_) + ")");
             }
             got += static_cast<std::size_t>(n);
@@ -184,7 +196,7 @@ Bytes Connection::readFrameLocked() {
                                             (std::uint32_t(header[1]) << 16) |
                                             (std::uint32_t(header[2]) << 8) | header[3]);
     if (length < 0) {
-        closeLocked();
+        failLocked();
         throw Error("negative frame length " + std::to_string(length));
     }
     Bytes payload(static_cast<std::size_t>(length));
@@ -202,7 +214,7 @@ Bytes Connection::request(std::int16_t apiKey, const Bytes& body) {
     if (got != correlationId) {
         // The stream has desynchronised; continuing would pair every later
         // response with the wrong request.
-        closeLocked();
+        failLocked();
         throw Error("correlation id mismatch: expected " + std::to_string(correlationId) +
                     ", got " + std::to_string(got));
     }

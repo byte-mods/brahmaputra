@@ -1,6 +1,7 @@
 // Connection, metadata routing, producer and single-partition consumer.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -60,6 +61,14 @@ public:
     /// Asks the broker which API versions it speaks, and its version string.
     std::pair<std::vector<ApiVersionRange>, std::string> apiVersions();
 
+    /// Changes how long one request/response round trip may take before the
+    /// socket is abandoned as broken.
+    void setRequestTimeout(std::chrono::milliseconds timeout);
+    /// Whether the last request failed (timeout, reset, desync) so the socket
+    /// was discarded. A broken connection is never reused: the next request
+    /// dials a fresh socket.
+    bool broken() const { return broken_.load(); }
+
     void close();
     const std::string& host() const { return host_; }
     std::uint16_t port() const { return port_; }
@@ -67,6 +76,7 @@ public:
 private:
     void ensureOpenLocked();
     void closeLocked();
+    void failLocked();
     void writeAllLocked(const Bytes& data);
     Bytes readFrameLocked();
 
@@ -78,6 +88,7 @@ private:
     std::mutex mu_;
     int fd_ = -1;
     std::int32_t next_ = 0;
+    std::atomic<bool> broken_{false};
 };
 
 // ---------------------------------------------------------------------------
