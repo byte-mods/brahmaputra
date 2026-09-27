@@ -90,6 +90,65 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # Every client driver's end-to-end suite against a live broker. Each
+  # driver speaks the wire protocol natively, so a broker change that alters
+  # an encoding shows up here as the driver that stopped agreeing.
+  clients:
+    name: Client driver (${{ matrix.driver }})
+    runs-on: ubuntu-latest
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: [rust, go, nodejs, python, java, dotnet, cpp, c, php, ruby, erlang, elixir]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - if: matrix.driver == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - if: matrix.driver == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - if: matrix.driver == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: matrix.driver == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - if: matrix.driver == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - if: matrix.driver == 'cpp' || matrix.driver == 'c'
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cmake
+      - if: matrix.driver == 'php'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: zlib
+      - if: matrix.driver == 'ruby'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - if: matrix.driver == 'erlang' || matrix.driver == 'elixir'
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "26"
+          elixir-version: ${{ matrix.driver == 'elixir' && '1.16' || '' }}
+
+      - name: Build broker
+        run: cargo build --locked --release -p brahmaputra-server
+      - name: ${{ matrix.driver }} end-to-end suite
+        run: bash clients/run-e2e.sh ${{ matrix.driver }}
+
   # Chaos is slower and deliberately randomised, so it runs on demand and on
   # main rather than on every pull request.
   chaos:
