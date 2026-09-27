@@ -1,0 +1,114 @@
+# WebSocket gateway on Kubernetes. Stateless: scale replicas to scale
+# sockets; the brokers see only GW_PRODUCERS connections per replica.
+#
+#   kubectl create secret generic ws-gateway-jwt --from-literal=secrets="kid1:$(openssl rand -hex 32)"
+#   kubectl apply -f deploy/ws-gateway/kubernetes.yaml
+#
+# Capacity per replica is memory- and descriptor-bound: ~5 KB per idle
+# socket measured, so the 2 GiB limit below is sized for ~250k sockets with
+# headroom. Node sysctls for high socket counts are in crates/gateway/README.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-gateway
+  labels: { app: ws-gateway }
+spec:
+  replicas: 4
+  selector:
+    matchLabels: { app: ws-gateway }
+  strategy:
+    type: RollingUpdate
+    # Replace one replica at a time: its clients reconnect to the others.
+    rollingUpdate: { maxUnavailable: 1, maxSurge: 1 }
+  template:
+    metadata:
+      labels: { app: ws-gateway }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8091"
+    spec:
+      # Above GW_SHUTDOWN_GRACE_SECS, so in-flight messages are acknowledged
+      # before the pod is killed.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: gateway
+          image: brahmaputra-ws-gateway:latest
+          ports:
+            - { name: ws, containerPort: 8090 }
+            - { name: ops, containerPort: 8091 }
+          env:
+            - { name: GW_BROKERS, value: "brahmaputra-0.brahmaputra:9092,brahmaputra-1.brahmaputra:9092,brahmaputra-2.brahmaputra:9092" }
+            - { name: GW_DEFAULT_TOPIC, value: "events" }
+            - { name: GW_ALLOWED_TOPICS, value: "events,orders.*" }
+            - { name: GW_JWT_SECRET_FILE, value: "/etc/ws-gateway/secrets" }
+            - { name: GW_MAX_CONNECTIONS, value: "250000" }
+            - { name: GW_SHUTDOWN_GRACE_SECS, value: "30" }
+            - { name: GW_ACKS, value: "all" }
+            - { name: RUST_LOG, value: "info" }
+          volumeMounts:
+            - { name: jwt, mountPath: /etc/ws-gateway, readOnly: true }
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits: { memory: 2Gi }
+          readinessProbe:
+            httpGet: { path: /readyz, port: ops }
+            periodSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: ops }
+            periodSeconds: 10
+      volumes:
+        - name: jwt
+          secret:
+            secretName: ws-gateway-jwt
+            items: [{ key: secrets, path: secrets }]
+---
+# L4 load balancer for the WebSocket port only; terminate TLS here or in
+# front of it. No session affinity is needed.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ws-gateway
+spec:
+  type: LoadBalancer
+  selector: { app: ws-gateway }
+  ports:
+    - { name: ws, port: 443, targetPort: ws }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ws-gateway-ops
+spec:
+  selector: { app: ws-gateway }
+  ports:
+    - { name: ops, port: 8091, targetPort: ops }
+---
+# Scale on memory (sockets) and CPU (message rate). Scaling in drains a
+# replica gracefully; its clients reconnect elsewhere.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ws-gateway
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: ws-gateway }
+  minReplicas: 4
+  maxReplicas: 64
+  metrics:
+    - type: Resource
+      resource: { name: memory, target: { type: Utilization, averageUtilization: 70 } }
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+  behavior:
+    scaleDown:
+      # Every scale-down reconnects that replica's clients; do it slowly.
+      policies: [{ type: Pods, value: 1, periodSeconds: 120 }]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ws-gateway
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: ws-gateway }

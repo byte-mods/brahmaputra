@@ -80,21 +80,21 @@ pub struct GatewayConfig {
     /// default is 128 KiB, which at a million sockets is 128 GB of buffers
     /// for connections that are mostly idle; larger messages still work,
     /// the buffer grows for them and they take more reads.
-    #[arg(long, env = "GW_READ_BUFFER_BYTES", default_value_t = 4096)]
+    #[arg(long, env = "GW_READ_BUFFER_BYTES", default_value_t = 1024)]
     pub read_buffer_bytes: usize,
 
     /// Messages one connection may have awaiting a broker acknowledgement.
     /// At the limit the gateway stops reading that socket, so a client
     /// faster than the cluster is slowed by TCP rather than buffered.
-    #[arg(long, env = "GW_MAX_INFLIGHT", default_value_t = 64)]
+    #[arg(long = "max-inflight", env = "GW_MAX_INFLIGHT", default_value_t = 64)]
     pub max_inflight_per_connection: usize,
 
     /// Sustained messages per second per connection (0 disables).
-    #[arg(long, env = "GW_RATE_LIMIT", default_value_t = 1000.0)]
+    #[arg(long = "rate-limit", env = "GW_RATE_LIMIT", default_value_t = 1000.0)]
     pub rate_limit_per_sec: f64,
 
     /// Burst allowance on top of the sustained rate.
-    #[arg(long, env = "GW_RATE_BURST", default_value_t = 2000.0)]
+    #[arg(long = "rate-burst", env = "GW_RATE_BURST", default_value_t = 2000.0)]
     pub rate_limit_burst: f64,
 
     /// Close a connection that sent nothing (not even a pong) for this long.

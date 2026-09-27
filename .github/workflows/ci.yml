@@ -66,6 +66,7 @@ jobs:
           - verify-transactions
           - verify-compaction
           - verify-jbod
+          - verify-ws-gateway
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
