@@ -205,7 +205,11 @@ didn't budget for:
 
 - **Stateless:** any instance can serve any client; no sticky sessions.
   Put an **L4** (TCP) load balancer in front, or an L7 one with long idle
-  timeouts, and terminate TLS there (`wss://`).
+  timeouts.
+- **TLS (`wss://`):** terminate it at the load balancer, which keeps the
+  per-socket memory figures above. Or pass `--tls-cert`/`--tls-key` (PEM)
+  and the gateway serves `wss://` itself. That costs rustls session state
+  per socket, so measure before sizing for millions that way.
 - **Probes:** liveness `GET :8091/healthz`, readiness `GET :8091/readyz`.
   Keep `:8091` off the public load balancer.
 - **Shutdown:** on SIGTERM the instance goes unready, stops accepting,

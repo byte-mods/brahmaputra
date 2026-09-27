@@ -807,3 +807,76 @@ async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
     stream.read_to_string(&mut out).await.unwrap();
     out
 }
+
+#[tokio::test]
+async fn tls_listener_serves_wss_and_refuses_plaintext() {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+    std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+    let env = Env::start(|c| {
+        c.tls_cert = Some(cert_path.clone());
+        c.tls_key = Some(key_path.clone());
+    })
+    .await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certified.cert.der().clone()).unwrap();
+    let client = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+    let tcp = TcpStream::connect(env.gw().ws_addr).await.unwrap();
+    let tls = connector
+        .connect("localhost".try_into().unwrap(), tcp)
+        .await
+        .expect("TLS handshake with the gateway");
+    let url = format!(
+        "wss://localhost:{}/ws?topic=e2e-tls",
+        env.gw().ws_addr.port()
+    );
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {}", token("secure", None, 60))).unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::client_async(request, tls).await.unwrap();
+    let hello = next_json_any(&mut ws).await;
+    assert_eq!(hello["type"], "welcome");
+    ws.send(Message::text(
+        json!({"id": 1, "value": "over tls"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let ack = next_json_any(&mut ws).await;
+    assert_eq!(ack["type"], "ack", "{ack}");
+    let log = env.read_topic("e2e-tls").await;
+    assert_eq!(log.values().map(Vec::len).sum::<usize>(), 1);
+
+    // A plaintext upgrade against the TLS listener goes nowhere.
+    assert!(
+        connect(&env.url("topic=e2e-tls"), Some(&token("u", None, 60)))
+            .await
+            .is_err()
+    );
+    env.finish().await;
+}
+
+async fn next_json_any<S>(ws: &mut WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("frame within 10s")
+            .expect("open")
+            .expect("frame")
+        {
+            Message::Text(text) => return serde_json::from_str(&text).unwrap(),
+            _ => continue,
+        }
+    }
+}

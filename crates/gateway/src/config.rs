@@ -18,6 +18,15 @@ pub struct GatewayConfig {
     #[arg(long, env = "GW_HTTP_LISTEN", default_value = "0.0.0.0:8091")]
     pub http_listen: SocketAddr,
 
+    /// PEM certificate chain for `wss://`. Usually TLS is terminated at the
+    /// load balancer instead; set this (with --tls-key) when there is none.
+    #[arg(long, env = "GW_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM private key matching --tls-cert.
+    #[arg(long, env = "GW_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
+
     /// Brahmaputra bootstrap brokers, host:port, comma-separated. The
     /// first reachable one is used to discover the rest of the cluster.
     #[arg(

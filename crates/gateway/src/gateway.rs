@@ -35,6 +35,7 @@ use brahmaputra_protocol::RecordHeader;
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
 use futures::{Future, SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
@@ -70,6 +71,7 @@ struct Shared {
     /// last one without holding a handle per connection.
     connection_closed: Notify,
     ws_config: WebSocketConfig,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 }
 
 impl Shared {
@@ -191,6 +193,12 @@ pub async fn start(config: GatewayConfig) -> anyhow::Result<RunningGateway> {
         .max_message_size(Some(config.max_message_bytes))
         .max_frame_size(Some(config.max_message_bytes));
 
+    let tls = match (&config.tls_cert, &config.tls_key) {
+        (Some(cert), Some(key)) => Some(tls_acceptor(cert, key)?),
+        (None, None) => None,
+        _ => bail!("--tls-cert and --tls-key must be given together"),
+    };
+
     let listener = bind(config.listen)?;
     let ws_addr = listener.local_addr()?;
     let http_listener = tokio::net::TcpListener::bind(config.http_listen)
@@ -210,6 +218,7 @@ pub async fn start(config: GatewayConfig) -> anyhow::Result<RunningGateway> {
         shutdown,
         connection_closed: Notify::new(),
         ws_config,
+        tls,
     });
 
     let health = tokio::spawn(health_loop(shared.clone(), health_consumer));
@@ -287,6 +296,35 @@ async fn resolve_broker(config: &GatewayConfig) -> anyhow::Result<SocketAddr> {
     Err(last_error
         .unwrap_or_else(|| anyhow::anyhow!("no brokers configured"))
         .context("no bootstrap broker reachable"))
+}
+
+/// Terminate TLS in the gateway itself (`wss://`). Terminating at the
+/// load balancer instead is usually cheaper per socket; this is for
+/// deployments without one.
+fn tls_acceptor(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    use std::io::BufReader;
+    let chain = rustls_pemfile::certs(&mut BufReader::new(
+        std::fs::File::open(cert).with_context(|| format!("opening {}", cert.display()))?,
+    ))
+    .collect::<Result<Vec<_>, _>>()
+    .with_context(|| format!("reading certificates from {}", cert.display()))?;
+    if chain.is_empty() {
+        bail!("no certificates in {}", cert.display());
+    }
+    let key = rustls_pemfile::private_key(&mut BufReader::new(
+        std::fs::File::open(key).with_context(|| format!("opening {}", key.display()))?,
+    ))
+    .with_context(|| format!("reading {}", key.display()))?
+    .with_context(|| format!("no private key in {}", key.display()))?;
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .context("building the TLS configuration")?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
 fn bind(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
@@ -373,11 +411,41 @@ impl Session {
     }
 }
 
+async fn serve(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
+    let _ = stream.set_nodelay(true);
+    match shared.tls.clone() {
+        None => upgrade(shared, stream, peer).await,
+        Some(acceptor) => {
+            // The TLS handshake shares the upgrade's deadline: a client
+            // that stalls mid-handshake holds a socket and a task.
+            let deadline = Duration::from_secs(shared.config.handshake_timeout_secs);
+            match tokio::time::timeout(deadline, acceptor.accept(stream)).await {
+                Ok(Ok(tls)) => upgrade(shared, tls, peer).await,
+                Ok(Err(error)) => {
+                    debug!(%peer, %error, "tls handshake failed");
+                    shared
+                        .metrics
+                        .handshakes_rejected_other
+                        .fetch_add(1, Relaxed);
+                }
+                Err(_) => {
+                    shared
+                        .metrics
+                        .handshakes_rejected_other
+                        .fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+}
+
 // `ErrorResponse` is the handshake callback's error type, fixed by
 // tungstenite; it is built once per refused upgrade, never per message.
 #[allow(clippy::result_large_err)]
-async fn serve(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
-    let _ = stream.set_nodelay(true);
+async fn upgrade<S>(shared: Arc<Shared>, stream: S, peer: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut session = None;
     let callback =
         |request: &Request, response: Response| match authenticate(&shared, request, response) {
@@ -616,10 +684,10 @@ impl RateLimit {
     }
 }
 
-struct Connection {
+struct Connection<S> {
     shared: Arc<Shared>,
     session: Session,
-    ws: WebSocketStream<TcpStream>,
+    ws: WebSocketStream<S>,
     inflight: FuturesUnordered<ProduceFuture>,
     limiter: RateLimit,
     binary_seq: u64,
@@ -632,8 +700,8 @@ enum Step {
     Gone,
 }
 
-impl Connection {
-    fn new(shared: Arc<Shared>, session: Session, ws: WebSocketStream<TcpStream>) -> Self {
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
+    fn new(shared: Arc<Shared>, session: Session, ws: WebSocketStream<S>) -> Self {
         let limiter = RateLimit::new(
             shared.config.rate_limit_per_sec,
             shared.config.rate_limit_burst,
