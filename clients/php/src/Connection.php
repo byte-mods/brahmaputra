@@ -40,7 +40,7 @@ final class Connection
         public readonly string $host,
         public readonly int $port,
         private readonly string $clientId,
-        private readonly int $requestTimeoutMs,
+        private int $requestTimeoutMs,
     ) {
         $this->socket = $socket;
     }
@@ -75,6 +75,21 @@ final class Connection
     public function isOpen(): bool
     {
         return $this->socket !== null && !feof($this->socket);
+    }
+
+    /**
+     * True once a socket error or timeout has closed this connection. A
+     * broken connection is never reused: the Router dials a fresh one.
+     */
+    public function isBroken(): bool
+    {
+        return $this->socket === null;
+    }
+
+    /** Change how long one round trip may take before it fails and breaks the connection. */
+    public function setRequestTimeout(int $timeoutMs): void
+    {
+        $this->requestTimeoutMs = max(1, $timeoutMs);
     }
 
     public function close(): void

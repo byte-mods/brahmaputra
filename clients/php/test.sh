@@ -13,4 +13,7 @@ find "$DIR/src" "$DIR/autoload.php" "$DIR/test_manual.php" -name '*.php' -print0
     while IFS= read -r -d '' file; do
         "$PHP" -l "$file" >/dev/null || { echo "syntax error in $file" >&2; exit 1; }
     done
+for ext in zlib pcntl posix; do
+    "$PHP" -m | grep -qx "$ext" || { echo "the e2e suite needs the PHP $ext extension" >&2; exit 1; }
+done
 exec "$PHP" -d zend.assertions=1 "$DIR/test_manual.php" "$1" "$2"

@@ -13,8 +13,9 @@ implementation otherwise. No Composer? Require the bundled autoloader:
 require '/path/to/clients/php/autoload.php';
 ```
 
-Verified end to end against a live broker: **38/38 checks**
-(`./test.sh 127.0.0.1 9092`, a port of the Go suite).
+Verified end to end against a live broker: **54/54 checks**
+(`./test.sh 127.0.0.1 9092`, a port of the Go suite with the same
+sections and checks).
 
 ## No threads: what that changes
 
@@ -29,9 +30,22 @@ librdkafka-less PHP clients work:
   `$producer->poll(0)` from a long-running loop so a lingering batch does
   not wait for the next `send()`, and always `flush()` or `close()` before
   the script ends (the destructor flushes as a last resort and warns if it
-  cannot). Because sends are synchronous, a batch's outcome is known when
-  the call that sent it returns: failures are thrown from that call, or
-  passed to `delivery.report.callback` if you set one.
+  cannot).
+- **Producer errors.** A batch the call itself had to send (its record
+  filled the batch, `linger.ms` is 0, `sendSync()`, `flush()`) throws from
+  that call. A batch sent only because its linger expired while you called
+  `send()`/`poll()` for something else is a *background* flush: its failure
+  is held and thrown by the next `flush()` or `close()`, never dropped and
+  never thrown from the unrelated call. With `delivery.report.callback`
+  set, every outcome goes to the callback instead.
+- **Ordering.** A partition has one open batch and batches are sent
+  synchronously, so at most one batch per partition is ever in flight and
+  records keep send order across the send/poll/flush/sendSync paths
+  (`sendSync()` first sends the partition's open batch).
+- **Broken connections.** A socket error or request timeout closes the
+  connection (`Connection::isBroken()`); it is never reused, and the next
+  request redials. Producers retry a dropped connection within `retries`;
+  consumers resend an idempotent read once.
 - **`buffer.memory` / `max.block.ms`.** When the buffer is full, `send()`
   blocks while sending any batch whose linger falls due; if that frees
   nothing within `max.block.ms` it throws `BufferFullException`.
@@ -39,9 +53,13 @@ librdkafka-less PHP clients work:
   (default `session.timeout.ms / 3`) while it waits, and `commit()`
   heartbeats too. Processing between two polls must therefore stay under
   `session.timeout.ms`; for longer work call `$consumer->heartbeat()` from
-  your loop. `max.poll.interval.ms` is enforced at the next `poll()` (or
-  `heartbeat()`): if it was exceeded the member leaves, drops its
-  uncommitted positions and rejoins, as Java's heartbeat thread would have.
+  your loop. `max.poll.interval.ms` bounds only the time *between* polls
+  (it is stamped when `poll()` is entered and again when it returns, so a
+  slow join inside `poll()` never counts). It is enforced at the next
+  `poll()` (or `heartbeat()`): if it was exceeded the member leaves, drops
+  its uncommitted positions and rejoins, as Java's heartbeat thread would
+  have. `UNKNOWN_MEMBER_ID` on join, sync or heartbeat clears the member id
+  and rejoins.
 - Run one `GroupConsumer` per process. Two members in one PHP process
   cannot both answer a rebalance at once, because each blocks the other.
 
@@ -216,8 +234,11 @@ Start a broker, then:
 php test_manual.php 127.0.0.1 9092
 ```
 
-It prints one line per check and ends with `N passed, 0 failed`; the exit
-status is non-zero on any failure.
+It prints one line per check and ends with `54 passed, 0 failed`; the exit
+status is non-zero on any failure. The suite (not the driver) needs the
+`pcntl` and `posix` extensions of the PHP CLI: the connection-failure
+section runs a small TCP proxy in a forked child, and the long-poll group
+section produces from a forked child while the parent polls.
 
 ## Not implemented
 

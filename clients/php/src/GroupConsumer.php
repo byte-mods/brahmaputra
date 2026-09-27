@@ -28,12 +28,15 @@ use Brahmaputra\Protocol\Writer;
  * rebalances. For longer processing call heartbeat() periodically from
  * your own loop, or raise session.timeout.ms.
  *
- * `max.poll.interval.ms` is enforced at the next poll(): if the gap since
- * the previous poll exceeded it, this member leaves the group (as the Java
- * client's heartbeat thread would have done when the deadline passed),
- * drops its uncommitted positions, and rejoins. A heartbeat() call made
- * after the interval has passed does the same, so a stuck application does
- * not keep asserting a liveness it no longer has.
+ * `max.poll.interval.ms` bounds the time the *application* spends between
+ * polls — from one poll() returning to the next being called. It is
+ * enforced at the next poll(): if that gap exceeded it, this member leaves
+ * the group (as the Java client's heartbeat thread would have done when
+ * the deadline passed), drops its uncommitted positions, and rejoins. A
+ * heartbeat() call made after the interval has passed does the same, so a
+ * stuck application does not keep asserting a liveness it no longer has.
+ * Time spent *inside* poll() — joining, syncing, waiting for records —
+ * never counts: the clock is stamped on entry and again on return.
  *
  * Single-instance by design: one GroupConsumer per worker process.
  */
@@ -97,6 +100,7 @@ final class GroupConsumer
     private int $lastCommitMs;
     private int $lastHeartbeatMs = 0;
     private bool $closed = false;
+    private bool $inPoll = false;
 
     /** @param array<string, mixed> $config Kafka-style keys; see defaults() */
     public function __construct(array $config)
@@ -161,12 +165,22 @@ final class GroupConsumer
             throw new BrahmaputraException('subscribe to at least one topic before polling');
         }
         $this->enforcePollInterval();
-        // Stamped on entry: the interval bounds how long the *application*
-        // goes without asking for records; a poll that blocks for its full
-        // timeout is the consumer working normally.
+        // Stamped on entry and again on return: the interval bounds how long
+        // the *application* goes without asking for records, and a poll that
+        // spends its time joining or waiting is the consumer working normally.
         $this->lastPollMs = Config::nowMs();
-        $deadline = $this->lastPollMs + $timeoutMs;
+        $this->inPoll = true;
+        try {
+            return $this->pollInner($this->lastPollMs + $timeoutMs);
+        } finally {
+            $this->inPoll = false;
+            $this->lastPollMs = Config::nowMs();
+        }
+    }
 
+    /** @return list<ConsumedRecord> */
+    private function pollInner(int $deadline): array
+    {
         while (true) {
             $this->maybeHeartbeat();
             if (!$this->joined) {
@@ -383,7 +397,7 @@ final class GroupConsumer
      */
     private function enforcePollInterval(): bool
     {
-        if ($this->lastPollMs === null || !$this->joined) {
+        if ($this->inPoll || $this->lastPollMs === null || !$this->joined) {
             return true;
         }
         $idle = Config::nowMs() - $this->lastPollMs;
@@ -528,6 +542,11 @@ final class GroupConsumer
         $reader = Reader::body($this->coordinatorRequest(ApiKey::SYNC_GROUP, $writer->bytes(), (int) $this->config['rebalance.timeout.ms']));
         $code = $reader->int32();
         if ($code === ErrorCode::REBALANCE_IN_PROGRESS || $code === ErrorCode::ILLEGAL_GENERATION) {
+            return false;
+        }
+        if ($code === ErrorCode::UNKNOWN_MEMBER_ID) {
+            // Evicted between join and sync: rejoin under a fresh id.
+            $this->memberId = '';
             return false;
         }
         if ($code !== ErrorCode::NONE) {

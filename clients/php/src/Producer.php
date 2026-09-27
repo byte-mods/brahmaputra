@@ -32,10 +32,22 @@ use Brahmaputra\Protocol\Writer;
  *
  * So a long-lived worker should call poll(0) from its loop (as with
  * php-rdkafka), and every script must call flush() or close() before it
- * ends; the destructor flushes as a last resort. Sends are synchronous
- * round trips, which also means a batch's delivery outcome is known when
- * the call that sent it returns: failures are thrown from that call, or
- * handed to `delivery.report.callback` if you configure one.
+ * ends; the destructor flushes as a last resort.
+ *
+ * Errors. A batch the call itself had to send — its own record filled the
+ * batch, linger.ms is 0, sendSync(), flush() — throws from that call. A
+ * batch sent only because its linger expired while you called send() or
+ * poll() for something else is this client's "background" flush: its
+ * failure is not thrown from the unrelated call but held and thrown by the
+ * next flush() or close(), so it is never dropped. With
+ * `delivery.report.callback` set, every outcome goes to the callback
+ * instead and nothing is held.
+ *
+ * Ordering. A partition has at most one open batch and batches are sent
+ * synchronously, one at a time, so there is never more than one batch in
+ * flight per partition and a partition's records reach the broker in send
+ * order whichever path (send, poll, flush, sendSync) sends them. sendSync()
+ * sends the partition's open batch first for the same reason.
  *
  * Retries: a batch the broker refuses with a retriable code (returned
  * before it appends, so no duplicate is possible) is retried up to
@@ -83,6 +95,9 @@ final class Producer
     private int $bufferedBytes = 0;
     private int $roundRobin = 0;
     private bool $closed = false;
+    /** The first failure of a background (linger) flush, held for the next flush()/close(). */
+    private ?\Throwable $pendingError = null;
+    private int $pendingFailures = 0;
 
     /** @param array<string, mixed> $config Kafka-style keys; see defaults() */
     public function __construct(array $config)
@@ -127,7 +142,7 @@ final class Producer
     ): void {
         $this->ensureOpen();
         // Deliver whatever has lingered long enough before adding more.
-        $this->sendExpired();
+        $this->sendExpired(true);
 
         $target = $partition ?? $this->choosePartition($topic, $key);
         $size = self::estimate($value, $key, $headers);
@@ -171,6 +186,9 @@ final class Producer
     ): int {
         $this->ensureOpen();
         $target = $partition ?? $this->choosePartition($topic, $key);
+        // Records already buffered for this partition were sent first, so
+        // they must reach the broker first.
+        $this->flushSlots([$topic . "\0" . $target]);
         $record = [
             'key' => $key,
             'value' => $value,
@@ -192,22 +210,49 @@ final class Producer
     public function poll(int $timeoutMs = 0): int
     {
         $this->ensureOpen();
-        $sent = $this->sendExpired();
+        $sent = $this->sendExpired(true);
         if ($timeoutMs > 0) {
             $deadline = Config::nowMs() + $timeoutMs;
             while ($this->hasBuffered() && Config::nowMs() < $deadline) {
                 $wait = min($this->nextDueMs() - Config::nowMs(), $deadline - Config::nowMs());
                 Config::sleepMs(max(1, $wait));
-                $sent += $this->sendExpired();
+                $sent += $this->sendExpired(true);
             }
         }
         return $sent;
     }
 
-    /** Send every buffered record now and wait for the broker to acknowledge them. */
+    /**
+     * Send every buffered record now and wait for the broker to acknowledge
+     * them. Also throws any failure a background (linger) flush has held
+     * since the last flush, so no failed batch goes unreported.
+     */
     public function flush(): void
     {
-        $this->flushSlots(array_keys($this->slots));
+        try {
+            $this->flushSlots(array_keys($this->slots));
+        } finally {
+            $held = $this->takePendingError();
+        }
+        if ($held !== null) {
+            throw $held;
+        }
+    }
+
+    private function takePendingError(): ?\Throwable
+    {
+        $error = $this->pendingError;
+        $failures = $this->pendingFailures;
+        $this->pendingError = null;
+        $this->pendingFailures = 0;
+        if ($error !== null && $failures > 1) {
+            return new BrahmaputraException(
+                "{$failures} background batches failed to deliver; first: " . $error->getMessage(),
+                0,
+                $error,
+            );
+        }
+        return $error;
     }
 
     /** Flush, then close every connection. */
@@ -285,7 +330,7 @@ final class Producer
         $maxBlock = (int) $this->config['max.block.ms'];
         $deadline = Config::nowMs() + $maxBlock;
         while ($this->bufferedBytes + $size > $limit) {
-            $this->sendExpired();
+            $this->sendExpired(true);
             if ($this->bufferedBytes + $size <= $limit) {
                 break;
             }
@@ -325,7 +370,8 @@ final class Producer
         return $due;
     }
 
-    private function sendExpired(): int
+    /** @param bool $background hold failures for the next flush()/close() instead of throwing */
+    private function sendExpired(bool $background): int
     {
         $now = Config::nowMs();
         $linger = (int) $this->config['linger.ms'];
@@ -336,7 +382,7 @@ final class Producer
             }
         }
         if ($due !== []) {
-            $this->flushSlots($due);
+            $this->flushSlots($due, $background);
         }
         return count($due);
     }
@@ -346,8 +392,9 @@ final class Producer
      * first failure is then thrown (or each is reported to the callback).
      *
      * @param list<string> $names
+     * @param bool $background hold failures for the next flush()/close() instead of throwing
      */
-    private function flushSlots(array $names): void
+    private function flushSlots(array $names, bool $background = false): void
     {
         $firstError = null;
         $failures = 0;
@@ -367,6 +414,11 @@ final class Producer
                     $firstError ??= $error;
                 }
             }
+        }
+        if ($firstError !== null && $background) {
+            $this->pendingError ??= $firstError;
+            $this->pendingFailures += $failures;
+            return;
         }
         if ($firstError !== null) {
             if ($failures > 1) {

@@ -380,5 +380,400 @@ section('bounded client buffer');
     check('a full buffer blocks and then reports', $blocked);
 }
 
+section('wire edge cases');
+{
+    $edgeTopic = unique('php-edge');
+    $producer = new Producer($producerConfig());
+    $large = '';
+    for ($i = 0; $i < (1 << 20); $i++) {
+        $large .= chr(($i * 7) & 0xff);
+    }
+    $unicodeKey = 'ключ-✓-🔑';
+    $unicodeValue = 'значение — 数据 — 🚀';
+    $producer->send($edgeTopic, $large, null, [], 0);
+    $producer->send($edgeTopic, $unicodeValue, $unicodeKey, [new RecordHeader('ünïcødé-🏷', '✓')], 0);
+    // An empty key and an empty header value are values, not nulls.
+    $producer->send($edgeTopic, 'empty-key', '', [new RecordHeader('empty', ''), new RecordHeader('null', null)], 0);
+    $producer->send($edgeTopic, 'null-key', null, [], 0);
+    $producer->close();
+
+    $consumer = new Consumer($consumerConfig());
+    $got = [];
+    for ($offset = 0; count($got) < 4;) {
+        try {
+            $batch = $consumer->fetch($edgeTopic, 0, $offset, 500);
+        } catch (\Throwable) {
+            break;
+        }
+        if ($batch === []) {
+            break;
+        }
+        array_push($got, ...$batch);
+        $offset = $batch[count($batch) - 1]->offset + 1;
+    }
+    check('edge records all arrive', count($got) === 4, 'got ' . count($got));
+    if (count($got) === 4) {
+        check('a 1 MiB value round-trips byte-identical', $got[0]->value === $large, strlen((string) $got[0]->value) . ' bytes');
+        check(
+            'unicode key, value and header key round-trip',
+            $got[1]->key === $unicodeKey && $got[1]->value === $unicodeValue
+                && count($got[1]->headers) === 1 && $got[1]->headers[0]->key === 'ünïcødé-🏷',
+        );
+        check('an empty key stays empty, not null', $got[2]->key === '', var_export($got[2]->key, true));
+        check(
+            'an empty header value stays empty, not null',
+            count($got[2]->headers) === 2 && $got[2]->headers[0]->value === '' && $got[2]->headers[1]->value === null,
+            var_export($got[2]->headers, true),
+        );
+        check('a null key stays null', $got[3]->key === null, var_export($got[3]->key, true));
+    }
+    $consumer->close();
+}
+
+section('ordering under linger flushes');
+{
+    $orderTopic = unique('php-order');
+    $producer = new Producer(['bootstrap.servers' => $bootstrap, 'linger.ms' => 1, 'batch.size' => 256]);
+    $total = 5000;
+    for ($i = 0; $i < $total; $i++) {
+        $producer->send($orderTopic, (string) $i, null, [], 0);
+    }
+    $producer->close();
+    $consumer = new Consumer($consumerConfig());
+    $values = [];
+    for ($offset = 0; count($values) < $total;) {
+        try {
+            $batch = $consumer->fetch($orderTopic, 0, $offset, 500);
+        } catch (\Throwable) {
+            break;
+        }
+        if ($batch === []) {
+            break;
+        }
+        foreach ($batch as $record) {
+            $values[] = (int) $record->value;
+        }
+        $offset = $batch[count($batch) - 1]->offset + 1;
+    }
+    $inversions = 0;
+    for ($i = 1; $i < count($values); $i++) {
+        if ($values[$i] < $values[$i - 1]) {
+            $inversions++;
+        }
+    }
+    check("every record of a partition arrives", count($values) === $total, 'got ' . count($values));
+    check("a partition's records keep send order", $inversions === 0, "{$inversions} inversions");
+    $consumer->close();
+}
+
+section('background flush failures are reported');
+{
+    $producer = new Producer(['bootstrap.servers' => $bootstrap, 'linger.ms' => 20]);
+    // Partition 999 does not exist. PHP has no ticker thread, so the
+    // "background" flush is the linger-expired one poll() performs; its
+    // failure must not vanish, and must not be thrown from poll() either.
+    $sendError = null;
+    $pollError = null;
+    $flushError = null;
+    try {
+        $producer->send(unique('php-bgfail'), 'lost', null, [], 999);
+    } catch (\Throwable $e) {
+        $sendError = $e;
+    }
+    usleep(300_000);
+    try {
+        $producer->poll(0);
+    } catch (\Throwable $e) {
+        $pollError = $e;
+    }
+    try {
+        $producer->flush();
+    } catch (\Throwable $e) {
+        $flushError = $e;
+    }
+    check(
+        'a failed linger flush surfaces on the next Flush',
+        $sendError === null && $pollError === null && $flushError !== null,
+        sprintf('send=%s poll=%s flush=%s', $sendError?->getMessage() ?? 'nil', $pollError?->getMessage() ?? 'nil', $flushError?->getMessage() ?? 'nil'),
+    );
+    $started = nowMs();
+    try {
+        $producer->close();
+    } catch (\Throwable) {
+    }
+    check('Close returns after a failed flush', nowMs() - $started < 5000, 'hung');
+}
+
+section('connection failures');
+{
+    // A broker that accepts and never answers must cost an error, not a
+    // process blocked forever. The kernel completes the handshake from the
+    // listen backlog, so this socket never needs to accept().
+    $silent = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+    if ($silent !== false) {
+        [$silentHost, $silentPort] = explode(':', stream_socket_get_name($silent, false));
+        $conn = \Brahmaputra\Connection::open($silentHost, (int) $silentPort, 'php-test', 1000);
+        $conn->setRequestTimeout(300);
+        $started = nowMs();
+        $requestError = null;
+        try {
+            $conn->apiVersions();
+        } catch (\Throwable $e) {
+            $requestError = $e;
+        }
+        check(
+            'a request to an unresponsive broker times out',
+            $requestError !== null && nowMs() - $started < 3000,
+            $requestError?->getMessage() ?? 'no error',
+        );
+        check('a timed-out connection is not reused', $conn->isBroken());
+        $conn->close();
+        fclose($silent);
+    }
+
+    // A connection the broker drops is redialled, not kept forever.
+    $proxy = TestProxy::start($host, (int) $port);
+    $dropTopic = unique('php-drop');
+    $producer = new Producer(['bootstrap.servers' => $proxy->address, 'linger.ms' => 0]);
+    $producer->send($dropTopic, 'before', null, [], 0);
+    $proxy->dropAll();
+    $recovered = 'not attempted';
+    for ($attempt = 0; $attempt < 3 && $recovered !== null; $attempt++) {
+        try {
+            $producer->send($dropTopic, 'after', null, [], 0);
+            $recovered = null;
+        } catch (\Throwable $e) {
+            $recovered = $e->getMessage();
+        }
+    }
+    check('a producer recovers after its connection drops', $recovered === null, (string) $recovered);
+    try {
+        $producer->close();
+    } catch (\Throwable) {
+    }
+    $consumer = new Consumer(['bootstrap.servers' => $proxy->address]);
+    $consumer->fetch($dropTopic, 0, 0, 100);
+    $proxy->dropAll();
+    $fetchError = 'not attempted';
+    $fetched = [];
+    for ($attempt = 0; $attempt < 3 && $fetchError !== null; $attempt++) {
+        try {
+            $fetched = $consumer->fetch($dropTopic, 0, 0, 100);
+            $fetchError = null;
+        } catch (\Throwable $e) {
+            $fetchError = $e->getMessage();
+        }
+    }
+    check('a consumer recovers after its connection drops', $fetchError === null && count($fetched) >= 1, (string) $fetchError);
+    $consumer->close();
+    $proxy->close();
+}
+
+section('consumer group: max.poll.interval and rejoin');
+{
+    $slowTopic = unique('php-slow');
+    $producer = new Producer($producerConfig());
+    for ($i = 0; $i < 10; $i++) {
+        $producer->send($slowTopic, "s{$i}");
+    }
+    $consumer = new GroupConsumer($groupConfig(unique('php-slow-grp'), ['max.poll.interval.ms' => 1500]));
+    $consumer->subscribe([$slowTopic]);
+    $first = [];
+    $deadline = nowMs() + 15_000;
+    while (count($first) < 10 && nowMs() < $deadline) {
+        try {
+            array_push($first, ...$consumer->poll(300));
+        } catch (\Throwable) {
+            break;
+        }
+    }
+    $consumer->commit();
+    // Stall past max.poll.interval.ms: the member leaves the group.
+    usleep(2_500_000);
+    for ($i = 10; $i < 20; $i++) {
+        $producer->send($slowTopic, "s{$i}");
+    }
+    $producer->close();
+    $second = [];
+    $pollError = null;
+    $deadline = nowMs() + 15_000;
+    while (count($second) < 10 && nowMs() < $deadline) {
+        try {
+            array_push($second, ...$consumer->poll(300));
+        } catch (\Throwable $e) {
+            $pollError = $e;
+            break;
+        }
+    }
+    check(
+        'a member that stalled rejoins on its next poll',
+        count($first) === 10 && count($second) === 10 && $pollError === null,
+        sprintf('first=%d second=%d err=%s', count($first), count($second), $pollError?->getMessage() ?? 'nil'),
+    );
+    $consumer->close();
+}
+
+section('consumer group: time inside poll does not count against max.poll.interval');
+{
+    $joinTopic = unique('php-inpoll');
+    $producer = new Producer($producerConfig());
+    $producer->router()->partitions($joinTopic);
+    $producer->close();
+    // Far shorter than the poll below, which spends ~1s joining (the
+    // broker's initial rebalance delay) and then waits for data.
+    $consumer = new GroupConsumer($groupConfig(unique('php-inpoll-grp'), ['max.poll.interval.ms' => 600]));
+    $consumer->subscribe([$joinTopic]);
+    // PHP has no threads: a forked child produces while the parent polls.
+    $child = runInChild(static function () use ($bootstrap, $joinTopic): void {
+        usleep(2_000_000);
+        $late = new Producer(['bootstrap.servers' => $bootstrap, 'linger.ms' => 0]);
+        for ($i = 0; $i < 10; $i++) {
+            $late->send($joinTopic, "j{$i}");
+        }
+        $late->close();
+    });
+    $got = [];
+    $pollError = null;
+    $commitError = null;
+    try {
+        // One long poll: it joins, then waits for the records above.
+        $got = $consumer->poll(4000);
+    } catch (\Throwable $e) {
+        $pollError = $e;
+    }
+    // Committed straight away, before another poll could quietly rejoin:
+    // this fails if the member left the group mid-poll.
+    try {
+        $consumer->commit();
+    } catch (\Throwable $e) {
+        $commitError = $e;
+    }
+    check(
+        'a member is still in its group after a long poll',
+        $pollError === null && count($got) > 0 && $commitError === null,
+        sprintf('got=%d poll=%s commit=%s', count($got), $pollError?->getMessage() ?? 'nil', $commitError?->getMessage() ?? 'nil'),
+    );
+    pcntl_waitpid($child, $status);
+    $consumer->close();
+}
+
 echo "\n{$passed} passed, {$failed} failed\n";
 exit($failed > 0 ? 1 : 0);
+
+/**
+ * Run $work in a forked child. The child ends with SIGKILL rather than
+ * exit() so it never runs destructors on the parent's copies of open
+ * clients (which would send LeaveGroup or commits on shared sockets).
+ */
+function runInChild(callable $work): int
+{
+    $pid = pcntl_fork();
+    if ($pid < 0) {
+        throw new \RuntimeException('fork failed');
+    }
+    if ($pid === 0) {
+        try {
+            $work();
+        } catch (\Throwable $e) {
+            fwrite(STDERR, 'child failed: ' . $e->getMessage() . "\n");
+        }
+        posix_kill(posix_getpid(), SIGKILL);
+    }
+    return $pid;
+}
+
+/**
+ * Forwards TCP to the broker from a forked child and can sever every live
+ * connection (SIGUSR1), which is how a broker restart or an idle timeout
+ * looks to a client.
+ */
+final class TestProxy
+{
+    private function __construct(public readonly string $address, private readonly int $pid)
+    {
+    }
+
+    public static function start(string $host, int $port): self
+    {
+        $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+        if ($server === false) {
+            throw new \RuntimeException("proxy: {$errstr}");
+        }
+        $address = stream_socket_get_name($server, false);
+        $pid = runInChild(static function () use ($server, $host, $port): void {
+            $drop = false;
+            pcntl_async_signals(true);
+            pcntl_signal(SIGUSR1, function () use (&$drop): void {
+                $drop = true;
+            });
+            $pairs = []; // id => [client, upstream]
+            while (true) {
+                if ($drop) {
+                    foreach ($pairs as [$a, $b]) {
+                        @fclose($a);
+                        @fclose($b);
+                    }
+                    $pairs = [];
+                    $drop = false;
+                }
+                $read = [$server];
+                foreach ($pairs as [$a, $b]) {
+                    $read[] = $a;
+                    $read[] = $b;
+                }
+                $write = null;
+                $except = null;
+                if (@stream_select($read, $write, $except, 0, 50_000) === false) {
+                    continue; // interrupted by the signal
+                }
+                foreach ($read as $socket) {
+                    if ($socket === $server) {
+                        $client = @stream_socket_accept($server, 1);
+                        $upstream = @stream_socket_client("tcp://{$host}:{$port}", $errno, $errstr, 2);
+                        if ($client !== false && $upstream !== false) {
+                            $pairs[] = [$client, $upstream];
+                        } elseif ($client !== false) {
+                            fclose($client);
+                        }
+                        continue;
+                    }
+                    foreach ($pairs as $id => [$a, $b]) {
+                        if ($socket !== $a && $socket !== $b) {
+                            continue;
+                        }
+                        $data = @fread($socket, 1 << 16);
+                        if ($data === '' || $data === false) {
+                            @fclose($a);
+                            @fclose($b);
+                            unset($pairs[$id]);
+                        } else {
+                            $peer = $socket === $a ? $b : $a;
+                            for ($off = 0; $off < strlen($data);) {
+                                $n = @fwrite($peer, substr($data, $off));
+                                if ($n === false || $n === 0) {
+                                    break;
+                                }
+                                $off += $n;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        fclose($server);
+        return new self($address, $pid);
+    }
+
+    public function dropAll(): void
+    {
+        posix_kill($this->pid, SIGUSR1);
+        usleep(100_000);
+    }
+
+    public function close(): void
+    {
+        posix_kill($this->pid, SIGKILL);
+        pcntl_waitpid($this->pid, $status);
+    }
+}

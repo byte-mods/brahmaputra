@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace Brahmaputra;
 
+use Brahmaputra\Exception\ConnectionException;
 use Brahmaputra\Exception\ProtocolException;
 use Brahmaputra\Exception\ServerException;
+use Brahmaputra\Exception\TimeoutException;
 use Brahmaputra\Protocol\ApiKey;
 use Brahmaputra\Protocol\ErrorCode;
 use Brahmaputra\Protocol\Protocol;
@@ -83,7 +85,7 @@ final class Consumer
     public function listOffsets(string $topic, int $partition, int $timestamp): int
     {
         $body = Writer::body()->string($topic)->int32($partition)->int64($timestamp)->bytes();
-        $reader = Reader::body($this->router->connectionFor($topic, $partition)->request(ApiKey::LIST_OFFSETS, $body));
+        $reader = Reader::body($this->requestLeader($topic, $partition, ApiKey::LIST_OFFSETS, $body));
         $reader->string(); // topic
         $reader->int32();  // partition
         $code = $reader->int32();
@@ -130,10 +132,10 @@ final class Consumer
         // The broker may hold the request for $wait before answering.
         $timeout = (int) $this->config['request.timeout.ms'] + $wait;
 
-        $result = $this->decodeFetch($this->router->connectionFor($topic, $partition)->request(ApiKey::FETCH, $body, $timeout));
+        $result = $this->decodeFetch($this->requestLeader($topic, $partition, ApiKey::FETCH, $body, $timeout));
         if ($result[0] === ErrorCode::NOT_LEADER_OR_FOLLOWER) {
             $this->router->refresh($topic);
-            $result = $this->decodeFetch($this->router->connectionFor($topic, $partition)->request(ApiKey::FETCH, $body, $timeout));
+            $result = $this->decodeFetch($this->requestLeader($topic, $partition, ApiKey::FETCH, $body, $timeout));
         }
         [$code, $highWatermark, $batches] = $result;
         if ($code !== ErrorCode::NONE) {
@@ -161,6 +163,23 @@ final class Consumer
             }
         }
         return new FetchResult($records, $highWatermark);
+    }
+
+    /**
+     * Send a read to the partition leader. Reads are idempotent, so a
+     * connection that dropped (broker restart, idle timeout) is redialled
+     * and the request sent once more before the error reaches the caller.
+     */
+    private function requestLeader(string $topic, int $partition, int $apiKey, string $body, ?int $timeoutMs = null): string
+    {
+        try {
+            return $this->router->connectionFor($topic, $partition)->request($apiKey, $body, $timeoutMs);
+        } catch (ConnectionException $error) {
+            if ($error instanceof TimeoutException) {
+                throw $error;
+            }
+            return $this->router->connectionFor($topic, $partition)->request($apiKey, $body, $timeoutMs);
+        }
     }
 
     /** @return array{0:int, 1:int, 2:list<array{baseOffset:int,maxTimestamp:int,records:list<array>}>} */
