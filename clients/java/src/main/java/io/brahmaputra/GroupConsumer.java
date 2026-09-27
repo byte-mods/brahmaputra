@@ -155,6 +155,14 @@ public final class GroupConsumer implements AutoCloseable {
     private final List<ConsumedRecord> buffered = new ArrayList<>();
 
     private volatile long lastPollMs = Client.nowMs();
+    /**
+     * True while {@link #poll} runs. {@code maxPollIntervalMs} bounds the gap <i>between</i>
+     * polls — time the application spends processing — so a poll that is itself busy joining a
+     * slow rebalance must not count against it.
+     */
+    private volatile boolean inPoll;
+    /** Guards compare-and-clear of {@link #joined} against a concurrent (re)join. */
+    private final Object membership = new Object();
     private long lastCommitMs = Client.nowMs();
     private volatile boolean closed;
     private final Thread heartbeat;
@@ -242,17 +250,28 @@ public final class GroupConsumer implements AutoCloseable {
         if (subscribed.isEmpty()) {
             throw new BrahmaputraException("subscribe to at least one topic before polling");
         }
-        // Stamped on entry, not on return: the interval bounds how long the *application* may
-        // go without asking for records, and a poll that blocks for its full timeout is the
-        // consumer working normally.
+        // Stamped on entry and again on return, and not enforced in between: the interval
+        // bounds how long the *application* may go without asking for records, and a poll that
+        // blocks — for its timeout, or on a slow rebalance — is the consumer working normally.
         lastPollMs = Client.nowMs();
-
-        if (!joined) {
-            join();
+        inPoll = true;
+        try {
+            return pollInside(timeoutMs);
+        } finally {
+            lastPollMs = Client.nowMs();
+            inPoll = false;
         }
+    }
 
+    private List<ConsumedRecord> pollInside(long timeoutMs) {
         long deadline = Client.nowMs() + timeoutMs;
         while (true) {
+            // Checked every sweep, not only on entry: a rebalance the heartbeat learns of
+            // mid-poll must stop this member fetching partitions it may no longer own, rather
+            // than carrying on until the timeout.
+            if (!joined) {
+                join();
+            }
             if (!buffered.isEmpty()) {
                 return takeBuffered();
             }
@@ -422,6 +441,12 @@ public final class GroupConsumer implements AutoCloseable {
                 sleep(100);
                 continue;
             }
+            if (code == ErrorCode.UNKNOWN_MEMBER_ID) {
+                // The coordinator dropped this member (session expiry, or removed while it
+                // waited): join again as a new one.
+                memberId = "";
+                continue;
+            }
             if (code != ErrorCode.NONE) {
                 throw new ServerException(code, "join_group");
             }
@@ -440,8 +465,10 @@ public final class GroupConsumer implements AutoCloseable {
                 members.add(new MemberInfo(id, topics, held));
             }
 
-            memberId = newMemberId;
-            generation = newGeneration;
+            synchronized (membership) {
+                memberId = newMemberId;
+                generation = newGeneration;
+            }
 
             Map<String, List<TopicPartition>> assignments = memberId.equals(leaderId)
                     ? computeAssignment(members)
@@ -471,6 +498,10 @@ public final class GroupConsumer implements AutoCloseable {
         Reader reader = Reader.body(coordinatorRequest(ApiKey.SYNC_GROUP, writer.bytes()));
         int code = reader.int32();
         if (code == ErrorCode.REBALANCE_IN_PROGRESS || code == ErrorCode.ILLEGAL_GENERATION) {
+            return false;
+        }
+        if (code == ErrorCode.UNKNOWN_MEMBER_ID) {
+            memberId = "";
             return false;
         }
         if (code != ErrorCode.NONE) {
@@ -535,12 +566,18 @@ public final class GroupConsumer implements AutoCloseable {
             if (closed) {
                 return;
             }
-            if (!joined || memberId.isEmpty()) {
+            String currentMember;
+            int currentGeneration;
+            synchronized (membership) {
+                currentMember = memberId;
+                currentGeneration = generation;
+            }
+            if (!joined || currentMember.isEmpty()) {
                 continue;
             }
 
             long idleMs = Client.nowMs() - lastPollMs;
-            if (idleMs >= config.maxPollIntervalMs) {
+            if (!inPoll && idleMs >= config.maxPollIntervalMs) {
                 // The application has stopped consuming even though the process is alive.
                 // Continuing to heartbeat would assert a liveness this member no longer has,
                 // holding its partitions away from a consumer that could make progress.
@@ -560,14 +597,21 @@ public final class GroupConsumer implements AutoCloseable {
             try {
                 Writer writer = Writer.body()
                         .string(groupId)
-                        .int32(generation)
-                        .string(memberId);
+                        .int32(currentGeneration)
+                        .string(currentMember);
                 Reader reader = Reader.body(coordinatorRequest(ApiKey.HEARTBEAT, writer.bytes()));
                 int code = reader.int32();
                 if (code == ErrorCode.REBALANCE_IN_PROGRESS
                         || code == ErrorCode.UNKNOWN_MEMBER_ID
                         || code == ErrorCode.ILLEGAL_GENERATION) {
-                    joined = false;
+                    // Only if nothing has changed since the snapshot: a heartbeat for an old
+                    // generation answering after the member already rejoined must not send it
+                    // round again.
+                    synchronized (membership) {
+                        if (generation == currentGeneration && memberId.equals(currentMember)) {
+                            joined = false;
+                        }
+                    }
                 }
             } catch (BrahmaputraException ignored) {
                 // Transient: retry on the next tick.

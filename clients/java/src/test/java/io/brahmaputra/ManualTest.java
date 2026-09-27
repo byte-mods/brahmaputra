@@ -10,6 +10,13 @@ import io.brahmaputra.Client.ProducerConfig;
 import io.brahmaputra.GroupConsumer.GroupConfig;
 import io.brahmaputra.Protocol.RecordHeader;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -449,6 +456,447 @@ public final class ManualTest {
             check("a full buffer blocks and then reports", blocked, "");
             // Like the Go suite, this producer is abandoned rather than closed: closing would
             // flush the records the check just proved were held back.
+        }
+
+        section("wire edge cases");
+        {
+            String edgeTopic = unique("java-edge");
+            byte[] large = new byte[1 << 20];
+            for (int i = 0; i < large.length; i++) {
+                large[i] = (byte) (i * 7);
+            }
+            byte[] unicodeKey = bytes("ключ-✓-🔑");
+            byte[] unicodeValue = bytes("значение — 数据 — 🚀");
+            try (Producer producer = new Producer(host, port, unbatched())) {
+                producer.sendTo(edgeTopic, 0, large, null);
+                producer.sendTo(edgeTopic, 0, unicodeValue, unicodeKey,
+                        new RecordHeader("ünïcødé-🏷", bytes("✓")));
+                // An empty key and an empty header value are values, not nulls.
+                producer.sendTo(edgeTopic, 0, bytes("empty-key"), new byte[0],
+                        new RecordHeader("empty", new byte[0]),
+                        new RecordHeader("null", null));
+                producer.sendTo(edgeTopic, 0, bytes("null-key"), null);
+            }
+
+            try (Consumer consumer = new Consumer(host, port, new ConsumerConfig())) {
+                List<ConsumedRecord> got = fetchAll(consumer, edgeTopic, 4);
+                check("edge records all arrive", got.size() == 4, "got " + got.size());
+                if (got.size() == 4) {
+                    check("a 1 MiB value round-trips byte-identical",
+                            Arrays.equals(got.get(0).value, large),
+                            (got.get(0).value == null ? "null" : got.get(0).value.length)
+                                    + " bytes");
+                    ConsumedRecord unicode = got.get(1);
+                    check("unicode key, value and header key round-trip",
+                            Arrays.equals(unicode.key, unicodeKey)
+                                    && Arrays.equals(unicode.value, unicodeValue)
+                                    && unicode.headers.size() == 1
+                                    && unicode.headers.get(0).key.equals("ünïcødé-🏷"), "");
+                    ConsumedRecord empty = got.get(2);
+                    check("an empty key stays empty, not null",
+                            empty.key != null && empty.key.length == 0,
+                            String.valueOf(empty.key));
+                    check("an empty header value stays empty, not null",
+                            empty.headers.size() == 2
+                                    && empty.headers.get(0).value != null
+                                    && empty.headers.get(0).value.length == 0
+                                    && empty.headers.get(1).value == null,
+                            empty.headers.size() + " headers");
+                    check("a null key stays null", got.get(3).key == null,
+                            String.valueOf(got.get(3).key));
+                }
+            }
+        }
+
+        section("ordering under linger flushes");
+        {
+            String orderTopic = unique("java-order");
+            ProducerConfig config = new ProducerConfig();
+            config.lingerMs = 1;
+            config.batchSize = 256;
+            final int total = 5000;
+            try (Producer producer = new Producer(host, port, config)) {
+                for (int i = 0; i < total; i++) {
+                    producer.sendTo(orderTopic, 0, bytes(Integer.toString(i)), null);
+                }
+            }
+            try (Consumer consumer = new Consumer(host, port, new ConsumerConfig())) {
+                List<ConsumedRecord> got = fetchAll(consumer, orderTopic, total);
+                int inversions = 0;
+                for (int i = 1; i < got.size(); i++) {
+                    if (Integer.parseInt(new String(got.get(i).value, UTF_8))
+                            < Integer.parseInt(new String(got.get(i - 1).value, UTF_8))) {
+                        inversions++;
+                    }
+                }
+                check("every record of a partition arrives", got.size() == total,
+                        "got " + got.size());
+                check("a partition's records keep send order", inversions == 0,
+                        inversions + " inversions");
+            }
+        }
+
+        section("background flush failures are reported");
+        {
+            ProducerConfig config = new ProducerConfig();
+            config.lingerMs = 20;
+            Producer producer = new Producer(host, port, config);
+            // Partition 999 does not exist, so the linger thread's flush fails.
+            RuntimeException sendError = null;
+            try {
+                producer.sendTo(unique("java-bgfail"), 999, bytes("lost"), null);
+            } catch (RuntimeException error) {
+                sendError = error;
+            }
+            sleep(300);
+            RuntimeException flushError = null;
+            try {
+                producer.flush();
+            } catch (RuntimeException error) {
+                flushError = error;
+            }
+            check("a failed linger flush surfaces on the next flush",
+                    sendError == null && flushError != null,
+                    "send=" + sendError + " flush=" + flushError);
+            Thread closer = new Thread(() -> {
+                try {
+                    producer.close();
+                } catch (RuntimeException ignored) {
+                    // Returning with an error is still returning.
+                }
+            });
+            closer.start();
+            try {
+                closer.join(5_000);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+            check("close returns after a failed flush", !closer.isAlive(),
+                    closer.isAlive() ? "hung" : "");
+        }
+
+        section("connection failures");
+        {
+            // A broker that accepts and never answers must cost an error, not a thread
+            // blocked forever.
+            try (SilentBroker silent = new SilentBroker()) {
+                Client.Connection connection =
+                        Client.Connection.connect("127.0.0.1", silent.port(), "java-test", 1000);
+                connection.setRequestTimeout(300);
+                long started = System.currentTimeMillis();
+                RuntimeException requestError = null;
+                try {
+                    connection.apiVersions();
+                } catch (RuntimeException error) {
+                    requestError = error;
+                }
+                check("a request to an unresponsive broker times out",
+                        requestError != null && System.currentTimeMillis() - started < 3_000,
+                        String.valueOf(requestError));
+                check("a timed-out connection is not reused", connection.isBroken(), "");
+                connection.close();
+            }
+
+            // A connection the broker drops is redialled, not kept forever.
+            try (DropProxy proxy = new DropProxy(host, port)) {
+                String dropTopic = unique("java-drop");
+                try (Producer producer = new Producer("127.0.0.1", proxy.port(), unbatched())) {
+                    producer.sendTo(dropTopic, 0, bytes("before"), null);
+                    proxy.dropAll();
+                    RuntimeException recovered = new RuntimeException("not attempted");
+                    for (int attempt = 0; attempt < 3 && recovered != null; attempt++) {
+                        try {
+                            producer.sendTo(dropTopic, 0, bytes("after"), null);
+                            recovered = null;
+                        } catch (RuntimeException error) {
+                            recovered = error;
+                        }
+                    }
+                    check("a producer recovers after its connection drops", recovered == null,
+                            String.valueOf(recovered));
+                }
+                try (Consumer consumer =
+                        new Consumer("127.0.0.1", proxy.port(), new ConsumerConfig())) {
+                    consumer.fetch(dropTopic, 0, 0, 100);
+                    proxy.dropAll();
+                    RuntimeException fetchError = new RuntimeException("not attempted");
+                    List<ConsumedRecord> fetched = Collections.emptyList();
+                    for (int attempt = 0; attempt < 3 && fetchError != null; attempt++) {
+                        try {
+                            fetched = consumer.fetch(dropTopic, 0, 0, 100);
+                            fetchError = null;
+                        } catch (RuntimeException error) {
+                            fetchError = error;
+                        }
+                    }
+                    check("a consumer recovers after its connection drops",
+                            fetchError == null && fetched.size() >= 1,
+                            String.valueOf(fetchError));
+                }
+            }
+        }
+
+        section("consumer group: max.poll.interval and rejoin");
+        {
+            String slowTopic = unique("java-slow");
+            Producer producer = new Producer(host, port, unbatched());
+            for (int i = 0; i < 10; i++) {
+                producer.send(slowTopic, bytes("s" + i));
+            }
+            GroupConfig groupConfig = new GroupConfig();
+            groupConfig.autoCommitIntervalMs = 0;
+            groupConfig.maxPollIntervalMs = 1500;
+            GroupConsumer consumer =
+                    new GroupConsumer(host, port, unique("java-slow-grp"), groupConfig);
+            consumer.subscribe(Collections.singletonList(slowTopic));
+            List<ConsumedRecord> first = new ArrayList<>();
+            long deadline = System.currentTimeMillis() + 15_000;
+            while (first.size() < 10 && System.currentTimeMillis() < deadline) {
+                try {
+                    first.addAll(consumer.poll(300));
+                } catch (Protocol.BrahmaputraException error) {
+                    break;
+                }
+            }
+            consumer.commit();
+            // Stall past max.poll.interval.ms: the member leaves the group.
+            sleep(2500);
+            for (int i = 10; i < 20; i++) {
+                producer.send(slowTopic, bytes("s" + i));
+            }
+            producer.close();
+            List<ConsumedRecord> second = new ArrayList<>();
+            RuntimeException pollError = null;
+            deadline = System.currentTimeMillis() + 15_000;
+            while (second.size() < 10 && System.currentTimeMillis() < deadline) {
+                try {
+                    second.addAll(consumer.poll(300));
+                } catch (Protocol.BrahmaputraException error) {
+                    pollError = error;
+                    break;
+                }
+            }
+            check("a member that stalled rejoins on its next poll",
+                    first.size() == 10 && second.size() == 10 && pollError == null,
+                    "first=" + first.size() + " second=" + second.size() + " err=" + pollError);
+            consumer.close();
+        }
+
+        section("consumer group: time inside poll does not count against max.poll.interval");
+        {
+            String joinTopic = unique("java-inpoll");
+            Producer producer = new Producer(host, port, unbatched());
+            producer.router().partitions(joinTopic);
+            GroupConfig groupConfig = new GroupConfig();
+            groupConfig.autoCommitIntervalMs = 0;
+            // Far shorter than the first poll below, which spends ~1s joining (the broker's
+            // initial rebalance delay) and then waits for data.
+            groupConfig.maxPollIntervalMs = 600;
+            GroupConsumer consumer =
+                    new GroupConsumer(host, port, unique("java-inpoll-grp"), groupConfig);
+            consumer.subscribe(Collections.singletonList(joinTopic));
+            Thread late = new Thread(() -> {
+                sleep(2000);
+                for (int i = 0; i < 10; i++) {
+                    try {
+                        producer.send(joinTopic, bytes("j" + i));
+                    } catch (RuntimeException ignored) {
+                        // The check below reports what did not arrive.
+                    }
+                }
+            });
+            late.start();
+            // One long poll: it joins, then waits for the records above.
+            List<ConsumedRecord> got = Collections.emptyList();
+            RuntimeException pollError = null;
+            try {
+                got = consumer.poll(4000);
+            } catch (RuntimeException error) {
+                pollError = error;
+            }
+            // Committed straight away, before another poll could quietly rejoin: this fails
+            // if the member left the group mid-poll.
+            RuntimeException commitError = null;
+            try {
+                consumer.commit();
+            } catch (RuntimeException error) {
+                commitError = error;
+            }
+            check("a member is still in its group after a long poll",
+                    pollError == null && !got.isEmpty() && commitError == null,
+                    "got=" + got.size() + " poll=" + pollError + " commit=" + commitError);
+            try {
+                late.join();
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+            consumer.close();
+            producer.close();
+        }
+    }
+
+    /** Fetch partition 0 from the start until {@code want} records arrive or it runs dry. */
+    private static List<ConsumedRecord> fetchAll(Consumer consumer, String topic, int want) {
+        List<ConsumedRecord> got = new ArrayList<>();
+        long offset = 0;
+        while (got.size() < want) {
+            List<ConsumedRecord> batch;
+            try {
+                batch = consumer.fetch(topic, 0, offset, 500);
+            } catch (Protocol.BrahmaputraException error) {
+                break;
+            }
+            if (batch.isEmpty()) {
+                break;
+            }
+            got.addAll(batch);
+            offset = batch.get(batch.size() - 1).offset + 1;
+        }
+        return got;
+    }
+
+    /** Accepts connections and reads them forever without ever answering. */
+    private static final class SilentBroker implements AutoCloseable {
+        private final ServerSocket server;
+        private final List<Socket> accepted = Collections.synchronizedList(new ArrayList<>());
+
+        SilentBroker() {
+            try {
+                server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+            } catch (IOException error) {
+                throw new UncheckedIOException(error);
+            }
+            daemon(() -> {
+                while (true) {
+                    Socket socket;
+                    try {
+                        socket = server.accept();
+                    } catch (IOException closed) {
+                        return;
+                    }
+                    accepted.add(socket);
+                    daemon(() -> drain(socket));
+                }
+            });
+        }
+
+        int port() {
+            return server.getLocalPort();
+        }
+
+        @Override
+        public void close() {
+            closeQuietly(server);
+            synchronized (accepted) {
+                for (Socket socket : accepted) {
+                    closeQuietly(socket);
+                }
+            }
+        }
+    }
+
+    /**
+     * Forwards TCP to the broker and can sever every live connection, which is how a broker
+     * restart or an idle timeout looks to a client.
+     */
+    private static final class DropProxy implements AutoCloseable {
+        private final ServerSocket server;
+        private final List<Socket> live = new ArrayList<>();
+
+        DropProxy(String targetHost, int targetPort) {
+            try {
+                server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+            } catch (IOException error) {
+                throw new UncheckedIOException(error);
+            }
+            daemon(() -> {
+                while (true) {
+                    Socket client;
+                    try {
+                        client = server.accept();
+                    } catch (IOException closed) {
+                        return;
+                    }
+                    Socket upstream;
+                    try {
+                        upstream = new Socket(targetHost, targetPort);
+                    } catch (IOException error) {
+                        closeQuietly(client);
+                        continue;
+                    }
+                    synchronized (live) {
+                        live.add(client);
+                        live.add(upstream);
+                    }
+                    daemon(() -> pipe(client, upstream));
+                    daemon(() -> pipe(upstream, client));
+                }
+            });
+        }
+
+        int port() {
+            return server.getLocalPort();
+        }
+
+        void dropAll() {
+            synchronized (live) {
+                for (Socket socket : live) {
+                    closeQuietly(socket);
+                }
+                live.clear();
+            }
+            sleep(50);
+        }
+
+        @Override
+        public void close() {
+            closeQuietly(server);
+            dropAll();
+        }
+    }
+
+    private static void pipe(Socket from, Socket to) {
+        byte[] chunk = new byte[64 * 1024];
+        try {
+            InputStream in = from.getInputStream();
+            OutputStream out = to.getOutputStream();
+            int read;
+            while ((read = in.read(chunk)) >= 0) {
+                out.write(chunk, 0, read);
+            }
+        } catch (IOException closed) {
+            // Either side went away; the finally closes the other.
+        } finally {
+            closeQuietly(from);
+            closeQuietly(to);
+        }
+    }
+
+    private static void drain(Socket socket) {
+        byte[] chunk = new byte[4096];
+        try {
+            InputStream in = socket.getInputStream();
+            while (in.read(chunk) >= 0) {
+                // Discard: this broker never answers.
+            }
+        } catch (IOException closed) {
+            // Done.
+        } finally {
+            closeQuietly(socket);
+        }
+    }
+
+    private static void daemon(Runnable body) {
+        Thread thread = new Thread(body);
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private static void closeQuietly(java.io.Closeable closeable) {
+        try {
+            closeable.close();
+        } catch (IOException ignored) {
+            // Nothing useful to do.
         }
     }
 

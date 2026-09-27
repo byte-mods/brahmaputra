@@ -3,7 +3,7 @@
 Java 17+. No dependencies — standard library only (gzip from `java.util.zip`,
 CRC32C from `java.util.zip.CRC32C`).
 
-Verified end to end against a live broker: **38/38 checks**, the same
+Verified end to end against a live broker: **54/54 checks**, the same
 sections and checks as the Go suite (`./test.sh HOST PORT`).
 
 ## Build
@@ -59,8 +59,15 @@ try (Client.Producer producer = new Client.Producer("127.0.0.1", 9092, config)) 
 ```
 
 `send` buffers and returns; errors from a batch surface from the `flush`
-(or the `send` that filled the batch) that sent it. `close()` flushes,
-then releases the connections even if that flush failed.
+(or the `send` that filled the batch) that sent it. A batch the background
+linger thread failed to send is reported by the next `flush()` or
+`close()` — those records have left the buffer, so nothing else would say
+so. `close()` flushes, then releases the connections even if that flush
+failed.
+
+A partition has at most one batch in flight: the linger thread and a send
+that fills a batch never race each other to the wire, so a partition's
+records land in the order they were sent, retries included.
 
 ## Consume one partition
 
@@ -111,6 +118,11 @@ heartbeat runs on a daemon thread of its own, but joining a group happens
 inside `poll`, so two consumers polled alternately from *one* thread will
 keep evicting each other — each join waits for the other member, which
 cannot rejoin while the thread is busy.
+
+`max.poll.interval.ms` bounds the time *between* polls. Time spent inside
+`poll` — including a slow join — does not count; a member that does stall
+leaves the group and rejoins on its next `poll`. A member the coordinator
+no longer knows (`UNKNOWN_MEMBER_ID`) rejoins as a new one.
 
 `AutoOffsetReset.NONE` makes `poll` throw
 `Protocol.NoOffsetForPartitionException` rather than guess where to start.
@@ -187,6 +199,17 @@ If you register lz4, note that the broker expects a little-endian `uint32`
 of the uncompressed length followed by a raw LZ4 **block** — not the LZ4
 frame format, which a frame-format library would silently produce instead.
 
+## Connections
+
+Each broker connection carries one request at a time and bounds each
+round trip with `Client.DEFAULT_REQUEST_TIMEOUT_MS` (2 minutes — longer
+than any legitimate long-poll or rebalance wait;
+`Connection.setRequestTimeout` changes it). A timeout, I/O error or
+correlation mismatch closes the connection and marks it broken
+(`isBroken()`), because the byte stream is at an unknown position; the
+router redials it on next use, so a dropped socket costs one failed
+request, not the client.
+
 ## Errors
 
 Everything the driver throws is an unchecked
@@ -204,7 +227,7 @@ Start a broker, then:
 
 `test.sh` compiles with plain `javac -Xlint:all -Werror` into `out/` and
 runs `io.brahmaputra.ManualTest` (`src/test/java`), a port of the Go
-driver's `cmd/manualtest`. It prints `38 passed, 0 failed` and exits
+driver's `cmd/manualtest`. It prints `54 passed, 0 failed` and exits
 non-zero on any failure. With Maven instead:
 
 ```bash

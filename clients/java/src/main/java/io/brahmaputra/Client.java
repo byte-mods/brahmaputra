@@ -25,7 +25,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /** Connection, routing, producer and simple consumer. */
 public final class Client {
@@ -46,41 +45,86 @@ public final class Client {
     // -----------------------------------------------------------------------
 
     /**
-     * One TCP connection to one broker, multiplexed by correlation id.
+     * How long one request/response round trip may take on the socket before the connection is
+     * abandoned. It must exceed the longest the broker may legitimately hold a request (a fetch
+     * long-poll, an acks=all wait, a JoinGroup waiting out a rebalance), so it is generous; its
+     * job is to turn a wedged broker into an error instead of a thread blocked forever.
+     */
+    public static final int DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+
+    /**
+     * One TCP connection to one broker.
      *
-     * <p>The broker may answer out of order, so responses are matched by correlation id. Requests
-     * are serialised on this object; that is enough for a producer that batches, and matches how
-     * the Rust client behaves.
+     * <p>Requests are serialised on this object, so there is at most one in flight per
+     * connection; that is enough for a producer that batches, and it is what keeps a
+     * partition's appends in order.
+     *
+     * <p>Any I/O failure, timeout or correlation mismatch leaves the byte stream at an unknown
+     * position — a partial frame may have been written, or a late response may still arrive — so
+     * the connection is closed and marked broken rather than reused. The {@link Router} notices
+     * and redials.
      */
     public static final class Connection implements AutoCloseable {
         private final Socket socket;
         private final DataInputStream input;
         private final OutputStream output;
         private final String clientId;
-        private final AtomicInteger correlation = new AtomicInteger();
+        private final String address;
+        private int correlation;
+        private volatile boolean broken;
 
-        private Connection(Socket socket, String clientId) throws IOException {
+        private Connection(Socket socket, String clientId, String address) throws IOException {
             this.socket = socket;
-            this.input = new DataInputStream(socket.getInputStream());
+            this.input = new DataInputStream(new java.io.BufferedInputStream(socket.getInputStream()));
             this.output = socket.getOutputStream();
             this.clientId = clientId;
+            this.address = address;
+            socket.setSoTimeout(DEFAULT_REQUEST_TIMEOUT_MS);
         }
 
         public static Connection connect(String host, int port, String clientId, int timeoutMs) {
+            Socket socket = new Socket();
             try {
-                Socket socket = new Socket();
                 socket.connect(new InetSocketAddress(host, port), timeoutMs);
                 // Responses are small and latency matters more than packet count; without this
                 // every request pays Nagle plus the peer's delayed ACK.
                 socket.setTcpNoDelay(true);
-                return new Connection(socket, clientId);
+                return new Connection(socket, clientId, host + ":" + port);
             } catch (IOException error) {
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // Already failing; the connect error is the one worth reporting.
+                }
                 throw new BrahmaputraException("connect to " + host + ":" + port + " failed", error);
             }
         }
 
+        /**
+         * Change how long one round trip may take before the connection is abandoned. Zero
+         * disables the bound.
+         */
+        public synchronized void setRequestTimeout(int timeoutMs) {
+            try {
+                socket.setSoTimeout(Math.max(timeoutMs, 0));
+            } catch (IOException error) {
+                throw fail(error);
+            }
+        }
+
+        /** Whether this connection failed and must not be reused. */
+        public boolean isBroken() {
+            return broken;
+        }
+
+        /** The host:port this connection was dialled to. */
+        public String address() {
+            return address;
+        }
+
         @Override
         public void close() {
+            broken = true;
             try {
                 socket.close();
             } catch (IOException ignored) {
@@ -88,11 +132,33 @@ public final class Client {
             }
         }
 
+        /** Mark the connection unusable and describe why. Called with this object's lock held. */
+        private BrahmaputraException fail(Exception cause) {
+            close();
+            if (cause instanceof BrahmaputraException) {
+                return (BrahmaputraException) cause;
+            }
+            String what = cause instanceof java.net.SocketTimeoutException
+                    ? "request to " + address + " timed out"
+                    : "request to " + address + " failed";
+            return new BrahmaputraException(what, cause);
+        }
+
+        private void ensureUsable() {
+            if (broken) {
+                throw new BrahmaputraException(
+                        "connection to " + address + " is broken; the router will redial");
+            }
+        }
+
         public synchronized byte[] request(short apiKey, byte[] body) {
-            int correlationId = correlation.incrementAndGet();
+            ensureUsable();
+            int correlationId = ++correlation;
             try {
                 output.write(Protocol.encodeFrame(apiKey, correlationId, clientId, body));
                 output.flush();
+                // A timeout here included: the response may still be on its way, and reading on
+                // from here would pair it with the next request.
                 byte[] payload = readFrame();
                 Protocol.FramePayload frame = Protocol.decodeFramePayload(payload);
                 if (frame.correlationId != correlationId) {
@@ -103,19 +169,19 @@ public final class Client {
                             + correlationId + ", got " + frame.correlationId);
                 }
                 return frame.body;
-            } catch (IOException error) {
-                throw new BrahmaputraException("request failed", error);
+            } catch (IOException | RuntimeException error) {
+                throw fail(error);
             }
         }
 
         /** Send without awaiting a response (acks=0). */
         public synchronized void sendOneway(short apiKey, byte[] body) {
+            ensureUsable();
             try {
-                output.write(
-                        Protocol.encodeFrame(apiKey, correlation.incrementAndGet(), clientId, body));
+                output.write(Protocol.encodeFrame(apiKey, ++correlation, clientId, body));
                 output.flush();
             } catch (IOException error) {
-                throw new BrahmaputraException("send failed", error);
+                throw fail(error);
             }
         }
 
@@ -445,27 +511,52 @@ public final class Client {
      *
      * <p>Metadata is cached and refreshed only when a request says the route was stale, because
      * refreshing per request would put the control plane on the data path.
+     *
+     * <p>A connection that failed is replaced on its next use rather than kept: without that,
+     * one dropped socket — a broker restart, an idle timeout on a load balancer — would fail
+     * every later request for the life of the client.
      */
     public static final class Router implements AutoCloseable {
         private final String clientId;
         private final int timeoutMs;
-        private final Connection seed;
+        private final String seedHost;
+        private final int seedPort;
+        private Connection seed;
         private final Map<Integer, Connection> connections = new HashMap<>();
         private ClusterMetadata metadata;
 
-        private Router(String clientId, int timeoutMs, Connection seed) {
+        private Router(String clientId, int timeoutMs, String host, int port, Connection seed) {
             this.clientId = clientId;
             this.timeoutMs = timeoutMs;
+            this.seedHost = host;
+            this.seedPort = port;
             this.seed = seed;
         }
 
         public static Router connect(String host, int port, String clientId, int timeoutMs) {
-            return new Router(clientId, timeoutMs,
+            return new Router(clientId, timeoutMs, host, port,
                     Connection.connect(host, port, clientId, timeoutMs));
         }
 
-        public Connection seed() {
-            return seed;
+        /** The connection this router was opened with, redialled if it has failed. */
+        public synchronized Connection seed() {
+            return liveSeed();
+        }
+
+        /** The seed connection, redialled if it broke. Called with this router's lock held. */
+        private Connection liveSeed() {
+            if (!seed.isBroken()) {
+                return seed;
+            }
+            Connection fresh = Connection.connect(seedHost, seedPort, clientId, timeoutMs);
+            Connection old = seed;
+            seed = fresh;
+            for (Map.Entry<Integer, Connection> entry : connections.entrySet()) {
+                if (entry.getValue() == old) {
+                    entry.setValue(fresh);
+                }
+            }
+            return fresh;
         }
 
         @Override
@@ -484,7 +575,8 @@ public final class Client {
                 return metadata;
             }
             Writer writer = Writer.body().stringArray(topics);
-            metadata = decodeMetadata(Reader.body(seed.request(ApiKey.METADATA, writer.bytes())));
+            metadata = decodeMetadata(
+                    Reader.body(liveSeed().request(ApiKey.METADATA, writer.bytes())));
             return metadata;
         }
 
@@ -518,7 +610,13 @@ public final class Client {
             }
             Connection existing = connections.get(leader);
             if (existing != null) {
-                return existing;
+                if (!existing.isBroken()) {
+                    return existing;
+                }
+                connections.remove(leader);
+                if (existing != seed) {
+                    existing.close();
+                }
             }
             for (BrokerInfo broker : image.brokers) {
                 if (broker.nodeId != leader) {
@@ -528,8 +626,9 @@ public final class Client {
                 // may not be the one we dialled; reuse the seed rather than opening a second
                 // connection to ourselves.
                 if (image.brokers.size() == 1) {
-                    connections.put(leader, seed);
-                    return seed;
+                    Connection live = liveSeed();
+                    connections.put(leader, live);
+                    return live;
                 }
                 Connection connection =
                         Connection.connect(broker.host, broker.port, clientId, timeoutMs);
@@ -625,11 +724,19 @@ public final class Client {
         private final Map<Slot, Integer> sizes = new HashMap<>();
         private final Object lock = new Object();
         /**
-         * Held from taking a partition's batch until the broker has answered for it, so two
-         * flushes of one partition (the linger thread and a caller, say) cannot overtake each
-         * other on the wire and reorder a key's records.
+         * One per partition, held from taking that partition's batch until the broker has
+         * answered for it (retries included). Without it the linger thread and a send that fills
+         * a batch can each take a batch for the same partition and race to the connection, and
+         * a batch waiting out a retry backoff is overtaken by the next one — either way the log
+         * ends up in a different order from the one the application sent.
          */
-        private final Object sendLock = new Object();
+        private final Map<Slot, Object> sendLocks = new HashMap<>();
+        /**
+         * The first failure of a linger-driven flush. Those records have already left the
+         * buffer, so this is the only trace of them; the next {@link #flush} or {@link #close}
+         * throws it rather than reporting a success that did not happen.
+         */
+        private RuntimeException backgroundError;
         private long bufferedBytes;
         private int roundRobin;
         private volatile boolean closed;
@@ -754,13 +861,47 @@ public final class Client {
             int partition = choosePartition(topic, key);
             Record record = new Record(key, value,
                     headers == null ? new ArrayList<>() : new ArrayList<>(headers));
-            synchronized (sendLock) {
+            synchronized (sendLockFor(new Slot(topic, partition))) {
                 return produce(topic, partition, Collections.singletonList(
                         new Buffered(record, nowMs(), topic, partition)));
             }
         }
 
+        /**
+         * Send every buffered record and wait for acknowledgement. Also throws the failure of
+         * any background (linger) flush since the last call, because those records are gone and
+         * no other call would say so.
+         */
         public void flush() {
+            RuntimeException failure = null;
+            try {
+                flushAll();
+            } catch (RuntimeException error) {
+                failure = error;
+            }
+            RuntimeException background;
+            synchronized (lock) {
+                background = backgroundError;
+                backgroundError = null;
+            }
+            if (failure != null) {
+                if (background != null && background != failure) {
+                    failure.addSuppressed(background);
+                }
+                throw failure;
+            }
+            if (background != null) {
+                throw background;
+            }
+        }
+
+        private Object sendLockFor(Slot slot) {
+            synchronized (lock) {
+                return sendLocks.computeIfAbsent(slot, unused -> new Object());
+            }
+        }
+
+        private void flushAll() {
             List<Slot> slots;
             synchronized (lock) {
                 slots = new ArrayList<>();
@@ -830,16 +971,21 @@ public final class Client {
                     return;
                 }
                 try {
-                    flush();
-                } catch (RuntimeException ignored) {
+                    flushAll();
+                } catch (RuntimeException error) {
                     // A background flush that fails must not kill the ticker; the next explicit
                     // flush surfaces the error to a caller who can act on it.
+                    synchronized (lock) {
+                        if (backgroundError == null) {
+                            backgroundError = error;
+                        }
+                    }
                 }
             }
         }
 
         private void flushSlot(Slot slot) {
-            synchronized (sendLock) {
+            synchronized (sendLockFor(slot)) {
                 List<Buffered> batch;
                 int size;
                 synchronized (lock) {
