@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Brahmaputra.FSharp</RootNamespace>
+    <AssemblyName>Brahmaputra.FSharp</AssemblyName>
+    <Version>0.1.0</Version>
+    <Description>Idiomatic F# API for the Brahmaputra log broker, built on the native .NET driver.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningLevel>5</WarningLevel>
+    <!-- 3390: malformed XML doc comments. 1182: unused variables. -->
+    <OtherFlags>$(OtherFlags) --warnon:3390 --warnon:1182</OtherFlags>
+    <!-- FSharp.Core ships with the SDK (library-packs); no other packages. -->
+    <DisableImplicitNuGetFallbackFolder>true</DisableImplicitNuGetFallbackFolder>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Types.fs" />
+    <Compile Include="Internal.fs" />
+    <Compile Include="Connection.fs" />
+    <Compile Include="Producer.fs" />
+    <Compile Include="Consumer.fs" />
+    <Compile Include="GroupConsumer.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../dotnet/Brahmaputra/Brahmaputra.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,7 @@
+bin/
+obj/
+out/
+artifacts/
+*.user
+.vs/
+TestResults/
