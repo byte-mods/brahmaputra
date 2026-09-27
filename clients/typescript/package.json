@@ -1,0 +1,19 @@
+{
+  "name": "brahmaputra-typescript-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Strict TypeScript end-to-end suite and typings tests for the Brahmaputra Node.js driver (../nodejs)",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
+    "test:manual": "node out/test_manual.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "~6.0.3"
+  }
+}

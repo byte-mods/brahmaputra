@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Brahmaputra client for Node.js",
   "main": "src/index.js",
+  "types": "src/index.d.ts",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=18"

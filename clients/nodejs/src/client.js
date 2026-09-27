@@ -322,7 +322,7 @@ function decodeMetadata(reader) {
   // which is what "no such topic" uses.
   const requestError = reader.int32();
   if (requestError !== 0) {
-    throw serverError(requestError, 'metadata');
+    throw new ServerError(requestError, 'metadata');
   }
   const brokers = [];
   for (let count = reader.int32(); count > 0; count -= 1) {

@@ -1,0 +1,23 @@
+{
+  // Type-checks everything: the e2e suite (src/) and the typings tests
+  // (tests/), which are compiled but never run. Emits nothing; see
+  // tsconfig.build.json for the build of the suite.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "node16",
+    "moduleResolution": "node16",
+    "types": ["node"],
+    "strict": true,
+    "noImplicitAny": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUncheckedIndexedAccess": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": false,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}
