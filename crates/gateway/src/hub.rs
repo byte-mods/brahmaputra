@@ -124,16 +124,25 @@ impl Hub {
         keys: Option<&HashSet<Bytes>>,
         snapshot: bool,
     ) -> Subscription {
-        let mut warm = self.feed(topic).warm.subscribe();
-        let _ = tokio::time::timeout(WARMUP_WAIT, warm.wait_for(|w| *w)).await;
-        // The feeds lock is held until the channel is joined, so a feed
-        // retiring for want of subscribers cannot slip in between (and a
-        // feed that retired while this one waited is simply restarted).
-        let feeds = self.feeds.lock().expect("feeds");
-        let feed = self.feed_locked(feeds, topic);
-        let cache = feed.0.cache.lock().expect("feed cache");
-        let receiver = feed.0.tx.subscribe();
-        drop(feed.1);
+        let mut feed = self.feed(topic);
+        let (feed, feeds) = loop {
+            let mut warm = feed.warm.subscribe();
+            let _ = tokio::time::timeout(WARMUP_WAIT, warm.wait_for(|w| *w)).await;
+            // The feeds lock is held until the channel is joined, so a feed
+            // retiring for want of subscribers cannot slip in between.
+            let feeds = self.feeds.lock().expect("feeds");
+            let (current, feeds) = self.feed_locked(feeds, topic);
+            // If the feed waited on retired meanwhile, its replacement must
+            // be positioned too before this subscriber is told it is live.
+            if Arc::ptr_eq(&current, &feed) || *current.warm.borrow() {
+                break (current, feeds);
+            }
+            drop(feeds);
+            feed = current;
+        };
+        let cache = feed.cache.lock().expect("feed cache");
+        let receiver = feed.tx.subscribe();
+        drop(feeds);
         let mut records: Vec<Arc<FeedRecord>> = if !snapshot {
             Vec::new()
         } else if let Some(keys) = keys {
