@@ -1,0 +1,8 @@
+# Written by every run.sh / run_all.sh; test_data.bin is the committed reference.
+test_data_*.bin
+# Per-language generated code and build output (see README.md).
+*/gen/
+# Cargo lockfile of the standalone Rust test crate (no dependencies).
+rust/Cargo.lock
+__pycache__/
+*.pyc

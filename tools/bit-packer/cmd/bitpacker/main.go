@@ -70,8 +70,9 @@ func main() {
 
 	// 3. Generate Code
 	targetLangs := strings.Split(*langs, ",")
+	failed := false
 	for _, lang := range targetLangs {
-		lang = strings.TrimSpace(lang)
+		lang = canonicalLang(strings.TrimSpace(lang))
 		fmt.Printf("🚀 Generating %s (Big Endian)...\n", lang)
 
 		// Determine package name based on language defaults
@@ -106,7 +107,12 @@ func main() {
 
 		if err := generateCode(lang, ctx.Classes, cfg); err != nil {
 			fmt.Printf("   ⚠️ Error generating %s: %v\n", lang, err)
+			failed = true
 		}
+	}
+	if failed {
+		fmt.Println("❌ Generation failed for at least one language")
+		os.Exit(1)
 	}
 	fmt.Println("✅ Generation Complete!")
 }
@@ -286,6 +292,7 @@ package {{.Config.PackageName}}
 
 import (
 	"errors"
+	"unicode/utf8"
 )
 
 const VERSION = "{{.Config.Version}}"
@@ -354,13 +361,28 @@ func (b *ZeroCopyByteBuff) putVarUint64(v uint64) {
 	b.buf = append(b.buf, byte(v))
 }
 
+// Floats are fixed point: trunc(v * 10000) as an int64, computed in the
+// field's own precision (float32 for float, float64 for double). NaN, ±Inf
+// and values whose scaled form does not fit an int64 cannot be encoded;
+// Encode has no error return, so they panic with ErrFloatRange.
+var ErrFloatRange = errors.New("bitpacker: float is NaN, infinite or out of range")
+
+func checkScaled(s float64) {
+	if !(s >= -9223372036854775808.0 && s < 9223372036854775808.0) {
+		panic(ErrFloatRange)
+	}
+}
+
 func (b *ZeroCopyByteBuff) PutFloat32(v float32) {
-	// Multiply by 10000.0 and truncate
-	b.PutVarInt64(int64(v * 10000.0))
+	scaled := float32(v * float32(10000.0))
+	checkScaled(float64(scaled))
+	b.PutVarInt64(int64(scaled))
 }
 
 func (b *ZeroCopyByteBuff) PutFloat64(v float64) {
-	b.PutVarInt64(int64(v * 10000.0))
+	scaled := float64(v * float64(10000.0))
+	checkScaled(scaled)
+	b.PutVarInt64(int64(scaled))
 }
 
 func (b *ZeroCopyByteBuff) PutBool(v bool) {
@@ -381,20 +403,41 @@ func (b *ZeroCopyByteBuff) PutString(v string) {
 
 func (b *ZeroCopyByteBuff) getVarUint64() (uint64, error) {
 	var result uint64
-	var shift uint
-	for {
+	for i := uint(0); i < 10; i++ {
 		if b.offset >= len(b.buf) {
 			return 0, errors.New("buffer underflow")
 		}
 		byt := b.buf[b.offset]
 		b.offset++
-		result |= uint64(byt&0x7F) << shift
-		if byt&0x80 == 0 {
-			break
+		if i == 9 && byt > 1 {
+			return 0, errors.New("varint overflows 64 bits")
 		}
-		shift += 7
+		result |= uint64(byt&0x7F) << (7 * i)
+		if byt&0x80 == 0 {
+			return result, nil
+		}
 	}
-	return result, nil
+	return 0, errors.New("varint too long")
+}
+
+// Remaining returns the number of unread bytes.
+func (b *ZeroCopyByteBuff) Remaining() int {
+	return len(b.buf) - b.offset
+}
+
+// GetLength reads an array element count and rejects negative counts and
+// counts that cannot possibly fit in the rest of the input (every element
+// takes at least one byte), so a corrupt length cannot force a huge
+// allocation.
+func (b *ZeroCopyByteBuff) GetLength() (int, error) {
+	n, err := b.GetInt32()
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 || int(n) > b.Remaining() {
+		return 0, errors.New("invalid array length")
+	}
+	return int(n), nil
 }
 
 func (b *ZeroCopyByteBuff) GetInt32() (int32, error) {
@@ -417,7 +460,7 @@ func (b *ZeroCopyByteBuff) GetVarInt64() (int64, error) {
 
 func (b *ZeroCopyByteBuff) GetFloat32() (float32, error) {
 	v, err := b.GetVarInt64()
-	return float32(v) / 10000.0, err
+	return float32(v) / float32(10000.0), err
 }
 
 func (b *ZeroCopyByteBuff) GetFloat64() (float64, error) {
@@ -439,13 +482,16 @@ func (b *ZeroCopyByteBuff) GetString() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	length := int(l)
-	if b.offset+length > len(b.buf) {
-		return "", errors.New("buffer underflow")
+	if l < 0 || l > int64(b.Remaining()) {
+		return "", errors.New("invalid string length")
 	}
-	s := string(b.buf[b.offset : b.offset+length])
+	length := int(l)
+	raw := b.buf[b.offset : b.offset+length]
+	if !utf8.Valid(raw) {
+		return "", errors.New("invalid UTF-8 string")
+	}
 	b.offset += length
-	return s, nil
+	return string(raw), nil
 }
 `
 
@@ -508,10 +554,10 @@ func Decode{{.Name}}From(buf *ZeroCopyByteBuff) (*{{.Name}}, error) {
 	var err error
 	{{range .Fields}}
 	{{if .IsArray}}
-	{{.Name}}Len, err := buf.GetInt32()
+	{{.Name}}Len, err := buf.GetLength()
 	if err != nil { return nil, err }
 	o.{{.Name | Title}} = make([]{{mapTypeGo .Type}}, {{.Name}}Len)
-	for i := 0; i < int({{.Name}}Len); i++ {
+	for i := 0; i < {{.Name}}Len; i++ {
 		{{decodeFieldGo (printf "o.%s[i]" (.Name | Title)) "" "" .Type}}
 	}
 	{{else}}
@@ -792,6 +838,40 @@ impl<'a> ZeroCopyByteBuff<'a> {
     pub fn put_float(&mut self, value: f64) {
         let i_val = (value * self.multiplier) as i64;
 		self.put_varint64(Self::zigzag_encode64(i_val));
+    }
+
+    // float and double are fixed point: trunc(v * 10000) as an i64, with the
+    // multiplication done in the field's own precision.
+    // NaN, infinities and values whose scaled form does not fit an i64 are
+    // rejected rather than saturated.
+    #[inline(always)]
+    pub fn put_f32(&mut self, value: f32) -> Result<(), Error> {
+        let scaled: f32 = value * 10000.0_f32;
+        if !(scaled >= -9223372036854775808.0_f32 && scaled < 9223372036854775808.0_f32) {
+            return Err(Error::new(ErrorKind::InvalidInput, "float is NaN, infinite or out of range"));
+        }
+        self.put_i64(scaled as i64);
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn put_f64(&mut self, value: f64) -> Result<(), Error> {
+        let scaled: f64 = value * 10000.0_f64;
+        if !(scaled >= -9223372036854775808.0_f64 && scaled < 9223372036854775808.0_f64) {
+            return Err(Error::new(ErrorKind::InvalidInput, "double is NaN, infinite or out of range"));
+        }
+        self.put_i64(scaled as i64);
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn get_f32(&mut self) -> f32 {
+        self.get_i64() as f32 / 10000.0_f32
+    }
+
+    #[inline(always)]
+    pub fn get_f64(&mut self) -> f64 {
+        self.get_i64() as f64 / 10000.0_f64
     }
 
     pub fn finish(self) -> Vec<u8> {
@@ -1147,6 +1227,40 @@ impl<'a> ZeroCopyByteBuff<'a> {
 		self.put_varint64(Self::zigzag_encode64(i_val));
     }
 
+    // float and double are fixed point: trunc(v * 10000) as an i64, with the
+    // multiplication done in the field's own precision.
+    // NaN, infinities and values whose scaled form does not fit an i64 are
+    // rejected rather than saturated.
+    #[inline(always)]
+    pub fn put_f32(&mut self, value: f32) -> Result<(), Error> {
+        let scaled: f32 = value * 10000.0_f32;
+        if !(scaled >= -9223372036854775808.0_f32 && scaled < 9223372036854775808.0_f32) {
+            return Err(Error::new(ErrorKind::InvalidInput, "float is NaN, infinite or out of range"));
+        }
+        self.put_i64(scaled as i64);
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn put_f64(&mut self, value: f64) -> Result<(), Error> {
+        let scaled: f64 = value * 10000.0_f64;
+        if !(scaled >= -9223372036854775808.0_f64 && scaled < 9223372036854775808.0_f64) {
+            return Err(Error::new(ErrorKind::InvalidInput, "double is NaN, infinite or out of range"));
+        }
+        self.put_i64(scaled as i64);
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn get_f32(&mut self) -> f32 {
+        self.get_i64() as f32 / 10000.0_f32
+    }
+
+    #[inline(always)]
+    pub fn get_f64(&mut self) -> f64 {
+        self.get_i64() as f64 / 10000.0_f64
+    }
+
     pub fn finish(self) -> Vec<u8> {
         self.write_buf
     }
@@ -1295,12 +1409,22 @@ public class {{.Config.MainClass}} {
             buf[offset++] = (byte) zz;
         }
         
+        // float and double are fixed point: trunc(v * 10000) as a long, with
+        // the multiplication done in the field's own precision.
+        // NaN, infinities and values whose scaled form does not fit a long
+        // are rejected rather than saturated.
         public void putFloat(float v) {
-            putVarInt64((long)(v * 10000.0f));
+            float scaled = v * 10000.0f;
+            if (!(scaled >= -9.223372036854775808E18f && scaled < 9.223372036854775808E18f))
+                throw new IllegalArgumentException("float is NaN, infinite or out of range: " + v);
+            putVarInt64((long) scaled);
         }
-        
+
         public void putDouble(double v) {
-            putVarInt64((long)(v * 10000.0));
+            double scaled = v * 10000.0;
+            if (!(scaled >= -9.223372036854775808E18 && scaled < 9.223372036854775808E18))
+                throw new IllegalArgumentException("double is NaN, infinite or out of range: " + v);
+            putVarInt64((long) scaled);
         }
 
         public void putBool(boolean v) {
@@ -1321,26 +1445,32 @@ public class {{.Config.MainClass}} {
             return (int) getVarInt64();
         }
 
+        public int remaining() {
+            return capacity - offset;
+        }
+
+        // Array element count: never negative, never more than the bytes left
+        // (every element takes at least one), so corrupt input cannot force a
+        // huge allocation.
+        public int getLength() throws Exception {
+            int n = getInt32();
+            if (n < 0 || n > remaining()) throw new Exception("Invalid array length " + n);
+            return n;
+        }
+
         public long getInt64() throws Exception {
             return getVarInt64();
         }
 
         public long getVarInt64() throws Exception {
             long result = 0;
-            int shift = 0;
-            // FAST PATH: 1 byte
-            byte b = buf[offset++];
-            if ((b & 0x80) == 0) {
-                result = b & 0x7F;
-            } else {
-                result = b & 0x7F;
-                shift = 7;
-                while (true) {
-                    b = buf[offset++];
-                    result |= (long) (b & 0x7F) << shift;
-                    if ((b & 0x80) == 0) break;
-                    shift += 7;
-                }
+            for (int i = 0; ; i++) {
+                if (offset >= capacity) throw new Exception("Buffer underflow");
+                if (i == 10) throw new Exception("Varint too long");
+                byte b = buf[offset++];
+                if (i == 9 && (b & 0xFF) > 1) throw new Exception("Varint overflows 64 bits");
+                result |= (long) (b & 0x7F) << (7 * i);
+                if ((b & 0x80) == 0) break;
             }
             // ZigZag decode: (n >>> 1) ^ -(n & 1)
             return (result >>> 1) ^ -(result & 1);
@@ -1360,9 +1490,16 @@ public class {{.Config.MainClass}} {
         }
 
         public String getString() throws Exception {
-            int len = (int) getVarInt64();
-            if (offset + len > capacity) throw new Exception("Buffer underflow");
-            String s = new String(buf, offset, len, StandardCharsets.UTF_8);
+            long l = getVarInt64();
+            if (l < 0 || l > remaining()) throw new Exception("Invalid string length " + l);
+            int len = (int) l;
+            String s;
+            try {
+                s = StandardCharsets.UTF_8.newDecoder()
+                        .decode(java.nio.ByteBuffer.wrap(buf, offset, len)).toString();
+            } catch (java.nio.charset.CharacterCodingException e) {
+                throw new Exception("Invalid UTF-8 string");
+            }
             offset += len;
             return s;
         }
@@ -1406,7 +1543,7 @@ public class {{.Config.MainClass}} {
             {{.Name}} obj = new {{.Name}}();
             {{range .Fields}}
             {{if .IsArray}}
-            int {{.Name}}Len = buf.getInt32();
+            int {{.Name}}Len = buf.getLength();
             obj.{{.Name}} = new {{mapTypeJava .Type}}[{{.Name}}Len];
             for(int i=0; i<{{.Name}}Len; i++) {
                 {{decodeFieldJava (printf "obj.%s[i]" .Name) .Type}}
@@ -1429,6 +1566,32 @@ const tmplPython = `import struct
 import zlib
 import sys
 
+_F32 = struct.Struct('<f')
+
+
+def _f32(v):
+    """Round a Python float (a double) to the nearest float32."""
+    return _F32.unpack(_F32.pack(v))[0]
+
+
+def _wrap32(v):
+    """Wrap an int to the signed 32-bit range, like int32 arithmetic does."""
+    v &= 0xFFFFFFFF
+    return v - 0x100000000 if v & 0x80000000 else v
+
+
+def _scaled(s):
+    """trunc() of a scaled float; NaN, infinities and values outside int64 are rejected."""
+    if not (-9223372036854775808.0 <= s < 9223372036854775808.0):
+        raise ValueError(f"float is NaN, infinite or out of range: {s / 10000.0}")
+    return int(s)
+
+
+def _wrap64(v):
+    v &= 0xFFFFFFFFFFFFFFFF
+    return v - 0x10000000000000000 if v & 0x8000000000000000 else v
+
+
 # Try to import C extension for best performance
 _USING_C_EXT = False
 try:
@@ -1440,7 +1603,7 @@ except ImportError:
     class ZeroCopyByteBuff:
         def __init__(self, data=None):
             if data is not None:
-                self._buf = bytearray(data)
+                self._buf = bytes(data)
                 self._offset = 0
             else:
                 self._buf = bytearray(65536)
@@ -1451,9 +1614,7 @@ except ImportError:
             while self._write_pos + n > len(self._buf):
                 self._buf.extend(bytearray(len(self._buf)))
 
-        def _put_varint(self, v):
-            zz = (v << 1) ^ (v >> 63)
-            zz &= 0xFFFFFFFFFFFFFFFF
+        def _put_uvarint(self, zz):
             if zz < 0x80:
                 self._ensure(1)
                 self._buf[self._write_pos] = zz
@@ -1473,23 +1634,36 @@ except ImportError:
             self._buf[self._write_pos] = zz
             self._write_pos += 1
 
-        def _get_varint(self):
+        def _put_varint(self, v):
+            v = _wrap64(v)
+            self._put_uvarint(((v << 1) ^ (v >> 63)) & 0xFFFFFFFFFFFFFFFF)
+
+        def _get_uvarint(self):
             result = 0
-            shift = 0
-            while True:
-                b = self._buf[self._offset]
+            buf = self._buf
+            for i in range(10):
+                if self._offset >= len(buf):
+                    raise ValueError("buffer underflow")
+                b = buf[self._offset]
                 self._offset += 1
-                result |= (b & 0x7F) << shift
+                if i == 9 and b > 1:
+                    raise ValueError("varint overflows 64 bits")
+                result |= (b & 0x7F) << (7 * i)
                 if not (b & 0x80):
-                    break
-                shift += 7
+                    return result
+            raise ValueError("varint too long")
+
+        def _get_varint(self):
+            result = self._get_uvarint()
             return (result >> 1) ^ -(result & 1)
 
-        def put_int32(self, v): self._put_varint(v)
+        def put_int32(self, v): self._put_varint(_wrap32(v))
         def put_int64(self, v): self._put_varint(v)
         def put_varint64(self, v): self._put_varint(v)
-        def put_float(self, v): self._put_varint(int(v * 10000.0))
-        def put_double(self, v): self._put_varint(int(v * 10000.0))
+        # float and double are fixed point: trunc(v * 10000) as an int64,
+        # computed in the field's precision (float32 for float).
+        def put_float(self, v): self._put_varint(_scaled(_f32(_f32(v) * 10000.0)))
+        def put_double(self, v): self._put_varint(_scaled(float(v) * 10000.0))
         def put_bool(self, v):
             self._ensure(1)
             self._buf[self._write_pos] = 1 if v else 0
@@ -1502,20 +1676,31 @@ except ImportError:
             self._write_pos += len(b)
         def ensure_capacity(self, n): self._ensure(n)
 
-        def get_int32(self): return self._get_varint()
+        def get_int32(self): return _wrap32(self._get_varint())
         def get_int64(self): return self._get_varint()
         def get_varint64(self): return self._get_varint()
-        def get_float(self): return self._get_varint() / 10000.0
+        def get_float(self): return _f32(_f32(float(self._get_varint())) / 10000.0)
         def get_double(self): return self._get_varint() / 10000.0
         def get_bool(self):
+            if self._offset >= len(self._buf):
+                raise ValueError("buffer underflow")
             v = self._buf[self._offset] != 0
             self._offset += 1
             return v
         def get_string(self):
             length = self._get_varint()
+            if length < 0 or length > len(self._buf) - self._offset:
+                raise ValueError("invalid string length")
             s = self._buf[self._offset:self._offset + length].decode('utf-8')
             self._offset += length
             return s
+        def get_length(self):
+            n = self.get_int32()
+            if n < 0 or n > len(self._buf) - self._offset:
+                raise ValueError("invalid array length")
+            return n
+        def remaining(self):
+            return len(self._buf) - self._offset
         def get_bytes(self):
             return bytes(self._buf[:self._write_pos])
 
@@ -1559,7 +1744,7 @@ class {{.Name}}:
         obj = {{.Name}}.__new__({{.Name}}) # Optimization: Skip __init__
         {{range .Fields}}
         {{if .IsArray}}
-        length_{{.Name}} = buf.get_int32()
+        length_{{.Name}} = buf.get_length()
         obj.{{.Name}} = [None] * length_{{.Name}}
         for i in range(length_{{.Name}}):
             {{decodeFieldPy .Type (printf "obj.%s[i]" .Name)}}
@@ -1573,14 +1758,19 @@ class {{.Name}}:
 
 const tmplBitpackerC = `#define PY_SSIZE_T_CLEAN
 #include <Python.h>
-#include <structmember.h>
+#include <stdint.h>
+#include <string.h>
+
+/* BitPacker runtime for the generated Python code (same API as the
+ * pure-Python ZeroCopyByteBuff fallback). A buffer is either a writer
+ * (constructed with no data) or a reader over a copy of the given bytes;
+ * every read is bounds-checked and raises ValueError on bad input. */
 
 typedef struct {
     PyObject_HEAD
     char *buf;
-    size_t capacity;
-    size_t offset;
-    size_t limit; // Not strictly needed if offset tracks write, but useful for read bounds if we passed size
+    size_t capacity; /* writer: allocated size; reader: data length */
+    size_t offset;   /* writer: bytes written; reader: read cursor */
 } ZeroCopyByteBuff;
 
 static void
@@ -1615,23 +1805,21 @@ ZeroCopyByteBuff_init(ZeroCopyByteBuff *self, PyObject *args, PyObject *kwds)
         return -1;
 
     if (data && data != Py_None) {
-        if (PyBytes_Check(data)) {
-            Py_ssize_t size = PyBytes_Size(data);
-            self->buf = malloc(size);
-            if (!self->buf) {
-                PyErr_NoMemory();
-                return -1;
-            }
-            memcpy(self->buf, PyBytes_AsString(data), size);
-            self->capacity = size;
-            self->offset = 0; // Decoding starts at 0
-        } else {
-             PyErr_SetString(PyExc_TypeError, "data must be bytes");
-             return -1;
+        Py_buffer view;
+        if (PyObject_GetBuffer(data, &view, PyBUF_SIMPLE) < 0)
+            return -1;
+        self->buf = malloc(view.len > 0 ? (size_t)view.len : 1);
+        if (!self->buf) {
+            PyBuffer_Release(&view);
+            PyErr_NoMemory();
+            return -1;
         }
+        memcpy(self->buf, view.buf, (size_t)view.len);
+        self->capacity = (size_t)view.len;
+        self->offset = 0;
+        PyBuffer_Release(&view);
     } else {
-        // Default 64MB based on our optimization findings
-        self->capacity = 64 * 1024 * 1024; 
+        self->capacity = 65536;
         self->buf = malloc(self->capacity);
         if (!self->buf) {
             PyErr_NoMemory();
@@ -1639,11 +1827,10 @@ ZeroCopyByteBuff_init(ZeroCopyByteBuff *self, PyObject *args, PyObject *kwds)
         }
         self->offset = 0;
     }
-
     return 0;
 }
 
-static void ensure_capacity(ZeroCopyByteBuff *self, size_t needed) {
+static int ensure_capacity(ZeroCopyByteBuff *self, size_t needed) {
     if (self->offset + needed > self->capacity) {
         size_t new_capacity = self->capacity * 2;
         if (new_capacity < self->offset + needed) {
@@ -1651,77 +1838,108 @@ static void ensure_capacity(ZeroCopyByteBuff *self, size_t needed) {
         }
         char *new_buf = realloc(self->buf, new_capacity);
         if (!new_buf) {
-            return; 
+            PyErr_NoMemory();
+            return -1;
         }
         self->buf = new_buf;
         self->capacity = new_capacity;
     }
+    return 0;
+}
+
+static int write_uvarint(ZeroCopyByteBuff *self, uint64_t zz) {
+    if (ensure_capacity(self, 10) < 0) return -1;
+    unsigned char *p = (unsigned char *)self->buf + self->offset;
+    while (zz >= 0x80) {
+        *p++ = (unsigned char)((zz & 0x7F) | 0x80);
+        zz >>= 7;
+    }
+    *p++ = (unsigned char)zz;
+    self->offset = (size_t)((char *)p - self->buf);
+    return 0;
+}
+
+static uint64_t zigzag64(int64_t v) {
+    return ((uint64_t)v << 1) ^ (uint64_t)(v >> 63);
+}
+
+static int write_varint(ZeroCopyByteBuff *self, int64_t v) {
+    return write_uvarint(self, zigzag64(v));
+}
+
+/* Reads one unsigned LEB128 varint (at most 10 bytes, 64 bits). */
+static int read_uvarint(ZeroCopyByteBuff *self, uint64_t *out) {
+    uint64_t result = 0;
+    for (int i = 0; i < 10; i++) {
+        if (self->offset >= self->capacity) {
+            PyErr_SetString(PyExc_ValueError, "buffer underflow");
+            return -1;
+        }
+        unsigned char b = (unsigned char)self->buf[self->offset++];
+        if (i == 9 && b > 1) {
+            PyErr_SetString(PyExc_ValueError, "varint overflows 64 bits");
+            return -1;
+        }
+        result |= ((uint64_t)(b & 0x7F)) << (7 * i);
+        if (!(b & 0x80)) {
+            *out = result;
+            return 0;
+        }
+    }
+    PyErr_SetString(PyExc_ValueError, "varint too long");
+    return -1;
+}
+
+static int read_varint(ZeroCopyByteBuff *self, int64_t *out) {
+    uint64_t r;
+    if (read_uvarint(self, &r) < 0) return -1;
+    *out = (int64_t)(r >> 1) ^ -(int64_t)(r & 1);
+    return 0;
+}
+
+/* Converts a Python int to int64, wrapping modulo 2^64 like the pure path. */
+static int as_int64(PyObject *args, int64_t *out) {
+    PyObject *o;
+    if (!PyArg_ParseTuple(args, "O", &o)) return -1;
+    unsigned long long u = PyLong_AsUnsignedLongLongMask(o);
+    if (u == (unsigned long long)-1 && PyErr_Occurred()) return -1;
+    *out = (int64_t)u;
+    return 0;
 }
 
 // --- Write Helpers ---
 
 static PyObject *
-ZeroCopyByteBuff_put_varint64(ZeroCopyByteBuff *self, PyObject *args)
+ZeroCopyByteBuff_put_int64(ZeroCopyByteBuff *self, PyObject *args)
 {
-    long long v;
-    if (!PyArg_ParseTuple(args, "L", &v)) // L for long long (64 bit)
-        return NULL;
-    
-    // ZigZag
-    unsigned long long zz = (v << 1) ^ (v >> 63);
-
-    ensure_capacity(self, 10);
-    char *p = self->buf + self->offset;
-
-    // Unrolled fast path logic similar to Python but in C
-    if (zz < 0x80) {
-        *p++ = (char)zz;
-    } else if (zz < 0x4000) {
-        *p++ = (char)((zz & 0x7F) | 0x80);
-        *p++ = (char)(zz >> 7);
-    } else {
-        while (zz & ~0x7F) {
-            *p++ = (char)((zz & 0x7F) | 0x80);
-            zz >>= 7;
-        }
-        *p++ = (char)zz;
-    }
-    
-    self->offset = p - self->buf;
+    int64_t v;
+    if (as_int64(args, &v) < 0) return NULL;
+    if (write_varint(self, v) < 0) return NULL;
     Py_RETURN_NONE;
 }
 
-// Aliases
-static PyObject *ZeroCopyByteBuff_put_int32(ZeroCopyByteBuff *self, PyObject *args) { return ZeroCopyByteBuff_put_varint64(self, args); }
-static PyObject *ZeroCopyByteBuff_put_int64(ZeroCopyByteBuff *self, PyObject *args) { return ZeroCopyByteBuff_put_varint64(self, args); }
+static PyObject *
+ZeroCopyByteBuff_put_int32(ZeroCopyByteBuff *self, PyObject *args)
+{
+    int64_t v;
+    if (as_int64(args, &v) < 0) return NULL;
+    if (write_varint(self, (int64_t)(int32_t)(uint32_t)(uint64_t)v) < 0) return NULL;
+    Py_RETURN_NONE;
+}
 
+/* float and double are fixed point: trunc(v * 10000) as an int64, computed
+ * in the field's own precision. */
 static PyObject *
 ZeroCopyByteBuff_put_float(ZeroCopyByteBuff *self, PyObject *args)
 {
     float v;
     if (!PyArg_ParseTuple(args, "f", &v)) return NULL;
-    
-    // Reuse varint logic: int(v * 10000.0)
-    long long iv = (long long)(v * 10000.0f);
-    
-    unsigned long long zz = (iv << 1) ^ (iv >> 63);
-
-    ensure_capacity(self, 10);
-    char *p = self->buf + self->offset;
-
-    if (zz < 0x80) {
-        *p++ = (char)zz;
-    } else if (zz < 0x4000) {
-        *p++ = (char)((zz & 0x7F) | 0x80);
-        *p++ = (char)(zz >> 7);
-    } else {
-        while (zz & ~0x7F) {
-            *p++ = (char)((zz & 0x7F) | 0x80);
-            zz >>= 7;
-        }
-        *p++ = (char)zz;
+    volatile float scaled = v * 10000.0f;
+    if (!(scaled >= -9223372036854775808.0f && scaled < 9223372036854775808.0f)) {
+        PyErr_SetString(PyExc_ValueError, "float is NaN, infinite or out of range");
+        return NULL;
     }
-    self->offset = p - self->buf;
+    if (write_varint(self, (int64_t)scaled) < 0) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -1730,34 +1948,21 @@ ZeroCopyByteBuff_put_double(ZeroCopyByteBuff *self, PyObject *args)
 {
     double v;
     if (!PyArg_ParseTuple(args, "d", &v)) return NULL;
-    long long iv = (long long)(v * 10000.0);
-    unsigned long long zz = (iv << 1) ^ (iv >> 63);
-
-    ensure_capacity(self, 10);
-    char *p = self->buf + self->offset;
-
-    if (zz < 0x80) {
-        *p++ = (char)zz;
-    } else if (zz < 0x4000) {
-        *p++ = (char)((zz & 0x7F) | 0x80);
-        *p++ = (char)(zz >> 7);
-    } else {
-        while (zz & ~0x7F) {
-            *p++ = (char)((zz & 0x7F) | 0x80);
-            zz >>= 7;
-        }
-        *p++ = (char)zz;
+    volatile double scaled = v * 10000.0;
+    if (!(scaled >= -9223372036854775808.0 && scaled < 9223372036854775808.0)) {
+        PyErr_SetString(PyExc_ValueError, "double is NaN, infinite or out of range");
+        return NULL;
     }
-    self->offset = p - self->buf;
+    if (write_varint(self, (int64_t)scaled) < 0) return NULL;
     Py_RETURN_NONE;
 }
 
 static PyObject *
 ZeroCopyByteBuff_put_bool(ZeroCopyByteBuff *self, PyObject *args)
 {
-    int v; // bool is int in C API
+    int v;
     if (!PyArg_ParseTuple(args, "p", &v)) return NULL;
-    ensure_capacity(self, 1);
+    if (ensure_capacity(self, 1) < 0) return NULL;
     self->buf[self->offset++] = v ? 1 : 0;
     Py_RETURN_NONE;
 }
@@ -1765,164 +1970,134 @@ ZeroCopyByteBuff_put_bool(ZeroCopyByteBuff *self, PyObject *args)
 static PyObject *
 ZeroCopyByteBuff_put_string(ZeroCopyByteBuff *self, PyObject *args)
 {
-    char *s;
+    const char *s;
     Py_ssize_t len;
     if (!PyArg_ParseTuple(args, "s#", &s, &len)) return NULL;
-
-    // len varint
-    unsigned long long zz = ((unsigned long long)len) << 1; // Always positive
-
-    ensure_capacity(self, len + 10);
-    char *p = self->buf + self->offset;
-
-    // Optimized varint using unrolled loops/switch for small values
-    if (zz < 0x80) {
-        *p++ = (char)zz;
-    } else if (zz < 0x4000) {
-        *p++ = (char)((zz & 0x7F) | 0x80);
-        *p++ = (char)(zz >> 7);
-    } else {
-        while (zz & ~0x7F) {
-            *p++ = (char)((zz & 0x7F) | 0x80);
-            zz >>= 7;
-        }
-        *p++ = (char)zz;
-    }
-
-    memcpy(p, s, len);
-    self->offset = (p - self->buf) + len;
+    if (write_varint(self, (int64_t)len) < 0) return NULL;
+    if (ensure_capacity(self, (size_t)len) < 0) return NULL;
+    memcpy(self->buf + self->offset, s, (size_t)len);
+    self->offset += (size_t)len;
     Py_RETURN_NONE;
 }
 
-
 // --- Read Helpers ---
 
-
-
 static PyObject *
-ZeroCopyByteBuff_get_varint64(ZeroCopyByteBuff *self, PyObject *Py_UNUSED(ignored))
+ZeroCopyByteBuff_get_int64(ZeroCopyByteBuff *self, PyObject *Py_UNUSED(ignored))
 {
-    if (self->offset >= self->capacity) { // Simple bounds check, tough to do exact without decoding
-         PyErr_SetString(PyExc_IndexError, "Buffer underflow");
-         return NULL;
-    }
-    
-    char *p = self->buf + self->offset;
-    unsigned long long result = 0;
-    int shift = 0;
-    
-    while (1) {
-        unsigned char b = *p++;
-        result |= ((unsigned long long)(b & 0x7F)) << shift;
-        if (!(b & 0x80)) break;
-        shift += 7;
-    }
-    self->offset = p - self->buf;
-    
-    long long decoded = (result >> 1) ^ -(long long)(result & 1);
-    return PyLong_FromLongLong(decoded);
+    int64_t v;
+    if (read_varint(self, &v) < 0) return NULL;
+    return PyLong_FromLongLong((long long)v);
 }
 
-// Aliases
-static PyObject *ZeroCopyByteBuff_get_int32(ZeroCopyByteBuff *self, PyObject *a) { return ZeroCopyByteBuff_get_varint64(self, a); }
-static PyObject *ZeroCopyByteBuff_get_int64(ZeroCopyByteBuff *self, PyObject *a) { return ZeroCopyByteBuff_get_varint64(self, a); }
+static PyObject *
+ZeroCopyByteBuff_get_int32(ZeroCopyByteBuff *self, PyObject *Py_UNUSED(ignored))
+{
+    int64_t v;
+    if (read_varint(self, &v) < 0) return NULL;
+    return PyLong_FromLong((long)(int32_t)(uint32_t)(uint64_t)v);
+}
 
 static PyObject *
 ZeroCopyByteBuff_get_float(ZeroCopyByteBuff *self, PyObject *Py_UNUSED(ignored))
 {
-    // Reuse varint logic
-    PyObject *val = ZeroCopyByteBuff_get_varint64(self, NULL);
-    if (!val) return NULL;
-    long long iv = PyLong_AsLongLong(val);
-    Py_DECREF(val);
-    return PyFloat_FromDouble((double)iv / 10000.0);
+    int64_t v;
+    if (read_varint(self, &v) < 0) return NULL;
+    return PyFloat_FromDouble((double)((float)v / 10000.0f));
 }
 
 static PyObject *
 ZeroCopyByteBuff_get_double(ZeroCopyByteBuff *self, PyObject *Py_UNUSED(ignored))
 {
-    PyObject *val = ZeroCopyByteBuff_get_varint64(self, NULL);
-    if (!val) return NULL;
-    long long iv = PyLong_AsLongLong(val);
-    Py_DECREF(val);
-    return PyFloat_FromDouble((double)iv / 10000.0);
+    int64_t v;
+    if (read_varint(self, &v) < 0) return NULL;
+    return PyFloat_FromDouble((double)v / 10000.0);
 }
 
 static PyObject *
 ZeroCopyByteBuff_get_bool(ZeroCopyByteBuff *self, PyObject *Py_UNUSED(ignored))
 {
     if (self->offset >= self->capacity) {
-         PyErr_SetString(PyExc_IndexError, "Buffer underflow");
-         return NULL;
+        PyErr_SetString(PyExc_ValueError, "buffer underflow");
+        return NULL;
     }
     int val = self->buf[self->offset++] != 0;
     if (val) Py_RETURN_TRUE;
-    else Py_RETURN_FALSE;
+    Py_RETURN_FALSE;
 }
 
 static PyObject *
 ZeroCopyByteBuff_get_string(ZeroCopyByteBuff *self, PyObject *Py_UNUSED(ignored))
 {
-    // Decode length (varint)
-    char *p = self->buf + self->offset;
-    unsigned long long result = 0;
-    int shift = 0;
-    
-    while (1) {
-        unsigned char b = *p++;
-        result |= ((unsigned long long)(b & 0x7F)) << shift;
-        if (!(b & 0x80)) break;
-        shift += 7;
-    }
-    // Update offset temporarily
-    self->offset = p - self->buf;
-    
-    long long len = (result >> 1); // ZigZag decode positive
-    
-    if (self->offset + len > self->capacity) {
-        PyErr_SetString(PyExc_IndexError, "Buffer underflow (string)");
+    int64_t len;
+    if (read_varint(self, &len) < 0) return NULL;
+    if (len < 0 || (uint64_t)len > (uint64_t)(self->capacity - self->offset)) {
+        PyErr_SetString(PyExc_ValueError, "invalid string length");
         return NULL;
     }
-    
-    PyObject *s = PyUnicode_FromStringAndSize(self->buf + self->offset, len);
-    self->offset += len;
+    PyObject *s = PyUnicode_DecodeUTF8(self->buf + self->offset, (Py_ssize_t)len, "strict");
+    if (!s) return NULL;
+    self->offset += (size_t)len;
     return s;
+}
+
+/* Array element count: never negative and never more than the bytes left
+ * (every element takes at least one byte). */
+static PyObject *
+ZeroCopyByteBuff_get_length(ZeroCopyByteBuff *self, PyObject *Py_UNUSED(ignored))
+{
+    int64_t v;
+    if (read_varint(self, &v) < 0) return NULL;
+    int32_t n = (int32_t)(uint32_t)(uint64_t)v;
+    if (n < 0 || (uint64_t)n > (uint64_t)(self->capacity - self->offset)) {
+        PyErr_SetString(PyExc_ValueError, "invalid array length");
+        return NULL;
+    }
+    return PyLong_FromLong((long)n);
+}
+
+static PyObject *
+ZeroCopyByteBuff_remaining(ZeroCopyByteBuff *self, PyObject *Py_UNUSED(ignored))
+{
+    return PyLong_FromSize_t(self->capacity - self->offset);
 }
 
 static PyObject *
 ZeroCopyByteBuff_get_bytes(ZeroCopyByteBuff *self, PyObject *Py_UNUSED(ignored))
 {
-    return PyBytes_FromStringAndSize(self->buf, self->offset);
+    return PyBytes_FromStringAndSize(self->buf, (Py_ssize_t)self->offset);
 }
 
 static PyObject *
 ZeroCopyByteBuff_ensure_capacity(ZeroCopyByteBuff *self, PyObject *args)
 {
-    long needed;
-    if (!PyArg_ParseTuple(args, "l", &needed)) return NULL;
-    ensure_capacity(self, (size_t)needed);
+    Py_ssize_t needed;
+    if (!PyArg_ParseTuple(args, "n", &needed)) return NULL;
+    if (needed > 0 && ensure_capacity(self, (size_t)needed) < 0) return NULL;
     Py_RETURN_NONE;
 }
 
 static PyMethodDef ZeroCopyByteBuff_methods[] = {
     {"put_int32", (PyCFunction)ZeroCopyByteBuff_put_int32, METH_VARARGS, "Put int32"},
     {"put_int64", (PyCFunction)ZeroCopyByteBuff_put_int64, METH_VARARGS, "Put int64"},
-    {"put_varint64", (PyCFunction)ZeroCopyByteBuff_put_varint64, METH_VARARGS, "Put varint64"},
+    {"put_varint64", (PyCFunction)ZeroCopyByteBuff_put_int64, METH_VARARGS, "Put varint64"},
     {"put_float", (PyCFunction)ZeroCopyByteBuff_put_float, METH_VARARGS, "Put float"},
     {"put_double", (PyCFunction)ZeroCopyByteBuff_put_double, METH_VARARGS, "Put double"},
     {"put_bool", (PyCFunction)ZeroCopyByteBuff_put_bool, METH_VARARGS, "Put bool"},
     {"put_string", (PyCFunction)ZeroCopyByteBuff_put_string, METH_VARARGS, "Put string"},
     {"ensure_capacity", (PyCFunction)ZeroCopyByteBuff_ensure_capacity, METH_VARARGS, "Ensure capacity"},
-    
+
     {"get_int32", (PyCFunction)ZeroCopyByteBuff_get_int32, METH_NOARGS, "Get int32"},
     {"get_int64", (PyCFunction)ZeroCopyByteBuff_get_int64, METH_NOARGS, "Get int64"},
-    {"get_varint64", (PyCFunction)ZeroCopyByteBuff_get_varint64, METH_NOARGS, "Get varint64"},
+    {"get_varint64", (PyCFunction)ZeroCopyByteBuff_get_int64, METH_NOARGS, "Get varint64"},
     {"get_float", (PyCFunction)ZeroCopyByteBuff_get_float, METH_NOARGS, "Get float"},
     {"get_double", (PyCFunction)ZeroCopyByteBuff_get_double, METH_NOARGS, "Get double"},
     {"get_bool", (PyCFunction)ZeroCopyByteBuff_get_bool, METH_NOARGS, "Get bool"},
     {"get_string", (PyCFunction)ZeroCopyByteBuff_get_string, METH_NOARGS, "Get string"},
-    
-    {"get_bytes", (PyCFunction)ZeroCopyByteBuff_get_bytes, METH_NOARGS, "Get internal bytes"},
+    {"get_length", (PyCFunction)ZeroCopyByteBuff_get_length, METH_NOARGS, "Get array length"},
+    {"remaining", (PyCFunction)ZeroCopyByteBuff_remaining, METH_NOARGS, "Unread bytes"},
+
+    {"get_bytes", (PyCFunction)ZeroCopyByteBuff_get_bytes, METH_NOARGS, "Get written bytes"},
     {NULL}  /* Sentinel */
 };
 
@@ -1942,7 +2117,7 @@ static PyTypeObject ZeroCopyByteBuffType = {
 static PyModuleDef bitpackermodule = {
     PyModuleDef_HEAD_INIT,
     .m_name = "_bitpacker",
-    .m_doc = "Example module that creates an extension type.",
+    .m_doc = "BitPacker runtime (C extension).",
     .m_size = -1,
 };
 
@@ -1987,58 +2162,183 @@ setup (name = 'BitPacker',
 // 6. PHP TEMPLATE (FIXED)
 // ==========================================
 const tmplPHP = `<?php
-class {{.Config.MainClass}} {
-    const VERSION = "{{.Config.Version}}";
+// Generated by BitPacker. Requires 64-bit PHP (PHP_INT_SIZE == 8).
+declare(strict_types=1);
+
+if (!class_exists('BitPackerBuffer', false)) {
+    /**
+     * Wire runtime shared by every class generated from any schema.
+     * Writers append to $data; readers consume $data from $pos and throw
+     * BitPackerException on truncated or malformed input.
+     */
+    class BitPackerException extends Exception {}
+
+    class BitPackerBuffer {
+        public string $data;
+        public int $pos = 0;
+
+        public function __construct(string $data = "") {
+            if (PHP_INT_SIZE !== 8) {
+                throw new BitPackerException("BitPacker requires 64-bit PHP");
+            }
+            $this->data = $data;
+        }
+
+        // --- write ---
+        public function putUVarint(int $zz): void {
+            // $zz holds an unsigned 64-bit value in a signed int.
+            while (($zz & ~0x7F) !== 0) {
+                $this->data .= chr(($zz & 0x7F) | 0x80);
+                $zz = ($zz >> 7) & 0x01FFFFFFFFFFFFFF; // logical shift
+            }
+            $this->data .= chr($zz);
+        }
+        public function putLong(int $v): void {
+            $this->putUVarint(($v << 1) ^ ($v >> 63));
+        }
+        public function putInt(int $v): void {
+            $v &= 0xFFFFFFFF; // wrap to 32 bits like int32 arithmetic
+            if ($v & 0x80000000) { $v -= 0x100000000; }
+            $this->putLong($v);
+        }
+        // float and double are fixed point: trunc(v * 10000) as an int64, with
+        // the multiplication done in the field's own precision (float32 for
+        // float; PHP floats are doubles).
+        public static function f32(float $v): float {
+            return unpack("g", pack("g", $v))[1];
+        }
+        // NaN, infinities and values whose scaled form does not fit an int64
+        // are rejected rather than saturated.
+        private static function scaled(float $s): int {
+            if (!($s >= -9223372036854775808.0 && $s < 9223372036854775808.0)) {
+                throw new BitPackerException("float is NaN, infinite or out of range");
+            }
+            return (int) $s;
+        }
+        public function putFloat(float $v): void {
+            $this->putLong(self::scaled(self::f32(self::f32($v) * 10000.0)));
+        }
+        public function putDouble(float $v): void {
+            $this->putLong(self::scaled($v * 10000.0));
+        }
+        public function putBool(bool $v): void {
+            $this->data .= $v ? "\x01" : "\x00";
+        }
+        public function putString(string $v): void {
+            $this->putLong(strlen($v));
+            $this->data .= $v;
+        }
+
+        // --- read ---
+        public function remaining(): int {
+            return strlen($this->data) - $this->pos;
+        }
+        public function getUVarint(): int {
+            $result = 0;
+            $len = strlen($this->data);
+            for ($i = 0; $i < 10; $i++) {
+                if ($this->pos >= $len) {
+                    throw new BitPackerException("buffer underflow");
+                }
+                $b = ord($this->data[$this->pos++]);
+                if ($i === 9 && $b > 1) {
+                    throw new BitPackerException("varint overflows 64 bits");
+                }
+                $result |= ($b & 0x7F) << (7 * $i);
+                if (($b & 0x80) === 0) {
+                    return $result;
+                }
+            }
+            throw new BitPackerException("varint too long");
+        }
+        public function getLong(): int {
+            $r = $this->getUVarint();
+            return (($r >> 1) & PHP_INT_MAX) ^ -($r & 1);
+        }
+        public function getInt(): int {
+            $v = $this->getLong() & 0xFFFFFFFF;
+            return ($v & 0x80000000) ? $v - 0x100000000 : $v;
+        }
+        public function getFloat(): float {
+            return self::f32(self::f32((float) $this->getLong()) / 10000.0);
+        }
+        public function getDouble(): float {
+            return $this->getLong() / 10000.0;
+        }
+        public function getBool(): bool {
+            if ($this->pos >= strlen($this->data)) {
+                throw new BitPackerException("buffer underflow");
+            }
+            return $this->data[$this->pos++] !== "\x00";
+        }
+        public function getString(): string {
+            $n = $this->getLong();
+            if ($n < 0 || $n > $this->remaining()) {
+                throw new BitPackerException("invalid string length $n");
+            }
+            $s = (string) substr($this->data, $this->pos, $n);
+            $this->pos += $n;
+            if (preg_match('//u', $s) !== 1) {
+                throw new BitPackerException("invalid UTF-8 string");
+            }
+            return $s;
+        }
+        // Array element count: never negative and never more than the bytes
+        // left (every element takes at least one byte).
+        public function getLength(): int {
+            $n = $this->getInt();
+            if ($n < 0 || $n > $this->remaining()) {
+                throw new BitPackerException("invalid array length $n");
+            }
+            return $n;
+        }
+    }
 }
 
 {{range .Classes}}
 class {{.Name}} {
-    {{range .Fields}}public ${{.Name}};
+    const VERSION = "{{$.Config.Version}}";
+
+    {{range .Fields}}public {{if .IsArray}}array ${{.Name}} = [];{{else}}{{phpType .Type}} ${{.Name}}{{phpDefault .Type}};{{end}}
     {{end}}
 
-    public function encode() {
-        $d = "";
-        $v = {{$.Config.MainClass}}::VERSION;
-        $d .= pack("N", strlen($v)) . $v;
-
-        {{range .Fields}}
-        {{if .IsArray}}
-        $d .= pack("N", count($this->{{.Name}}));
-        foreach($this->{{.Name}} as $item) {
-            {{encodeFieldPHP "item" .Type}}
-        }
-        {{else}}
-        {{encodeFieldPHP (printf "$this->%s" .Name) .Type}}
-        {{end}}
-        {{end}}
-        
-        {{if $.Config.UseCompress}}return gzcompress($d);{{else}}return $d;{{end}}
+    public function encode(): string {
+        $buf = new BitPackerBuffer();
+        $buf->putString(self::VERSION);
+        $this->encodeTo($buf);
+        {{if $.Config.UseCompress}}return gzcompress($buf->data);{{else}}return $buf->data;{{end}}
     }
 
-    public static function decode($data) {
-        {{if $.Config.UseCompress}}$data = gzuncompress($data);{{end}}
-        $offset = 0;
-        
-        $vLen = unpack("N", substr($data, $offset, 4))[1]; $offset+=4;
-        $vStr = substr($data, $offset, $vLen); $offset+=$vLen;
-        
-        if ($vStr !== {{$.Config.MainClass}}::VERSION) {
-            throw new Exception("Version Mismatch: Expected " . {{$.Config.MainClass}}::VERSION . ", got " . $vStr);
+    public function encodeTo(BitPackerBuffer $buf): void {
+        {{range .Fields}}{{if .IsArray}}$buf->putInt(count($this->{{.Name}}));
+        foreach ($this->{{.Name}} as $item) {
+            {{encodeFieldPHP "$item" .Type}}
         }
+        {{else}}{{encodeFieldPHP (printf "$this->%s" .Name) .Type}}
+        {{end}}{{end}}
+    }
 
-        $obj = new {{.Name}}();
-        {{range .Fields}}
-        {{if .IsArray}}
-        $count = unpack("N", substr($data, $offset, 4))[1]; $offset+=4;
-        $obj->{{.Name}} = [];
-        for($i=0; $i<$count; $i++) {
-            {{decodeFieldPHP "val" .Type}}
-            $obj->{{.Name}}[] = $val;
+    /** @throws BitPackerException on a version mismatch or malformed input */
+    public static function decode(string $data): {{.Name}} {
+        {{if $.Config.UseCompress}}$data = gzuncompress($data);
+        if ($data === false) { throw new BitPackerException("zlib: bad data"); }
+        {{end}}$buf = new BitPackerBuffer($data);
+        $version = $buf->getString();
+        if ($version !== self::VERSION) {
+            throw new BitPackerException("Version Mismatch: Expected " . self::VERSION . ", got " . $version);
         }
-        {{else}}
-        {{decodeFieldPHP (printf "$obj->%s" .Name) .Type}}
-        {{end}}
-        {{end}}
+        return self::decodeFrom($buf);
+    }
+
+    public static function decodeFrom(BitPackerBuffer $buf): {{.Name}} {
+        $obj = new {{.Name}}();
+        {{range .Fields}}{{if .IsArray}}$n = $buf->getLength();
+        $obj->{{.Name}} = [];
+        for ($i = 0; $i < $n; $i++) {
+            $obj->{{.Name}}[] = {{decodeFieldPHP .Type}};
+        }
+        {{else}}$obj->{{.Name}} = {{decodeFieldPHP .Type}};
+        {{end}}{{end}}
         return $obj;
     }
 }
@@ -2074,7 +2374,7 @@ class ZeroCopyByteBuff {
             this.multiplier = 10000.0;
         }
         this.textEncoder = new TextEncoder();
-        this.textDecoder = new TextDecoder();
+        this.textDecoder = new TextDecoder('utf-8', { fatal: true }); // invalid UTF-8 throws
     }
 
     ensureCapacity(needed) {
@@ -2093,7 +2393,18 @@ class ZeroCopyByteBuff {
     static zigzagDecode32(n) {
         return (n >>> 1) ^ -(n & 1);
     }
-    
+
+    remaining() {
+        return this.writeBuf.length - this.cursor;
+    }
+
+    readByte() {
+        if (this.cursor >= this.writeBuf.length) {
+            throw new RangeError("BitPacker: buffer underflow");
+        }
+        return this.writeBuf[this.cursor++];
+    }
+
     // VarInt32
     putVarInt32(value) {
         this.ensureCapacity(5);
@@ -2105,20 +2416,20 @@ class ZeroCopyByteBuff {
         this.writeBuf[this.cursor++] = value;
     }
 
+    // Reads a varint and returns its low 32 bits (unsigned). Up to 10 bytes
+    // are accepted, since ints and lengths may be written as 64-bit varints.
     getVarInt32() {
         let result = 0;
-        let shift = 0;
-        while (true) {
-            const byte = this.writeBuf[this.cursor++];
-            result |= (byte & 0x7F) << shift;
-            if ((byte & 0x80) === 0) break;
-            shift += 7;
+        for (let i = 0; i < 10; i++) {
+            const byte = this.readByte();
+            if (i < 5) result |= (byte & 0x7F) << (7 * i);
+            if ((byte & 0x80) === 0) return result >>> 0;
         }
-        return result >>> 0; // unsigned
+        throw new RangeError("BitPacker: varint too long");
     }
 
     putInt32(val) {
-        this.putVarInt32(ZeroCopyByteBuff.zigzagEncode32(val));
+        this.putVarInt32(ZeroCopyByteBuff.zigzagEncode32(val | 0));
     }
 
     getInt32() {
@@ -2126,16 +2437,25 @@ class ZeroCopyByteBuff {
         return ZeroCopyByteBuff.zigzagDecode32(val);
     }
 
-    // 64-bit VarInt (using BigInt for full precision)
+    // Array element count: never negative and never more than the bytes left
+    // (every element takes at least one), so corrupt input cannot force a
+    // huge allocation.
+    getLength() {
+        const n = this.getInt32();
+        if (n < 0 || n > this.remaining()) {
+            throw new RangeError("BitPacker: invalid array length " + n);
+        }
+        return n;
+    }
+
+    // 64-bit VarInt (BigInt for full precision). Accepts a BigInt or an
+    // integral Number; wraps to signed 64 bits like int64 arithmetic.
     putVarInt64(val) {
-        // Only safe if val is BigInt or safe integer
-        // Force BigInt
-        let v = BigInt(val); 
+        const v = BigInt.asIntN(64, BigInt(val));
         this.ensureCapacity(10);
-        // ZigZag 64: (n << 1) ^ (n >> 63)
-        let zz = (v << 1n) ^ (v >> 63n);
-        
-        while ((zz & ~0x7Fn) !== 0n) {
+        // ZigZag 64: (n << 1) ^ (n >> 63), as an unsigned 64-bit value
+        let zz = BigInt.asUintN(64, (v << 1n) ^ (v >> 63n));
+        while (zz > 0x7Fn) {
             this.writeBuf[this.cursor++] = Number((zz & 0x7Fn) | 0x80n);
             zz >>= 7n;
         }
@@ -2144,43 +2464,67 @@ class ZeroCopyByteBuff {
 
     getVarInt64() {
         let result = 0n;
-        let shift = 0n;
-        while (true) {
-            const byte = this.writeBuf[this.cursor++];
-            result |= BigInt(byte & 0x7F) << shift;
-            if ((byte & 0x80) === 0) break;
-            shift += 7n;
+        for (let i = 0; i < 10; i++) {
+            const byte = this.readByte();
+            if (i === 9 && byte > 1) {
+                throw new RangeError("BitPacker: varint overflows 64 bits");
+            }
+            result |= BigInt(byte & 0x7F) << BigInt(7 * i);
+            if ((byte & 0x80) === 0) {
+                // ZigZag Decode 64: (n >>> 1) ^ -(n & 1)
+                return BigInt.asIntN(64, (result >> 1n) ^ -(result & 1n));
+            }
         }
-        // ZigZag Decode 64: (n >>> 1) ^ -(n & 1)
-        return (result >> 1n) ^ -(result & 1n);
+        throw new RangeError("BitPacker: varint too long");
     }
 
 	putInt64(val) {
         this.putVarInt64(val);
     }
 
+    // long fields decode to BigInt (a Number cannot hold every int64).
     getInt64() {
         return this.getVarInt64();
     }
 
+    // float and double are fixed point: trunc(v * 10000) as an int64, with
+    // the multiplication done in the field's own precision.
+    // NaN, infinities and values whose scaled form does not fit an int64
+    // are rejected rather than saturated.
+    static checkScaled(scaled) {
+        if (!(scaled >= -9223372036854775808 && scaled < 9223372036854775808)) {
+            throw new RangeError("BitPacker: float is NaN, infinite or out of range");
+        }
+        return BigInt(Math.trunc(scaled));
+    }
+
     putFloat(val) {
-       // Multiply by scalar and store as int64
-       const scaled = BigInt(Math.round(val * this.multiplier));
-       this.putVarInt64(scaled);
+        const scaled = Math.fround(Math.fround(val) * this.multiplier);
+        this.putVarInt64(ZeroCopyByteBuff.checkScaled(scaled));
+    }
+
+    putDouble(val) {
+        const scaled = val * this.multiplier;
+        this.putVarInt64(ZeroCopyByteBuff.checkScaled(scaled));
     }
 
     getFloat() {
-       const val = this.getVarInt64();
-       return Number(val) / this.multiplier;
+        const val = this.getVarInt64();
+        return Math.fround(Math.fround(Number(val)) / this.multiplier);
+    }
+
+    getDouble() {
+        const val = this.getVarInt64();
+        return Number(val) / this.multiplier;
     }
 
     putBoolean(val) {
         this.ensureCapacity(1);
         this.writeBuf[this.cursor++] = val ? 1 : 0;
     }
-    
+
     getBoolean() {
-        return this.writeBuf[this.cursor++] !== 0;
+        return this.readByte() !== 0;
     }
 
     putString(val) {
@@ -2192,10 +2536,14 @@ class ZeroCopyByteBuff {
     }
 
     getString() {
-        const len = this.getInt32();
-        if (len === 0) return "";
-        const bytes = this.writeBuf.subarray(this.cursor, this.cursor + len);
-        this.cursor += len;
+        const len = this.getVarInt64();
+        if (len < 0n || len > BigInt(this.remaining())) {
+            throw new RangeError("BitPacker: invalid string length " + len);
+        }
+        const n = Number(len);
+        if (n === 0) return "";
+        const bytes = this.writeBuf.subarray(this.cursor, this.cursor + n);
+        this.cursor += n;
         // TextDecoder handles Uint8Array view correctly
         return this.textDecoder.decode(bytes);
     }
@@ -2249,7 +2597,7 @@ static decodeFrom(buf) {
 	// explicit field order
 	{{range .Fields}}
 	{{if .IsArray}}
-	const {{.Name}}_len = buf.getInt32();
+	const {{.Name}}_len = buf.getLength();
 	obj.{{.Name}} = new Array({{.Name}}_len);
 	for (let i = 0; i < {{.Name}}_len; i++) {
 		{{decodeFieldJS "obj" .Name "i" .Type}}
@@ -2306,10 +2654,17 @@ func funcMap(cfg GeneratorConfig) template.FuncMap {
 		"printf": fmt.Sprintf,
 		// Type Maps
 		"mapTypeGo": func(t string) string {
-			if t == "int" {
+			switch t {
+			case "int":
 				return "int32"
+			case "long":
+				return "int64"
+			case "float":
+				return "float32"
+			case "double":
+				return "float64"
 			}
-			return t
+			return t // bool, string and class names are already Go types
 		},
 		"mapTypeRust": func(t string) string {
 			if t == "int" {
@@ -2317,6 +2672,12 @@ func funcMap(cfg GeneratorConfig) template.FuncMap {
 			}
 			if t == "long" {
 				return "i64"
+			}
+			if t == "float" {
+				return "f32"
+			}
+			if t == "double" {
+				return "f64"
 			}
 			if t == "string" {
 				return "String"
@@ -2392,6 +2753,12 @@ func funcMap(cfg GeneratorConfig) template.FuncMap {
 			if t == "bool" {
 				return fmt.Sprintf("buf.put_bool(*%s);", name)
 			}
+			if t == "float" {
+				return fmt.Sprintf("buf.put_f32(*%s)?;", name)
+			}
+			if t == "double" {
+				return fmt.Sprintf("buf.put_f64(*%s)?;", name)
+			}
 			return fmt.Sprintf("%s.encode_to(buf)?;", name)
 		},
 		"decodeFieldRust": func(target, t string) string {
@@ -2406,6 +2773,12 @@ func funcMap(cfg GeneratorConfig) template.FuncMap {
 			}
 			if t == "bool" {
 				return fmt.Sprintf("%s = buf.get_bool();", target)
+			}
+			if t == "float" {
+				return fmt.Sprintf("%s = buf.get_f32();", target)
+			}
+			if t == "double" {
+				return fmt.Sprintf("%s = buf.get_f64();", target)
 			}
 			return fmt.Sprintf("%s = %s::decode_from(buf)?;", target, t)
 		},
@@ -2510,16 +2883,68 @@ func funcMap(cfg GeneratorConfig) template.FuncMap {
 		"decodeFieldJS":  decodeFieldJS,
 		// PHP Helpers (FIXED)
 		"encodeFieldPHP": func(name, t string) string {
-			if t == "string" {
-				return fmt.Sprintf("$d .= pack('N', strlen(%s)) . %s;", name, name)
+			switch t {
+			case "int":
+				return fmt.Sprintf("$buf->putInt(%s);", name)
+			case "long":
+				return fmt.Sprintf("$buf->putLong(%s);", name)
+			case "float":
+				return fmt.Sprintf("$buf->putFloat(%s);", name)
+			case "double":
+				return fmt.Sprintf("$buf->putDouble(%s);", name)
+			case "bool":
+				return fmt.Sprintf("$buf->putBool(%s);", name)
+			case "string":
+				return fmt.Sprintf("$buf->putString(%s);", name)
+			default:
+				return fmt.Sprintf("%s->encodeTo($buf);", name)
 			}
-			return fmt.Sprintf("$d .= pack('N', %s);", name)
 		},
-		"decodeFieldPHP": func(target, t string) string {
-			if t == "string" {
-				return fmt.Sprintf("$len = unpack('N', substr($data, $offset, 4))[1]; $offset+=4; %s = substr($data, $offset, $len); $offset+=$len;", target)
+		"decodeFieldPHP": func(t string) string {
+			switch t {
+			case "int":
+				return "$buf->getInt()"
+			case "long":
+				return "$buf->getLong()"
+			case "float":
+				return "$buf->getFloat()"
+			case "double":
+				return "$buf->getDouble()"
+			case "bool":
+				return "$buf->getBool()"
+			case "string":
+				return "$buf->getString()"
+			default:
+				return t + "::decodeFrom($buf)"
 			}
-			return fmt.Sprintf("%s = unpack('N', substr($data, $offset, 4))[1]; $offset+=4;", target)
+		},
+		"phpType": func(t string) string {
+			switch t {
+			case "int", "long":
+				return "int"
+			case "float", "double":
+				return "float"
+			case "bool":
+				return "bool"
+			case "string":
+				return "string"
+			default:
+				return "?" + t // nested class; null until set
+			}
+		},
+		"phpDefault": func(t string) string {
+			switch t {
+			case "int", "long":
+				return " = 0"
+			case "float", "double":
+				return " = 0.0"
+			case "bool":
+				return " = false"
+			case "string":
+				return ` = ""`
+			default:
+				return " = null"
+			}
 		},
 		// --- C Helpers ---
 		"mapTypeC": func(t string) string {
@@ -2605,7 +3030,9 @@ func funcMap(cfg GeneratorConfig) template.FuncMap {
 
 func defaultValueJS(t string) string {
 	switch t {
-	case "int", "float", "long", "short", "byte":
+	case "long":
+		return "0n" // long fields are BigInt
+	case "int", "float", "double", "short", "byte":
 		return "0"
 	case "bool":
 		return "false"
@@ -2656,6 +3083,8 @@ func encodeFieldJS(access, arrayIdx, fieldName, fieldType string) string {
 		return fmt.Sprintf("buf.putInt64(%s);", prefix)
 	case "float":
 		return fmt.Sprintf("buf.putFloat(%s);", prefix)
+	case "double":
+		return fmt.Sprintf("buf.putDouble(%s);", prefix)
 	case "bool":
 		return fmt.Sprintf("buf.putBoolean(%s);", prefix)
 	case "string":
@@ -2678,6 +3107,8 @@ func decodeFieldJS(objVar, fieldName, arrayIdx, fieldType string) string {
 		return fmt.Sprintf("%s = buf.getInt64();", target)
 	case "float":
 		return fmt.Sprintf("%s = buf.getFloat();", target)
+	case "double":
+		return fmt.Sprintf("%s = buf.getDouble();", target)
 	case "bool":
 		return fmt.Sprintf("%s = buf.getBoolean();", target)
 	case "string":

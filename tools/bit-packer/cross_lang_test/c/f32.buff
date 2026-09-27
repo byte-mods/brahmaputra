@@ -1,0 +1,9 @@
+version = 1.0.0
+
+// float fields are single precision on the wire: f32(f32(v) * 10000), then
+// trunc. In double precision 0.29 would give 2899, 16777.217 167772170.
+class F32 {
+    float f;
+    float[] fs;
+    double d;
+}

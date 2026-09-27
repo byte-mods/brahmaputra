@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Python roundtrip test + write encoded data to file for cross-language testing."""
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'generated/python'))
+"""The canonical bench_complex WorldState, shared by every target's test.
 
-from bench_complex import WorldState, Guild, Character, Item, Vec3, _USING_C_EXT
+create_test_data() builds the value every target encodes; its encoding is
+the committed test_data.bin (see make_test_data.py). verify() lists the
+fields every target checks after decoding. This module needs the generated
+bench_complex module on sys.path; python/run.sh sets that up — run that
+(or ../run_all.sh) rather than this file.
+"""
+from bench_complex import WorldState, Guild, Character, Item, Vec3
+
 
 def create_test_data():
     """Create a deterministic test WorldState object."""
@@ -23,7 +28,7 @@ def create_test_data():
     hero.position.y = -20
     hero.position.z = 30
     hero.skills = [1, 2, 3, 100]
-    
+
     sword = Item()
     sword.id = 1
     sword.name = "Excalibur"
@@ -38,7 +43,7 @@ def create_test_data():
     guild.members = [hero]
 
     w.guilds = [guild]
-    
+
     potion = Item()
     potion.id = 2
     potion.name = "HealthPotion"
@@ -47,6 +52,7 @@ def create_test_data():
     potion.rarity = "Common"
     w.loot_table = [potion]
     return w
+
 
 def verify(decoded, label=""):
     """Verify decoded data matches expected values."""
@@ -75,23 +81,6 @@ def verify(decoded, label=""):
     assert decoded.loot_table[0].name == "HealthPotion", f"{label} potion name"
     assert decoded.loot_table[0].rarity == "Common", f"{label} potion rarity"
 
+
 if __name__ == "__main__":
-    print(f"🐍 Python (C ext: {_USING_C_EXT})")
-    
-    # 1. Roundtrip test
-    w = create_test_data()
-    encoded = w.encode()
-    print(f"   Encoded: {len(encoded)} bytes")
-    
-    decoded = WorldState.decode(encoded)
-    verify(decoded, "Python roundtrip")
-    print("   ✅ Roundtrip PASS")
-    
-    # 2. Write to file for cross-language testing
-    outfile = os.path.join(os.path.dirname(__file__), "test_data.bin")
-    with open(outfile, "wb") as f:
-        f.write(encoded)
-    print(f"   📁 Written to {outfile} ({len(encoded)} bytes)")
-    
-    # 3. Print hex for debugging
-    print(f"   Hex: {encoded[:40].hex()}...")
+    raise SystemExit("run python/run.sh (or run_all.sh); this module only holds the canonical value")

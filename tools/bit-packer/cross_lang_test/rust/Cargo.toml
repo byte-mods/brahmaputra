@@ -1,0 +1,13 @@
+[package]
+name = "bitpacker-crosstest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: this directory sits under the Brahmaputra workspace root but is
+# not a member of it.
+[workspace]
+
+[[bin]]
+name = "crosstest"
+path = "src/main.rs"

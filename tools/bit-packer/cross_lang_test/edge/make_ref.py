@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Write edge_ref.bin: the canonical Edge value, encoded by hand.
+"""Write edge_ref.bin (the canonical Edge value) and edge_float32_ref.bin
+(the same value with float fields that single precision rounds), encoded by hand.
 
 This encoder is deliberately independent of every BitPacker generator, so
 a generator bug cannot hide by agreeing with itself. It follows the wire
 rules in README.md and nothing else.
 """
 import os
+import struct
 
 VERSION = "2.1.0"
 
@@ -36,6 +38,18 @@ def fixed(v):
     scaled = v * 10000
     assert scaled == int(scaled), v
     return zz64(int(scaled))
+
+
+def f32(v):
+    """Round a Python float (a double) to the nearest float32."""
+    return struct.unpack("<f", struct.pack("<f", v))[0]
+
+
+def fixed_f32(v):
+    # float fields: round v to float32, multiply by 10000 in float32 (the
+    # float32 product is the double product rounded to float32, since both
+    # factors have <= 24 significant bits), truncate toward zero.
+    return zz64(int(f32(f32(v) * 10000.0)))
 
 
 def string(s):
@@ -74,16 +88,23 @@ EDGE = {
 }
 
 
-def encode(e):
+# The canonical value with float fields whose x10000 product is NOT exact in
+# float32: 0.29 -> 2900, 0.7 -> 7000, 16777.217 -> 167772160, -0.29 -> -2900.
+# A target that computes a float field's x10000 in double precision sends
+# 2899, 6999, 167772167, -2899 instead and fails this fixture.
+EDGE_F32 = dict(EDGE, f=0.29, floats=[0.7, 16777.217, -0.29])
+
+
+def encode(e, float_enc=fixed):
     return b"".join([
         string(VERSION),
         zz32(e["i_min"]), zz32(e["i_max"]), zz32(e["i_zero"]), zz32(e["i_neg"]),
         zz64(e["l_min"]), zz64(e["l_max"]), zz64(e["l_neg"]),
-        fixed(e["f"]), fixed(e["d"]), fixed(e["d_neg"]),
+        float_enc(e["f"]), fixed(e["d"]), fixed(e["d_neg"]),
         boolean(e["yes"]), boolean(e["no"]),
         string(e["empty"]), string(e["unicode"]),
         array(e["ints"], zz32), array(e["longs"], zz64),
-        array(e["floats"], fixed), array(e["doubles"], fixed),
+        array(e["floats"], float_enc), array(e["doubles"], fixed),
         array(e["bools"], boolean), array(e["strings"], string),
         array(e["no_ints"], zz32),
         inner(e["inner"]),
@@ -92,8 +113,12 @@ def encode(e):
 
 
 if __name__ == "__main__":
-    data = encode(EDGE)
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edge_ref.bin")
-    with open(path, "wb") as f:
-        f.write(data)
-    print(f"wrote {path} ({len(data)} bytes)")
+    here = os.path.dirname(os.path.abspath(__file__))
+    # For the canonical EDGE, fixed_f32 and fixed agree (asserted here).
+    assert encode(EDGE) == encode(EDGE, fixed_f32)
+    for name, data in (("edge_ref.bin", encode(EDGE)),
+                       ("edge_float32_ref.bin", encode(EDGE_F32, fixed_f32))):
+        path = os.path.join(here, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        print(f"wrote {path} ({len(data)} bytes)")

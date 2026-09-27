@@ -2,7 +2,7 @@
 
 **A high-performance, schema-driven binary serialization tool for game development and real-time applications.**
 
-BitPacker generates type-safe serialization code for **Rust, Go, C++, C#, Java, JavaScript, and Python** from a simple `.buff` schema file. It produces significantly smaller payloads and faster encoding/decoding compared to JSON, MessagePack, Protocol Buffers, and FlatBuffers — without sacrificing cross-language compatibility.
+BitPacker generates type-safe serialization code for **Rust, Go, C++, C#, Java, JavaScript, Python, and PHP** from a simple `.buff` schema file, plus the targets listed in [`docs/`](docs/) (one `docs/<lang>.md` per additional language). It produces significantly smaller payloads and faster encoding/decoding compared to JSON, MessagePack, Protocol Buffers, and FlatBuffers — without sacrificing cross-language compatibility.
 
 ---
 
@@ -16,7 +16,7 @@ BitPacker generates type-safe serialization code for **Rust, Go, C++, C#, Java, 
 | **VarInt/ZigZag encoding** | ✅ | ❌ | ✅ | ✅ | ❌ |
 | **Payload size** | ⭐ Smallest | Largest | Medium | Small | Medium |
 | **Encoding speed** | ⭐ Fastest | Slowest | Medium | Fast | Fast |
-| **Language support** | 7 languages | Universal | Most | Most | Most |
+| **Language support** | 8 core + [`docs/`](docs/) | Universal | Most | Most | Most |
 | **External dependencies** | ❌ None | Varies | Varies | Runtime lib | Runtime lib |
 | **Code complexity** | Low | Low | Low | Medium | High |
 
@@ -173,10 +173,12 @@ class WorldState {
 **Supported types:**
 | Type | Description |
 |---|---|
-| `int` | Variable-length integer (VarInt + ZigZag encoded) |
-| `string` | UTF-8 string with length prefix |
+| `int` | 32-bit signed integer (ZigZag + VarInt) |
+| `long` | 64-bit signed integer (ZigZag + VarInt) |
+| `float` | 32-bit float, sent as **fixed point** (4 decimal places, see [Wire Format](#wire-format)) |
+| `double` | 64-bit float, sent as **fixed point** (4 decimal places) |
+| `string` | UTF-8 string with a byte-length prefix |
 | `bool` | Single byte boolean |
-| `float` | 32-bit IEEE 754 floating point |
 | `<Type>` | Nested custom class |
 | `<Type>[]` | Array of any type above |
 
@@ -201,8 +203,14 @@ bitpacker --file game.buff --lang java --out ./gen/java --package com.myapp.mode
 bitpacker --file game.buff --lang python --out ./gen/python
 # Optional: cd gen/python && python3 setup.py build_ext --inplace
 
-# JavaScript
+# JavaScript (long fields are BigInt)
 bitpacker --file game.buff --lang js --out ./gen/js
+
+# Rust (--sep: structs and impls in separate files)
+bitpacker --file game.buff --lang rust --out ./gen/rust
+
+# PHP (64-bit PHP; long fields are int)
+bitpacker --file game.buff --lang php --out ./gen/php
 ```
 
 **CLI Flags:**
@@ -210,7 +218,7 @@ bitpacker --file game.buff --lang js --out ./gen/js
 | Flag | Description |
 |---|---|
 | `--file` | Path to the `.buff` schema file |
-| `--lang` | Target language: `go`, `cpp`, `csharp`, `java`, `python`, `js` |
+| `--lang` | Comma-separated targets: `go`, `rust`, `cpp`, `csharp`, `java`, `python`, `js`, `php`, plus those in [`docs/`](docs/) |
 | `--out` | Output directory for generated files |
 | `--package` | Package/namespace name (Go, Java, C#). Defaults: Go=`bitpacker`, Java=`generated`, C#=`Generated` |
 | `--sep` | Generate separate files for structs and impls (Go/Rust only) |
@@ -602,16 +610,24 @@ version = 1.0.0   // Major.Minor.Patch
 
 ### Wire Format
 
-BitPacker uses a compact binary format:
+A message is the schema `version` as a `string`, then the root class. There are
+no field tags, type markers or padding, which is why the payloads are small.
+The normative rules, and the edge-case value every target must round-trip, are
+in [`cross_lang_test/edge/README.md`](cross_lang_test/edge/README.md):
 
-| Encoding | Description |
+| Type | Encoding |
 |---|---|
-| **VarInt** | Variable-length encoding for integers (1-5 bytes depending on value) |
-| **ZigZag** | Efficient encoding of negative numbers (maps -1→1, 1→2, -2→3, etc.) |
-| **Length-prefixed** | Strings and arrays are prefixed with their VarInt-encoded length |
-| **Inline structs** | Nested objects are encoded inline without metadata overhead |
+| `int` | ZigZag (32-bit), then unsigned LEB128 VarInt |
+| `long` | ZigZag (64-bit), then unsigned LEB128 VarInt |
+| `float`, `double` | fixed point: `trunc(v × 10000)` computed in the field's own precision, sent as a `long`; decoders return `n / 10000` (lossy by design) |
+| `bool` | one byte, `0` or `1` (decoders accept any non-zero as true) |
+| `string` | UTF-8 byte length as a `long`, then the bytes |
+| `T[]` | element count as an `int`, then each element |
+| class | its fields in schema order, no framing |
 
-This is why BitPacker achieves the smallest payloads — no field tags, no type markers, pure data.
+Decoders check the version prefix and reject truncated input, negative or
+impossible lengths and over-long VarInts with an error rather than a crash
+or a huge allocation.
 
 ### Cross-Language Compatibility
 
@@ -677,8 +693,12 @@ except Exception as e:
 ```
 bitpacker/
 ├── cmd/bitpacker/          # Code generator (Go)
-│   ├── main.go             # CLI entry point and parser
-│   └── *.go.tmpl           # Language-specific code templates
+│   ├── main.go             # CLI, parser, and the go/rust/java/python/js/php templates
+│   ├── tmplCPP.go, tmplCSharp.go
+│   ├── registry.go         # How additional targets register themselves
+│   └── gen_<lang>.go       # Additional targets (documented in docs/<lang>.md)
+├── cross_lang_test/        # Conformance tests: <lang>/run.sh + run_all.sh
+├── docs/                   # One page per additional target
 ├── benchmark/              # Performance benchmarks
 │   ├── rust/               # Rust benchmark
 │   ├── go/                 # Go benchmark
@@ -704,6 +724,20 @@ bitpacker/
 3. Add tests for your changes
 4. Run benchmarks to ensure no regression
 5. Submit a Pull Request
+
+### Cross-Language Conformance Tests
+
+`cross_lang_test/` checks every target against committed reference bytes
+(`test_data.bin` for the bench schema, `edge/edge_ref.bin` for every type at
+its extremes). Each language has a `cross_lang_test/<lang>/run.sh` that
+generates fresh code with the current generator, builds it and runs the checks.
+
+```bash
+cross_lang_test/run_all.sh            # every language; missing toolchains are SKIPped
+cross_lang_test/run_all.sh go rust    # a subset
+```
+
+See [`cross_lang_test/README.md`](cross_lang_test/README.md) for the contract.
 
 ### Running Benchmarks
 

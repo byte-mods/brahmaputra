@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningLevel>5</WarningLevel>
+    <OtherFlags>$(OtherFlags) --warnon:1182,3390</OtherFlags>
+    <Nullable>enable</Nullable>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="gen/fsharp/bench_complex.fs" />
+    <Compile Include="gen/fsharp/edge.fs" />
+    <Compile Include="Test.fs" />
+  </ItemGroup>
+</Project>

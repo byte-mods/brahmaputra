@@ -260,6 +260,40 @@ impl<'a> ZeroCopyByteBuff<'a> {
 		self.put_varint64(Self::zigzag_encode64(i_val));
     }
 
+    // float and double are fixed point: trunc(v * 10000) as an i64, with the
+    // multiplication done in the field's own precision.
+    // NaN, infinities and values whose scaled form does not fit an i64 are
+    // rejected rather than saturated.
+    #[inline(always)]
+    pub fn put_f32(&mut self, value: f32) -> Result<(), Error> {
+        let scaled: f32 = value * 10000.0_f32;
+        if !(scaled >= -9223372036854775808.0_f32 && scaled < 9223372036854775808.0_f32) {
+            return Err(Error::new(ErrorKind::InvalidInput, "float is NaN, infinite or out of range"));
+        }
+        self.put_i64(scaled as i64);
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn put_f64(&mut self, value: f64) -> Result<(), Error> {
+        let scaled: f64 = value * 10000.0_f64;
+        if !(scaled >= -9223372036854775808.0_f64 && scaled < 9223372036854775808.0_f64) {
+            return Err(Error::new(ErrorKind::InvalidInput, "double is NaN, infinite or out of range"));
+        }
+        self.put_i64(scaled as i64);
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn get_f32(&mut self) -> f32 {
+        self.get_i64() as f32 / 10000.0_f32
+    }
+
+    #[inline(always)]
+    pub fn get_f64(&mut self) -> f64 {
+        self.get_i64() as f64 / 10000.0_f64
+    }
+
     pub fn finish(self) -> Vec<u8> {
         self.write_buf
     }
