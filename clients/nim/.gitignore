@@ -1,0 +1,4 @@
+build/
+nimcache/
+tests/manual_test
+*.exe
