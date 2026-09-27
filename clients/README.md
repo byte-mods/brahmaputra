@@ -1,24 +1,30 @@
 # Client drivers
 
-Native clients for Brahmaputra. Each speaks the wire protocol directly
-rather than wrapping the Rust client, so there is no FFI, no sidecar and
-no shared native library to ship.
+Native clients for Brahmaputra in twelve languages. The Rust client is the
+[`brahmaputra-client`](../crates/client) crate; every other driver speaks
+the wire protocol directly rather than wrapping it, so there is no FFI, no
+sidecar and no shared native library to ship.
 
-| Language | Directory | Built | Tested against a live broker |
+| Language | Directory | Build | End-to-end suite, live broker |
 |---|---|---|---|
-| Go | [go/](go) | ✅ `go build ./...`, `go vet` clean | ✅ **34/34** |
-| Node.js | [nodejs/](nodejs) | ✅ loads on Node 22 | ✅ **34/34** |
-| Python | [python/](python) | ❌ no interpreter on the build host | ❌ not run — see below |
-| Java | [java/](java) | ❌ no JDK on the build host | ❌ not run — see below |
+| Rust | [../crates/client](../crates/client) | `cargo`, clippy clean | ✅ **56/56** (`examples/manual_test.rs`) |
+| Go | [go/](go) | `go vet` clean, suite runs under `-race` | ✅ **54/54** |
+| Node.js | [nodejs/](nodejs) | Node 22, no dependencies | ✅ **57/57** |
+| Python | [python/](python) | Python ≥ 3.9, no dependencies | ✅ **54/54** |
+| Java | [java/](java) | Java 17, `javac -Xlint:all -Werror`; Maven `pom.xml` | ✅ **54/54** |
+| C# / .NET | [dotnet/](dotnet) | .NET 8, warnings as errors, no NuGet packages | ✅ **54/54** |
+| C++ | [cpp/](cpp) | C++17, CMake, `-Wall -Wextra -Wpedantic` clean, TSan clean | ✅ **54/54** |
+| C | [c/](c) | C11, Make or CMake, `-Werror` clean, ASan/UBSan/TSan clean | ✅ **54/54** |
+| PHP | [php/](php) | PHP 8, Composer package with a no-Composer autoloader | ✅ **54/54** |
+| Ruby | [ruby/](ruby) | Ruby 3, gem, stdlib only | ✅ **54/54** |
+| Erlang | [erlang/](erlang) | OTP 25+, rebar3 layout, `erlc -Werror` | ✅ **54/54** |
+| Elixir | [elixir/](elixir) | Elixir 1.14+, `mix compile --warnings-as-errors`, no deps | ✅ **54/54** |
 
-**On the two untested drivers.** Python and Java are written to the same
-design as the two that were verified, and the design is the part that was
-in doubt — the wire format is unusual enough that a transcription slip
-shows up immediately, and Go and Node caught none. But "written to a
-verified design" is not "verified", and the difference matters: neither
-has been compiled or executed, so treat them as unreviewed until you have
-run their suites. The commands are below; each prints the same 34 checks
-the other two do.
+Every suite is a port of the Go suite
+([go/cmd/manualtest](go/cmd/manualtest/main.go)) with the same sections
+and checks, so the numbers are comparable; Node and Rust carry a few
+extra checks of their own. CI runs every suite against a live broker on
+each push (the `clients` job).
 
 ## What every driver implements
 
@@ -78,8 +84,15 @@ dependency does not acquire one by using this client.
 |---|---|---|
 | Go | `none`, `gzip` | `lz4`, `zstd`, `snappy` via `RegisterCodec` |
 | Node.js | `none`, `gzip`, `zstd` (Node ≥ 22.15) | `lz4`, `snappy` via `registerCodec` |
-| Python | `none`, `gzip` | `lz4`, `zstd`, `snappy` via `pip install` |
-| Java | `none`, `gzip` | `lz4`, `zstd`, `snappy` via `registerCodec` |
+| Python | `none`, `gzip` | `lz4`, `zstd`, `snappy` via `pip install brahmaputra[all]`, or `register_codec` |
+| Java | `none`, `gzip` | `lz4`, `zstd`, `snappy` via `Protocol.registerCodec` |
+| .NET | `none`, `gzip` | others via `Codecs.Register` |
+| C++ | `none`, `gzip` (zlib, CMake option) | others via `registerCodec` |
+| C | `none`, `gzip` (zlib, build flag) | others via `brp_register_codec` |
+| PHP | `none`, `gzip` (ext-zlib) | others via `Compression::register` |
+| Ruby | `none`, `gzip` | others via `Brahmaputra.register_codec` |
+| Erlang | `none`, `gzip` (`zlib`) | others via `brahmaputra_protocol:register_codec/3` |
+| Elixir | `none`, `gzip` (`:zlib`) | others via `Brahmaputra.register_codec/3` |
 
 If you register lz4 yourself, note that the broker uses
 `lz4_flex::compress_prepend_size`: a little-endian `u32` of the
@@ -89,51 +102,58 @@ cannot read.
 
 ## Running the test suites
 
-Start a broker first:
+One command starts a private broker and runs every driver whose toolchain
+is installed, then prints a summary. A driver without its toolchain shows
+as SKIP, never as a pass:
+
+```bash
+clients/run-e2e.sh                  # all twelve
+clients/run-e2e.sh go python c      # just these
+BROKER_ADDR=127.0.0.1:9092 clients/run-e2e.sh   # against a broker you run
+```
+
+Each driver also runs on its own against any broker:
 
 ```bash
 brahmaputra-server --data-dir ./data --default-partitions 4
-```
-
-Then, from this directory:
-
-```bash
-cd go && go run ./cmd/manualtest 127.0.0.1:9092
-```
-
-```bash
-cd nodejs && node test_manual.js 127.0.0.1 9092
-```
-
-```bash
-cd python && python3 test_manual.py 127.0.0.1 9092
-```
-
-```bash
-cd java && javac -d out $(find src -name '*.java') ManualTest.java && java -cp out ManualTest 127.0.0.1 9092
+clients/<driver>/test.sh 127.0.0.1 9092
+cargo run --release -p brahmaputra-client --example manual_test -- 127.0.0.1 9092
 ```
 
 Each suite asserts properties of the system rather than that a function
-ran: records come back byte-identical with contiguous offsets, a key pins
-every record to one partition and preserves order within it, headers and
-null header values survive, timestamps are real wall-clock values, a group
-splits partitions and a rejoining member resumes from its commit instead
-of replaying, `auto.offset.reset=none` refuses to guess, and a full client
-buffer blocks and then reports rather than growing without limit.
+ran:
+- Records come back byte-identical with contiguous offsets.
+- A key pins every record to one partition and keeps its order there.
+- Headers, null header values and empty-but-not-null keys and values
+  survive, and a tombstone stays distinct from an empty value.
+- Timestamps are real wall-clock values.
+- Linger and batch-full flushes never reorder a partition, and a failed
+  background flush is reported rather than dropped.
+- A timed-out connection is never reused, and a dropped one is redialled.
+- A group splits partitions, and a rejoining member resumes from its
+  commit instead of replaying.
+- A member that exceeds `max.poll.interval.ms` leaves and rejoins, while
+  time spent inside `poll` does not count against it.
+- `auto.offset.reset=none` refuses to guess.
+- A full client buffer blocks and then reports, rather than growing
+  without limit.
 
-## What none of them does
+## What the drivers other than Rust do not do
 
 - **No Kafka wire compatibility.** These speak Brahmaputra's protocol.
   Existing Kafka clients do not work against this broker, and these
   drivers do not work against Kafka.
-- **No transactions.** Exactly-once semantics are not implemented
-  broker-side, so no client exposes them.
-- **No TLS or QUIC yet.** The drivers speak plaintext TCP. The broker's
-  `--transport tcp-tls` and `--transport quic` listeners need TLS support
-  in each driver, which is not written. Authentication is implemented
-  (`Authenticate`, api key 17) but the broker refuses credentials on a
-  plaintext listener, so it is unusable from these drivers until TLS
-  lands.
-- **No idempotent producer.** `InitProducerId` and magic-v2 batches are
-  understood on the read path but no driver allocates a producer id, so
-  an ambiguous send cannot be safely replayed.
+- **No TLS or QUIC.** They speak plaintext TCP. The Rust client supports
+  `--transport tcp-tls` and `--transport quic`; the others do not yet.
+  Several implement `Authenticate` (SCRAM-SHA-256), but the broker refuses
+  credentials on a plaintext listener, so it is unusable until TLS lands.
+- **No idempotent or transactional producer.** The broker and the Rust
+  client support both. The other drivers do not allocate a producer id, so
+  retrying an ambiguous send, such as one whose connection dropped
+  mid-request, can duplicate a record.
+- **Commits during a rebalance can be refused.** The broker bumps a
+  group's generation as soon as a rebalance starts, so a commit sent with
+  the old generation is rejected before the member hears of the
+  rebalance. Records processed since the last commit are then delivered
+  again to the partition's next owner. This is at-least-once delivery, as
+  documented; fixing it needs a broker change.

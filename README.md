@@ -1500,6 +1500,9 @@ scripts/                    live verification and benchmark harnesses
 scripts/run-cluster.sh      a three-node cluster on one machine, dashboard included
 scripts/load-100k.sh        push 100,000 records at acks=1 and verify they landed
 scripts/consume-follow.sh   tail a topic, printing each record
+clients/                    native drivers: Go, Node.js, Python, Java, .NET, C++, C,
+                            PHP, Ruby, Erlang, Elixir (Rust is crates/client);
+                            clients/run-e2e.sh runs all their live suites
 bench/                      Dockerfile and results for the Kafka comparison
 .github/workflows/ci.yml    tests plus the live suites on every PR
 crates/
