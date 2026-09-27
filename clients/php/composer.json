@@ -1,0 +1,19 @@
+{
+    "name": "brahmaputra/client",
+    "description": "Native PHP client for the Brahmaputra log broker (producer, consumer, consumer groups)",
+    "type": "library",
+    "license": "Apache-2.0",
+    "keywords": ["brahmaputra", "kafka", "log", "streaming", "producer", "consumer"],
+    "require": {
+        "php": ">=8.2",
+        "ext-zlib": "*"
+    },
+    "suggest": {
+        "ext-hash": "Provides a native crc32c; a pure-PHP table fallback is used otherwise"
+    },
+    "autoload": {
+        "psr-4": {
+            "Brahmaputra\\": "src/"
+        }
+    }
+}
