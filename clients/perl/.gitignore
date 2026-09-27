@@ -1,0 +1,10 @@
+# ExtUtils::MakeMaker build outputs
+/Makefile
+/Makefile.old
+/MYMETA.*
+/blib/
+/pm_to_blib
+/Brahmaputra-*/
+/Brahmaputra-*.tar.gz
+/_build/
+/local/
