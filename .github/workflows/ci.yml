@@ -179,6 +179,49 @@ jobs:
           BROKER_LOG: info,brahmaputra_broker::group=debug
           BRP_DEBUG: ${{ matrix.driver == 'c' && '1' || '' }}
 
+  # Manual only (Actions > CI > Run workflow): hammer the C driver's
+  # two-member rebalance, which has failed intermittently on runners. Saves
+  # the driver's group trace and the broker's group log as artifacts.
+  c-rebalance-stress:
+    name: C rebalance stress (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: Build broker and harness
+        run: |
+          cargo build --locked --release -p brahmaputra-server
+          make -C clients/c build/rebalance_stress
+      - name: Stress
+        run: |
+          mkdir -p stress
+          RUST_LOG=info,brahmaputra_broker::group=debug \
+            target/release/brahmaputra-server --data-dir stress/data --default-partitions 4 \
+            --port 19092 --http-port 18092 > stress/broker.log 2>&1 &
+          for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/19092) 2>/dev/null && break; sleep 0.2; done
+          BRP_DEBUG=1 clients/c/build/rebalance_stress 127.0.0.1 19092 100 2> stress/trace.txt | tee stress/result.txt
+          # And the whole suite a few times, as the failing job ran it.
+          for i in 1 2 3; do
+            BRP_DEBUG=1 bash clients/c/test.sh 127.0.0.1 19092 > "stress/suite-$i.txt" 2>&1 || echo "suite run $i failed"
+            grep -E 'passed, [0-9]+ failed' "stress/suite-$i.txt" | tail -1
+          done
+          ! grep -q FAIL stress/result.txt stress/suite-*.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-rebalance-stress
+          path: stress/*.txt
+          retention-days: 7
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-rebalance-stress-broker
+          path: stress/broker.log
+          retention-days: 7
+
   # BitPacker conformance: every generator target encodes the fixtures
   # byte-identically and rejects hostile input. Targets whose toolchain the
   # runner lacks report SKIP; the per-driver jobs above cover the rest.

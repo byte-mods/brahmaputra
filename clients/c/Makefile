@@ -36,7 +36,7 @@ TEST := $(BUILD)/manual_test
 HOST ?= 127.0.0.1
 PORT ?= 9092
 
-.PHONY: all clean test
+.PHONY: all clean test stress
 all: $(LIB) $(TEST)
 
 $(BUILD):
@@ -53,6 +53,16 @@ $(TEST): test/manual_test.c $(LIB) include/brahmaputra.h
 
 test: $(TEST)
 	./$(TEST) $(HOST) $(PORT)
+
+# Repeats the two-member rebalance; see test/rebalance_stress.c.
+STRESS := $(BUILD)/rebalance_stress
+ITERATIONS ?= 50
+
+$(STRESS): test/rebalance_stress.c $(LIB) include/brahmaputra.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LIB) $(LDLIBS)
+
+stress: $(STRESS)
+	./$(STRESS) $(HOST) $(PORT) $(ITERATIONS)
 
 clean:
 	rm -rf build build-asan build-cmake build-*
