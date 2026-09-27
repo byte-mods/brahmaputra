@@ -2,7 +2,7 @@
 
 **A high-performance, schema-driven binary serialization tool for game development and real-time applications.**
 
-BitPacker generates type-safe serialization code for **Rust, Go, C++, C#, Java, JavaScript, Python, and PHP** from a simple `.buff` schema file, plus the targets listed in [`docs/`](docs/) (one `docs/<lang>.md` per additional language). It produces significantly smaller payloads and faster encoding/decoding compared to JSON, MessagePack, Protocol Buffers, and FlatBuffers — without sacrificing cross-language compatibility.
+BitPacker generates type-safe serialization code for **24 languages** from a simple `.buff` schema file: Rust, Go, C, C++, C#, F#, Java, Kotlin, Scala, JavaScript, TypeScript, Python, PHP, Ruby, Perl, Lua, Erlang, Elixir, Haskell, OCaml, Dart, Crystal, Nim and D (per-language guides in [`docs/`](docs/)). Every target passes the same conformance suite and produces byte-identical output (`cross_lang_test/run_all.sh`). It produces significantly smaller payloads and faster encoding/decoding compared to JSON, MessagePack, Protocol Buffers, and FlatBuffers — without sacrificing cross-language compatibility.
 
 ---
 
