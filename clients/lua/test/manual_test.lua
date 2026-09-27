@@ -80,6 +80,423 @@ local function groupConfig(groupId, overrides)
   return merge({ ["bootstrap.servers"] = bootstrap, ["group.id"] = groupId, ["enable.auto.commit"] = false }, overrides)
 end
 
+-- ---------------------------------------------------------------------------
+-- Checks beyond the Go suite's 54: one per feature of the client contract
+-- that those do not already exercise.
+-- ---------------------------------------------------------------------------
+
+-- Polls until `want` records arrive or `limitMs` passes; also returns the
+-- biggest single poll.
+local function pollUntil(consumer, want, limitMs)
+  local seen, largest = {}, 0
+  local deadline = nowMs() + limitMs
+  while #seen < want and nowMs() < deadline do
+    local ok, batch = pcall(consumer.poll, consumer, 300)
+    if ok then
+      if #batch > largest then largest = #batch end
+      for _, r in ipairs(batch) do seen[#seen + 1] = r end
+    end
+  end
+  return seen, largest
+end
+
+local function committedTotal(consumer)
+  local total = 0
+  for _, entry in ipairs(consumer:committed()) do total = total + entry.offset end
+  return total
+end
+
+local function count(list) return #list end
+
+-- The frame-aware fault proxy runs as a child process driven over a
+-- control socket.
+local function startFaultProxy()
+  local proc = assert(io.popen(string.format("%s %s/fault_proxy.lua %s %s", interpreter, testDir, host, port), "r"))
+  local line = proc:read("l")
+  local listenPort, controlPort = line:match("^(%d+) (%d+)$")
+  local control = assert(socket.connect("127.0.0.1", tonumber(controlPort)))
+  control:settimeout(5)
+  local proxy = { address = "127.0.0.1:" .. listenPort }
+  function proxy.failProduces(n, code)
+    control:send(string.format("fail %d %d\n", n, code))
+    control:receive("*l")
+  end
+  function proxy.stats()
+    control:send("stats\n")
+    local produces, acks, timeout = control:receive("*l"):match("^(%-?%d+) (%-?%d+) (%-?%d+)$")
+    return tonumber(produces), tonumber(acks), tonumber(timeout)
+  end
+  function proxy.close()
+    control:send("quit\n")
+    control:receive("*l")
+    control:close()
+    proc:close()
+  end
+  return proxy
+end
+
+local function extra()
+  local ErrorCode = brahmaputra.ErrorCode
+
+  section("producer: explicit partition, timestamp and synchronous send")
+  do
+    local t = unique("lua-sync")
+    local producer = Producer.new(producerConfig())
+    local offsets = {}
+    for i = 0, 2 do offsets[#offsets + 1] = producer:sendSync(t, "sync-" .. i, nil, { partition = 0 }) end
+    check("sendSync returns each record's offset", table.concat(offsets, ",") == "0,1,2", table.concat(offsets, ","))
+    producer:send(t, "stamped", nil, { partition = 2, timestamp = 1600000000123 })
+    producer:close()
+    local consumer = Consumer.new(consumerConfig())
+    local onTwo = consumer:fetch(t, 2, 0, 500)
+    check("an explicit partition is honoured", #onTwo == 1 and #consumer:fetch(t, 0, 0, 500) == 3,
+      "partition 2 holds " .. #onTwo)
+    check("an explicit timestamp survives the round trip", #onTwo == 1 and onTwo[1].timestamp == 1600000000123,
+      #onTwo > 0 and tostring(onTwo[1].timestamp) or "no record")
+    consumer:close()
+  end
+
+  section("producer: round-robin for records without a key")
+  do
+    local t = unique("lua-rr")
+    local producer = Producer.new(producerConfig())
+    local partitions = producer:router():partitions(t)
+    for i = 0, 7 do producer:send(t, "rr" .. i) end
+    producer:close()
+    local consumer = Consumer.new(consumerConfig())
+    local counts = {}
+    for _, p in ipairs(partitions) do counts[#counts + 1] = #consumer:fetch(t, p, 0, 300) end
+    check("unkeyed records are spread evenly over every partition", table.concat(counts, " ") == "2 2 2 2",
+      table.concat(counts, " "))
+    consumer:close()
+  end
+
+  section("producer: batch.size, linger.ms and close")
+  do
+    local consumer = Consumer.new(consumerConfig())
+    local full = unique("lua-batchfull")
+    local eager = Producer.new(producerConfig({ ["linger.ms"] = 60000, ["batch.size"] = 64 }))
+    eager:send(full, string.rep("b", 100), nil, { partition = 0 })
+    check("a batch that reaches batch.size is sent without waiting for linger.ms", #consumer:fetch(full, 0, 0, 300) == 1)
+
+    -- No sender thread: a lingering batch goes out from the next call into
+    -- the producer once linger.ms has passed (poll() in a worker loop).
+    local lingering = unique("lua-linger")
+    local lazy = Producer.new(producerConfig({ ["linger.ms"] = 100, ["batch.size"] = 1 << 20 }))
+    lazy:send(lingering, "waits", nil, { partition = 0 })
+    lazy:poll(0)
+    local heldBack = #consumer:fetch(lingering, 0, 0, 0) == 0
+    sleepMs(300)
+    lazy:poll(0)
+    check("linger.ms holds a partial batch, then sends it once linger.ms has passed",
+      heldBack and #consumer:fetch(lingering, 0, 0, 300) == 1, heldBack and "never sent" or "sent before linger.ms")
+
+    local closing = unique("lua-close")
+    local closer = Producer.new(producerConfig({ ["linger.ms"] = 60000, ["batch.size"] = 1 << 20 }))
+    for i = 0, 4 do closer:send(closing, "c" .. i, nil, { partition = 0 }) end
+    closer:close()
+    check("close flushes what is still buffered", #consumer:fetch(closing, 0, 0, 300) == 5)
+    eager:close()
+    lazy:close()
+    consumer:close()
+  end
+
+  section("producer: retries, request.timeout.ms and delivery.timeout.ms")
+  do
+    local proxy = startFaultProxy()
+    local t = unique("lua-retry")
+    local base = { ["bootstrap.servers"] = proxy.address, ["linger.ms"] = 0, ["acks"] = "all",
+      ["request.timeout.ms"] = 4321 }
+    local producer = Producer.new(merge(base, { retries = 3, ["retry.backoff.ms"] = 50 }))
+    producer:router():partitions(t)
+    proxy.failProduces(2, ErrorCode.NOT_LEADER_OR_FOLLOWER)
+    local ok, err = pcall(producer.send, producer, t, "persistent", nil, { partition = 0 })
+    local produces, acks, timeout = proxy.stats()
+    local consumer = Consumer.new(consumerConfig())
+    check("a retriable error is retried until the send succeeds",
+      ok and produces == 3 and #consumer:fetch(t, 0, 0, 300) == 1,
+      string.format("attempts=%d %s", produces, ok and "" or msg(err)))
+    check("request.timeout.ms and acks travel on the produce request", timeout == 4321 and acks == -1,
+      string.format("%d/%d", timeout, acks))
+    consumer:close()
+
+    local bounded = Producer.new(merge(base, { retries = 2, ["retry.backoff.ms"] = 150 }))
+    bounded:router():partitions(t)
+    proxy.failProduces(1000, ErrorCode.NOT_LEADER_OR_FOLLOWER)
+    local started = nowMs()
+    ok, err = pcall(bounded.send, bounded, t, "doomed", nil, { partition = 0 })
+    local took = nowMs() - started
+    produces = proxy.stats()
+    check("retries are bounded and spaced by retry.backoff.ms",
+      not ok and errors.is(err, "ServerError") and err.code == ErrorCode.NOT_LEADER_OR_FOLLOWER
+        and produces == 3 and took >= 300,
+      string.format("attempts=%d took %dms %s", produces, took, msg(err)))
+
+    proxy.failProduces(1000, ErrorCode.INVALID_REQUEST)
+    pcall(bounded.send, bounded, t, "malformed", nil, { partition = 0 })
+    produces = proxy.stats()
+    check("a non-retriable error is not retried", produces == 1, "attempts=" .. produces)
+    pcall(bounded.close, bounded)
+
+    local capped = Producer.new(merge(base, { retries = 1000, ["retry.backoff.ms"] = 50, ["delivery.timeout.ms"] = 400 }))
+    capped:router():partitions(t)
+    proxy.failProduces(100000, ErrorCode.NOT_LEADER_OR_FOLLOWER)
+    started = nowMs()
+    ok = pcall(capped.send, capped, t, "late", nil, { partition = 0 })
+    took = nowMs() - started
+    produces = proxy.stats()
+    check("delivery.timeout.ms caps the whole retry loop", not ok and took < 3000,
+      string.format("took %dms, attempts=%d", took, produces))
+    proxy.failProduces(0, 0)
+    pcall(capped.close, capped)
+    producer:close()
+    proxy.close()
+  end
+
+  section("compression: registering a codec")
+  do
+    local refused = not pcall(function()
+      Producer.new({ ["bootstrap.servers"] = bootstrap, ["compression.type"] = "snappy" }):close()
+    end)
+    check("an unregistered codec is refused up front", refused)
+
+    -- A toy reversible codec: enough to prove the hook is used on both the
+    -- produce and the fetch path. The broker stores batches as-is.
+    local function flip(data)
+      local out = {}
+      for i = #data, 1, -1 do out[#out + 1] = string.char(string.byte(data, i) ~ 0x5a) end
+      return table.concat(out)
+    end
+    brahmaputra.registerCodec("snappy", flip, flip)
+    local t = unique("lua-codec")
+    local producer = Producer.new(producerConfig({ ["compression.type"] = "snappy" }))
+    producer:send(t, "through a registered codec", "k", { partition = 0, headers = { header("h", "v") } })
+    producer:close()
+    local consumer = Consumer.new(consumerConfig())
+    local got = consumer:fetch(t, 0, 0, 300)
+    check("a registered codec compresses on produce and decompresses on fetch",
+      #got == 1 and got[1].value == "through a registered codec" and got[1].key == "k" and #got[1].headers == 1)
+    consumer:close()
+    local encoded = brahmaputra.record_batch.encode({ { key = "k", value = "v", headers = {}, timestampDelta = 0 } },
+      nowMs(), brahmaputra.compression.SNAPPY)
+    local decoded = brahmaputra.record_batch.decode(encoded, 1)
+    check("a batch encoded with it decodes offline", #decoded.records == 1 and decoded.records[1].value == "v")
+  end
+
+  section("consumer: fetch limits, watermark, offsets by time, metadata")
+  do
+    local t = unique("lua-fetch")
+    local producer = Producer.new(producerConfig())
+    local base = 1700000000000
+    for i = 0, 19 do
+      producer:send(t, string.rep(string.char(97 + i), 1000), nil, { partition = 0, timestamp = base + i * 1000 })
+    end
+    producer:close()
+
+    local limited = Consumer.new(merge(consumerConfig(), { ["fetch.max.bytes"] = 2500 }))
+    local capped = limited:fetch(t, 0, 0, 300)
+    check("fetch.max.bytes caps a response", #capped > 0 and #capped < 20, #capped .. " records")
+    limited:close()
+
+    local consumer = Consumer.new(consumerConfig())
+    local _, highWatermark = consumer:fetchVerbose(t, 0, 0, 300)
+    check("the high watermark is reported", highWatermark == 20, tostring(highWatermark))
+
+    local waiter = Consumer.new(merge(consumerConfig(), { ["fetch.max.wait.ms"] = 400, ["fetch.min.bytes"] = 1 }))
+    local started = nowMs()
+    local none = waiter:fetch(t, 0, 20, 10000)
+    local took = nowMs() - started
+    check("fetch.max.wait.ms bounds a long poll at the end of the log", #none == 0 and took >= 250 and took < 3000,
+      took .. "ms")
+    waiter:close()
+
+    local byTime = consumer:listOffsets(t, 0, base + 5000)
+    local between = consumer:listOffsets(t, 0, base + 5500)
+    check("list offsets by timestamp finds the first record at or after it", byTime == 5 and between == 6,
+      byTime .. "," .. between)
+
+    local meta = consumer:router():metadata({ t }, true)
+    local infos = meta.topics[t] or {}
+    local led = #infos == 4
+    for _, info in ipairs(infos) do
+      if info.leader < 0 then led = false end
+    end
+    check("metadata lists a topic's partitions and their leaders", led, #infos .. " partitions")
+    consumer:close()
+
+    local group = GroupConsumer.new(groupConfig(unique("lua-maxpoll"), { ["max.poll.records"] = 3 }))
+    group:subscribe({ t })
+    local seen, largest = pollUntil(group, 20, 20000)
+    check("max.poll.records caps every poll", #seen == 20 and largest == 3,
+      string.format("%d records, largest poll %d", #seen, largest))
+    group:close()
+  end
+
+  section("decoding is bounds-checked")
+  do
+    local protocol = brahmaputra.protocol
+    local ok, err = pcall(function() protocol.Reader.body(protocol.Writer.body():int32(-5):bytes()):string() end)
+    check("a negative length is an error, not a read", not ok and errors.is(err, "ProtocolError"), msg(err))
+    local okBig, errBig = pcall(function() protocol.Reader.body(protocol.Writer.body():int32(1 << 30):bytes()):string() end)
+    local batch = brahmaputra.record_batch.encode({ { key = "k", value = "v", headers = {}, timestampDelta = 0 } }, nowMs())
+    batch = string.sub(batch, 1, 8) .. "\x7f" .. string.sub(batch, 10) -- batch_length far past the buffer
+    local okBatch, errBatch = pcall(brahmaputra.record_batch.decode, batch, 1)
+    check("an oversized length is an error, not a read",
+      not okBig and errors.is(errBig, "ProtocolError") and not okBatch and errors.is(errBatch, "ProtocolError"))
+  end
+
+  section("consumer groups: auto commit, several topics, heartbeats")
+  do
+    local t1, t2 = unique("lua-multi-a"), unique("lua-multi-b")
+    local producer = Producer.new(producerConfig())
+    for i = 0, 5 do
+      producer:send(t1, "a" .. i)
+      producer:send(t2, "b" .. i)
+    end
+    producer:close()
+
+    local consumer = GroupConsumer.new(groupConfig(unique("lua-multi"),
+      { ["enable.auto.commit"] = true, ["auto.commit.interval.ms"] = 200 }))
+    consumer:subscribe({ t1, t2 })
+    local seen = pollUntil(consumer, 12, 20000)
+    local topics = {}
+    for _, r in ipairs(seen) do topics[r.topic] = true end
+    local distinct = 0
+    for _ in pairs(topics) do distinct = distinct + 1 end
+    check("one member subscribed to two topics consumes both", #seen == 12 and distinct == 2, #seen .. " records")
+    sleepMs(300)
+    pcall(consumer.poll, consumer, 300)
+    local total = committedTotal(consumer)
+    check("enable.auto.commit commits on poll after auto.commit.interval.ms", total == 12, "committed " .. total)
+    consumer:close()
+
+    -- No threads: heartbeats run inside poll(), commit() and heartbeat().
+    -- An application busy between polls calls heartbeat().
+    local idle = unique("lua-idle")
+    local seeder = Producer.new(producerConfig())
+    seeder:send(idle, "x")
+    seeder:close()
+    local quiet = GroupConsumer.new(groupConfig(unique("lua-heartbeat"),
+      { ["session.timeout.ms"] = 1500, ["heartbeat.interval.ms"] = 300 }))
+    quiet:subscribe({ idle })
+    pollUntil(quiet, 1, 15000)
+    local generation = quiet:generation()
+    local untilMs = nowMs() + 4000
+    while nowMs() < untilMs do
+      sleepMs(300)
+      pcall(quiet.heartbeat, quiet)
+    end
+    local ok, err = pcall(quiet.commit, quiet)
+    check("heartbeats keep an idle member in its group past session.timeout.ms",
+      ok and quiet:generation() == generation, ok and "" or msg(err))
+    quiet:close()
+  end
+
+  section("consumer groups: fencing, rejoin, leave and static membership")
+  do
+    local t = unique("lua-fence")
+    local producer = Producer.new(producerConfig())
+    for i = 0, 7 do producer:send(t, "f" .. i) end
+
+    local groupId = unique("lua-fence-grp")
+    local conf = { ["max.poll.interval.ms"] = 60000, ["heartbeat.interval.ms"] = 200 }
+    local first = GroupConsumer.new(groupConfig(groupId, conf))
+    first:subscribe({ t })
+    pollUntil(first, 8, 15000)
+
+    -- The coordinator forgets this member behind its back, as it does when
+    -- a session expires.
+    local protocol = brahmaputra.protocol
+    local leave = protocol.Writer.body():string(groupId):string(first:memberId()):bytes()
+    first:consumer():router():seed():request(protocol.ApiKey.LEAVE_GROUP, leave)
+    local oldMember, oldGeneration = first:memberId(), first:generation()
+    sleepMs(1000)
+    for i = 8, 11 do producer:send(t, "f" .. i) end
+    local after = pollUntil(first, 4, 15000)
+    local commitOk, commitErr = pcall(first.commit, first)
+    check("a member the coordinator forgot rejoins on its next poll",
+      #after == 4 and first:generation() > oldGeneration and commitOk,
+      string.format("%d records, %s@%d -> %s@%d %s", #after, oldMember, oldGeneration, first:memberId(),
+        first:generation(), commitOk and "" or msg(commitErr)))
+
+    -- A second member joins; the first sits out the rebalance and its
+    -- generation goes stale.
+    local staleGeneration = first:generation()
+    local second = GroupConsumer.new(groupConfig(groupId, conf))
+    second:subscribe({ t })
+    pollUntil(second, 1000, 8000)
+    local fencedOk, fencedErr = pcall(first.commit, first)
+    local fencedCode = (not fencedOk and errors.is(fencedErr, "ServerError")) and fencedErr.code or 0
+    check("a commit from a stale generation is fenced",
+      fencedCode == ErrorCode.ILLEGAL_GENERATION or fencedCode == ErrorCode.UNKNOWN_MEMBER_ID,
+      string.format("generation %d -> code %d", staleGeneration, fencedCode))
+    second:close()
+    first:close()
+
+    -- Close sends LeaveGroup: the next member gets every partition at once
+    -- instead of waiting out a long session.
+    local slow = merge(conf, { ["session.timeout.ms"] = 30000, ["rebalance.timeout.ms"] = 30000 })
+    local leaver = GroupConsumer.new(groupConfig(groupId .. "-leave", slow))
+    leaver:subscribe({ t })
+    pollUntil(leaver, 12, 15000)
+    leaver:close()
+    local successor = GroupConsumer.new(groupConfig(groupId .. "-leave", slow))
+    successor:subscribe({ t })
+    local started = nowMs()
+    for i = 12, 13 do producer:send(t, "f" .. i) end
+    local handedOver = pollUntil(successor, 2, 15000)
+    local took = nowMs() - started
+    check("close leaves the group so partitions move without a session timeout",
+      #handedOver == 2 and count(successor:assignment()) == 4 and took < 10000,
+      string.format("%d records after %dms", #handedOver, took))
+    successor:close()
+
+    local staticGroup = unique("lua-static")
+    local static = merge(conf, { ["group.instance.id"] = "lua-instance-1" })
+    local original = GroupConsumer.new(groupConfig(staticGroup, static))
+    original:subscribe({ t })
+    pollUntil(original, 14, 15000)
+    local originalMember, originalGeneration = original:memberId(), original:generation()
+    local restarted = GroupConsumer.new(groupConfig(staticGroup, static))
+    restarted:subscribe({ t })
+    pollUntil(restarted, 1000, 3000)
+    check("a static member reclaims its member id without a rebalance",
+      originalMember ~= "" and restarted:memberId() == originalMember and restarted:generation() == originalGeneration,
+      string.format("%s@%d vs %s@%d", originalMember, originalGeneration, restarted:memberId(), restarted:generation()))
+    restarted:close()
+    original:close()
+    producer:close()
+  end
+
+  section("assignors: sticky keeps what members hold")
+  do
+    local assignor = brahmaputra.assignor
+    local function tp(p) return { topic = "t", partition = p } end
+    local members = { { id = "m1", topics = { "t" } }, { id = "m2", topics = { "t" } } }
+    local topics = { t = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 } }
+    local previous = { m1 = { tp(2), tp(10), tp(11) }, m2 = { tp(0), tp(1) } }
+    local sticky = assignor.assign("sticky", members, topics, previous)
+    local function holds(id, p)
+      for _, slot in ipairs(sticky[id]) do
+        if slot.partition == p then return true end
+      end
+      return false
+    end
+    check("sticky leaves every held partition where it was",
+      holds("m1", 2) and holds("m1", 10) and holds("m1", 11) and holds("m2", 0) and holds("m2", 1)
+        and #sticky.m1 == 6 and #sticky.m2 == 6)
+    local numeric = #sticky.m1 > 1
+    for i = 2, #sticky.m1 do
+      if sticky.m1[i - 1].partition >= sticky.m1[i].partition then numeric = false end
+    end
+    check("sticky orders partitions as numbers, not strings", numeric)
+    local range = assignor.assign("range", members, topics)
+    local rr = assignor.assign("roundrobin", members, topics)
+    check("range and roundrobin split twelve partitions six and six",
+      #range.m1 == 6 and #range.m2 == 6 and #rr.m1 == 6 and rr.m1[2].partition == 2)
+  end
+end
+
 local function main()
   section("connection and metadata")
   do
@@ -576,6 +993,8 @@ local function main()
     if childOutput ~= "" then io.write("  (late producer: " .. childOutput .. ")\n") end
     consumer:close()
   end
+
+  extra()
 end
 
 local ok, err = xpcall(main, debug.traceback)

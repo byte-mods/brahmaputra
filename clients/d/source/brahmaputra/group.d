@@ -33,13 +33,19 @@ struct GroupConfig
     string clientId = "brahmaputra-d";
     /// `session.timeout.ms`: the coordinator evicts a member silent this long.
     int sessionTimeoutMs = 10_000;
+    /// `heartbeat.interval.ms`: how often the background thread heartbeats;
+    /// 0 means `session.timeout.ms / 3`. Must be below the session timeout.
+    int heartbeatIntervalMs = 0;
     /// `rebalance.timeout.ms`: how long the coordinator waits for rejoins.
     int rebalanceTimeoutMs = 3_000;
     /// `max.poll.interval.ms`: the longest gap between polls before this
     /// member is presumed stuck and leaves. Time spent inside `poll` does not
     /// count against it.
     int maxPollIntervalMs = 300_000;
-    /// `auto.commit.interval.ms`; 0 disables auto-commit.
+    /// `enable.auto.commit`: commit delivered positions from `poll` every
+    /// `auto.commit.interval.ms`.
+    bool enableAutoCommit = true;
+    /// `auto.commit.interval.ms`; 0 also disables auto-commit.
     int autoCommitIntervalMs = 5_000;
     /// `auto.offset.reset`: earliest, latest or none.
     string autoOffsetReset = AUTO_OFFSET_RESET_EARLIEST;
@@ -51,6 +57,10 @@ struct GroupConfig
     int maxPollRecords = 500;
     /// `fetch.max.bytes`.
     int fetchMaxBytes = 8 * 1024 * 1024;
+    /// `fetch.min.bytes`.
+    int fetchMinBytes = 1;
+    /// `fetch.max.wait.ms`.
+    int fetchMaxWaitMs = 500;
     /// Time allowed to open a TCP connection.
     Duration connectTimeout = DEFAULT_CONNECT_TIMEOUT;
     /// Socket round-trip bound.
@@ -96,7 +106,12 @@ final class GroupConsumer
     {
         ConsumerConfig consumerConfig;
         consumerConfig.clientId = config.clientId;
+        if (config.heartbeatIntervalMs >= config.sessionTimeoutMs)
+            throw new BrahmaputraException(
+                "heartbeat.interval.ms must be lower than session.timeout.ms");
         consumerConfig.fetchMaxBytes = config.fetchMaxBytes;
+        consumerConfig.fetchMinBytes = config.fetchMinBytes;
+        consumerConfig.fetchMaxWaitMs = config.fetchMaxWaitMs;
         consumerConfig.maxPollRecords = config.maxPollRecords;
         consumerConfig.connectTimeout = config.connectTimeout;
         consumerConfig.requestTimeout = config.requestTimeout;
@@ -122,6 +137,18 @@ final class GroupConsumer
     @property const(TopicPartition)[] assigned() const
     {
         return assignment;
+    }
+
+    /// The member id the coordinator assigned, empty before the first join.
+    @property string groupMemberId()
+    {
+        return membership().memberId;
+    }
+
+    /// The generation this member last joined, -1 before the first join.
+    @property int groupGeneration()
+    {
+        return membership().generation;
     }
 
     /// Sets the topics this member wants a share of.
@@ -366,7 +393,7 @@ final class GroupConsumer
     private void maybeAutoCommit()
     {
         const interval = config.autoCommitIntervalMs;
-        if (interval <= 0 || positions.length == 0)
+        if (!config.enableAutoCommit || interval <= 0 || positions.length == 0)
             return;
         if (nowMillis() - lastCommitMs < interval)
             return;
@@ -573,7 +600,8 @@ final class GroupConsumer
             mu.unlock();
         }
         // Two independent deadlines, so wake often enough for the shorter.
-        int heartbeatEvery = config.sessionTimeoutMs / 3;
+        int heartbeatEvery = config.heartbeatIntervalMs > 0
+            ? config.heartbeatIntervalMs : config.sessionTimeoutMs / 3;
         if (heartbeatEvery < 1)
             heartbeatEvery = 1;
         int pollCheckEvery = config.maxPollIntervalMs / 3;

@@ -647,5 +647,529 @@ begin
   must { p.close }
 end
 
+# ---------------------------------------------------------------------------
+# Checks beyond the Go suite's 54: one per feature of the client contract
+# that those do not already exercise.
+# ---------------------------------------------------------------------------
+
+def elapsed_ms(since) = ((monotonic - since) * 1000).round
+
+# Polls until want records arrive or limit_ms passes.
+def poll_until(consumer, want, limit_ms, largest: nil)
+  seen = []
+  deadline = monotonic + limit_ms / 1000.0
+  while seen.size < want && monotonic < deadline
+    batch = begin
+      consumer.poll(300)
+    rescue StandardError
+      []
+    end
+    largest[0] = [largest[0], batch.size].max if largest
+    seen.concat(batch)
+  end
+  seen
+end
+
+def committed_total(consumer) = consumer.committed.values.sum
+
+# A proxy that understands frames. It forwards every request to the broker
+# except Produce, which it can answer itself with an error code for the next
+# `failures` requests -- how a leader move or an under-replicated partition
+# looks to a producer -- and it records what each Produce asked for.
+class FaultProxy
+  attr_reader :address, :produces, :last_acks, :last_timeout_ms
+
+  def initialize(host, port)
+    @server = TCPServer.new("127.0.0.1", 0)
+    @address = "127.0.0.1:#{@server.addr[1]}"
+    @lock = Mutex.new
+    @live = []
+    @failures = 0
+    @code = 0
+    @produces = 0
+    @last_acks = nil
+    @last_timeout_ms = nil
+    @thread = Thread.new do
+      loop do
+        client = @server.accept
+        upstream = begin
+          TCPSocket.new(host, port)
+        rescue SystemCallError
+          client.close
+          next
+        end
+        @lock.synchronize { @live.push(client, upstream) }
+        Thread.new { serve(client, upstream) }
+      end
+    rescue IOError, SystemCallError
+      nil
+    end
+  end
+
+  # Answer the next count Produce requests with code.
+  def fail_produces(count, code)
+    @lock.synchronize do
+      @failures = count
+      @code = code
+      @produces = 0
+    end
+  end
+
+  def close
+    @server.close
+    @lock.synchronize do
+      @live.each { |socket| socket.close rescue nil } # rubocop:disable Style/RescueModifier
+      @live.clear
+    end
+  end
+
+  private
+
+  def read_frame(socket)
+    header = socket.read(4)
+    return nil if header.nil? || header.bytesize < 4
+
+    payload = socket.read(header.unpack1("N"))
+    payload && header + payload
+  end
+
+  def serve(client, upstream)
+    while (frame = read_frame(client))
+      api_key = frame.byteslice(4, 2).unpack1("s>")
+      expect_reply = true
+      if api_key == Brahmaputra::Protocol::ApiKey::PRODUCE
+        correlation_id, body = Brahmaputra::Protocol.decode_frame_payload(frame.byteslice(4, frame.bytesize - 4))
+        reader = Brahmaputra::Protocol.body_reader(body)
+        topic = reader.string
+        partition = reader.int32
+        acks = reader.int32
+        timeout_ms = reader.int32
+        expect_reply = !acks.zero?
+        code = @lock.synchronize do
+          @produces += 1
+          @last_acks = acks
+          @last_timeout_ms = timeout_ms
+          if @failures.positive?
+            @failures -= 1
+            @code
+          else
+            0
+          end
+        end
+        unless code.zero?
+          reply = Brahmaputra::Protocol.body_writer.string(topic).int32(partition).int32(code)
+                                       .int64(-1).int64(-1).bytes
+          client.write(Brahmaputra::Protocol.encode_frame(api_key, correlation_id, "", reply))
+          next
+        end
+      end
+      upstream.write(frame)
+      next unless expect_reply
+
+      reply = read_frame(upstream)
+      break if reply.nil?
+
+      client.write(reply)
+    end
+  rescue IOError, SystemCallError, Brahmaputra::Error
+    nil
+  ensure
+    [client, upstream].each { |socket| socket.close rescue nil } # rubocop:disable Style/RescueModifier
+  end
+end
+
+section("producer: explicit partition, timestamp and synchronous send")
+begin
+  t = unique("rb-sync")
+  p = producer
+  offsets = Array.new(3) { |i| must { p.send_sync(t, "sync-#{i}", partition: 0).offset } }
+  check("send_sync returns each record's offset", offsets == [0, 1, 2], offsets.inspect)
+  must { p.send(t, "stamped", partition: 2, timestamp: 1_600_000_000_123) }
+  must { p.close }
+  c = consumer
+  on_two = must { c.fetch(t, 2, 0, 500) }
+  check("an explicit partition is honoured", on_two.size == 1 && must { c.fetch(t, 0, 0, 500) }.size == 3,
+        "partition 2 holds #{on_two.size}")
+  check("an explicit timestamp survives the round trip",
+        on_two.size == 1 && on_two[0].timestamp == 1_600_000_000_123, on_two.map(&:timestamp).inspect)
+  c.close
+end
+
+section("producer: round-robin for records without a key")
+begin
+  t = unique("rb-rr")
+  p = producer
+  partitions = must { p.partitions_for(t) }
+  8.times { |i| must { p.send(t, "rr#{i}") } }
+  must { p.close }
+  c = consumer
+  counts = partitions.map { |partition| must { c.fetch(t, partition, 0, 300) }.size }
+  check("unkeyed records are spread evenly over every partition", counts == [2, 2, 2, 2], counts.inspect)
+  c.close
+end
+
+section("producer: batch.size, linger.ms and close")
+begin
+  c = consumer
+  full = unique("rb-batchfull")
+  eager = producer("linger.ms" => 60_000, "batch.size" => 64)
+  must { eager.send(full, "b" * 100, partition: 0) }
+  sleep 0.3
+  check("a batch that reaches batch.size is sent without waiting for linger.ms",
+        must { c.fetch(full, 0, 0, 300) }.size == 1)
+
+  lingering = unique("rb-linger")
+  lazy = producer("linger.ms" => 100, "batch.size" => 1 << 20)
+  must { lazy.send(lingering, "waits", partition: 0) }
+  held_back = must { c.fetch(lingering, 0, 0, 0) }.empty?
+  sleep 0.8
+  check("linger.ms holds a partial batch, then sends it in the background",
+        held_back && must { c.fetch(lingering, 0, 0, 300) }.size == 1,
+        held_back ? "never sent" : "sent before linger.ms")
+
+  closing = unique("rb-close")
+  closer = producer("linger.ms" => 60_000, "batch.size" => 1 << 20)
+  5.times { |i| must { closer.send(closing, "c#{i}", partition: 0) } }
+  must { closer.close }
+  check("close flushes what is still buffered", must { c.fetch(closing, 0, 0, 300) }.size == 5)
+  must { eager.close }
+  must { lazy.close }
+  c.close
+end
+
+section("producer: retries, request.timeout.ms and delivery.timeout.ms")
+begin
+  proxy = FaultProxy.new(HOST, PORT)
+  t = unique("rb-retry")
+  base = { "bootstrap.servers" => proxy.address, "linger.ms" => 0, "acks" => "all",
+           "request.timeout.ms" => 4321 }
+  p = must { Brahmaputra::Producer.new(base.merge("retries" => 3, "retry.backoff.ms" => 50)) }
+  must { p.partitions_for(t) }
+  proxy.fail_produces(2, Brahmaputra::ErrorCode::NOT_LEADER_OR_FOLLOWER)
+  error = nil
+  begin
+    p.send(t, "persistent", partition: 0).value
+  rescue StandardError => e
+    error = e
+  end
+  c = consumer
+  check("a retriable error is retried until the send succeeds",
+        error.nil? && proxy.produces == 3 && must { c.fetch(t, 0, 0, 300) }.size == 1,
+        "attempts=#{proxy.produces} #{error.inspect}")
+  check("request.timeout.ms and acks travel on the produce request",
+        proxy.last_timeout_ms == 4321 && proxy.last_acks == -1, "#{proxy.last_timeout_ms}/#{proxy.last_acks}")
+  c.close
+
+  bounded = must { Brahmaputra::Producer.new(base.merge("retries" => 2, "retry.backoff.ms" => 150)) }
+  must { bounded.partitions_for(t) }
+  proxy.fail_produces(1000, Brahmaputra::ErrorCode::NOT_LEADER_OR_FOLLOWER)
+  started = monotonic
+  failed_right = false
+  begin
+    bounded.send(t, "doomed", partition: 0).value
+  rescue Brahmaputra::ServerError => e
+    failed_right = e.code == Brahmaputra::ErrorCode::NOT_LEADER_OR_FOLLOWER
+  end
+  took = elapsed_ms(started)
+  check("retries are bounded and spaced by retry.backoff.ms",
+        failed_right && proxy.produces == 3 && took >= 300, "attempts=#{proxy.produces} took #{took}ms")
+
+  proxy.fail_produces(1000, Brahmaputra::ErrorCode::INVALID_REQUEST)
+  begin
+    bounded.send(t, "malformed", partition: 0).value
+  rescue StandardError
+    nil
+  end
+  check("a non-retriable error is not retried", proxy.produces == 1, "attempts=#{proxy.produces}")
+  begin
+    bounded.close
+  rescue StandardError
+    nil
+  end
+
+  capped = must do
+    Brahmaputra::Producer.new(base.merge("retries" => 1000, "retry.backoff.ms" => 50, "delivery.timeout.ms" => 400))
+  end
+  must { capped.partitions_for(t) }
+  proxy.fail_produces(100_000, Brahmaputra::ErrorCode::NOT_LEADER_OR_FOLLOWER)
+  started = monotonic
+  gave_up = false
+  begin
+    capped.send(t, "late", partition: 0).value
+  rescue Brahmaputra::Error
+    gave_up = true
+  end
+  took = elapsed_ms(started)
+  check("delivery.timeout.ms caps the whole retry loop", gave_up && took < 3000,
+        "took #{took}ms, attempts=#{proxy.produces}")
+  proxy.fail_produces(0, 0)
+  begin
+    capped.close
+  rescue StandardError
+    nil
+  end
+  must { p.close }
+  proxy.close
+end
+
+section("compression: registering a codec")
+begin
+  refused = begin
+    Brahmaputra::Producer.new("bootstrap.servers" => BOOTSTRAP, "compression.type" => "snappy").close
+    false
+  rescue ArgumentError, Brahmaputra::Error
+    true
+  end
+  check("an unregistered codec is refused up front", refused)
+
+  # A toy reversible codec: enough to prove the hook is used on both the
+  # produce and the fetch path. The broker stores batches as-is.
+  flip = ->(data) { data.b.reverse.bytes.map { |byte| byte ^ 0x5a }.pack("C*") }
+  Brahmaputra.register_codec("snappy", compress: flip, decompress: flip)
+  t = unique("rb-codec")
+  p = producer("compression.type" => "snappy")
+  must { p.send(t, "through a registered codec", key: "k", partition: 0, headers: { "h" => "v" }) }
+  must { p.close }
+  c = consumer
+  got = must { c.fetch(t, 0, 0, 300) }
+  check("a registered codec compresses on produce and decompresses on fetch",
+        got.size == 1 && got[0].value == "through a registered codec".b && got[0].key == "k".b &&
+        got[0].headers.size == 1)
+  c.close
+  record = Brahmaputra::Protocol::BatchRecord.new("k", "v", 0, [])
+  encoded = Brahmaputra::Protocol.encode_record_batch([record], now_ms, Brahmaputra::Protocol::Compression::SNAPPY)
+  decoded, = Brahmaputra::Protocol.decode_record_batch(encoded, 0)
+  check("a batch encoded with it decodes offline", decoded.records.size == 1 && decoded.records[0].value == "v")
+end
+
+section("consumer: fetch limits, watermark, offsets by time, metadata")
+begin
+  t = unique("rb-fetch")
+  p = producer
+  base = 1_700_000_000_000
+  # One batch per record: the broker resolves a timestamp to a batch.
+  20.times { |i| must { p.send(t, ("a".ord + i).chr * 1000, partition: 0, timestamp: base + i * 1000).value } }
+  must { p.close }
+
+  limited = must { Brahmaputra::Consumer.new("bootstrap.servers" => BOOTSTRAP, "fetch.max.bytes" => 2500) }
+  capped = must { limited.fetch(t, 0, 0, 300) }
+  check("fetch.max.bytes caps a response", !capped.empty? && capped.size < 20, "#{capped.size} records")
+  limited.close
+
+  c = consumer
+  result = must { c.fetch_verbose(t, 0, 0, 300) }
+  check("the high watermark is reported", result.high_watermark == 20, result.high_watermark.to_s)
+
+  waiter = must do
+    Brahmaputra::Consumer.new("bootstrap.servers" => BOOTSTRAP, "fetch.max.wait.ms" => 400, "fetch.min.bytes" => 1)
+  end
+  started = monotonic
+  none = must { waiter.fetch(t, 0, 20, 10_000) }
+  took = elapsed_ms(started)
+  check("fetch.max.wait.ms bounds a long poll at the end of the log", none.empty? && took >= 250 && took < 3000,
+        "#{took}ms")
+  waiter.close
+
+  by_time = must { c.list_offsets(t, 0, base + 5000) }
+  between = must { c.list_offsets(t, 0, base + 5500) }
+  check("list offsets by timestamp finds the first record at or after it", by_time == 5 && between == 6,
+        "#{by_time},#{between}")
+
+  metadata = must { c.router.metadata([t], refresh: true) }
+  partitions = metadata.partitions_of(t)
+  check("metadata lists a topic's partitions and their leaders",
+        partitions.size == 4 && partitions.all? { |partition| metadata.leader_of(t, partition) >= 0 },
+        "#{partitions.size} partitions")
+  c.close
+
+  g = group(unique("rb-maxpoll"), "enable.auto.commit" => false, "max.poll.records" => 3)
+  g.subscribe([t])
+  largest = [0]
+  seen = poll_until(g, 20, 20_000, largest: largest)
+  check("max.poll.records caps every poll", seen.size == 20 && largest[0] == 3,
+        "#{seen.size} records, largest poll #{largest[0]}")
+  must { g.close }
+end
+
+section("decoding is bounds-checked")
+begin
+  negative = begin
+    Brahmaputra::Protocol.body_reader(Brahmaputra::Protocol.body_writer.int32(-5).bytes).string
+    false
+  rescue Brahmaputra::ProtocolError
+    true
+  end
+  check("a negative length is an error, not a read", negative)
+  oversized = begin
+    Brahmaputra::Protocol.body_reader(Brahmaputra::Protocol.body_writer.int32(1 << 30).bytes).string
+    false
+  rescue Brahmaputra::ProtocolError
+    true
+  end
+  record = Brahmaputra::Protocol::BatchRecord.new("k", "v", 0, [])
+  batch = Brahmaputra::Protocol.encode_record_batch([record], now_ms)
+  batch.setbyte(8, 0x7f) # batch_length far past the buffer
+  truncated = begin
+    Brahmaputra::Protocol.decode_record_batch(batch, 0)
+    false
+  rescue Brahmaputra::ProtocolError
+    true
+  end
+  check("an oversized length is an error, not a read", oversized && truncated)
+end
+
+section("consumer groups: auto commit, several topics, heartbeats")
+begin
+  t1 = unique("rb-multi-a")
+  t2 = unique("rb-multi-b")
+  p = producer
+  6.times do |i|
+    must { p.send(t1, "a#{i}") }
+    must { p.send(t2, "b#{i}") }
+  end
+  must { p.close }
+
+  g = group(unique("rb-multi"), "enable.auto.commit" => true, "auto.commit.interval.ms" => 200)
+  g.subscribe([t1, t2])
+  seen = poll_until(g, 12, 20_000)
+  check("one member subscribed to two topics consumes both",
+        seen.size == 12 && seen.map(&:topic).uniq.size == 2, "#{seen.size} records")
+  sleep 0.3
+  begin
+    g.poll(300)
+  rescue StandardError
+    nil
+  end
+  total = must { committed_total(g) }
+  check("enable.auto.commit commits on poll after auto.commit.interval.ms", total == 12, "committed #{total}")
+  must { g.close }
+
+  idle = unique("rb-idle")
+  p = producer
+  must { p.send(idle, "x") }
+  must { p.close }
+  quiet = group(unique("rb-heartbeat"), "enable.auto.commit" => false, "session.timeout.ms" => 1500,
+                                         "heartbeat.interval.ms" => 300)
+  quiet.subscribe([idle])
+  poll_until(quiet, 1, 15_000)
+  generation = quiet.generation
+  sleep 4 # no poll: only heartbeats keep it in
+  error = nil
+  begin
+    quiet.commit
+  rescue StandardError => e
+    error = e
+  end
+  check("heartbeats keep an idle member in its group past session.timeout.ms",
+        error.nil? && quiet.generation == generation, error.inspect)
+  must { quiet.close }
+end
+
+section("consumer groups: fencing, rejoin, leave and static membership")
+begin
+  t = unique("rb-fence")
+  p = producer
+  8.times { |i| must { p.send(t, "f#{i}") } }
+
+  group_id = unique("rb-fence-grp")
+  config = { "enable.auto.commit" => false, "max.poll.interval.ms" => 60_000, "heartbeat.interval.ms" => 200 }
+  first = group(group_id, **config)
+  first.subscribe([t])
+  poll_until(first, 8, 15_000)
+
+  # The coordinator forgets this member behind its back, as it does when a
+  # session expires.
+  leave = Brahmaputra::Protocol.body_writer.string(group_id).string(first.member_id).bytes
+  must { first.consumer.router.seed.request(Brahmaputra::Protocol::ApiKey::LEAVE_GROUP, leave) }
+  old_member = first.member_id
+  old_generation = first.generation
+  sleep 1 # a heartbeat learns UNKNOWN_MEMBER_ID
+  4.times { |i| must { p.send(t, "f#{8 + i}") } }
+  after = poll_until(first, 4, 15_000)
+  commit_error = nil
+  begin
+    first.commit
+  rescue StandardError => e
+    commit_error = e
+  end
+  check("a member the coordinator forgot rejoins on its next poll",
+        after.size == 4 && first.generation > old_generation && commit_error.nil?,
+        "#{after.size} records, #{old_member}@#{old_generation} -> #{first.member_id}@#{first.generation} " \
+        "#{commit_error.inspect}")
+
+  # A second member joins; the first sits out the rebalance and its
+  # generation goes stale.
+  stale_generation = first.generation
+  second = group(group_id, **config)
+  second.subscribe([t])
+  poll_until(second, 1000, 8000)
+  fenced_code = nil
+  begin
+    first.commit
+  rescue Brahmaputra::ServerError => e
+    fenced_code = e.code
+  end
+  check("a commit from a stale generation is fenced",
+        [Brahmaputra::ErrorCode::ILLEGAL_GENERATION, Brahmaputra::ErrorCode::UNKNOWN_MEMBER_ID].include?(fenced_code),
+        "generation #{stale_generation} -> code #{fenced_code.inspect}")
+  must { second.close }
+  must { first.close }
+
+  # Close sends LeaveGroup: the next member gets every partition at once
+  # instead of waiting out a long session.
+  slow = config.merge("session.timeout.ms" => 30_000, "rebalance.timeout.ms" => 30_000)
+  leaver = group("#{group_id}-leave", **slow)
+  leaver.subscribe([t])
+  poll_until(leaver, 12, 15_000)
+  must { leaver.close }
+  successor = group("#{group_id}-leave", **slow)
+  successor.subscribe([t])
+  started = monotonic
+  2.times { |i| must { p.send(t, "f#{12 + i}") } }
+  handed_over = poll_until(successor, 2, 15_000)
+  took = elapsed_ms(started)
+  check("close leaves the group so partitions move without a session timeout",
+        handed_over.size == 2 && successor.assignment.size == 4 && took < 10_000,
+        "#{handed_over.size} records after #{took}ms")
+  must { successor.close }
+
+  static_group = unique("rb-static")
+  static = config.merge("group.instance.id" => "rb-instance-1")
+  original = group(static_group, **static)
+  original.subscribe([t])
+  poll_until(original, 14, 15_000)
+  original_member = original.member_id
+  original_generation = original.generation
+  restarted = group(static_group, **static)
+  restarted.subscribe([t])
+  poll_until(restarted, 1000, 3000)
+  check("a static member reclaims its member id without a rebalance",
+        !original_member.empty? && restarted.member_id == original_member &&
+        restarted.generation == original_generation,
+        "#{original_member}@#{original_generation} vs #{restarted.member_id}@#{restarted.generation}")
+  must { restarted.close }
+  must { original.close }
+  must { p.close }
+end
+
+section("assignors: sticky keeps what members hold")
+begin
+  tp = ->(partition) { Brahmaputra::TopicPartition.new("t", partition) }
+  members = [["m1", ["t"]], ["m2", ["t"]]]
+  topics = { "t" => (0..11).to_a }
+  previous = { "m1" => [tp[2], tp[10], tp[11]], "m2" => [tp[0], tp[1]] }
+  sticky = Brahmaputra::Assignors.assign("sticky", members, topics, previous)
+  check("sticky leaves every held partition where it was",
+        [2, 10, 11].all? { |n| sticky["m1"].include?(tp[n]) } && [0, 1].all? { |n| sticky["m2"].include?(tp[n]) } &&
+        sticky["m1"].size == 6 && sticky["m2"].size == 6)
+  ids = sticky["m1"].map(&:partition)
+  check("sticky orders partitions as numbers, not strings", ids.size > 1 && ids == ids.sort && ids.uniq == ids,
+        ids.inspect)
+  range = Brahmaputra::Assignors.assign("range", members, topics)
+  rr = Brahmaputra::Assignors.assign("roundrobin", members, topics)
+  check("range and roundrobin split twelve partitions six and six",
+        range["m1"].size == 6 && range["m2"].size == 6 && rr["m1"].size == 6 && rr["m1"][1].partition == 2)
+end
+
 puts "\n#{$passed} passed, #{$failed} failed"
 exit(1) if $failed.positive?

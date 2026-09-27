@@ -26,6 +26,7 @@ GroupConfig GroupConfig::fromProperties(const Properties& props) {
         if (key == "bootstrap.servers" || key == "group.id") continue;  // constructor arguments
         if (key == "client.id") c.clientId = value;
         else if (key == "session.timeout.ms") c.sessionTimeoutMs = static_cast<std::int32_t>(parseInteger(key, value));
+        else if (key == "heartbeat.interval.ms") c.heartbeatIntervalMs = static_cast<int>(parseInteger(key, value));
         else if (key == "rebalance.timeout.ms") c.rebalanceTimeoutMs = static_cast<std::int32_t>(parseInteger(key, value));
         else if (key == "max.poll.interval.ms") c.maxPollIntervalMs = static_cast<int>(parseInteger(key, value));
         else if (key == "enable.auto.commit") c.enableAutoCommit = detail::parseBoolean(key, value);
@@ -57,6 +58,9 @@ GroupConsumer::GroupConsumer(const std::string& bootstrap, std::string groupId, 
     const auto& r = config_.autoOffsetReset;
     if (r != offset_reset::Earliest && r != offset_reset::Latest && r != offset_reset::None) {
         throw Error("unknown auto.offset.reset \"" + r + "\"");
+    }
+    if (config_.heartbeatIntervalMs >= config_.sessionTimeoutMs) {
+        throw Error("heartbeat.interval.ms must be lower than session.timeout.ms");
     }
     ConsumerConfig cc;
     cc.clientId = config_.clientId;
@@ -495,8 +499,10 @@ void GroupConsumer::leave() {
 void GroupConsumer::heartbeatLoop() {
     // This loop enforces two independent deadlines, so it wakes often
     // enough for the shorter of them.
-    int interval = std::max(1, std::min(static_cast<int>(config_.sessionTimeoutMs) / 3,
-                                        config_.maxPollIntervalMs / 3));
+    int heartbeatEvery = config_.heartbeatIntervalMs > 0
+                             ? config_.heartbeatIntervalMs
+                             : static_cast<int>(config_.sessionTimeoutMs) / 3;
+    int interval = std::max(1, std::min(heartbeatEvery, config_.maxPollIntervalMs / 3));
     bool leftForSlowPoll = false;
     std::unique_lock<std::mutex> lock(mu_);
     for (;;) {

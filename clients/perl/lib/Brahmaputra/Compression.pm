@@ -49,6 +49,12 @@ sub register {
     return;
 }
 
+# True when $codec can be used: none and gzip always, others once registered.
+sub available {
+    my ($codec) = @_;
+    return $codec == NONE || $codec == GZIP || exists $CODECS{$codec};
+}
+
 sub parse {
     my ($name) = @_;
     my $codec = $NAMES{ lc($name // '') };

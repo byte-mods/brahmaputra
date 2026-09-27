@@ -31,9 +31,11 @@
 -- Retries: a batch the broker refuses with a retriable code (returned
 -- before it appends, so no duplicate is possible) is retried up to
 -- `retries` times, `retry.backoff.ms` apart, within `delivery.timeout.ms`
--- of its oldest record. A connection failure mid-request is retried too,
--- after a redial, as Kafka's non-idempotent producer does: the broker may
--- already have appended the batch, so that case is at-least-once.
+-- of its oldest record. So is a batch that never left because the leader
+-- could not be reached. A connection that fails once the request is on the
+-- wire is not retried: the broker may already have appended the batch, and
+-- resending it would write it twice. That error goes to the caller, and the
+-- broken connection is redialled on the next send.
 
 local errors = require("brahmaputra.errors")
 local protocol = require("brahmaputra.protocol")
@@ -402,24 +404,19 @@ function Producer:produce(topic, partition, buffered)
     if nowMs() >= deadline then
       errors.raise("TimeoutError", string.format("delivery.timeout.ms expired for %s-%d", topic, partition))
     end
-    local ok, result = pcall(function()
-      local conn = router:connectionFor(topic, partition)
-      if self.acks == 0 then
-        conn:sendOneway(ApiKey.PRODUCE, body)
-        return false
-      end
-      return conn:request(ApiKey.PRODUCE, body, requestTimeout + 5000)
-    end)
+    local ok, conn = pcall(router.connectionFor, router, topic, partition)
     if not ok then
-      if not errors.is(result, "ConnectionError") or attemptsLeft <= 0 or nowMs() >= deadline then
-        error(result, 0)
+      -- Nothing was sent, so a retry cannot duplicate.
+      if not errors.is(conn, "ConnectionError") or attemptsLeft <= 0 or nowMs() >= deadline then
+        error(conn, 0)
       end
       attemptsLeft = attemptsLeft - 1
       config.sleepMs(backoff)
-    elseif result == false then
+    elseif self.acks == 0 then
+      conn:sendOneway(ApiKey.PRODUCE, body)
       return -1
     else
-      local r = protocol.Reader.body(result)
+      local r = protocol.Reader.body(conn:request(ApiKey.PRODUCE, body, requestTimeout + 5000))
       r:string() -- topic
       r:int32()  -- partition
       local code = r:int32()

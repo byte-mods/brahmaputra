@@ -67,7 +67,13 @@ start_link(Address, Opts) ->
     Config0 = maps:merge(default_config(), Opts),
     Config = Config0#{acks := normalize_acks(maps:get(acks, Config0))},
     case brahmaputra_protocol:parse_compression(maps:get(compression, Config)) of
-        {ok, Codec} -> gen_server:start_link(?MODULE, {Address, Config, Codec}, []);
+        {ok, Codec} ->
+            %% An unregistered codec fails here rather than on the first
+            %% (possibly background) flush.
+            case brahmaputra_protocol:codec_available(Codec) of
+                true -> gen_server:start_link(?MODULE, {Address, Config, Codec}, []);
+                false -> {error, {codec_not_registered, Codec}}
+            end;
         {error, _} = E -> E
     end.
 
@@ -100,7 +106,8 @@ send_to(Producer, Topic, Partition, Value, Opts) ->
     call(Producer, {send, to_bin(Topic), Partition, Value, Opts}).
 
 %% @doc Send one record on its own and return its offset. A full round
-%% trip per record: correct, and slow.
+%% trip per record: correct, and slow. Options are those of {@link send/4}
+%% plus `partition', an explicit partition.
 send_sync(Producer, Topic, Value) -> send_sync(Producer, Topic, Value, #{}).
 
 send_sync(Producer, Topic, Value, Opts) ->
@@ -145,7 +152,12 @@ handle_call({send_sync, Topic, Value, Opts}, _From, State) ->
         {ok, Partition, S1} ->
             Item = #{key => Key, value => Value, headers => maps:get(headers, Opts, []),
                      created_ms => maps:get(timestamp, Opts, now_ms())},
-            {reply, produce(Topic, Partition, [Item], S1), S1};
+            %% Anything already buffered for this partition goes first, so a
+            %% synchronous send never overtakes an earlier asynchronous one.
+            case flush_slot({Topic, Partition}, S1) of
+                {ok, S2} -> {reply, produce(Topic, Partition, [Item], S2), S2};
+                {{error, _} = E, S2} -> {reply, E, S2}
+            end;
         {error, _} = E ->
             {reply, E, State}
     end;

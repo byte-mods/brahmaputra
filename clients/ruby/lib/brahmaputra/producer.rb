@@ -88,7 +88,7 @@ module Brahmaputra
       "linger.ms" => 5,
       "compression.type" => "none",
       # Retries of a send refused with a retriable error (one the broker
-      # returns before appending) or lost to a broken connection.
+      # returns before appending) or that could not reach its leader at all.
       "retries" => 5,
       "retry.backoff.ms" => 100,
       # Caps the whole send: time buffered plus every attempt.
@@ -384,8 +384,15 @@ module Brahmaputra
 
       attempts_left = @config["retries"]
       loop do
-        begin
-          connection = @router.connection_for(batch.topic, batch.partition)
+        error = catch(:retry) do
+          begin
+            connection = @router.connection_for(batch.topic, batch.partition)
+          rescue ConnectionError => e
+            # Routing or dialling failed, so nothing was sent and a retry
+            # cannot duplicate. A failure once the request is on the wire is
+            # not retried: the broker may already have appended it.
+            throw :retry, e
+          end
           if @acks.zero?
             connection.send_oneway(Protocol::ApiKey::PRODUCE, body)
             return -1
@@ -400,10 +407,11 @@ module Brahmaputra
           reader.skip_int64 # log_append_time_ms
           return base_offset if code == ErrorCode::NONE
 
-          error = ServerError.new(code, "produce to #{batch.topic}-#{batch.partition}")
-          raise error unless error.retriable?
-        rescue ConnectionError, TimeoutError => e
-          error = e
+          server_error = ServerError.new(code, "produce to #{batch.topic}-#{batch.partition}")
+          # Only codes the broker returns before appending are retried.
+          raise server_error unless server_error.retriable?
+
+          server_error
         end
         raise error if attempts_left <= 0 || monotonic >= deadline
 

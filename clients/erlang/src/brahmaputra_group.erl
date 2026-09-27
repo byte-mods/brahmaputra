@@ -20,7 +20,7 @@
 -include("brahmaputra.hrl").
 
 -export([start_link/3, subscribe/2, poll/2, commit/1, committed/1, committed/2,
-         assignment/1, member_id/1, close/1, default_config/0]).
+         assignment/1, member_id/1, generation/1, close/1, default_config/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(COORDINATOR_ATTEMPTS, 4).
@@ -52,7 +52,10 @@
 %% <ul>
 %%   <li>`session_timeout_ms' (10000), `rebalance_timeout_ms' (3000),
 %%       `max_poll_interval_ms' (300000).</li>
-%%   <li>`auto_commit_interval_ms' — 0 disables auto-commit.</li>
+%%   <li>`heartbeat_interval_ms' — how often to heartbeat; 0 means
+%%       `session_timeout_ms div 3'. Must be below the session timeout.</li>
+%%   <li>`enable_auto_commit' (true) and `auto_commit_interval_ms' (5000;
+%%       0 also disables auto-commit).</li>
 %%   <li>`auto_offset_reset' — `earliest', `latest' or `none'.</li>
 %%   <li>`assignor' — `range', `roundrobin' or `sticky'.</li>
 %%   <li>`group_instance_id' — static membership; `<<>>' for dynamic.</li>
@@ -61,8 +64,10 @@
 default_config() ->
     maps:merge(brahmaputra_consumer:default_config(),
                #{session_timeout_ms => 10000,
+                 heartbeat_interval_ms => 0,
                  rebalance_timeout_ms => 3000,
                  max_poll_interval_ms => 300000,
+                 enable_auto_commit => true,
                  auto_commit_interval_ms => 5000,
                  auto_offset_reset => earliest,
                  assignor => range,
@@ -71,7 +76,11 @@ default_config() ->
 -spec start_link(term(), binary(), map()) -> {ok, pid()} | {error, term()}.
 start_link(Address, GroupId, Opts) ->
     Config = maps:merge(default_config(), Opts),
-    gen_server:start_link(?MODULE, {Address, to_bin(GroupId), Config}, []).
+    case maps:get(heartbeat_interval_ms, Config) >= maps:get(session_timeout_ms, Config) of
+        true -> {error, {heartbeat_interval_ms_not_below_session_timeout_ms,
+                         maps:get(heartbeat_interval_ms, Config)}};
+        false -> gen_server:start_link(?MODULE, {Address, to_bin(GroupId), Config}, [])
+    end.
 
 %% @doc Set the topics this member wants a share of. Takes effect on the
 %% next poll, which (re)joins the group.
@@ -96,6 +105,8 @@ committed(Group, Partitions) -> gen_server:call(Group, {committed, Partitions}, 
 
 assignment(Group) -> gen_server:call(Group, assignment, infinity).
 member_id(Group) -> gen_server:call(Group, member_id, infinity).
+%% @doc The generation this member last joined; -1 before the first join.
+generation(Group) -> gen_server:call(Group, generation, infinity).
 
 %% @doc Commit, leave the group, then stop.
 %%
@@ -143,6 +154,8 @@ handle_call(assignment, _From, State) ->
     {reply, State#state.assignment, State};
 handle_call(member_id, _From, State) ->
     {reply, State#state.member_id, State};
+handle_call(generation, _From, State) ->
+    {reply, State#state.generation, State};
 handle_call(close, _From, State) ->
     S1 = case State#state.joined of
              true -> element(2, do_commit(State));
@@ -280,7 +293,8 @@ take_buffered(State = #state{buffered = Buffered, config = Config}) ->
 
 maybe_auto_commit(State = #state{config = Config}) ->
     Interval = maps:get(auto_commit_interval_ms, Config),
-    case Interval > 0 andalso map_size(State#state.positions) > 0
+    case maps:get(enable_auto_commit, Config) =:= true andalso Interval > 0
+        andalso map_size(State#state.positions) > 0
         andalso now_ms() - State#state.last_commit_ms >= Interval of
         %% A failed auto-commit is retried on the next poll; an explicit
         %% commit is what a caller relies on.
@@ -315,6 +329,12 @@ do_commit(State) ->
         {ok, Resp} ->
             case P:peek_error_code(Resp) of
                 ?ERR_NONE -> {ok, State#state{last_commit_ms = now_ms()}};
+                Code when Code =:= ?ERR_ILLEGAL_GENERATION;
+                          Code =:= ?ERR_UNKNOWN_MEMBER_ID;
+                          Code =:= ?ERR_REBALANCE_IN_PROGRESS ->
+                    %% Generation fencing: the group moved on without this
+                    %% member's generation; the next poll rejoins.
+                    {{error, P:server_error(Code, offset_commit)}, State#state{joined = false}};
                 Code -> {{error, P:server_error(Code, offset_commit)}, State}
             end;
         {error, _} = E ->
@@ -540,8 +560,11 @@ do_leave(State) ->
 %% deriving it from the session timeout alone would leave a long session
 %% with a short poll interval unchecked long after it stalled.
 schedule_heartbeat(State = #state{config = Config}) ->
-    Interval = max(1, min(maps:get(session_timeout_ms, Config) div 3,
-                          maps:get(max_poll_interval_ms, Config) div 3)),
+    HeartbeatEvery = case maps:get(heartbeat_interval_ms, Config) of
+                         N when N > 0 -> N;
+                         _ -> maps:get(session_timeout_ms, Config) div 3
+                     end,
+    Interval = max(1, min(HeartbeatEvery, maps:get(max_poll_interval_ms, Config) div 3)),
     State#state{heartbeat_timer = erlang:send_after(Interval, self(), heartbeat)}.
 
 heartbeat_tick(State = #state{joined = false}) -> State;

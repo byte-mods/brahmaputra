@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -183,6 +184,159 @@ private:
     std::vector<std::thread> pumps_;
 };
 
+
+// A proxy that understands frames. It forwards every request to the broker
+// except Produce, which it can answer itself with an error code for the next
+// `failures` requests — how a leader move or an under-replicated partition
+// looks to a producer — and it records what each Produce asked for.
+class FaultProxy {
+public:
+    explicit FaultProxy(const std::string& target) {
+        auto colon = target.rfind(':');
+        targetHost_ = target.substr(0, colon);
+        targetPort_ = static_cast<std::uint16_t>(std::stoi(target.substr(colon + 1)));
+        std::uint16_t port = 0;
+        listenFd_ = listenLocal(port);
+        address = "127.0.0.1:" + std::to_string(port);
+        acceptor_ = std::thread([this] { acceptLoop(); });
+    }
+    ~FaultProxy() { close(); }
+
+    /// Answer the next `count` Produce requests with `code` instead of
+    /// forwarding them.
+    void failProduces(int count, std::int32_t code) {
+        std::lock_guard<std::mutex> lock(mu_);
+        failures_ = count;
+        code_ = code;
+        produces = 0;
+    }
+
+    void close() {
+        if (listenFd_ < 0) return;
+        ::shutdown(listenFd_, SHUT_RDWR);
+        if (acceptor_.joinable()) acceptor_.join();
+        ::close(listenFd_);
+        listenFd_ = -1;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            for (int fd : fds_) ::shutdown(fd, SHUT_RDWR);
+        }
+        for (auto& t : workers_) t.join();
+        for (int fd : fds_) ::close(fd);
+    }
+
+    std::string address;
+    std::atomic<int> produces{0};
+    std::atomic<std::int32_t> lastAcks{0};
+    std::atomic<std::int32_t> lastTimeoutMs{0};
+
+private:
+    static bool readExact(int fd, std::uint8_t* out, std::size_t len) {
+        std::size_t got = 0;
+        while (got < len) {
+            ssize_t n = ::recv(fd, out + got, len - got, 0);
+            if (n <= 0) return false;
+            got += static_cast<std::size_t>(n);
+        }
+        return true;
+    }
+    static bool readFrame(int fd, bp::Bytes& frame) {
+        std::uint8_t header[4];
+        if (!readExact(fd, header, 4)) return false;
+        std::uint32_t len = (std::uint32_t(header[0]) << 24) | (std::uint32_t(header[1]) << 16) |
+                            (std::uint32_t(header[2]) << 8) | header[3];
+        frame.assign(header, header + 4);
+        frame.resize(4 + len);
+        return readExact(fd, frame.data() + 4, len);
+    }
+    static bool writeAll(int fd, const bp::Bytes& data) {
+        std::size_t off = 0;
+        while (off < data.size()) {
+            ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
+            if (n <= 0) return false;
+            off += static_cast<std::size_t>(n);
+        }
+        return true;
+    }
+
+    void serve(int client, int upstream) {
+        bp::Bytes frame;
+        while (readFrame(client, frame)) {
+            auto apiKey = static_cast<std::int16_t>((frame[4] << 8) | frame[5]);
+            bool expectReply = true;
+            if (apiKey == bp::api::Produce) {
+                bp::Bytes payload(frame.begin() + 4, frame.end());
+                auto [correlationId, body] = bp::decodeFramePayload(payload);
+                bp::BodyReader r(body);
+                std::string topic = r.string();
+                std::int32_t partition = r.int32();
+                std::int32_t acks = r.int32();
+                std::int32_t timeoutMs = r.int32();
+                lastAcks = acks;
+                lastTimeoutMs = timeoutMs;
+                ++produces;
+                expectReply = acks != 0;
+                std::int32_t code = 0;
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    if (failures_ > 0) {
+                        --failures_;
+                        code = code_;
+                    }
+                }
+                if (code != 0) {
+                    bp::BodyWriter w;
+                    w.string(topic);
+                    w.int32(partition);
+                    w.int32(code);
+                    w.int64(-1);
+                    w.int64(-1);
+                    if (!writeAll(client, bp::encodeFrame(apiKey, correlationId, "", w.bytes()))) break;
+                    continue;
+                }
+            }
+            if (!writeAll(upstream, frame)) break;
+            if (!expectReply) continue;
+            bp::Bytes reply;
+            if (!readFrame(upstream, reply) || !writeAll(client, reply)) break;
+        }
+        ::shutdown(client, SHUT_RDWR);
+        ::shutdown(upstream, SHUT_RDWR);
+    }
+
+    void acceptLoop() {
+        for (;;) {
+            int client = ::accept(listenFd_, nullptr, nullptr);
+            if (client < 0) return;
+            int upstream = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(targetPort_);
+            ::inet_pton(AF_INET, targetHost_ == "localhost" ? "127.0.0.1" : targetHost_.c_str(),
+                        &addr.sin_addr);
+            if (::connect(upstream, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) {
+                ::close(upstream);
+                ::close(client);
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(mu_);
+            fds_.push_back(client);
+            fds_.push_back(upstream);
+            workers_.emplace_back([this, client, upstream] { serve(client, upstream); });
+        }
+    }
+
+    std::string targetHost_;
+    std::uint16_t targetPort_ = 0;
+    int listenFd_ = -1;
+    std::thread acceptor_;
+    std::mutex mu_;
+    int failures_ = 0;
+    std::int32_t code_ = 0;
+    std::vector<int> fds_;
+    std::vector<std::thread> workers_;
+};
+
 std::vector<bp::ConsumedRecord> fetchAll(bp::Consumer& consumer, const std::string& topic,
                                          std::size_t want) {
     std::vector<bp::ConsumedRecord> got;
@@ -199,6 +353,520 @@ std::vector<bp::ConsumedRecord> fetchAll(bp::Consumer& consumer, const std::stri
         for (auto& r : batch) got.push_back(std::move(r));
     }
     return got;
+}
+
+
+long long elapsedMs(Clock::time_point since) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since).count();
+}
+
+// Polls until `want` records arrive or `limit` passes.
+std::vector<bp::ConsumedRecord> pollUntil(bp::GroupConsumer& consumer, std::size_t want,
+                                          std::chrono::milliseconds limit,
+                                          std::size_t* largestPoll = nullptr) {
+    std::vector<bp::ConsumedRecord> seen;
+    auto deadline = Clock::now() + limit;
+    while (seen.size() < want && Clock::now() < deadline) {
+        std::vector<bp::ConsumedRecord> batch;
+        try {
+            batch = consumer.poll(300ms);
+        } catch (const bp::Error&) {
+            continue;
+        }
+        if (largestPoll) *largestPoll = std::max(*largestPoll, batch.size());
+        for (auto& record : batch) seen.push_back(std::move(record));
+    }
+    return seen;
+}
+
+std::int64_t committedTotal(bp::GroupConsumer& consumer) {
+    std::int64_t total = 0;
+    for (const auto& [slot, offset] : consumer.committed()) total += offset;
+    return total;
+}
+
+// Checks beyond the Go suite's 54: one per feature of the client contract
+// that those do not already exercise.
+void runExtra(const std::string& address) {
+    section("producer: explicit partition, timestamp and synchronous send");
+    {
+        std::string t = unique("cpp-sync");
+        bp::Producer producer(address, immediateProducer());
+        std::vector<std::int64_t> offsets;
+        for (int i = 0; i < 3; ++i) {
+            bp::ProducerRecord record;
+            record.topic = t;
+            record.partition = 0;
+            record.value = B("sync-" + std::to_string(i));
+            offsets.push_back(producer.sendSync(record));
+        }
+        check("sendSync returns each record's offset", offsets == std::vector<std::int64_t>{0, 1, 2},
+              std::to_string(offsets[0]) + "," + std::to_string(offsets[1]) + "," +
+                  std::to_string(offsets[2]));
+        bp::ProducerRecord stamped;
+        stamped.topic = t;
+        stamped.partition = 2;
+        stamped.value = B("stamped");
+        stamped.timestampMs = 1'600'000'000'123;
+        producer.send(stamped);
+        producer.flush();
+        producer.close();
+
+        bp::Consumer consumer(address);
+        auto onTwo = consumer.fetch(t, 2, 0, 500);
+        check("an explicit partition is honoured",
+              onTwo.size() == 1 && consumer.fetch(t, 0, 0, 500).size() == 3,
+              "partition 2 holds " + std::to_string(onTwo.size()));
+        check("an explicit timestamp survives the round trip",
+              onTwo.size() == 1 && onTwo[0].timestamp == 1'600'000'000'123,
+              onTwo.empty() ? "no record" : std::to_string(onTwo[0].timestamp));
+    }
+
+    section("producer: round-robin for records without a key");
+    {
+        std::string t = unique("cpp-rr");
+        bp::Producer producer(address, immediateProducer());
+        auto partitions = producer.router().partitions(t);
+        for (int i = 0; i < 8; ++i) producer.send(t, B("rr" + std::to_string(i)));
+        producer.close();
+        bp::Consumer consumer(address);
+        std::string counts;
+        bool even = partitions.size() == 4;
+        for (auto partition : partitions) {
+            auto n = consumer.fetch(t, partition, 0, 300).size();
+            counts += std::to_string(n) + " ";
+            if (n != 2) even = false;
+        }
+        check("unkeyed records are spread evenly over every partition", even, counts);
+    }
+
+    section("producer: batch.size, linger.ms and close");
+    {
+        bp::Consumer consumer(address);
+        std::string full = unique("cpp-batchfull");
+        auto config = immediateProducer();
+        config.lingerMs = 60'000;
+        config.batchSize = 64;
+        bp::Producer eager(address, config);
+        eager.sendTo(full, 0, bp::Bytes(100, 'b'));
+        check("a batch that reaches batch.size is sent without waiting for linger.ms",
+              consumer.fetch(full, 0, 0, 300).size() == 1);
+
+        std::string lingering = unique("cpp-linger");
+        config.lingerMs = 100;
+        config.batchSize = 1 << 20;
+        bp::Producer lazy(address, config);
+        lazy.sendTo(lingering, 0, B("waits"));
+        bool heldBack = consumer.fetch(lingering, 0, 0, 0).empty();
+        std::this_thread::sleep_for(800ms);
+        check("linger.ms holds a partial batch, then sends it in the background",
+              heldBack && consumer.fetch(lingering, 0, 0, 300).size() == 1,
+              heldBack ? "never sent" : "sent before linger.ms");
+
+        std::string closing = unique("cpp-close");
+        config.lingerMs = 60'000;
+        bp::Producer closer(address, config);
+        for (int i = 0; i < 5; ++i) closer.sendTo(closing, 0, B("c" + std::to_string(i)));
+        closer.close();
+        check("close flushes what is still buffered", consumer.fetch(closing, 0, 0, 300).size() == 5);
+        eager.close();
+        lazy.close();
+    }
+
+    section("producer: retries, request.timeout.ms and delivery.timeout.ms");
+    {
+        FaultProxy proxy(address);
+        std::string t = unique("cpp-retry");
+        auto config = immediateProducer();
+        config.retries = 3;
+        config.retryBackoffMs = 50;
+        config.requestTimeoutMs = 4321;
+        config.acks = -1;
+        {
+            bp::Producer producer(proxy.address, config);
+            producer.router().partitions(t);
+            proxy.failProduces(2, bp::errc::NotLeaderOrFollower);
+            std::string err;
+            try {
+                producer.sendTo(t, 0, B("persistent"));
+            } catch (const std::exception& e) {
+                err = e.what();
+            }
+            bp::Consumer consumer(address);
+            check("a retriable error is retried until the send succeeds",
+                  err.empty() && proxy.produces == 3 && consumer.fetch(t, 0, 0, 300).size() == 1,
+                  "attempts=" + std::to_string(proxy.produces.load()) + " " + err);
+            check("request.timeout.ms and acks travel on the produce request",
+                  proxy.lastTimeoutMs == 4321 && proxy.lastAcks == -1,
+                  std::to_string(proxy.lastTimeoutMs.load()) + "/" + std::to_string(proxy.lastAcks.load()));
+
+            config.retries = 2;
+            config.retryBackoffMs = 150;
+            bp::Producer bounded(proxy.address, config);
+            bounded.router().partitions(t);
+            proxy.failProduces(1000, bp::errc::NotLeaderOrFollower);
+            auto started = Clock::now();
+            bool failed = false;
+            try {
+                bounded.sendTo(t, 0, B("doomed"));
+            } catch (const bp::ServerError& e) {
+                failed = e.code() == bp::errc::NotLeaderOrFollower;
+            }
+            auto took = elapsedMs(started);
+            check("retries are bounded and spaced by retry.backoff.ms",
+                  failed && proxy.produces == 3 && took >= 300,
+                  "attempts=" + std::to_string(proxy.produces.load()) + " took " +
+                      std::to_string(took) + "ms");
+
+            proxy.failProduces(1000, bp::errc::InvalidRequest);
+            try {
+                bounded.sendTo(t, 0, B("malformed"));
+            } catch (const bp::Error&) {
+            }
+            check("a non-retriable error is not retried", proxy.produces == 1,
+                  "attempts=" + std::to_string(proxy.produces.load()));
+            bounded.close();
+
+            config.retries = 1000;
+            config.retryBackoffMs = 50;
+            config.deliveryTimeoutMs = 400;
+            bp::Producer capped(proxy.address, config);
+            capped.router().partitions(t);
+            proxy.failProduces(100000, bp::errc::NotLeaderOrFollower);
+            started = Clock::now();
+            failed = false;
+            try {
+                capped.sendTo(t, 0, B("late"));
+            } catch (const bp::ServerError&) {
+                failed = true;
+            }
+            took = elapsedMs(started);
+            check("delivery.timeout.ms caps the whole retry loop", failed && took < 3000,
+                  "took " + std::to_string(took) + "ms, attempts=" +
+                      std::to_string(proxy.produces.load()));
+            proxy.failProduces(0, 0);
+            capped.close();
+            producer.close();
+        }
+        proxy.close();
+    }
+
+    section("compression: registering a codec");
+    {
+        bool refused = false;
+        try {
+            bp::ProducerConfig config = immediateProducer();
+            config.compressionType = "snappy";
+            bp::Producer unregistered(address, config);
+        } catch (const bp::Error&) {
+            refused = true;
+        }
+        check("an unregistered codec is refused up front", refused);
+
+        // A toy reversible codec: enough to prove the hook is used on both
+        // the produce and the fetch path. The broker stores batches as-is.
+        auto flip = [](const bp::Bytes& in) {
+            bp::Bytes out(in.rbegin(), in.rend());
+            for (auto& byte : out) byte ^= 0x5a;
+            return out;
+        };
+        bp::registerCodec(bp::Compression::Snappy, flip, flip);
+        std::string t = unique("cpp-codec");
+        auto config = immediateProducer();
+        config.compressionType = "snappy";
+        bp::Producer producer(address, config);
+        producer.sendTo(t, 0, B("through a registered codec"), B("k"),
+                        {{"h", B("v")}});
+        producer.close();
+        bp::Consumer consumer(address);
+        auto got = consumer.fetch(t, 0, 0, 300);
+        check("a registered codec compresses on produce and decompresses on fetch",
+              got.size() == 1 && got[0].value == B("through a registered codec") &&
+                  got[0].key == B("k") && got[0].headers.size() == 1);
+        std::vector<bp::Record> records{bp::Record{B("k"), B("v"), 0, {}}};
+        auto encoded = bp::encodeRecordBatch(records, bp::nowMillis(), bp::Compression::Snappy);
+        std::size_t pos = 0;
+        auto decoded = bp::decodeRecordBatch(encoded, pos);
+        check("a batch encoded with it decodes offline",
+              decoded.records.size() == 1 && decoded.records[0].value == B("v"));
+    }
+
+    section("consumer: fetch limits, watermark, offsets by time, metadata");
+    {
+        std::string t = unique("cpp-fetch");
+        bp::Producer producer(address, immediateProducer());
+        const std::int64_t base = 1'700'000'000'000;
+        for (int i = 0; i < 20; ++i) {
+            bp::ProducerRecord record;
+            record.topic = t;
+            record.partition = 0;
+            record.value = bp::Bytes(1000, static_cast<std::uint8_t>('a' + i));
+            record.timestampMs = base + i * 1000;
+            producer.send(record);
+        }
+        producer.close();
+
+        bp::ConsumerConfig small;
+        small.fetchMaxBytes = 2500;
+        bp::Consumer limited(address, small);
+        auto capped = limited.fetch(t, 0, 0, 300);
+        check("fetch.max.bytes caps a response", !capped.empty() && capped.size() < 20,
+              std::to_string(capped.size()) + " records");
+
+        bp::Consumer consumer(address);
+        auto result = consumer.fetchWithWatermark(t, 0, 0, 300);
+        check("the high watermark is reported", result.highWatermark == 20,
+              std::to_string(result.highWatermark));
+
+        bp::ConsumerConfig patient;
+        patient.fetchMaxWaitMs = 400;
+        patient.fetchMinBytes = 1;
+        bp::Consumer waiter(address, patient);
+        auto started = Clock::now();
+        auto none = waiter.fetch(t, 0, 20, 10'000);
+        auto took = elapsedMs(started);
+        check("fetch.max.wait.ms bounds a long poll at the end of the log",
+              none.empty() && took >= 250 && took < 3000, std::to_string(took) + "ms");
+
+        auto byTime = consumer.listOffsets(t, 0, base + 5000);
+        auto between = consumer.listOffsets(t, 0, base + 5500);
+        check("list offsets by timestamp finds the first record at or after it",
+              byTime == 5 && between == 6,
+              std::to_string(byTime) + "," + std::to_string(between));
+
+        auto metadata = consumer.router().metadata({t}, true);
+        auto partitions = metadata.partitionsOf(t);
+        bool led = partitions.size() == 4;
+        for (auto partition : partitions) {
+            if (metadata.leaderOf(t, partition) < 0) led = false;
+        }
+        check("metadata lists a topic's partitions and their leaders", led,
+              std::to_string(partitions.size()) + " partitions");
+
+        bp::GroupConfig groupConfig;
+        groupConfig.enableAutoCommit = false;
+        groupConfig.maxPollRecords = 3;
+        bp::GroupConsumer group(address, unique("cpp-maxpoll"), groupConfig);
+        group.subscribe({t});
+        std::size_t largest = 0;
+        auto seen = pollUntil(group, 20, 20s, &largest);
+        check("max.poll.records caps every poll", seen.size() == 20 && largest == 3,
+              std::to_string(seen.size()) + " records, largest poll " + std::to_string(largest));
+        group.close();
+    }
+
+    section("decoding is bounds-checked");
+    {
+        bp::BodyWriter w;
+        w.int32(-5);  // a negative string length
+        bool negative = false;
+        try {
+            bp::BodyReader r(w.bytes());
+            (void)r.string();
+        } catch (const bp::Error&) {
+            negative = true;
+        }
+        check("a negative length is an error, not a read", negative);
+
+        bp::BodyWriter big;
+        big.int32(1 << 30);  // claims a gigabyte, carries nothing
+        bool oversized = false;
+        try {
+            bp::BodyReader r(big.bytes());
+            (void)r.string();
+        } catch (const bp::Error&) {
+            oversized = true;
+        }
+        std::vector<bp::Record> records{bp::Record{B("k"), B("v"), 0, {}}};
+        auto batch = bp::encodeRecordBatch(records, bp::nowMillis(), bp::Compression::None);
+        batch[8] = 0x7f;  // batch_length far past the buffer
+        bool truncated = false;
+        try {
+            std::size_t pos = 0;
+            (void)bp::decodeRecordBatch(batch, pos);
+        } catch (const bp::Error&) {
+            truncated = true;
+        }
+        check("an oversized length is an error, not a read", oversized && truncated);
+    }
+
+    section("consumer groups: auto commit, several topics, heartbeats");
+    {
+        std::string t1 = unique("cpp-multi-a");
+        std::string t2 = unique("cpp-multi-b");
+        bp::Producer producer(address, immediateProducer());
+        for (int i = 0; i < 6; ++i) {
+            producer.send(t1, B("a" + std::to_string(i)));
+            producer.send(t2, B("b" + std::to_string(i)));
+        }
+        producer.close();
+
+        bp::GroupConfig groupConfig;
+        groupConfig.enableAutoCommit = true;
+        groupConfig.autoCommitIntervalMs = 200;
+        bp::GroupConsumer consumer(address, unique("cpp-multi"), groupConfig);
+        consumer.subscribe({t1, t2});
+        auto seen = pollUntil(consumer, 12, 20s);
+        std::set<std::string> topics;
+        for (const auto& record : seen) topics.insert(record.topic);
+        check("one member subscribed to two topics consumes both",
+              seen.size() == 12 && topics.size() == 2, std::to_string(seen.size()) + " records");
+        std::this_thread::sleep_for(300ms);
+        (void)consumer.poll(300ms);
+        auto total = committedTotal(consumer);
+        check("enable.auto.commit commits on poll after auto.commit.interval.ms", total == 12,
+              "committed " + std::to_string(total));
+        consumer.close();
+
+        std::string idle = unique("cpp-idle");
+        bp::Producer seeder(address, immediateProducer());
+        seeder.send(idle, B("x"));
+        seeder.close();
+        bp::GroupConfig heartbeatConfig;
+        heartbeatConfig.enableAutoCommit = false;
+        heartbeatConfig.sessionTimeoutMs = 1500;
+        heartbeatConfig.heartbeatIntervalMs = 300;
+        bp::GroupConsumer quiet(address, unique("cpp-heartbeat"), heartbeatConfig);
+        quiet.subscribe({idle});
+        pollUntil(quiet, 1, 15s);
+        auto generation = quiet.generation();
+        std::this_thread::sleep_for(4s);  // no poll: only heartbeats keep it in
+        std::string err;
+        try {
+            quiet.commit();
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        check("heartbeats keep an idle member in its group past session.timeout.ms",
+              err.empty() && quiet.generation() == generation, err);
+        quiet.close();
+    }
+
+    section("consumer groups: fencing, rejoin, leave and static membership");
+    {
+        std::string t = unique("cpp-fence");
+        bp::Producer producer(address, immediateProducer());
+        for (int i = 0; i < 8; ++i) producer.send(t, B("f" + std::to_string(i)));
+
+        std::string groupId = unique("cpp-fence-grp");
+        bp::GroupConfig groupConfig;
+        groupConfig.enableAutoCommit = false;
+        groupConfig.maxPollIntervalMs = 60'000;
+        groupConfig.heartbeatIntervalMs = 200;
+        bp::GroupConsumer first(address, groupId, groupConfig);
+        first.subscribe({t});
+        pollUntil(first, 8, 15s);
+
+        // The coordinator forgets this member behind its back, as it does
+        // when a session expires.
+        {
+            bp::BodyWriter w;
+            w.string(groupId);
+            w.string(first.memberId());
+            (void)first.consumer().router().seed()->request(bp::api::LeaveGroup, w.bytes());
+        }
+        std::string oldMember = first.memberId();
+        auto oldGeneration = first.generation();
+        std::this_thread::sleep_for(1s);  // a heartbeat learns UNKNOWN_MEMBER_ID
+        for (int i = 8; i < 12; ++i) producer.send(t, B("f" + std::to_string(i)));
+        auto after = pollUntil(first, 4, 15s);
+        std::string commitErr;
+        try {
+            first.commit();
+        } catch (const std::exception& e) {
+            commitErr = e.what();
+        }
+        check("a member the coordinator forgot rejoins on its next poll",
+              after.size() == 4 && first.generation() > oldGeneration && commitErr.empty(),
+              std::to_string(after.size()) + " records, " + oldMember + "@" +
+                  std::to_string(oldGeneration) + " -> " + first.memberId() + "@" +
+                  std::to_string(first.generation()) + " " + commitErr);
+
+        // A second member joins; the first sits out the rebalance and its
+        // generation goes stale.
+        auto staleGeneration = first.generation();
+        bp::GroupConsumer second(address, groupId, groupConfig);
+        second.subscribe({t});
+        (void)pollUntil(second, 1000, 8s);
+        std::int32_t fencedCode = 0;
+        try {
+            first.commit();
+        } catch (const bp::ServerError& e) {
+            fencedCode = e.code();
+        }
+        check("a commit from a stale generation is fenced",
+              fencedCode == bp::errc::IllegalGeneration || fencedCode == bp::errc::UnknownMemberId,
+              "generation " + std::to_string(staleGeneration) + " -> code " +
+                  std::to_string(fencedCode));
+        second.close();
+
+        // Close sends LeaveGroup: the next member gets every partition at
+        // once instead of waiting out a long session.
+        first.close();
+        bp::GroupConfig slowSession = groupConfig;
+        slowSession.sessionTimeoutMs = 30'000;
+        slowSession.rebalanceTimeoutMs = 30'000;
+        bp::GroupConsumer leaver(address, groupId + "-leave", slowSession);
+        leaver.subscribe({t});
+        pollUntil(leaver, 12, 15s);
+        leaver.close();
+        bp::GroupConsumer successor(address, groupId + "-leave", slowSession);
+        successor.subscribe({t});
+        auto started = Clock::now();
+        for (int i = 12; i < 14; ++i) producer.send(t, B("f" + std::to_string(i)));
+        auto handedOver = pollUntil(successor, 2, 15s);
+        auto took = elapsedMs(started);
+        check("close leaves the group so partitions move without a session timeout",
+              handedOver.size() == 2 && successor.assignment().size() == 4 && took < 10'000,
+              std::to_string(handedOver.size()) + " records after " + std::to_string(took) + "ms");
+        successor.close();
+
+        bp::GroupConfig staticConfig = groupConfig;
+        staticConfig.groupInstanceId = "cpp-instance-1";
+        std::string staticGroup = unique("cpp-static");
+        bp::GroupConsumer original(address, staticGroup, staticConfig);
+        original.subscribe({t});
+        pollUntil(original, 14, 15s);
+        auto originalMember = original.memberId();
+        auto originalGeneration = original.generation();
+        bp::GroupConsumer restarted(address, staticGroup, staticConfig);
+        restarted.subscribe({t});
+        (void)pollUntil(restarted, 1000, 3s);
+        check("a static member reclaims its member id without a rebalance",
+              !originalMember.empty() && restarted.memberId() == originalMember &&
+                  restarted.generation() == originalGeneration,
+              originalMember + "@" + std::to_string(originalGeneration) + " vs " +
+                  restarted.memberId() + "@" + std::to_string(restarted.generation()));
+        restarted.close();
+        original.close();
+        producer.close();
+    }
+
+    section("assignors: sticky keeps what members hold");
+    {
+        std::vector<bp::AssignorMember> members{{"m1", {"t"}}, {"m2", {"t"}}};
+        bp::TopicPartitions topics{{"t", {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}}};
+        bp::Assignment previous{{"m1", {{"t", 2}, {"t", 10}, {"t", 11}}},
+                                {"m2", {{"t", 0}, {"t", 1}}}};
+        auto sticky = bp::stickyAssign(members, topics, previous);
+        auto holds = [&](const std::string& id, std::int32_t p) {
+            const auto& slots = sticky[id];
+            return std::find(slots.begin(), slots.end(), bp::TopicPartition{"t", p}) != slots.end();
+        };
+        check("sticky leaves every held partition where it was",
+              holds("m1", 2) && holds("m1", 10) && holds("m1", 11) && holds("m2", 0) &&
+                  holds("m2", 1) && sticky["m1"].size() == 6 && sticky["m2"].size() == 6);
+        bool numeric = sticky["m1"].size() > 1;
+        for (std::size_t i = 1; i < sticky["m1"].size(); ++i) {
+            if (sticky["m1"][i - 1].partition >= sticky["m1"][i].partition) numeric = false;
+        }
+        check("sticky orders partitions as numbers, not strings", numeric);
+        auto range = bp::rangeAssign(members, topics);
+        auto rr = bp::roundRobinAssign(members, topics);
+        check("range and roundrobin split twelve partitions six and six",
+              range["m1"].size() == 6 && range["m2"].size() == 6 && rr["m1"].size() == 6 &&
+                  rr["m1"][1].partition == 2);
+    }
 }
 
 void run(const std::string& address) {
@@ -785,6 +1453,8 @@ void run(const std::string& address) {
         consumer.close();
         producer.close();
     }
+
+    runExtra(address);
 }
 
 }  // namespace

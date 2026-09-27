@@ -745,9 +745,525 @@ int main(string[] args)
         mustDo(producer.close());
     }
 
+    runExtra(address);
+
     writefln("\n%d passed, %d failed", passed, failed);
     stdout.flush();
     return failed > 0 ? 1 : 0;
+}
+
+
+long elapsedMs(MonoTime since)
+{
+    return (MonoTime.currTime - since).total!"msecs";
+}
+
+/// Polls until `want` records arrive or `limit` passes.
+ConsumedRecord[] pollUntil(GroupConsumer consumer, size_t want, Duration limit,
+    size_t* largestPoll = null)
+{
+    ConsumedRecord[] seen;
+    const deadline = MonoTime.currTime + limit;
+    while (seen.length < want && MonoTime.currTime < deadline)
+    {
+        auto batch = pollQuietly(consumer, 300.msecs);
+        if (largestPoll !is null && batch.length > *largestPoll)
+            *largestPoll = batch.length;
+        seen ~= batch;
+    }
+    return seen;
+}
+
+long committedTotal(GroupConsumer consumer)
+{
+    long total;
+    foreach (_, offset; consumer.committed())
+        total += offset;
+    return total;
+}
+
+/// Checks beyond the Go suite's 54: one per feature of the client contract
+/// that those do not already exercise.
+void runExtra(string address)
+{
+    section("producer: explicit partition, timestamp and synchronous send");
+    {
+        const t = unique("d-sync");
+        auto producer = must(new Producer(address, immediate()));
+        long[] offsets;
+        foreach (i; 0 .. 3)
+            offsets ~= must(producer.sendSync(ProducerRecord(t, 0, null, b(format("sync-%d", i)))));
+        check("sendSync returns each record's offset", offsets == [0L, 1, 2], format("%s", offsets));
+        ProducerRecord stamped = ProducerRecord(t, 2, null, b("stamped"));
+        stamped.timestampMs = 1_600_000_000_123;
+        mustDo(producer.send(stamped));
+        mustDo(producer.close());
+
+        auto consumer = must(new Consumer(address));
+        auto onTwo = must(consumer.fetch(t, 2, 0, 500));
+        check("an explicit partition is honoured",
+            onTwo.length == 1 && must(consumer.fetch(t, 0, 0, 500)).length == 3,
+            format("partition 2 holds %d", onTwo.length));
+        check("an explicit timestamp survives the round trip",
+            onTwo.length == 1 && onTwo[0].timestamp == 1_600_000_000_123,
+            onTwo.length ? format("%d", onTwo[0].timestamp) : "no record");
+        consumer.close();
+    }
+
+    section("producer: round-robin for records without a key");
+    {
+        const t = unique("d-rr");
+        auto producer = must(new Producer(address, immediate()));
+        auto partitions = must(producer.router.partitions(t));
+        foreach (i; 0 .. 8)
+            mustDo(producer.send(t, b(format("rr%d", i))));
+        mustDo(producer.close());
+        auto consumer = must(new Consumer(address));
+        size_t[] counts;
+        foreach (partition; partitions)
+            counts ~= must(consumer.fetch(t, partition, 0, 300)).length;
+        check("unkeyed records are spread evenly over every partition",
+            counts == [2UL, 2, 2, 2], format("%s", counts));
+        consumer.close();
+    }
+
+    section("producer: batch.size, linger.ms and close");
+    {
+        auto consumer = must(new Consumer(address));
+        const full = unique("d-batchfull");
+        auto config = immediate();
+        config.lingerMs = 60_000;
+        config.batchSize = 64;
+        auto eager = must(new Producer(address, config));
+        mustDo(eager.sendTo(full, 0, new ubyte[100]));
+        check("a batch that reaches batch.size is sent without waiting for linger.ms",
+            must(consumer.fetch(full, 0, 0, 300)).length == 1);
+
+        const lingering = unique("d-linger");
+        config.lingerMs = 100;
+        config.batchSize = 1 << 20;
+        auto lazy_ = must(new Producer(address, config));
+        mustDo(lazy_.sendTo(lingering, 0, b("waits")));
+        const heldBack = must(consumer.fetch(lingering, 0, 0, 0)).length == 0;
+        Thread.sleep(800.msecs);
+        check("linger.ms holds a partial batch, then sends it in the background",
+            heldBack && must(consumer.fetch(lingering, 0, 0, 300)).length == 1,
+            heldBack ? "never sent" : "sent before linger.ms");
+
+        const closing = unique("d-close");
+        config.lingerMs = 60_000;
+        auto closer = must(new Producer(address, config));
+        foreach (i; 0 .. 5)
+            mustDo(closer.sendTo(closing, 0, b(format("c%d", i))));
+        mustDo(closer.close());
+        check("close flushes what is still buffered",
+            must(consumer.fetch(closing, 0, 0, 300)).length == 5);
+        mustDo(eager.close());
+        mustDo(lazy_.close());
+        consumer.close();
+    }
+
+    section("producer: retries, request.timeout.ms and delivery.timeout.ms");
+    {
+        auto proxy = new FaultProxy(address);
+        scope (exit)
+            proxy.close();
+        const t = unique("d-retry");
+        auto config = immediate();
+        config.retries = 3;
+        config.retryBackoffMs = 50;
+        config.requestTimeoutMs = 4321;
+        config.acks = -1;
+        auto producer = must(new Producer(proxy.address, config));
+        must(producer.router.partitions(t));
+        proxy.failProduces(2, ErrorCode.notLeaderOrFollower);
+        Exception err;
+        try
+            producer.sendTo(t, 0, b("persistent"));
+        catch (Exception e)
+            err = e;
+        auto consumer = must(new Consumer(address));
+        check("a retriable error is retried until the send succeeds",
+            err is null && proxy.produces == 3 && must(consumer.fetch(t, 0, 0, 300)).length == 1,
+            format("attempts=%d %s", proxy.produces, errText(err)));
+        check("request.timeout.ms and acks travel on the produce request",
+            proxy.lastTimeoutMs == 4321 && proxy.lastAcks == -1,
+            format("%d/%d", proxy.lastTimeoutMs, proxy.lastAcks));
+        consumer.close();
+
+        config.retries = 2;
+        config.retryBackoffMs = 150;
+        auto bounded = must(new Producer(proxy.address, config));
+        must(bounded.router.partitions(t));
+        proxy.failProduces(1000, ErrorCode.notLeaderOrFollower);
+        auto started = MonoTime.currTime;
+        bool failedRight;
+        try
+            bounded.sendTo(t, 0, b("doomed"));
+        catch (ServerException e)
+            failedRight = e.code == ErrorCode.notLeaderOrFollower;
+        auto took = elapsedMs(started);
+        check("retries are bounded and spaced by retry.backoff.ms",
+            failedRight && proxy.produces == 3 && took >= 300,
+            format("attempts=%d took %dms", proxy.produces, took));
+
+        proxy.failProduces(1000, ErrorCode.invalidRequest);
+        try
+            bounded.sendTo(t, 0, b("malformed"));
+        catch (Exception)
+        {
+        }
+        check("a non-retriable error is not retried", proxy.produces == 1,
+            format("attempts=%d", proxy.produces));
+        try
+            bounded.close();
+        catch (Exception)
+        {
+        }
+
+        config.retries = 1000;
+        config.retryBackoffMs = 50;
+        config.deliveryTimeoutMs = 400;
+        auto capped = must(new Producer(proxy.address, config));
+        must(capped.router.partitions(t));
+        proxy.failProduces(100_000, ErrorCode.notLeaderOrFollower);
+        started = MonoTime.currTime;
+        bool gaveUp;
+        try
+            capped.sendTo(t, 0, b("late"));
+        catch (ServerException)
+            gaveUp = true;
+        took = elapsedMs(started);
+        check("delivery.timeout.ms caps the whole retry loop", gaveUp && took < 3000,
+            format("took %dms, attempts=%d", took, proxy.produces));
+        proxy.failProduces(0, 0);
+        try
+            capped.close();
+        catch (Exception)
+        {
+        }
+        mustDo(producer.close());
+    }
+
+    section("compression: registering a codec");
+    {
+        bool refused;
+        try
+        {
+            auto config = immediate();
+            config.compressionType = "snappy";
+            auto unregistered = new Producer(address, config);
+            unregistered.close();
+        }
+        catch (BrahmaputraException)
+            refused = true;
+        check("an unregistered codec is refused up front", refused);
+
+        // A toy reversible codec: enough to prove the hook is used on both
+        // the produce and the fetch path. The broker stores batches as-is.
+        static const(ubyte)[] flip(const(ubyte)[] input)
+        {
+            auto out_ = new ubyte[input.length];
+            foreach (i, byte_; input)
+                out_[$ - 1 - i] = byte_ ^ 0x5a;
+            return out_;
+        }
+
+        registerCodec(Compression.snappy, &flip, &flip);
+        const t = unique("d-codec");
+        auto config = immediate();
+        config.compressionType = "snappy";
+        auto producer = must(new Producer(address, config));
+        mustDo(producer.sendTo(t, 0, b("through a registered codec"), b("k"),
+                [RecordHeader("h", b("v"))]));
+        mustDo(producer.close());
+        auto consumer = must(new Consumer(address));
+        auto got = must(consumer.fetch(t, 0, 0, 300));
+        check("a registered codec compresses on produce and decompresses on fetch",
+            got.length == 1 && got[0].value == b("through a registered codec")
+                && got[0].key == b("k") && got[0].headers.length == 1);
+        consumer.close();
+        auto encoded = encodeRecordBatch([Record(b("k"), b("v"))], nowMillis(), Compression.snappy);
+        size_t pos;
+        auto decoded = decodeRecordBatch(encoded, pos);
+        check("a batch encoded with it decodes offline",
+            decoded.records.length == 1 && decoded.records[0].value == b("v"));
+    }
+
+    section("consumer: fetch limits, watermark, offsets by time, metadata");
+    {
+        const t = unique("d-fetch");
+        auto producer = must(new Producer(address, immediate()));
+        const long base = 1_700_000_000_000;
+        foreach (i; 0 .. 20)
+        {
+            auto value = new ubyte[1000];
+            value[] = cast(ubyte)('a' + i);
+            auto record = ProducerRecord(t, 0, null, value);
+            record.timestampMs = base + i * 1000;
+            mustDo(producer.send(record));
+        }
+        mustDo(producer.close());
+
+        ConsumerConfig small;
+        small.fetchMaxBytes = 2500;
+        auto limited = must(new Consumer(address, small));
+        auto capped = must(limited.fetch(t, 0, 0, 300));
+        check("fetch.max.bytes caps a response", capped.length > 0 && capped.length < 20,
+            format("%d records", capped.length));
+        limited.close();
+
+        auto consumer = must(new Consumer(address));
+        auto result = must(consumer.fetchVerbose(t, 0, 0, 300));
+        check("the high watermark is reported", result.highWatermark == 20,
+            format("%d", result.highWatermark));
+
+        ConsumerConfig patient;
+        patient.fetchMaxWaitMs = 400;
+        patient.fetchMinBytes = 1;
+        auto waiter = must(new Consumer(address, patient));
+        const started = MonoTime.currTime;
+        auto none = must(waiter.fetch(t, 0, 20, 10_000));
+        const took = elapsedMs(started);
+        check("fetch.max.wait.ms bounds a long poll at the end of the log",
+            none.length == 0 && took >= 250 && took < 3000, format("%dms", took));
+        waiter.close();
+
+        const byTime = must(consumer.listOffsets(t, 0, base + 5000));
+        const between = must(consumer.listOffsets(t, 0, base + 5500));
+        check("list offsets by timestamp finds the first record at or after it",
+            byTime == 5 && between == 6, format("%d,%d", byTime, between));
+
+        auto metadata = must(consumer.router.metadata([t], true));
+        auto partitions = metadata.partitionsOf(t);
+        bool led = partitions.length == 4;
+        foreach (partition; partitions)
+            if (metadata.leaderOf(t, partition) < 0)
+                led = false;
+        check("metadata lists a topic's partitions and their leaders", led,
+            format("%d partitions", partitions.length));
+        consumer.close();
+
+        auto groupConfig = manualCommit();
+        groupConfig.maxPollRecords = 3;
+        auto group = must(new GroupConsumer(address, unique("d-maxpoll"), groupConfig));
+        group.subscribe([t]);
+        size_t largest;
+        auto seen = pollUntil(group, 20, 20.seconds, &largest);
+        check("max.poll.records caps every poll", seen.length == 20 && largest == 3,
+            format("%d records, largest poll %d", seen.length, largest));
+        mustDo(group.close());
+    }
+
+    section("decoding is bounds-checked");
+    {
+        auto w = BodyWriter.start();
+        w.i32(-5); // a negative string length
+        bool negative;
+        try
+            cast(void) BodyReader(w.data).str();
+        catch (ProtocolException)
+            negative = true;
+        check("a negative length is an error, not a read", negative);
+
+        auto big = BodyWriter.start();
+        big.i32(1 << 30); // claims a gigabyte, carries nothing
+        bool oversized;
+        try
+            cast(void) BodyReader(big.data).str();
+        catch (ProtocolException)
+            oversized = true;
+        auto batch = encodeRecordBatch([Record(b("k"), b("v"))], nowMillis(), Compression.none);
+        batch[8] = 0x7f; // batch_length far past the buffer
+        bool truncated;
+        try
+        {
+            size_t pos;
+            cast(void) decodeRecordBatch(batch, pos);
+        }
+        catch (ProtocolException)
+            truncated = true;
+        check("an oversized length is an error, not a read", oversized && truncated);
+    }
+
+    section("consumer groups: auto commit, several topics, heartbeats");
+    {
+        const t1 = unique("d-multi-a");
+        const t2 = unique("d-multi-b");
+        auto producer = must(new Producer(address, immediate()));
+        foreach (i; 0 .. 6)
+        {
+            mustDo(producer.send(t1, b(format("a%d", i))));
+            mustDo(producer.send(t2, b(format("b%d", i))));
+        }
+        mustDo(producer.close());
+
+        GroupConfig groupConfig;
+        groupConfig.enableAutoCommit = true;
+        groupConfig.autoCommitIntervalMs = 200;
+        auto consumer = must(new GroupConsumer(address, unique("d-multi"), groupConfig));
+        consumer.subscribe([t1, t2]);
+        auto seen = pollUntil(consumer, 12, 20.seconds);
+        bool[string] topics;
+        foreach (ref record; seen)
+            topics[record.topic] = true;
+        check("one member subscribed to two topics consumes both",
+            seen.length == 12 && topics.length == 2, format("%d records", seen.length));
+        Thread.sleep(300.msecs);
+        pollQuietly(consumer, 300.msecs);
+        const total = must(committedTotal(consumer));
+        check("enable.auto.commit commits on poll after auto.commit.interval.ms", total == 12,
+            format("committed %d", total));
+        mustDo(consumer.close());
+
+        const idle = unique("d-idle");
+        auto seeder = must(new Producer(address, immediate()));
+        mustDo(seeder.send(idle, b("x")));
+        mustDo(seeder.close());
+        auto heartbeatConfig = manualCommit();
+        heartbeatConfig.sessionTimeoutMs = 1500;
+        heartbeatConfig.heartbeatIntervalMs = 300;
+        auto quiet = must(new GroupConsumer(address, unique("d-heartbeat"), heartbeatConfig));
+        quiet.subscribe([idle]);
+        pollUntil(quiet, 1, 15.seconds);
+        const generation = quiet.groupGeneration;
+        Thread.sleep(4.seconds); // no poll: only heartbeats keep it in
+        Exception err;
+        try
+            quiet.commit();
+        catch (Exception e)
+            err = e;
+        check("heartbeats keep an idle member in its group past session.timeout.ms",
+            err is null && quiet.groupGeneration == generation, errText(err));
+        mustDo(quiet.close());
+    }
+
+    section("consumer groups: fencing, rejoin, leave and static membership");
+    {
+        const t = unique("d-fence");
+        auto producer = must(new Producer(address, immediate()));
+        foreach (i; 0 .. 8)
+            mustDo(producer.send(t, b(format("f%d", i))));
+
+        const groupId = unique("d-fence-grp");
+        auto groupConfig = manualCommit();
+        groupConfig.maxPollIntervalMs = 60_000;
+        groupConfig.heartbeatIntervalMs = 200;
+        auto first = must(new GroupConsumer(address, groupId, groupConfig));
+        first.subscribe([t]);
+        pollUntil(first, 8, 15.seconds);
+
+        // The coordinator forgets this member behind its back, as it does
+        // when a session expires.
+        {
+            auto w = BodyWriter.start();
+            w.str(groupId);
+            w.str(first.groupMemberId);
+            must(first.consumer.router.seed.request(ApiKey.leaveGroup, w.data));
+        }
+        const oldMember = first.groupMemberId;
+        const oldGeneration = first.groupGeneration;
+        Thread.sleep(1.seconds); // a heartbeat learns UNKNOWN_MEMBER_ID
+        foreach (i; 8 .. 12)
+            mustDo(producer.send(t, b(format("f%d", i))));
+        auto after = pollUntil(first, 4, 15.seconds);
+        Exception commitErr;
+        try
+            first.commit();
+        catch (Exception e)
+            commitErr = e;
+        check("a member the coordinator forgot rejoins on its next poll",
+            after.length == 4 && first.groupGeneration > oldGeneration && commitErr is null,
+            format("%d records, %s@%d -> %s@%d %s", after.length, oldMember, oldGeneration,
+                first.groupMemberId, first.groupGeneration, errText(commitErr)));
+
+        // A second member joins; the first sits out the rebalance and its
+        // generation goes stale.
+        const staleGeneration = first.groupGeneration;
+        auto second = must(new GroupConsumer(address, groupId, groupConfig));
+        second.subscribe([t]);
+        pollUntil(second, 1000, 8.seconds);
+        int fencedCode;
+        try
+            first.commit();
+        catch (ServerException e)
+            fencedCode = e.code;
+        check("a commit from a stale generation is fenced",
+            fencedCode == ErrorCode.illegalGeneration || fencedCode == ErrorCode.unknownMemberId,
+            format("generation %d -> code %d", staleGeneration, fencedCode));
+        mustDo(second.close());
+        mustDo(first.close());
+
+        // Close sends LeaveGroup: the next member gets every partition at
+        // once instead of waiting out a long session.
+        auto slowSession = groupConfig;
+        slowSession.sessionTimeoutMs = 30_000;
+        slowSession.rebalanceTimeoutMs = 30_000;
+        auto leaver = must(new GroupConsumer(address, groupId ~ "-leave", slowSession));
+        leaver.subscribe([t]);
+        pollUntil(leaver, 12, 15.seconds);
+        mustDo(leaver.close());
+        auto successor = must(new GroupConsumer(address, groupId ~ "-leave", slowSession));
+        successor.subscribe([t]);
+        const started = MonoTime.currTime;
+        foreach (i; 12 .. 14)
+            mustDo(producer.send(t, b(format("f%d", i))));
+        auto handedOver = pollUntil(successor, 2, 15.seconds);
+        const took = elapsedMs(started);
+        check("close leaves the group so partitions move without a session timeout",
+            handedOver.length == 2 && successor.assigned.length == 4 && took < 10_000,
+            format("%d records after %dms", handedOver.length, took));
+        mustDo(successor.close());
+
+        auto staticConfig = groupConfig;
+        staticConfig.groupInstanceId = "d-instance-1";
+        const staticGroup = unique("d-static");
+        auto original = must(new GroupConsumer(address, staticGroup, staticConfig));
+        original.subscribe([t]);
+        pollUntil(original, 14, 15.seconds);
+        const originalMember = original.groupMemberId;
+        const originalGeneration = original.groupGeneration;
+        auto restarted = must(new GroupConsumer(address, staticGroup, staticConfig));
+        restarted.subscribe([t]);
+        pollUntil(restarted, 1000, 3.seconds);
+        check("a static member reclaims its member id without a rebalance",
+            originalMember.length > 0 && restarted.groupMemberId == originalMember
+                && restarted.groupGeneration == originalGeneration,
+            format("%s@%d vs %s@%d", originalMember, originalGeneration,
+                restarted.groupMemberId, restarted.groupGeneration));
+        mustDo(restarted.close());
+        mustDo(original.close());
+        mustDo(producer.close());
+    }
+
+    section("assignors: sticky keeps what members hold");
+    {
+        auto members = [AssignorMember("m1", ["t"]), AssignorMember("m2", ["t"])];
+        int[][string] topics = ["t": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]];
+        TopicPartition[][string] previous = [
+            "m1": [TopicPartition("t", 2), TopicPartition("t", 10), TopicPartition("t", 11)],
+            "m2": [TopicPartition("t", 0), TopicPartition("t", 1)],
+        ];
+        auto sticky = stickyAssign(members, topics, previous);
+        bool holds(string id, int p)
+        {
+            return sticky[id].canFind(TopicPartition("t", p));
+        }
+
+        check("sticky leaves every held partition where it was",
+            holds("m1", 2) && holds("m1", 10) && holds("m1", 11) && holds("m2", 0)
+                && holds("m2", 1) && sticky["m1"].length == 6 && sticky["m2"].length == 6);
+        bool numeric = sticky["m1"].length > 1;
+        foreach (i; 1 .. sticky["m1"].length)
+            if (sticky["m1"][i - 1].partition >= sticky["m1"][i].partition)
+                numeric = false;
+        check("sticky orders partitions as numbers, not strings", numeric);
+        auto range = rangeAssign(members, topics);
+        auto rr = roundRobinAssign(members, topics);
+        check("range and roundrobin split twelve partitions six and six",
+            range["m1"].length == 6 && range["m2"].length == 6 && rr["m1"].length == 6
+                && rr["m1"][1].partition == 2);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -918,7 +1434,7 @@ final class Proxy
         }
     }
 
-    private static bool sendAll(Socket s, const(ubyte)[] data)
+    static bool sendAll(Socket s, const(ubyte)[] data)
     {
         while (data.length > 0)
         {
@@ -954,5 +1470,214 @@ final class Proxy
         atomicStore(stopping, true);
         acceptThread.join();
         dropAll();
+    }
+}
+
+/// A proxy that understands frames. It forwards every request to the broker
+/// except Produce, which it can answer itself with an error code for the
+/// next `failures` requests — how a leader move or an under-replicated
+/// partition looks to a producer — and it records what each Produce asked for.
+final class FaultProxy
+{
+    private TcpSocket listener;
+    private string target;
+    private shared bool stopping;
+    private Thread acceptThread;
+    private Mutex mu;
+    private Socket[] live;
+    private int failures;
+    private int failCode;
+    private shared int produces_;
+    private shared int lastAcks_;
+    private shared int lastTimeoutMs_;
+    string address;
+
+    this(string target)
+    {
+        this.target = target;
+        this.mu = new Mutex;
+        listener = listenLocal();
+        address = "127.0.0.1:" ~ listener.localAddress.toPortString;
+        acceptThread = new Thread(&acceptLoop);
+        acceptThread.isDaemon = true;
+        acceptThread.start();
+    }
+
+    @property int produces()
+    {
+        return atomicLoad(produces_);
+    }
+
+    @property int lastAcks()
+    {
+        return atomicLoad(lastAcks_);
+    }
+
+    @property int lastTimeoutMs()
+    {
+        return atomicLoad(lastTimeoutMs_);
+    }
+
+    /// Answers the next `count` Produce requests with `code`.
+    void failProduces(int count, int code)
+    {
+        mu.lock();
+        scope (exit)
+            mu.unlock();
+        failures = count;
+        failCode = code;
+        atomicStore(produces_, 0);
+    }
+
+    private void acceptLoop()
+    {
+        auto readable = new SocketSet();
+        while (!atomicLoad(stopping))
+        {
+            readable.reset();
+            readable.add(listener);
+            if (Socket.select(readable, null, null, 50.msecs) <= 0)
+                continue;
+            Socket client;
+            try
+                client = listener.accept();
+            catch (Exception)
+                continue;
+            Socket upstream;
+            try
+            {
+                string host;
+                ushort port;
+                splitAddress(target, host, port);
+                upstream = new TcpSocket(new InternetAddress(host, port));
+            }
+            catch (Exception)
+            {
+                client.close();
+                continue;
+            }
+            {
+                mu.lock();
+                scope (exit)
+                    mu.unlock();
+                live ~= client;
+                live ~= upstream;
+            }
+            auto worker = new Thread(() => serve(client, upstream));
+            worker.isDaemon = true;
+            worker.start();
+        }
+        listener.close();
+    }
+
+    private static bool readExact(Socket s, ubyte[] into)
+    {
+        size_t got;
+        while (got < into.length)
+        {
+            const n = s.receive(into[got .. $]);
+            if (n <= 0)
+                return false;
+            got += n;
+        }
+        return true;
+    }
+
+    private static bool readFrame(Socket s, out ubyte[] frame)
+    {
+        ubyte[4] header;
+        if (!readExact(s, header[]))
+            return false;
+        const len = (uint(header[0]) << 24) | (uint(header[1]) << 16) | (uint(header[2]) << 8) | header[3];
+        frame = new ubyte[4 + len];
+        frame[0 .. 4] = header[];
+        return readExact(s, frame[4 .. $]);
+    }
+
+    private void serve(Socket client, Socket upstream)
+    {
+        ubyte[] frame;
+        try
+        {
+            while (readFrame(client, frame))
+            {
+                const apiKey = cast(short)((frame[4] << 8) | frame[5]);
+                bool expectReply = true;
+                if (apiKey == ApiKey.produce)
+                {
+                    const correlationId = cast(int)((uint(frame[8]) << 24) | (uint(frame[9]) << 16)
+                            | (uint(frame[10]) << 8) | frame[11]);
+                    const clientLen = (frame[12] << 8) | frame[13];
+                    auto r = BodyReader(frame[14 + clientLen .. $]);
+                    const topic = r.str();
+                    const partition = r.i32();
+                    const acks = r.i32();
+                    const timeoutMs = r.i32();
+                    atomicStore(lastAcks_, acks);
+                    atomicStore(lastTimeoutMs_, timeoutMs);
+                    atomicStore(produces_, atomicLoad(produces_) + 1);
+                    expectReply = acks != 0;
+                    int code;
+                    {
+                        mu.lock();
+                        scope (exit)
+                            mu.unlock();
+                        if (failures > 0)
+                        {
+                            failures--;
+                            code = failCode;
+                        }
+                    }
+                    if (code != 0)
+                    {
+                        auto w = BodyWriter.start();
+                        w.str(topic);
+                        w.i32(partition);
+                        w.i32(code);
+                        w.i64(-1);
+                        w.i64(-1);
+                        if (!Proxy.sendAll(client, encodeFrame(apiKey, correlationId, "", w.data)))
+                            break;
+                        continue;
+                    }
+                }
+                if (!Proxy.sendAll(upstream, frame))
+                    break;
+                if (!expectReply)
+                    continue;
+                ubyte[] reply;
+                if (!readFrame(upstream, reply) || !Proxy.sendAll(client, reply))
+                    break;
+            }
+        }
+        catch (Exception)
+        {
+        }
+        foreach (s; [client, upstream])
+        {
+            try
+                s.shutdown(SocketShutdown.BOTH);
+            catch (Exception)
+            {
+            }
+            s.close();
+        }
+    }
+
+    void close()
+    {
+        atomicStore(stopping, true);
+        acceptThread.join();
+        mu.lock();
+        scope (exit)
+            mu.unlock();
+        foreach (s; live)
+        {
+            try
+                s.shutdown(SocketShutdown.BOTH);
+            catch (Exception)
+            {
+            }
+        }
     }
 }

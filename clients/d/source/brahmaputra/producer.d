@@ -54,6 +54,22 @@ class DeliveryException : BrahmaputraException
     }
 }
 
+/**
+ * One record with every field a send can set. `partition` -1 means: keyed
+ * records go to murmur2(key) % partitions, unkeyed ones round-robin.
+ * `timestampMs` -1 means now. A null `value` is a tombstone; an empty but
+ * non-null one is an ordinary empty value.
+ */
+struct ProducerRecord
+{
+    string topic;
+    int partition = -1;
+    const(ubyte)[] key;
+    const(ubyte)[] value;
+    const(RecordHeader)[] headers;
+    long timestampMs = -1;
+}
+
 private struct Buffered
 {
     Record record;
@@ -94,6 +110,10 @@ final class Producer
     {
         this.config = config;
         this.codec = parseCompression(config.compressionType);
+        // An unregistered codec fails here rather than on the first
+        // (possibly background) flush.
+        if (codec != Compression.none)
+            cast(void) compress(codec, null);
         this.router_ = new Router(address, config.clientId, config.connectTimeout,
             config.socketTimeout);
         this.mu = new Mutex;
@@ -167,19 +187,28 @@ final class Producer
     void sendTo(string topic, int partition, const(ubyte)[] value,
         const(ubyte)[] key = null, const(RecordHeader)[] headers = null)
     {
-        const record = Record(key, value, 0, headers);
-        size_t size = value.length + key.length + 16;
-        foreach (ref h; headers)
+        send(ProducerRecord(topic, partition, key, value, headers));
+    }
+
+    /// Buffers one record, honouring its explicit partition and timestamp
+    /// when set.
+    void send(ProducerRecord input)
+    {
+        const partition = input.partition >= 0 ? input.partition
+            : choosePartition(input.topic, input.key);
+        const record = Record(input.key, input.value, 0, input.headers);
+        size_t size = input.value.length + input.key.length + 16;
+        foreach (ref h; input.headers)
             size += h.key.length + h.value.length + 4;
         reserve(size);
 
-        const slot = TopicPartition(topic, partition);
+        const slot = TopicPartition(input.topic, partition);
         bool full;
         {
             mu.lock();
             scope (exit)
                 mu.unlock();
-            buffers[slot] ~= Buffered(record, nowMillis());
+            buffers[slot] ~= Buffered(record, input.timestampMs >= 0 ? input.timestampMs : nowMillis());
             sizes[slot] = sizes.get(slot, 0) + size;
             full = sizes[slot] >= config.batchSize;
         }
@@ -192,8 +221,26 @@ final class Producer
     long sendSync(string topic, const(ubyte)[] value, const(ubyte)[] key = null,
         const(RecordHeader)[] headers = null)
     {
-        const partition = choosePartition(topic, key);
-        return produce(topic, partition, [Buffered(Record(key, value, 0, headers), nowMillis())]);
+        return sendSync(ProducerRecord(topic, -1, key, value, headers));
+    }
+
+    /// ditto, honouring an explicit partition and timestamp. Anything already
+    /// buffered for the partition goes first, so a synchronous send never
+    /// overtakes an earlier asynchronous one.
+    long sendSync(ProducerRecord input)
+    {
+        const partition = input.partition >= 0 ? input.partition
+            : choosePartition(input.topic, input.key);
+        const slot = TopicPartition(input.topic, partition);
+        flushPartition(slot);
+        auto lock = sendLockFor(slot);
+        lock.lock();
+        scope (exit)
+            lock.unlock();
+        return produce(input.topic, partition, [
+            Buffered(Record(input.key, input.value, 0, input.headers),
+                input.timestampMs >= 0 ? input.timestampMs : nowMillis())
+        ]);
     }
 
     /**
@@ -328,21 +375,21 @@ final class Producer
         }
     }
 
+    private Mutex sendLockFor(TopicPartition slot)
+    {
+        mu.lock();
+        scope (exit)
+            mu.unlock();
+        if (auto existing = slot in sendLocks)
+            return *existing;
+        auto lock = new Mutex;
+        sendLocks[slot] = lock;
+        return lock;
+    }
+
     private void flushPartition(TopicPartition slot)
     {
-        Mutex lock;
-        {
-            mu.lock();
-            scope (exit)
-                mu.unlock();
-            if (auto existing = slot in sendLocks)
-                lock = *existing;
-            else
-            {
-                lock = new Mutex;
-                sendLocks[slot] = lock;
-            }
-        }
+        auto lock = sendLockFor(slot);
         lock.lock();
         scope (exit)
             lock.unlock();

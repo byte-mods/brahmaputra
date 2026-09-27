@@ -29,7 +29,7 @@
 -export([encode_record_batch/3, decode_record_batch/1, decode_record_batches/1]).
 %% Checksums, hashing, compression
 -export([crc32c/1, murmur2/1, partition_for_key/2]).
--export([parse_compression/1, compression_name/1, compress/2, decompress/2,
+-export([parse_compression/1, compression_name/1, compress/2, decompress/2, codec_available/1,
          register_codec/3, unregister_codec/1]).
 
 -export_type([record/0, header/0, batch/0, codec/0]).
@@ -333,6 +333,13 @@ compression_name(Codec) -> atom_to_binary(Codec, utf8).
 register_codec(Codec, CompressFun, DecompressFun)
   when Codec =:= lz4; Codec =:= zstd; Codec =:= snappy ->
     persistent_term:put({?MODULE, codec, Codec}, {CompressFun, DecompressFun}).
+
+%% @doc Whether a codec can be used now: `none' and `gzip' always, the
+%% others once registered.
+-spec codec_available(codec()) -> boolean().
+codec_available(none) -> true;
+codec_available(gzip) -> true;
+codec_available(Codec) -> persistent_term:get({?MODULE, codec, Codec}, undefined) =/= undefined.
 
 unregister_codec(Codec) ->
     _ = persistent_term:erase({?MODULE, codec, Codec}),

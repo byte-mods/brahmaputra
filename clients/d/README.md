@@ -4,9 +4,10 @@ A native D driver for Brahmaputra's wire protocol, built on Phobos and
 druntime alone (`std.socket`, `std.zlib`, `core.thread`, `core.sync`). It
 has no dependencies and no FFI.
 
-Verified end to end against a live broker: **54/54 checks**
+Verified end to end against a live broker: **87/87 checks**
 (`./test.sh HOST PORT`, which builds with `ldc2 -w` and runs
-`test/manual_test.d`, a port of the Go suite).
+`test/manual_test.d`: a port of the Go suite's 54 checks plus 33 more that
+cover the rest of the client contract).
 
 ## Install / build
 
@@ -60,6 +61,12 @@ producer.sendTo("orders", 0, null, toBytes("k3"));
 // Or wait for one record's offset: a full round trip, correct and slow.
 long offset = producer.sendSync("orders", toBytes(`{"id":2}`));
 
+// Every field at once: explicit partition (-1 = partitioner) and
+// timestamp (-1 = now).
+auto record = ProducerRecord("orders", 1, toBytes("user-9"), toBytes(`{"id":3}`));
+record.timestampMs = 1_700_000_000_000;
+producer.send(record);              // or producer.sendSync(record)
+
 producer.flush();   // also reports a failed background (linger) flush
 ```
 
@@ -87,7 +94,7 @@ long end   = consumer.listOffsets("orders", 0, LATEST);     // EARLIEST, LATEST 
 GroupConfig config;
 config.assignor = ASSIGNOR_STICKY;              // range (default), roundrobin, sticky
 config.autoOffsetReset = AUTO_OFFSET_RESET_EARLIEST;
-config.autoCommitIntervalMs = 0;                // commit explicitly
+config.enableAutoCommit = false;                // commit explicitly
 config.groupInstanceId = "worker-3";            // static membership
 
 auto consumer = new GroupConsumer("127.0.0.1:9092", "billing", config);
@@ -133,11 +140,25 @@ wait for data, does not count against the interval.
 (`READ_UNCOMMITTED`), `rack` (`client.rack`), `connectTimeout`,
 `requestTimeout` (120 s), `clientId`.
 
-`GroupConfig`: `sessionTimeoutMs` (10 000), `rebalanceTimeoutMs` (3 000),
-`maxPollIntervalMs` (300 000), `autoCommitIntervalMs` (5 000; 0 disables),
-`autoOffsetReset` (`earliest`/`latest`/`none`), `assignor`
-(`range`/`roundrobin`/`sticky`), `groupInstanceId`, `maxPollRecords`,
-`fetchMaxBytes`, `connectTimeout`, `requestTimeout`, `clientId`.
+`GroupConfig`:
+
+| Field | Kafka name | Default |
+|---|---|---|
+| `sessionTimeoutMs` | `session.timeout.ms` | 10 000 (Kafka: 45 000) |
+| `heartbeatIntervalMs` | `heartbeat.interval.ms` | 0 = `session.timeout.ms / 3`; must be below the session timeout |
+| `rebalanceTimeoutMs` | `rebalance.timeout.ms` | 3 000 |
+| `maxPollIntervalMs` | `max.poll.interval.ms` | 300 000 |
+| `enableAutoCommit` | `enable.auto.commit` | `true` |
+| `autoCommitIntervalMs` | `auto.commit.interval.ms` | 5 000 (0 also disables) |
+| `autoOffsetReset` | `auto.offset.reset` | `earliest` (`latest`, `none`) |
+| `assignor` | `partition.assignment.strategy` | `range` (`roundrobin`, `sticky`) |
+| `groupInstanceId` | `group.instance.id` | empty (dynamic member) |
+| `maxPollRecords` | `max.poll.records` | 500 |
+| `fetchMaxBytes` / `fetchMinBytes` / `fetchMaxWaitMs` | `fetch.*` | 8 MiB / 1 / 500 |
+| `connectTimeout`, `requestTimeout`, `clientId` | | 30 s, 120 s, `"brahmaputra-d"` |
+
+`groupMemberId` and `groupGeneration` report the current membership, and
+`assigned` the partitions this member holds.
 
 ## Errors and connections
 
@@ -162,7 +183,8 @@ connection.
 ## Compression
 
 `none` and `gzip` (through `std.zlib`) are built in. The others are
-opt-in, so this package pulls in no dependencies of its own:
+opt-in, so this package pulls in no dependencies of its own. A producer
+configured with a codec nobody registered fails in its constructor:
 
 ```d
 registerCodec(Compression.zstd,

@@ -56,6 +56,9 @@ struct GroupConfig {
     /// session.timeout.ms: the coordinator evicts a member that stops
     /// heartbeating for this long. Kafka defaults to 45s; this to 10s.
     std::int32_t sessionTimeoutMs = 10'000;
+    /// heartbeat.interval.ms: how often the background thread heartbeats.
+    /// <= 0 means session.timeout.ms / 3. Must be below session.timeout.ms.
+    int heartbeatIntervalMs = 0;
     /// rebalance.timeout.ms: how long the coordinator waits for rejoins.
     std::int32_t rebalanceTimeoutMs = 3'000;
     /// max.poll.interval.ms: the longest gap between poll() calls before this

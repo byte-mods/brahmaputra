@@ -371,6 +371,7 @@ run(Address) ->
     connection_failures(Address),
     max_poll_interval_rejoin(Address),
     time_inside_poll(Address),
+    extra(Address),
     ok.
 
 %% Fetch from offset 0 until Want records are in hand or a fetch comes
@@ -661,3 +662,498 @@ fill_until_blocked(Producer, Topic, N) ->
         {error, {buffer_full, _}} -> true;
         _ -> fill_until_blocked(Producer, Topic, N - 1)
     end.
+
+%% ===========================================================================
+%% Checks beyond the Go suite's 54: one per feature of the client contract
+%% that those do not already exercise.
+%% ===========================================================================
+
+extra(Address) ->
+    explicit_partition_timestamp_sync(Address),
+    round_robin(Address),
+    batch_linger_close(Address),
+    retries_and_timeouts(Address),
+    codec_registration(Address),
+    fetch_limits(Address),
+    bounds_checked_decoding(),
+    auto_commit_topics_heartbeats(Address),
+    fencing_rejoin_leave_static(Address),
+    sticky_unit(),
+    ok.
+
+bin(Format, Args) -> list_to_binary(fmt(Format, Args)).
+
+count_on(C, Topic, Partition) ->
+    length(must(?C:fetch(C, Topic, Partition, 0, 300))).
+
+committed_total(Group) ->
+    lists:sum(maps:values(must(?G:committed(Group)))).
+
+explicit_partition_timestamp_sync(Address) ->
+    section("producer: explicit partition, timestamp and synchronous send"),
+    T = unique("erl-sync"),
+    Producer = producer(Address, #{}),
+    Offsets = [must(?P:send_sync(Producer, T, bin("sync-~b", [I]), #{partition => 0}))
+               || I <- lists:seq(0, 2)],
+    check("send_sync returns each record's offset", Offsets =:= [0, 1, 2], fmt("~p", [Offsets])),
+    must(?P:send_to(Producer, T, 2, <<"stamped">>, #{timestamp => 1600000000123})),
+    must(?P:close(Producer)),
+    C = consumer(Address),
+    OnTwo = must(?C:fetch(C, T, 2, 0, 500)),
+    check("an explicit partition is honoured",
+          length(OnTwo) =:= 1 andalso count_on(C, T, 0) =:= 3,
+          fmt("partition 2 holds ~b", [length(OnTwo)])),
+    check("an explicit timestamp survives the round trip",
+          case OnTwo of [#{timestamp := 1600000000123}] -> true; _ -> false end,
+          fmt("~p", [[Ts || #{timestamp := Ts} <- OnTwo]])),
+    ?C:close(C).
+
+round_robin(Address) ->
+    section("producer: round-robin for records without a key"),
+    T = unique("erl-rr"),
+    Producer = producer(Address, #{}),
+    Partitions = must(brahmaputra_router:partitions(?P:router(Producer), T)),
+    [must(?P:send(Producer, T, bin("rr~b", [I]))) || I <- lists:seq(0, 7)],
+    must(?P:close(Producer)),
+    C = consumer(Address),
+    Counts = [count_on(C, T, P) || P <- Partitions],
+    check("unkeyed records are spread evenly over every partition", Counts =:= [2, 2, 2, 2],
+          fmt("~p", [Counts])),
+    ?C:close(C).
+
+batch_linger_close(Address) ->
+    section("producer: batch.size, linger.ms and close"),
+    C = consumer(Address),
+    Full = unique("erl-batchfull"),
+    Eager = producer(Address, #{linger_ms => 60000, batch_size => 64}),
+    must(?P:send_to(Eager, Full, 0, binary:copy(<<"b">>, 100))),
+    check("a batch that reaches batch.size is sent without waiting for linger.ms",
+          count_on(C, Full, 0) =:= 1, ""),
+
+    Lingering = unique("erl-linger"),
+    Lazy = producer(Address, #{linger_ms => 100, batch_size => 1 bsl 20}),
+    must(?P:send_to(Lazy, Lingering, 0, <<"waits">>)),
+    HeldBack = length(must(?C:fetch(C, Lingering, 0, 0, 0))) =:= 0,
+    timer:sleep(800),
+    check("linger.ms holds a partial batch, then sends it in the background",
+          HeldBack andalso count_on(C, Lingering, 0) =:= 1,
+          case HeldBack of true -> "never sent"; false -> "sent before linger.ms" end),
+
+    Closing = unique("erl-close"),
+    Closer = producer(Address, #{linger_ms => 60000, batch_size => 1 bsl 20}),
+    [must(?P:send_to(Closer, Closing, 0, bin("c~b", [I]))) || I <- lists:seq(0, 4)],
+    must(?P:close(Closer)),
+    check("close flushes what is still buffered", count_on(C, Closing, 0) =:= 5, ""),
+    must(?P:close(Eager)),
+    must(?P:close(Lazy)),
+    ?C:close(C).
+
+retries_and_timeouts({Host, Port} = Address) ->
+    section("producer: retries, request.timeout.ms and delivery.timeout.ms"),
+    Proxy = start_fault_proxy(Host, Port),
+    ProxyAddress = {"127.0.0.1", fault_proxy_port(Proxy)},
+    T = unique("erl-retry"),
+    Base = #{linger_ms => 0, acks => all, request_timeout_ms => 4321},
+    Producer = must(?P:start_link(ProxyAddress, Base#{retries => 3, retry_backoff_ms => 50})),
+    _ = must(brahmaputra_router:partitions(?P:router(Producer), T)),
+    fail_produces(Proxy, 2, 6),
+    Sent = ?P:send_to(Producer, T, 0, <<"persistent">>),
+    {Produces, Acks, Timeout} = fault_stats(Proxy),
+    C = consumer(Address),
+    check("a retriable error is retried until the send succeeds",
+          Sent =:= ok andalso Produces =:= 3 andalso count_on(C, T, 0) =:= 1,
+          fmt("attempts=~b ~p", [Produces, Sent])),
+    check("request.timeout.ms and acks travel on the produce request",
+          Timeout =:= 4321 andalso Acks =:= -1, fmt("~b/~b", [Timeout, Acks])),
+    ?C:close(C),
+
+    Bounded = must(?P:start_link(ProxyAddress, Base#{retries => 2, retry_backoff_ms => 150})),
+    _ = must(brahmaputra_router:partitions(?P:router(Bounded), T)),
+    fail_produces(Proxy, 1000, 6),
+    Started = now_ms(),
+    Doomed = ?P:send_to(Bounded, T, 0, <<"doomed">>),
+    Took = now_ms() - Started,
+    {Produces2, _, _} = fault_stats(Proxy),
+    check("retries are bounded and spaced by retry.backoff.ms",
+          case Doomed of {error, {server_error, 6, _, _}} -> true; _ -> false end
+              andalso Produces2 =:= 3 andalso Took >= 300,
+          fmt("attempts=~b took ~bms ~p", [Produces2, Took, Doomed])),
+
+    fail_produces(Proxy, 1000, 3),
+    _ = ?P:send_to(Bounded, T, 0, <<"malformed">>),
+    {Produces3, _, _} = fault_stats(Proxy),
+    check("a non-retriable error is not retried", Produces3 =:= 1, fmt("attempts=~b", [Produces3])),
+    _ = ?P:close(Bounded),
+
+    Capped = must(?P:start_link(ProxyAddress, Base#{retries => 1000, retry_backoff_ms => 50,
+                                                    delivery_timeout_ms => 400})),
+    _ = must(brahmaputra_router:partitions(?P:router(Capped), T)),
+    fail_produces(Proxy, 100000, 6),
+    Started2 = now_ms(),
+    Late = ?P:send_to(Capped, T, 0, <<"late">>),
+    Took2 = now_ms() - Started2,
+    {Produces4, _, _} = fault_stats(Proxy),
+    check("delivery.timeout.ms caps the whole retry loop",
+          element(1, Late) =:= error andalso Took2 < 3000,
+          fmt("took ~bms, attempts=~b", [Took2, Produces4])),
+    fail_produces(Proxy, 0, 0),
+    _ = ?P:close(Capped),
+    must(?P:close(Producer)),
+    stop_fault_proxy(Proxy).
+
+codec_registration(Address) ->
+    section("compression: registering a codec"),
+    Refused = case ?P:start_link(Address, #{compression => snappy}) of
+                  {error, _} -> true;
+                  {ok, Unexpected} -> ?P:stop(Unexpected), false
+              end,
+    check("an unregistered codec is refused up front", Refused, ""),
+    %% A toy reversible codec: enough to prove the hook is used on both the
+    %% produce and the fetch path. The broker stores batches as-is.
+    Flip = fun(Data) -> list_to_binary(lists:reverse([B bxor 16#5a || <<B>> <= Data])) end,
+    ok = brahmaputra_protocol:register_codec(snappy, Flip, Flip),
+    T = unique("erl-codec"),
+    Producer = producer(Address, #{compression => snappy}),
+    must(?P:send_to(Producer, T, 0, <<"through a registered codec">>,
+                    #{key => <<"k">>, headers => [{<<"h">>, <<"v">>}]})),
+    must(?P:close(Producer)),
+    C = consumer(Address),
+    Got = must(?C:fetch(C, T, 0, 0, 300)),
+    check("a registered codec compresses on produce and decompresses on fetch",
+          case Got of
+              [#{value := <<"through a registered codec">>, key := <<"k">>, headers := [_]}] -> true;
+              _ -> false
+          end, fmt("~p", [Got])),
+    ?C:close(C),
+    Record = #{key => <<"k">>, value => <<"v">>, headers => [], timestamp_delta => 0},
+    {ok, Encoded} = brahmaputra_protocol:encode_record_batch([Record], now_ms(), snappy),
+    Decoded = brahmaputra_protocol:decode_record_batch(Encoded),
+    check("a batch encoded with it decodes offline",
+          case Decoded of {ok, #{records := [#{value := <<"v">>}]}, <<>>} -> true; _ -> false end,
+          fmt("~p", [Decoded])).
+
+fetch_limits(Address) ->
+    section("consumer: fetch limits, watermark, offsets by time, metadata"),
+    T = unique("erl-fetch"),
+    Producer = producer(Address, #{}),
+    Base = 1700000000000,
+    [must(?P:send_to(Producer, T, 0, binary:copy(<<($a + I)>>, 1000), #{timestamp => Base + I * 1000}))
+     || I <- lists:seq(0, 19)],
+    must(?P:close(Producer)),
+
+    Limited = must(?C:new(Address, #{fetch_max_bytes => 2500})),
+    Capped = must(?C:fetch(Limited, T, 0, 0, 300)),
+    check("fetch.max.bytes caps a response", length(Capped) > 0 andalso length(Capped) < 20,
+          fmt("~b records", [length(Capped)])),
+    ?C:close(Limited),
+
+    C = consumer(Address),
+    {ok, _, HighWatermark} = ?C:fetch_verbose(C, T, 0, 0, 300),
+    check("the high watermark is reported", HighWatermark =:= 20, fmt("~b", [HighWatermark])),
+
+    Waiter = must(?C:new(Address, #{fetch_max_wait_ms => 400, fetch_min_bytes => 1})),
+    Started = now_ms(),
+    None = must(?C:fetch(Waiter, T, 0, 20, 10000)),
+    Took = now_ms() - Started,
+    check("fetch.max.wait.ms bounds a long poll at the end of the log",
+          None =:= [] andalso Took >= 250 andalso Took < 3000, fmt("~bms", [Took])),
+    ?C:close(Waiter),
+
+    ByTime = must(?C:list_offsets(C, T, 0, Base + 5000)),
+    Between = must(?C:list_offsets(C, T, 0, Base + 5500)),
+    check("list offsets by timestamp finds the first record at or after it",
+          ByTime =:= 5 andalso Between =:= 6, fmt("~b,~b", [ByTime, Between])),
+
+    Meta = must(brahmaputra_router:metadata(?C:router(C), [T], true)),
+    Partitions = brahmaputra_router:partitions_of(Meta, T),
+    Led = [P || P <- Partitions, brahmaputra_router:leader_of(Meta, T, P) >= 0],
+    check("metadata lists a topic's partitions and their leaders",
+          length(Partitions) =:= 4 andalso Led =:= Partitions,
+          fmt("~b partitions", [length(Partitions)])),
+    ?C:close(C),
+
+    Group = must(?G:start_link(Address, unique("erl-maxpoll"),
+                               #{enable_auto_commit => false, max_poll_records => 3})),
+    ok = ?G:subscribe(Group, [T]),
+    Sizes = poll_sizes(Group, 20, now_ms() + 20000, []),
+    check("max.poll.records caps every poll",
+          lists:sum(Sizes) =:= 20 andalso lists:max([0 | Sizes]) =:= 3,
+          fmt("~b records, polls ~p", [lists:sum(Sizes), Sizes])),
+    must(?G:close(Group)).
+
+poll_sizes(Group, Want, Deadline, Acc) ->
+    case lists:sum(Acc) < Want andalso now_ms() < Deadline of
+        false -> lists:reverse(Acc);
+        true ->
+            case ?G:poll(Group, 300) of
+                {ok, Records} -> poll_sizes(Group, Want, Deadline, [length(Records) | Acc]);
+                {error, _} -> poll_sizes(Group, Want, Deadline, Acc)
+            end
+    end.
+
+bounds_checked_decoding() ->
+    section("decoding is bounds-checked"),
+    P = brahmaputra_protocol,
+    Negative = P:decode_body(P:body([P:enc_int32(-5)]), fun(R) -> P:dec_string(R) end),
+    check("a negative length is an error, not a read",
+          element(1, Negative) =:= error, fmt("~p", [Negative])),
+    Oversized = P:decode_body(P:body([P:enc_int32(1 bsl 30)]), fun(R) -> P:dec_string(R) end),
+    Record = #{key => <<"k">>, value => <<"v">>, headers => [], timestamp_delta => 0},
+    {ok, <<Head:8/binary, _:8, Tail/binary>>} = P:encode_record_batch([Record], now_ms(), none),
+    Truncated = P:decode_record_batch(<<Head/binary, 16#7f, Tail/binary>>),
+    check("an oversized length is an error, not a read",
+          element(1, Oversized) =:= error andalso element(1, Truncated) =:= error,
+          fmt("~p ~p", [Oversized, Truncated])).
+
+auto_commit_topics_heartbeats(Address) ->
+    section("consumer groups: auto commit, several topics, heartbeats"),
+    T1 = unique("erl-multi-a"),
+    T2 = unique("erl-multi-b"),
+    Producer = producer(Address, #{}),
+    [begin
+         must(?P:send(Producer, T1, bin("a~b", [I]))),
+         must(?P:send(Producer, T2, bin("b~b", [I])))
+     end || I <- lists:seq(0, 5)],
+    must(?P:close(Producer)),
+
+    Group = must(?G:start_link(Address, unique("erl-multi"),
+                               #{enable_auto_commit => true, auto_commit_interval_ms => 200})),
+    ok = ?G:subscribe(Group, [T1, T2]),
+    {Seen, _} = poll_until(Group, 12, 20000, 300),
+    Topics = lists:usort([Tp || #{topic := Tp} <- Seen]),
+    check("one member subscribed to two topics consumes both",
+          length(Seen) =:= 12 andalso length(Topics) =:= 2, fmt("~b records", [length(Seen)])),
+    timer:sleep(300),
+    _ = ?G:poll(Group, 300),
+    Total = committed_total(Group),
+    check("enable.auto.commit commits on poll after auto.commit.interval.ms", Total =:= 12,
+          fmt("committed ~b", [Total])),
+    must(?G:close(Group)),
+
+    Idle = unique("erl-idle"),
+    Seeder = producer(Address, #{}),
+    must(?P:send(Seeder, Idle, <<"x">>)),
+    must(?P:close(Seeder)),
+    Quiet = must(?G:start_link(Address, unique("erl-heartbeat"),
+                               #{enable_auto_commit => false, session_timeout_ms => 1500,
+                                 heartbeat_interval_ms => 300})),
+    ok = ?G:subscribe(Quiet, [Idle]),
+    _ = poll_until(Quiet, 1, 15000, 300),
+    Generation = ?G:generation(Quiet),
+    timer:sleep(4000), % no poll: only heartbeats keep it in
+    Committed = ?G:commit(Quiet),
+    check("heartbeats keep an idle member in its group past session.timeout.ms",
+          Committed =:= ok andalso ?G:generation(Quiet) =:= Generation, fmt("~p", [Committed])),
+    must(?G:close(Quiet)).
+
+fencing_rejoin_leave_static(Address) ->
+    section("consumer groups: fencing, rejoin, leave and static membership"),
+    T = unique("erl-fence"),
+    Producer = producer(Address, #{}),
+    [must(?P:send(Producer, T, bin("f~b", [I]))) || I <- lists:seq(0, 7)],
+
+    GroupId = unique("erl-fence-grp"),
+    Config = #{enable_auto_commit => false, max_poll_interval_ms => 60000,
+               heartbeat_interval_ms => 200},
+    First = must(?G:start_link(Address, GroupId, Config)),
+    ok = ?G:subscribe(First, [T]),
+    _ = poll_until(First, 8, 15000, 300),
+
+    %% The coordinator forgets this member behind its back, as it does
+    %% when a session expires.
+    P = brahmaputra_protocol,
+    OldMember = ?G:member_id(First),
+    OldGeneration = ?G:generation(First),
+    Router = must(brahmaputra_router:start_link(Address, #{})),
+    {ok, Seed} = brahmaputra_router:seed(Router),
+    {ok, _} = brahmaputra_conn:request(Seed, 18, P:body([P:enc_string(GroupId),
+                                                          P:enc_string(OldMember)])),
+    brahmaputra_router:stop(Router),
+    timer:sleep(1000), % a heartbeat learns UNKNOWN_MEMBER_ID
+    [must(?P:send(Producer, T, bin("f~b", [I]))) || I <- lists:seq(8, 11)],
+    {After, _} = poll_until(First, 4, 15000, 300),
+    Recommit = ?G:commit(First),
+    check("a member the coordinator forgot rejoins on its next poll",
+          length(After) =:= 4 andalso ?G:generation(First) > OldGeneration andalso Recommit =:= ok,
+          fmt("~b records, ~s@~b -> ~s@~b ~p", [length(After), OldMember, OldGeneration,
+                                                ?G:member_id(First), ?G:generation(First), Recommit])),
+
+    %% A second member joins; the first sits out the rebalance and its
+    %% generation goes stale.
+    StaleGeneration = ?G:generation(First),
+    Second = must(?G:start_link(Address, GroupId, Config)),
+    ok = ?G:subscribe(Second, [T]),
+    _ = poll_until(Second, 1000, 8000, 300),
+    Fenced = ?G:commit(First),
+    check("a commit from a stale generation is fenced",
+          case Fenced of
+              {error, {server_error, Code, _, _}} -> Code =:= 16 orelse Code =:= 13;
+              _ -> false
+          end, fmt("generation ~b -> ~p", [StaleGeneration, Fenced])),
+    must(?G:close(Second)),
+    must(?G:close(First)),
+
+    %% Close sends LeaveGroup: the next member gets every partition at once
+    %% instead of waiting out a long session.
+    Slow = Config#{session_timeout_ms => 30000, rebalance_timeout_ms => 30000},
+    LeaveGroup = <<GroupId/binary, "-leave">>,
+    Leaver = must(?G:start_link(Address, LeaveGroup, Slow)),
+    ok = ?G:subscribe(Leaver, [T]),
+    _ = poll_until(Leaver, 12, 15000, 300),
+    must(?G:close(Leaver)),
+    Successor = must(?G:start_link(Address, LeaveGroup, Slow)),
+    ok = ?G:subscribe(Successor, [T]),
+    Started = now_ms(),
+    [must(?P:send(Producer, T, bin("f~b", [I]))) || I <- lists:seq(12, 13)],
+    {HandedOver, _} = poll_until(Successor, 2, 15000, 300),
+    Took = now_ms() - Started,
+    Held = ?G:assignment(Successor),
+    check("close leaves the group so partitions move without a session timeout",
+          length(HandedOver) =:= 2 andalso length(Held) =:= 4 andalso Took < 10000,
+          fmt("~b records after ~bms", [length(HandedOver), Took])),
+    must(?G:close(Successor)),
+
+    StaticGroup = unique("erl-static"),
+    Static = Config#{group_instance_id => <<"erl-instance-1">>},
+    Original = must(?G:start_link(Address, StaticGroup, Static)),
+    ok = ?G:subscribe(Original, [T]),
+    _ = poll_until(Original, 14, 15000, 300),
+    OriginalMember = ?G:member_id(Original),
+    OriginalGeneration = ?G:generation(Original),
+    Restarted = must(?G:start_link(Address, StaticGroup, Static)),
+    ok = ?G:subscribe(Restarted, [T]),
+    _ = poll_until(Restarted, 1000, 3000, 300),
+    check("a static member reclaims its member id without a rebalance",
+          OriginalMember =/= <<>> andalso ?G:member_id(Restarted) =:= OriginalMember
+              andalso ?G:generation(Restarted) =:= OriginalGeneration,
+          fmt("~s@~b vs ~s@~b", [OriginalMember, OriginalGeneration,
+                                 ?G:member_id(Restarted), ?G:generation(Restarted)])),
+    must(?G:close(Restarted)),
+    must(?G:close(Original)),
+    must(?P:close(Producer)).
+
+sticky_unit() ->
+    section("assignors: sticky keeps what members hold"),
+    Members = [{<<"m1">>, [<<"t">>]}, {<<"m2">>, [<<"t">>]}],
+    Topics = #{<<"t">> => lists:seq(0, 11)},
+    Previous = #{<<"m1">> => [{<<"t">>, 2}, {<<"t">>, 10}, {<<"t">>, 11}],
+                 <<"m2">> => [{<<"t">>, 0}, {<<"t">>, 1}]},
+    {ok, Sticky} = brahmaputra_assignor:assign(sticky, Members, Topics, Previous),
+    #{<<"m1">> := M1, <<"m2">> := M2} = Sticky,
+    Holds = fun(Slots, Ps) -> lists:all(fun(Pt) -> lists:member({<<"t">>, Pt}, Slots) end, Ps) end,
+    check("sticky leaves every held partition where it was",
+          Holds(M1, [2, 10, 11]) andalso Holds(M2, [0, 1])
+              andalso length(M1) =:= 6 andalso length(M2) =:= 6, fmt("~p", [Sticky])),
+    Ids = [Pt || {_, Pt} <- M1],
+    check("sticky orders partitions as numbers, not strings",
+          length(Ids) > 1 andalso Ids =:= lists:usort(Ids), fmt("~p", [Ids])),
+    {ok, Range} = brahmaputra_assignor:assign(range, Members, Topics, #{}),
+    {ok, RoundRobin} = brahmaputra_assignor:assign(roundrobin, Members, Topics, #{}),
+    check("range and roundrobin split twelve partitions six and six",
+          length(maps:get(<<"m1">>, Range)) =:= 6 andalso length(maps:get(<<"m2">>, Range)) =:= 6
+              andalso length(maps:get(<<"m1">>, RoundRobin)) =:= 6
+              andalso lists:nth(2, maps:get(<<"m1">>, RoundRobin)) =:= {<<"t">>, 2},
+          fmt("~p ~p", [Range, RoundRobin])).
+
+%% A proxy that understands frames. It forwards every request to the broker
+%% except Produce, which it can answer itself with an error code for the
+%% next N requests -- how a leader move or an under-replicated partition
+%% looks to a producer -- and it records what each Produce asked for. The
+%% connections are pipelined, so replies are matched by correlation id, not
+%% by order; the proxy only has to keep each frame whole.
+start_fault_proxy(Host, Port) ->
+    Self = self(),
+    Manager = spawn(fun() -> fault_manager(Self, Host, Port) end),
+    receive {fault_proxy_port, Manager, P} -> {Manager, P} end.
+
+fault_proxy_port({_, P}) -> P.
+
+fault_manager(Owner, Host, Port) ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}, {packet, 4}]),
+    {ok, P} = inet:port(Listen),
+    Manager = self(),
+    spawn_link(fun() -> fault_accept(Manager, Listen, Host, Port) end),
+    Owner ! {fault_proxy_port, self(), P},
+    fault_loop(Listen, [], #{failures => 0, code => 0, produces => 0, acks => 0, timeout => 0}).
+
+fault_loop(Listen, Pairs, Stats) ->
+    receive
+        {pair, Pid} ->
+            fault_loop(Listen, [Pid | Pairs], Stats);
+        {produce, From, Acks, Timeout} ->
+            #{failures := Failures, code := Code, produces := Produces} = Stats,
+            Reply = case Failures > 0 of true -> {fail, Code}; false -> forward end,
+            From ! {verdict, Reply},
+            fault_loop(Listen, Pairs, Stats#{failures := max(0, Failures - 1),
+                                             produces := Produces + 1,
+                                             acks := Acks, timeout := Timeout});
+        {fail, From, Count, Code} ->
+            From ! failing,
+            fault_loop(Listen, Pairs, Stats#{failures := Count, code := Code, produces := 0});
+        {stats, From} ->
+            From ! {stats, maps:get(produces, Stats), maps:get(acks, Stats), maps:get(timeout, Stats)},
+            fault_loop(Listen, Pairs, Stats);
+        {stop, From} ->
+            [exit(Pid, kill) || Pid <- Pairs],
+            gen_tcp:close(Listen),
+            From ! stopped
+    end.
+
+fault_accept(Manager, Listen, Host, Port) ->
+    case gen_tcp:accept(Listen) of
+        {ok, Client} ->
+            Pair = spawn(fun() -> fault_pair(Manager, Host, Port) end),
+            ok = gen_tcp:controlling_process(Client, Pair),
+            Pair ! {client, Client},
+            Manager ! {pair, Pair},
+            fault_accept(Manager, Listen, Host, Port);
+        {error, _} ->
+            ok
+    end.
+
+fault_pair(Manager, Host, Port) ->
+    receive {client, Client} -> ok end,
+    {ok, Upstream} = gen_tcp:connect(Host, Port, [binary, {active, true}, {packet, 4}]),
+    ok = inet:setopts(Client, [{active, true}]),
+    fault_pump(Manager, Client, Upstream).
+
+fault_pump(Manager, Client, Upstream) ->
+    P = brahmaputra_protocol,
+    receive
+        {tcp, Client, <<0:16/signed, _:16, Corr:32/signed, ClientLen:16/signed, Rest/binary>> = Frame} ->
+            <<_:ClientLen/binary, Body/binary>> = Rest,
+            {ok, {Topic, Partition, Acks, Timeout}} =
+                P:decode_body(Body, fun(R0) ->
+                    {Tp, R1} = P:dec_string(R0),
+                    {Pt, R2} = P:dec_int32(R1),
+                    {A, R3} = P:dec_int32(R2),
+                    {To, _} = P:dec_int32(R3),
+                    {Tp, Pt, A, To}
+                end),
+            Manager ! {produce, self(), Acks, Timeout},
+            receive
+                {verdict, forward} ->
+                    ok = gen_tcp:send(Upstream, Frame);
+                {verdict, {fail, Code}} ->
+                    Reply = P:body([P:enc_string(Topic), P:enc_int32(Partition), P:enc_int32(Code),
+                                    P:enc_int64(-1), P:enc_int64(-1)]),
+                    ok = gen_tcp:send(Client, P:encode_frame(0, Corr, <<>>, Reply))
+            end,
+            fault_pump(Manager, Client, Upstream);
+        {tcp, Client, Data} -> ok = gen_tcp:send(Upstream, Data), fault_pump(Manager, Client, Upstream);
+        {tcp, Upstream, Data} -> ok = gen_tcp:send(Client, Data), fault_pump(Manager, Client, Upstream);
+        {tcp_closed, _} -> gen_tcp:close(Client), gen_tcp:close(Upstream);
+        {tcp_error, _, _} -> gen_tcp:close(Client), gen_tcp:close(Upstream)
+    end.
+
+fail_produces({Manager, _}, Count, Code) ->
+    Manager ! {fail, self(), Count, Code},
+    receive failing -> ok end.
+
+fault_stats({Manager, _}) ->
+    Manager ! {stats, self()},
+    receive {stats, Produces, Acks, Timeout} -> {Produces, Acks, Timeout} end.
+
+stop_fault_proxy({Manager, _}) ->
+    Manager ! {stop, self()},
+    receive stopped -> ok end.

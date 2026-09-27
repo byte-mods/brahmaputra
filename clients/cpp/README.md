@@ -3,7 +3,7 @@
 C++17, POSIX sockets, `std::thread`. No dependencies beyond the standard
 library, except zlib for the built-in gzip codec, and that is optional.
 
-This was tested end to end against a live broker and passed all **54/54 checks**
+This was tested end to end against a live broker and passed all **87/87 checks**
 (`./test.sh 127.0.0.1 9092`). With `-Wall -Wextra -Wpedantic` it builds without
 warnings on g++ 13 and clang 18, and it runs clean under ThreadSanitizer.
 
@@ -112,7 +112,8 @@ the client recovers from a broker restart without being rebuilt.
 only one batch in flight per partition, so a linger flush and a batch-full
 flush cannot reorder a partition.
 
-A background thread heartbeats every `session.timeout.ms / 3`. If the
+A background thread heartbeats every `heartbeat.interval.ms` (default
+`session.timeout.ms / 3`). If the
 application goes `max.poll.interval.ms` without calling `poll()`, the thread
 sends LeaveGroup, and the next `poll()` rejoins. Time spent inside `poll()`
 does not count toward that interval. A commit from a generation the group
@@ -160,6 +161,7 @@ Kafka's property names. Unknown keys throw. `bootstrap.servers` and
 | Property | Field | Default |
 |---|---|---|
 | `session.timeout.ms` | `sessionTimeoutMs` | 10000 (Kafka: 45000) |
+| `heartbeat.interval.ms` | `heartbeatIntervalMs` | 0 = `session.timeout.ms / 3`; must be below the session timeout |
 | `rebalance.timeout.ms` | `rebalanceTimeoutMs` | 3000 |
 | `max.poll.interval.ms` | `maxPollIntervalMs` | 300000 |
 | `enable.auto.commit` | `enableAutoCommit` | `true` |
@@ -192,8 +194,16 @@ Start a broker, then:
 ./test.sh 127.0.0.1 9092        # builds into ./build and runs build/manual_test
 ```
 
-The suite is a port of `clients/go/cmd/manualtest` with the same sections and
-the same checks. It prints `54 passed, 0 failed` and exits non-zero on any
+The suite starts with a port of `clients/go/cmd/manualtest` (the same 54
+checks) and adds 33 more, one for every item of the client contract those do
+not reach: synchronous send, explicit partition and timestamp, round-robin,
+batch.size / linger.ms / close, retries, backoff, request.timeout.ms and
+delivery.timeout.ms (through a fault-injecting proxy that answers Produce with
+error codes), codec registration, fetch limits, high watermark, offsets by
+timestamp, metadata, max.poll.records, bounds-checked decoding, auto commit,
+multi-topic subscriptions, heartbeats, generation fencing, rejoin after the
+coordinator forgets a member, LeaveGroup on close, static membership and the
+sticky assignor. It prints `87 passed, 0 failed` and exits non-zero on any
 failure.
 
 ## Not implemented

@@ -14,12 +14,19 @@ or build and install the gem:
 cd clients/ruby && gem build brahmaputra.gemspec && gem install brahmaputra-0.1.0.gem
 ```
 
-Verified end to end against a live broker: **54/54 checks**, the same
-checks as the Go suite (`clients/go/cmd/manualtest`). They include wire
-edge cases (1 MiB values, empty vs null keys and header values, unicode),
-per-partition ordering under linger flushes, background flush failures,
-unresponsive and dropped connections, and `max.poll.interval.ms`
-behaviour. Run them with `./test.sh HOST PORT`.
+Verified end to end against a live broker: **87/87 checks**. The first 54
+are the Go suite's (`clients/go/cmd/manualtest`): wire edge cases (1 MiB
+values, empty vs null keys and header values, unicode), per-partition
+ordering under linger flushes, background flush failures, unresponsive and
+dropped connections, and `max.poll.interval.ms` behaviour. The other 33
+cover the rest of the client contract: synchronous send, explicit partition
+and timestamp, round-robin, `batch.size`/`linger.ms`/close, retries,
+backoff, `request.timeout.ms` and `delivery.timeout.ms` (through a
+fault-injecting proxy), codec registration, fetch limits, high watermark,
+offsets by timestamp, metadata, `max.poll.records`, bounds-checked decoding,
+auto commit, several topics, heartbeats, generation fencing, rejoin,
+LeaveGroup on close, static membership and the sticky assignor. Run them
+with `./test.sh HOST PORT`.
 
 ## Produce
 
@@ -118,7 +125,8 @@ Common: `bootstrap.servers` (comma-separated `host:port`), `client.id`,
 | `batch.size` | 16384 | bytes per partition batch |
 | `linger.ms` | 5 | Kafka's default is 0; `0` sends immediately |
 | `compression.type` | `none` | `none`, `gzip` built in; others via `register_codec` |
-| `retries` / `retry.backoff.ms` | 5 / 100 | retriable broker errors and broken connections |
+| `retries` / `retry.backoff.ms` | 5 / 100 | broker errors returned before the append (not leader, not enough replicas, ...) and failures to reach the leader; a request lost on the wire is not resent, since it may have been appended |
+| `request.timeout.ms` | 30000 | sent to the broker as its ack wait, and bounds each round trip |
 | `delivery.timeout.ms` | 120000 | caps buffered time plus every attempt |
 | `buffer.memory` / `max.block.ms` | 32 MiB / 60000 | bounded client buffer |
 

@@ -552,6 +552,376 @@ section('consumer group: time inside poll does not count against max.poll.interv
     $consumer->close;
 }
 
+# ---------------------------------------------------------------------------
+# Checks beyond the Go suite's 54: one per feature of the client contract
+# that those do not already exercise.
+# ---------------------------------------------------------------------------
+
+sub mono_ms { int(Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) * 1000) }
+
+# Polls until $want records arrive or $limit_ms passes. With $largest, also
+# records the biggest single poll.
+sub poll_until {
+    my ($consumer, $want, $limit_ms, $largest) = @_;
+    my @seen;
+    my $deadline = mono_ms() + $limit_ms;
+    while (@seen < $want && mono_ms() < $deadline) {
+        my @batch = eval { $consumer->poll(300) };
+        $$largest = @batch if $largest && @batch > $$largest;
+        push @seen, @batch;
+    }
+    return @seen;
+}
+
+sub committed_total {
+    my ($consumer) = @_;
+    my $total = 0;
+    $total += $_->offset for $consumer->committed;
+    return $total;
+}
+
+section('producer: explicit partition, timestamp and synchronous send');
+{
+    my $t = unique('perl-sync');
+    my $producer = Brahmaputra::Producer->new(producer_config());
+    my @offsets = map { $producer->send_sync(topic => $t, value => "sync-$_", partition => 0) } 0 .. 2;
+    check("send_sync returns each record's offset", "@offsets" eq '0 1 2', "@offsets");
+    $producer->send(topic => $t, value => 'stamped', partition => 2, timestamp => 1_600_000_000_123);
+    $producer->close;
+    my $consumer = Brahmaputra::Consumer->new(consumer_config());
+    my @on_two = $consumer->fetch($t, 2, 0, 500);
+    my @on_zero = $consumer->fetch($t, 0, 0, 500);
+    check('an explicit partition is honoured', @on_two == 1 && @on_zero == 3, 'partition 2 holds ' . scalar @on_two);
+    check('an explicit timestamp survives the round trip',
+        @on_two == 1 && $on_two[0]->timestamp == 1_600_000_000_123, @on_two ? $on_two[0]->timestamp : 'no record');
+    $consumer->close;
+}
+
+section('producer: round-robin for records without a key');
+{
+    my $t = unique('perl-rr');
+    my $producer = Brahmaputra::Producer->new(producer_config());
+    my @partitions = $producer->router->partitions($t);
+    $producer->send(topic => $t, value => "rr$_") for 0 .. 7;
+    $producer->close;
+    my $consumer = Brahmaputra::Consumer->new(consumer_config());
+    my @counts = map { scalar(my @r = $consumer->fetch($t, $_, 0, 300)) } @partitions;
+    check('unkeyed records are spread evenly over every partition', "@counts" eq '2 2 2 2', "@counts");
+    $consumer->close;
+}
+
+section('producer: batch.size, linger.ms and close');
+{
+    my $consumer = Brahmaputra::Consumer->new(consumer_config());
+    my $full = unique('perl-batchfull');
+    my $eager = Brahmaputra::Producer->new(producer_config('linger.ms' => 60_000, 'batch.size' => 64));
+    $eager->send(topic => $full, value => 'b' x 100, partition => 0);
+    check('a batch that reaches batch.size is sent without waiting for linger.ms',
+        scalar(my @f = $consumer->fetch($full, 0, 0, 300)) == 1);
+
+    # No sender thread here: a lingering batch goes out from the next call
+    # into the producer once linger.ms has passed (poll() in a worker loop).
+    my $lingering = unique('perl-linger');
+    my $lazy = Brahmaputra::Producer->new(producer_config('linger.ms' => 100, 'batch.size' => 1 << 20));
+    $lazy->send(topic => $lingering, value => 'waits', partition => 0);
+    $lazy->poll(0);
+    my $held_back = !scalar(my @h = $consumer->fetch($lingering, 0, 0, 0));
+    sleep_ms(300);
+    $lazy->poll(0);
+    check('linger.ms holds a partial batch, then sends it once linger.ms has passed',
+        $held_back && scalar(my @l = $consumer->fetch($lingering, 0, 0, 300)) == 1,
+        $held_back ? 'never sent' : 'sent before linger.ms');
+
+    my $closing = unique('perl-close');
+    my $closer = Brahmaputra::Producer->new(producer_config('linger.ms' => 60_000, 'batch.size' => 1 << 20));
+    $closer->send(topic => $closing, value => "c$_", partition => 0) for 0 .. 4;
+    $closer->close;
+    check('close flushes what is still buffered', scalar(my @c = $consumer->fetch($closing, 0, 0, 300)) == 5);
+    $eager->close;
+    $lazy->close;
+    $consumer->close;
+}
+
+section('producer: retries, request.timeout.ms and delivery.timeout.ms');
+{
+    my $proxy = FaultProxy->start($host, $port);
+    my $t = unique('perl-retry');
+    my %base = ('bootstrap.servers' => $proxy->address, 'linger.ms' => 0, 'acks' => 'all', 'request.timeout.ms' => 4321);
+    my $producer = Brahmaputra::Producer->new({ %base, retries => 3, 'retry.backoff.ms' => 50 });
+    $producer->router->partitions($t);
+    $proxy->fail_produces(2, Brahmaputra::ErrorCode::NOT_LEADER_OR_FOLLOWER);
+    my $error;
+    eval { $producer->send(topic => $t, value => 'persistent', partition => 0); 1 } or $error = $@;
+    my ($produces, $acks, $timeout) = $proxy->stats;
+    my $consumer = Brahmaputra::Consumer->new(consumer_config());
+    check('a retriable error is retried until the send succeeds',
+        !defined $error && $produces == 3 && scalar(my @r = $consumer->fetch($t, 0, 0, 300)) == 1,
+        "attempts=$produces " . msg($error));
+    check('request.timeout.ms and acks travel on the produce request', $timeout == 4321 && $acks == -1, "$timeout/$acks");
+    $consumer->close;
+
+    my $bounded = Brahmaputra::Producer->new({ %base, retries => 2, 'retry.backoff.ms' => 150 });
+    $bounded->router->partitions($t);
+    $proxy->fail_produces(1000, Brahmaputra::ErrorCode::NOT_LEADER_OR_FOLLOWER);
+    my $started = mono_ms();
+    my $failed_right = !eval { $bounded->send(topic => $t, value => 'doomed', partition => 0); 1 }
+        && blessed($@) && $@->isa('Brahmaputra::Error::Server') && $@->code == Brahmaputra::ErrorCode::NOT_LEADER_OR_FOLLOWER;
+    my $took = mono_ms() - $started;
+    ($produces) = $proxy->stats;
+    check('retries are bounded and spaced by retry.backoff.ms', $failed_right && $produces == 3 && $took >= 300,
+        "attempts=$produces took ${took}ms");
+
+    $proxy->fail_produces(1000, Brahmaputra::ErrorCode::INVALID_REQUEST);
+    eval { $bounded->send(topic => $t, value => 'malformed', partition => 0); 1 };
+    ($produces) = $proxy->stats;
+    check('a non-retriable error is not retried', $produces == 1, "attempts=$produces");
+    eval { $bounded->close };
+
+    my $capped = Brahmaputra::Producer->new({ %base, retries => 1000, 'retry.backoff.ms' => 50, 'delivery.timeout.ms' => 400 });
+    $capped->router->partitions($t);
+    $proxy->fail_produces(100_000, Brahmaputra::ErrorCode::NOT_LEADER_OR_FOLLOWER);
+    $started = mono_ms();
+    my $gave_up = !eval { $capped->send(topic => $t, value => 'late', partition => 0); 1 };
+    $took = mono_ms() - $started;
+    ($produces) = $proxy->stats;
+    check('delivery.timeout.ms caps the whole retry loop', $gave_up && $took < 3000, "took ${took}ms, attempts=$produces");
+    $proxy->fail_produces(0, 0);
+    eval { $capped->close };
+    $producer->close;
+    $proxy->close;
+}
+
+section('compression: registering a codec');
+{
+    my $refused = !eval {
+        Brahmaputra::Producer->new({ 'bootstrap.servers' => $bootstrap, 'compression.type' => 'snappy' })->close;
+        1;
+    };
+    check('an unregistered codec is refused up front', $refused);
+
+    # A toy reversible codec: enough to prove the hook is used on both the
+    # produce and the fetch path. The broker stores batches as-is.
+    my $flip = sub { scalar reverse($_[0] ^ ("\x5a" x length $_[0])) };
+    Brahmaputra::Compression::register(Brahmaputra::Compression::SNAPPY, $flip, $flip);
+    my $t = unique('perl-codec');
+    my $producer = Brahmaputra::Producer->new(producer_config('compression.type' => 'snappy'));
+    $producer->send(topic => $t, value => 'through a registered codec', key => 'k', partition => 0, headers => [['h', 'v']]);
+    $producer->close;
+    my $consumer = Brahmaputra::Consumer->new(consumer_config());
+    my @got = $consumer->fetch($t, 0, 0, 300);
+    check('a registered codec compresses on produce and decompresses on fetch',
+        @got == 1 && $got[0]->value eq 'through a registered codec' && $got[0]->key eq 'k' && @{ $got[0]->headers } == 1);
+    $consumer->close;
+    my $encoded = Brahmaputra::RecordBatch::encode([{ key => 'k', value => 'v', headers => [], timestamp_delta => 0 }],
+        now_ms(), Brahmaputra::Compression::SNAPPY);
+    my ($decoded) = Brahmaputra::RecordBatch::decode(\$encoded, 0);
+    check('a batch encoded with it decodes offline',
+        @{ $decoded->{records} } == 1 && $decoded->{records}[0]{value} eq 'v');
+}
+
+section('consumer: fetch limits, watermark, offsets by time, metadata');
+{
+    my $t = unique('perl-fetch');
+    my $producer = Brahmaputra::Producer->new(producer_config());
+    my $base = 1_700_000_000_000;
+    $producer->send(topic => $t, value => chr(ord('a') + $_) x 1000, partition => 0, timestamp => $base + $_ * 1000) for 0 .. 19;
+    $producer->close;
+
+    my $limited = Brahmaputra::Consumer->new({ %{ consumer_config() }, 'fetch.max.bytes' => 2500 });
+    my @capped = $limited->fetch($t, 0, 0, 300);
+    check('fetch.max.bytes caps a response', @capped > 0 && @capped < 20, scalar(@capped) . ' records');
+    $limited->close;
+
+    my $consumer = Brahmaputra::Consumer->new(consumer_config());
+    my $result = $consumer->fetch_verbose($t, 0, 0, 300);
+    check('the high watermark is reported', $result->{high_watermark} == 20, $result->{high_watermark});
+
+    my $waiter = Brahmaputra::Consumer->new({ %{ consumer_config() }, 'fetch.max.wait.ms' => 400, 'fetch.min.bytes' => 1 });
+    my $started = mono_ms();
+    my @none = $waiter->fetch($t, 0, 20, 10_000);
+    my $took = mono_ms() - $started;
+    check('fetch.max.wait.ms bounds a long poll at the end of the log', !@none && $took >= 250 && $took < 3000, "${took}ms");
+    $waiter->close;
+
+    my $by_time = $consumer->list_offsets($t, 0, $base + 5000);
+    my $between = $consumer->list_offsets($t, 0, $base + 5500);
+    check('list offsets by timestamp finds the first record at or after it', $by_time == 5 && $between == 6,
+        "$by_time,$between");
+
+    my $metadata = $consumer->router->metadata([$t], 1);
+    my @infos = @{ $metadata->{topics}{$t} || [] };
+    check("metadata lists a topic's partitions and their leaders",
+        @infos == 4 && !grep({ $_->{leader} < 0 } @infos), scalar(@infos) . ' partitions');
+    $consumer->close;
+
+    my $group = Brahmaputra::GroupConsumer->new(group_config(unique('perl-maxpoll'), 'max.poll.records' => 3));
+    $group->subscribe($t);
+    my $largest = 0;
+    my @seen = poll_until($group, 20, 20_000, \$largest);
+    check('max.poll.records caps every poll', @seen == 20 && $largest == 3,
+        scalar(@seen) . " records, largest poll $largest");
+    $group->close;
+}
+
+section('decoding is bounds-checked');
+{
+    my $negative = !eval { Brahmaputra::Reader->body(Brahmaputra::Writer->body->int32(-5)->bytes)->string; 1 }
+        && blessed($@) && $@->isa('Brahmaputra::Error::Protocol');
+    check('a negative length is an error, not a read', $negative);
+    my $oversized = !eval { Brahmaputra::Reader->body(Brahmaputra::Writer->body->int32(1 << 30)->bytes)->string; 1 }
+        && blessed($@) && $@->isa('Brahmaputra::Error::Protocol');
+    my $batch = Brahmaputra::RecordBatch::encode([{ key => 'k', value => 'v', headers => [], timestamp_delta => 0 }], now_ms());
+    substr($batch, 8, 1) = "\x7f";    # batch_length far past the buffer
+    my $truncated = !eval { Brahmaputra::RecordBatch::decode(\$batch, 0); 1 }
+        && blessed($@) && $@->isa('Brahmaputra::Error::Protocol');
+    check('an oversized length is an error, not a read', $oversized && $truncated);
+}
+
+section('consumer groups: auto commit, several topics, heartbeats');
+{
+    my ($t1, $t2) = (unique('perl-multi-a'), unique('perl-multi-b'));
+    my $producer = Brahmaputra::Producer->new(producer_config());
+    for my $i (0 .. 5) {
+        $producer->send(topic => $t1, value => "a$i");
+        $producer->send(topic => $t2, value => "b$i");
+    }
+    $producer->close;
+
+    my $consumer = Brahmaputra::GroupConsumer->new(group_config(unique('perl-multi'),
+        'enable.auto.commit' => 1, 'auto.commit.interval.ms' => 200));
+    $consumer->subscribe($t1, $t2);
+    my @seen = poll_until($consumer, 12, 20_000);
+    my %topics = map { $_->topic => 1 } @seen;
+    check('one member subscribed to two topics consumes both', @seen == 12 && keys %topics == 2,
+        scalar(@seen) . ' records');
+    sleep_ms(300);
+    eval { $consumer->poll(300) };
+    my $total = committed_total($consumer);
+    check('enable.auto.commit commits on poll after auto.commit.interval.ms', $total == 12, "committed $total");
+    $consumer->close;
+
+    # Single-threaded: heartbeats run inside poll(), commit() and
+    # heartbeat(). An application busy between polls calls heartbeat().
+    my $idle = unique('perl-idle');
+    my $seeder = Brahmaputra::Producer->new(producer_config());
+    $seeder->send(topic => $idle, value => 'x');
+    $seeder->close;
+    my $quiet = Brahmaputra::GroupConsumer->new(group_config(unique('perl-heartbeat'),
+        'session.timeout.ms' => 1500, 'heartbeat.interval.ms' => 300));
+    $quiet->subscribe($idle);
+    poll_until($quiet, 1, 15_000);
+    my $generation = $quiet->generation;
+    my $until = mono_ms() + 4000;
+    while (mono_ms() < $until) {
+        sleep_ms(300);
+        eval { $quiet->heartbeat };
+    }
+    my $error;
+    eval { $quiet->commit; 1 } or $error = $@;
+    check('heartbeats keep an idle member in its group past session.timeout.ms',
+        !defined $error && $quiet->generation == $generation, msg($error));
+    $quiet->close;
+}
+
+section('consumer groups: fencing, rejoin, leave and static membership');
+{
+    my $t = unique('perl-fence');
+    my $producer = Brahmaputra::Producer->new(producer_config());
+    $producer->send(topic => $t, value => "f$_") for 0 .. 7;
+
+    my $group_id = unique('perl-fence-grp');
+    my %config = ('max.poll.interval.ms' => 60_000, 'heartbeat.interval.ms' => 200);
+    my $first = Brahmaputra::GroupConsumer->new(group_config($group_id, %config));
+    $first->subscribe($t);
+    poll_until($first, 8, 15_000);
+
+    # The coordinator forgets this member behind its back, as it does when
+    # a session expires.
+    my $leave = Brahmaputra::Writer->body->string($group_id)->string($first->member_id)->bytes;
+    $first->consumer->router->seed->request(Brahmaputra::Protocol::API_LEAVE_GROUP, $leave);
+    my ($old_member, $old_generation) = ($first->member_id, $first->generation);
+    sleep_ms(1000);
+    $producer->send(topic => $t, value => "f$_") for 8 .. 11;
+    my @after = poll_until($first, 4, 15_000);
+    my $commit_error;
+    eval { $first->commit; 1 } or $commit_error = $@;
+    check('a member the coordinator forgot rejoins on its next poll',
+        @after == 4 && $first->generation > $old_generation && !defined $commit_error,
+        sprintf('%d records, %s@%d -> %s@%d %s', scalar @after, $old_member, $old_generation,
+            $first->member_id, $first->generation, msg($commit_error)));
+
+    # A second member joins; the first sits out the rebalance and its
+    # generation goes stale.
+    my $stale_generation = $first->generation;
+    my $second = Brahmaputra::GroupConsumer->new(group_config($group_id, %config));
+    $second->subscribe($t);
+    poll_until($second, 1000, 8000);
+    my $fenced_code = eval { $first->commit; 0 } // (blessed($@) && $@->can('code') ? $@->code : -1);
+    check('a commit from a stale generation is fenced',
+        $fenced_code == Brahmaputra::ErrorCode::ILLEGAL_GENERATION || $fenced_code == Brahmaputra::ErrorCode::UNKNOWN_MEMBER_ID,
+        "generation $stale_generation -> code $fenced_code");
+    $second->close;
+    $first->close;
+
+    # Close sends LeaveGroup: the next member gets every partition at once
+    # instead of waiting out a long session.
+    my %slow = (%config, 'session.timeout.ms' => 30_000, 'rebalance.timeout.ms' => 30_000);
+    my $leaver = Brahmaputra::GroupConsumer->new(group_config("$group_id-leave", %slow));
+    $leaver->subscribe($t);
+    poll_until($leaver, 12, 15_000);
+    $leaver->close;
+    my $successor = Brahmaputra::GroupConsumer->new(group_config("$group_id-leave", %slow));
+    $successor->subscribe($t);
+    my $started = mono_ms();
+    $producer->send(topic => $t, value => "f$_") for 12 .. 13;
+    my @handed_over = poll_until($successor, 2, 15_000);
+    my $took = mono_ms() - $started;
+    my @held = $successor->assignment;
+    check('close leaves the group so partitions move without a session timeout',
+        @handed_over == 2 && @held == 4 && $took < 10_000, scalar(@handed_over) . " records after ${took}ms");
+    $successor->close;
+
+    my $static_group = unique('perl-static');
+    my %static = (%config, 'group.instance.id' => 'perl-instance-1');
+    my $original = Brahmaputra::GroupConsumer->new(group_config($static_group, %static));
+    $original->subscribe($t);
+    poll_until($original, 14, 15_000);
+    my ($original_member, $original_generation) = ($original->member_id, $original->generation);
+    my $restarted = Brahmaputra::GroupConsumer->new(group_config($static_group, %static));
+    $restarted->subscribe($t);
+    poll_until($restarted, 1000, 3000);
+    check('a static member reclaims its member id without a rebalance',
+        length($original_member) && $restarted->member_id eq $original_member && $restarted->generation == $original_generation,
+        sprintf('%s@%d vs %s@%d', $original_member, $original_generation, $restarted->member_id, $restarted->generation));
+    $restarted->close;
+    $original->close;
+    $producer->close;
+}
+
+section('assignors: sticky keeps what members hold');
+{
+    my $tp = sub { Brahmaputra::TopicPartition->new('t', $_[0]) };
+    my $members = [{ id => 'm1', topics => ['t'] }, { id => 'm2', topics => ['t'] }];
+    my $topics = { t => [0 .. 11] };
+    my $previous = { m1 => [map { $tp->($_) } 2, 10, 11], m2 => [map { $tp->($_) } 0, 1] };
+    my $sticky = Brahmaputra::Assignor::assign('sticky', $members, $topics, $previous);
+    my $holds = sub {
+        my ($id, $p) = @_;
+        return grep { $_->partition == $p } @{ $sticky->{$id} };
+    };
+    check('sticky leaves every held partition where it was',
+        $holds->('m1', 2) && $holds->('m1', 10) && $holds->('m1', 11) && $holds->('m2', 0) && $holds->('m2', 1)
+            && @{ $sticky->{m1} } == 6 && @{ $sticky->{m2} } == 6);
+    my @ids = map { $_->partition } @{ $sticky->{m1} };
+    my $numeric = @ids > 1;
+    for my $i (1 .. $#ids) { $numeric = 0 unless $ids[ $i - 1 ] < $ids[$i] }
+    check('sticky orders partitions as numbers, not strings', $numeric, "@ids");
+    my $range = Brahmaputra::Assignor::assign('range', $members, $topics);
+    my $rr = Brahmaputra::Assignor::assign('roundrobin', $members, $topics);
+    check('range and roundrobin split twelve partitions six and six',
+        @{ $range->{m1} } == 6 && @{ $range->{m2} } == 6 && @{ $rr->{m1} } == 6 && $rr->{m1}[1]->partition == 2);
+}
+
 print "\n$passed passed, $failed failed\n";
 exit($failed > 0 ? 1 : 0);
 
@@ -640,6 +1010,159 @@ sub drop_all {
 
 sub close {
     my ($self) = @_;
+    kill 'KILL', $self->{pid};
+    waitpid($self->{pid}, 0);
+    return;
+}
+
+# A proxy that understands frames, in a forked child. It forwards every
+# request to the broker except Produce, which it can answer itself with an
+# error code for the next N requests -- how a leader move or an
+# under-replicated partition looks to a producer -- and it records what
+# each Produce asked for. Driven over a control socket, one line per
+# command: "fail N CODE" and "stats".
+package FaultProxy;
+
+use strict;
+use warnings;
+
+sub start {
+    my ($class, $host, $port) = @_;
+    my $server = IO::Socket::INET->new(Listen => 16, LocalAddr => '127.0.0.1', LocalPort => 0, Proto => 'tcp', ReuseAddr => 1)
+        or die "fault proxy: $!";
+    my $control = IO::Socket::INET->new(Listen => 4, LocalAddr => '127.0.0.1', LocalPort => 0, Proto => 'tcp', ReuseAddr => 1)
+        or die "fault proxy control: $!";
+    my $address = '127.0.0.1:' . $server->sockport;
+    my $control_port = $control->sockport;
+    my $pid = main::run_in_child(sub { _serve($server, $control, $host, $port) });
+    CORE::close $server;
+    CORE::close $control;
+    my $line = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $control_port, Proto => 'tcp')
+        or die "fault proxy control connect: $!";
+    $line->autoflush(1);
+    return bless { address => $address, pid => $pid, control => $line }, $class;
+}
+
+sub _serve {
+    my ($server, $control, $host, $port) = @_;
+    local $SIG{PIPE} = 'IGNORE';
+    my ($failures, $code, $produces, $acks, $timeout) = (0, 0, 0, 0, 0);
+    my $select = IO::Select->new($server, $control);
+    my (%peer, %is_client, %buffer, %controls);
+    my $drop = sub {
+        for my $s (@_) {
+            next unless $s;
+            my $fd = fileno $s;
+            $select->remove($s);
+            if (defined $fd) { delete $peer{$fd}; delete $is_client{$fd}; delete $buffer{$fd}; delete $controls{$fd} }
+            CORE::close $s;
+        }
+    };
+    my $write = sub {
+        my ($to, $data) = @_;
+        my $off = 0;
+        while ($off < length $data) {
+            my $w = syswrite($to, $data, length($data) - $off, $off);
+            return 0 unless $w;
+            $off += $w;
+        }
+        return 1;
+    };
+    while (1) {
+        for my $socket ($select->can_read(0.5)) {
+            if ($socket == $server) {
+                my $client = $server->accept or next;
+                my $upstream = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port, Proto => 'tcp', Timeout => 2);
+                unless ($upstream) { CORE::close $client; next }
+                $peer{ fileno $client } = $upstream;
+                $peer{ fileno $upstream } = $client;
+                $is_client{ fileno $client } = 1;
+                $buffer{ fileno $client } = '';
+                $select->add($client, $upstream);
+                next;
+            }
+            if ($socket == $control) {
+                my $c = $control->accept or next;
+                $controls{ fileno $c } = $c;
+                $select->add($c);
+                next;
+            }
+            my $fd = fileno $socket;
+            next unless defined $fd;
+            if ($controls{$fd}) {
+                my $n = sysread($socket, my $data, 4096);
+                unless ($n) { $drop->($socket); next }
+                $buffer{$fd} .= $data;
+                while ($buffer{$fd} =~ s/^([^\n]*)\n//) {
+                    my @words = split ' ', $1;
+                    if ($words[0] eq 'fail') {
+                        ($failures, $code, $produces) = ($words[1], $words[2], 0);
+                        $write->($socket, "ok\n");
+                    } elsif ($words[0] eq 'stats') {
+                        $write->($socket, "$produces $acks $timeout\n");
+                    }
+                }
+                next;
+            }
+            my $other = $peer{$fd};
+            next unless $other;
+            my $n = sysread($socket, my $data, 1 << 16);
+            unless ($n) { $drop->($socket, $other); next }
+            unless ($is_client{$fd}) {
+                $drop->($socket, $other) unless $write->($other, $data);
+                next;
+            }
+            $buffer{$fd} .= $data;
+            while (length $buffer{$fd} >= 4) {
+                my $length = unpack('N', $buffer{$fd});
+                last if length $buffer{$fd} < 4 + $length;
+                my $frame = substr($buffer{$fd}, 0, 4 + $length, '');
+                my $api_key = unpack('n', substr($frame, 4, 2));
+                if ($api_key == Brahmaputra::Protocol::API_PRODUCE) {
+                    my ($correlation, $body) = Brahmaputra::Protocol::decode_frame_payload(substr($frame, 4));
+                    my $reader = Brahmaputra::Reader->body($body);
+                    my $topic = $reader->string;
+                    my $partition = $reader->int32;
+                    $acks = $reader->int32;
+                    $timeout = $reader->int32;
+                    $produces++;
+                    if ($failures > 0) {
+                        $failures--;
+                        my $reply = Brahmaputra::Writer->body->string($topic)->int32($partition)->int32($code)
+                            ->int64(-1)->int64(-1)->bytes;
+                        $write->($socket, Brahmaputra::Protocol::encode_frame($api_key, $correlation, '', $reply));
+                        next;
+                    }
+                }
+                $write->($other, $frame);
+            }
+        }
+    }
+}
+
+sub address { $_[0]{address} }
+
+sub _command {
+    my ($self, $line) = @_;
+    print { $self->{control} } "$line\n";
+    my $reply = readline $self->{control};
+    chomp $reply;
+    return $reply;
+}
+
+# Answer the next $count Produce requests with $code.
+sub fail_produces {
+    my ($self, $count, $code) = @_;
+    $self->_command("fail $count $code");
+    return;
+}
+
+# (produce requests seen since the last fail_produces, their acks, their timeout)
+sub stats { split ' ', $_[0]->_command('stats') }
+
+sub close {
+    my ($self) = @_;
+    CORE::close $self->{control};
     kill 'KILL', $self->{pid};
     waitpid($self->{pid}, 0);
     return;

@@ -188,7 +188,10 @@ module Brahmaputra
       end
 
       def string_array
-        Array.new(int32) { string }
+        count = int32
+        raise ProtocolError, "array count #{count} exceeds the body" if count.negative? || count > remaining
+
+        Array.new(count) { string }
       end
 
       def rest

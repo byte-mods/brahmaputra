@@ -33,9 +33,11 @@ package Brahmaputra::Producer;
 # Retries. A batch refused with a retriable code (returned before the
 # broker appends, so no duplicate is possible) is retried up to `retries`
 # times, retry.backoff.ms apart, within delivery.timeout.ms of its oldest
-# record. A connection failure mid-request is retried too, as Kafka's
-# non-idempotent producer does: the broker may have appended the batch
-# before the connection dropped, so that case is at-least-once.
+# record. So is a batch that never left because the leader could not be
+# reached. A connection that fails once the request is on the wire is not
+# retried: the broker may already have appended the batch, and resending
+# it would write it twice. That error goes to the caller, and the broken
+# connection is redialled on the next send.
 
 use strict;
 use warnings;
@@ -97,6 +99,9 @@ sub new {
     croak "acks must be 0, 1, -1 or \"all\", got $c->{acks}" unless defined $acks && $acks =~ /^(?:0|1|-1)$/;
     $self->{acks} = 0 + $acks;
     $self->{codec} = Brahmaputra::Compression::parse($c->{'compression.type'});
+    # Fail here rather than on the first (possibly background) flush.
+    croak "compression.type=$c->{'compression.type'} needs Brahmaputra::Compression::register first"
+        unless Brahmaputra::Compression::available($self->{codec});
     croak 'delivery.report.callback must be a code ref'
         if defined $c->{'delivery.report.callback'} && ref $c->{'delivery.report.callback'} ne 'CODE';
     $self->{router} = Brahmaputra::Router->new(
@@ -434,23 +439,20 @@ sub _produce {
         if (Brahmaputra::Config::now_ms() >= $deadline) {
             Brahmaputra::Error::Timeout->throw("delivery.timeout.ms expired for $topic-$partition");
         }
-        my $response = eval {
-            my $connection = $self->{router}->connection_for($topic, $partition);
-            if ($self->{acks} == 0) {
-                $connection->send_oneway(API_PRODUCE, $body);
-                '';
-            } else {
-                $connection->request(API_PRODUCE, $body, $request_timeout + ROUND_TRIP_MARGIN_MS);
-            }
-        };
-        unless (defined $response) {
+        my $connection = eval { $self->{router}->connection_for($topic, $partition) };
+        unless ($connection) {
+            # Nothing was sent, so a retry cannot duplicate.
             my $error = $@;
             die $error unless blessed($error) && $error->isa('Brahmaputra::Error::Connection');
             die $error if $attempts_left-- <= 0 || Brahmaputra::Config::now_ms() >= $deadline;
             Brahmaputra::Config::sleep_ms($c->{'retry.backoff.ms'});
             next;
         }
-        return -1 if $self->{acks} == 0;
+        if ($self->{acks} == 0) {
+            $connection->send_oneway(API_PRODUCE, $body);
+            return -1;
+        }
+        my $response = $connection->request(API_PRODUCE, $body, $request_timeout + ROUND_TRIP_MARGIN_MS);
         my $reader = Brahmaputra::Reader->body($response);
         $reader->string;    # topic
         $reader->int32;     # partition

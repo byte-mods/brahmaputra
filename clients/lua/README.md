@@ -12,9 +12,10 @@ only **LuaSocket**; **lua-zlib** is optional and enables the gzip codec.
 Nothing is compiled: CRC32C, Kafka's murmur2, zigzag varints and the record
 batch codec are written in Lua on its native 64-bit integers.
 
-Verified end to end against a live broker: **54/54 checks**
-(`./test.sh HOST PORT`, a port of the Go suite with the same sections and
-checks).
+Verified end to end against a live broker: **87/87 checks**
+(`./test.sh HOST PORT`: the Go suite's 54 checks plus 33 covering the rest
+of the client contract, including retries and timeouts through a
+fault-injecting proxy).
 
 ## No threads: what that changes
 
@@ -48,8 +49,11 @@ driver):
   error, timeout or correlation-id mismatch closes the connection and sets
   `conn.broken`; it is never reused, and the router redials on next use,
   the seed connection included. An idle connection the broker closed is
-  noticed before it is used. Producers retry a dropped connection within
-  `retries`; consumers resend an idempotent read once.
+  noticed before it is used. A producer retries, within `retries`, a batch
+  that never left because the leader could not be reached; one whose
+  connection failed after the request was written is not resent (the
+  broker may already have appended it), so that error reaches the caller.
+  Consumers resend an idempotent read once.
 - **`buffer.memory` / `max.block.ms`.** When the buffer is full, `send()`
   blocks while sending any batch whose linger falls due; if that frees
   nothing within `max.block.ms` it raises `BufferFullError`.
@@ -187,7 +191,7 @@ integers.
 | `linger.ms` | `5` | Kafka defaults to 0 |
 | `compression.type` | `none` | `none`, `gzip`, or a registered codec |
 | `request.timeout.ms` | `30000` | broker-side ack wait; socket bound is this + 5 s |
-| `retries` | `5` | retriable broker errors and connection failures |
+| `retries` | `5` | broker errors returned before the append, and failures to reach the leader |
 | `retry.backoff.ms` | `100` | |
 | `delivery.timeout.ms` | `120000` | caps a batch from its oldest record's send() to its last retry |
 | `buffer.memory` | `33554432` | unsent bytes held client-side |
@@ -262,12 +266,14 @@ Start a broker, then:
 LUA_PATH="$PWD/?.lua;;" lua5.4 test/manual_test.lua 127.0.0.1 9092
 ```
 
-It prints one line per check and ends with `54 passed, 0 failed`; the exit
+It prints one line per check and ends with `87 passed, 0 failed`; the exit
 status is non-zero on any failure. `test.sh` sets `LUA_PATH` itself, so it
 works from any directory. The suite needs lua-zlib (it checks gzip). With no
 threads or fork in Lua, the connection-failure section runs its TCP proxy
-as a child process (`test/proxy.lua`), and the long-poll group section
-produces from another (`test/late_producer.lua`).
+as a child process (`test/proxy.lua`), the retry section runs a frame-aware
+proxy that answers Produce with injected error codes (`test/fault_proxy.lua`),
+and the long-poll group section produces from another
+(`test/late_producer.lua`).
 
 ## Not implemented
 

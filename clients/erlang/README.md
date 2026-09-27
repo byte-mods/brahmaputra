@@ -18,8 +18,10 @@ Without rebar3, build with plain `erlc`:
 make            # compiles src/ into ebin/, warning-free under -Werror
 ```
 
-Verified end to end against a live broker: **54/54 checks**
-(`./test.sh 127.0.0.1 9092`).
+Verified end to end against a live broker: **87/87 checks**
+(`./test.sh 127.0.0.1 9092`: the Go suite's 54 plus 33 covering the rest of
+the client contract, including retries and timeouts through a
+fault-injecting proxy).
 
 ## Design
 
@@ -53,6 +55,10 @@ ok = brahmaputra_producer:send_to(P, <<"orders">>, 0, undefined, #{key => <<"use
 %% Or wait for one record's offset. A full round trip — correct, and slow.
 {ok, Offset} = brahmaputra_producer:send_sync(P, <<"orders">>, <<"{\"id\":2}">>),
 
+%% Explicit partition and timestamp (unix ms) on either path.
+{ok, _} = brahmaputra_producer:send_sync(P, <<"orders">>, <<"{\"id\":3}">>,
+              #{partition => 1, timestamp => 1700000000000}),
+
 ok = brahmaputra_producer:flush(P),
 ok = brahmaputra_producer:close(P).   % flushes, then stops
 ```
@@ -81,7 +87,7 @@ brahmaputra_consumer:close(C).
 {ok, G} = brahmaputra_group:start_link("127.0.0.1:9092", <<"billing">>,
               #{assignor => sticky,
                 auto_offset_reset => earliest,
-                auto_commit_interval_ms => 0,        % commit explicitly
+                enable_auto_commit => false,         % commit explicitly
                 group_instance_id => <<"worker-3">>}), % static membership
 ok = brahmaputra_group:subscribe(G, [<<"orders">>]),
 
@@ -95,6 +101,10 @@ Loop = fun Loop() ->
 ...
 ok = brahmaputra_group:close(G).   % commits, then LeaveGroup so partitions move at once
 ```
+
+`member_id/1`, `generation/1` and `assignment/1` report the current
+membership. A commit refused for a stale generation (`ILLEGAL_GENERATION`,
+`UNKNOWN_MEMBER_ID`) returns the error and the next `poll/2` rejoins.
 
 With `auto_offset_reset => none`, `poll/2` returns
 `{error, {no_offset_for_partition, Topic, Partition}}` instead of guessing.
@@ -137,17 +147,20 @@ Keys are Kafka's names with dots turned into underscores.
 | Key | Default | Meaning |
 |---|---|---|
 | `session_timeout_ms` | `10000` | coordinator evicts a member silent this long |
+| `heartbeat_interval_ms` | `0` | heartbeat period; `0` means `session_timeout_ms div 3`; must be below the session timeout |
 | `rebalance_timeout_ms` | `3000` | how long the coordinator waits for rejoins |
 | `max_poll_interval_ms` | `300000` | longest gap between polls before this member leaves |
-| `auto_commit_interval_ms` | `5000` | `0` disables auto-commit |
+| `enable_auto_commit` | `true` | commit delivered positions from inside `poll` |
+| `auto_commit_interval_ms` | `5000` | how often; `0` also disables auto-commit |
 | `auto_offset_reset` | `earliest` | `earliest`, `latest` or `none` |
-| `assignor` | `range` | `range`, `roundrobin` or `sticky` |
+| `assignor` | `range` | `partition.assignment.strategy`: `range`, `roundrobin` or `sticky` |
 | `group_instance_id` | `<<>>` | static membership (KIP-345); empty for dynamic |
 
 ## Compression
 
 `none` and `gzip` (via `zlib`) are built in. The rest are opt-in, so this
-application pulls in no NIFs of its own:
+application pulls in no NIFs of its own. A producer started with a codec
+nobody registered returns `{error, {codec_not_registered, Codec}}`:
 
 ```erlang
 brahmaputra_protocol:register_codec(zstd,
@@ -175,8 +188,8 @@ make all test
 erl -noshell -pa ebin -pa test -eval 'brahmaputra_manual_test:main(["127.0.0.1", "9092"])'
 ```
 
-It prints the same sections and checks as the Go and Node.js suites, ends
-with `N passed, 0 failed`, and halts non-zero on any failure.
+It prints the same sections and checks as the Go and Node.js suites, then
+33 more, ends with `87 passed, 0 failed`, and halts non-zero on any failure.
 
 ## Not implemented
 

@@ -12,9 +12,10 @@ TCP using **core modules only**: `IO::Socket::IP`, `IO::Compress::Gzip` /
 `IO::Uncompress::Gunzip`, `Time::HiRes`, `Digest::SHA`, `MIME::Base64`,
 `List::Util`, `Scalar::Util`. No CPAN, no XS, no ithreads.
 
-Verified end to end against a live broker: **54/54 checks**
-(`./test.sh 127.0.0.1 9092`, a port of the Go suite with the same
-sections and checks). Every module compiles clean under
+Verified end to end against a live broker: **87/87 checks**
+(`./test.sh 127.0.0.1 9092`: the Go suite's 54 checks plus 33 covering
+the rest of the client contract, including retries and timeouts through a
+fault-injecting proxy). Every module compiles clean under
 `use strict; use warnings` (`perl -wc`).
 
 ## Single-threaded: what that changes
@@ -49,8 +50,11 @@ happens inside your calls, the same design as the PHP driver:
   `request.timeout.ms` + 5 s on client requests). A timeout, socket error
   or correlation-id mismatch closes the connection and marks it
   `$conn->broken`; it is never reused, and the router redials on next use
-  (the bootstrap connection included). Producers retry a dropped
-  connection within `retries`; consumers resend an idempotent read once.
+  (the bootstrap connection included). A producer retries, within
+  `retries`, a batch that never left because the leader could not be
+  reached; one whose connection failed after the request was written is
+  not resent (the broker may already have appended it), so that error
+  reaches the caller. Consumers resend an idempotent read once.
 - **`buffer.memory` / `max.block.ms`.** When the buffer is full, `send()`
   blocks while sending any batch whose linger falls due; if that frees
   nothing within `max.block.ms` it dies with
@@ -182,9 +186,9 @@ Kafka's names, passed as a hash reference. Unknown keys are rejected.
 | `acks` | `1` | `0`, `1`, `-1`/`all` |
 | `batch.size` | `16384` | bytes per partition batch before it is sent |
 | `linger.ms` | `5` | Kafka defaults to 0 |
-| `compression.type` | `none` | `none`, `gzip`, or a registered codec |
+| `compression.type` | `none` | `none`, `gzip`, or a registered codec (an unregistered one croaks in `new`) |
 | `request.timeout.ms` | `30000` | broker-side ack wait; the socket waits 5 s longer |
-| `retries` | `5` | retriable broker errors and connection failures |
+| `retries` | `5` | broker errors returned before the append, and failures to reach the leader |
 | `retry.backoff.ms` | `100` | |
 | `delivery.timeout.ms` | `120000` | caps a batch from its oldest record's `send()` to its last retry |
 | `buffer.memory` | `33554432` | unsent bytes held client-side |
@@ -257,11 +261,12 @@ perl t/manual_test.pl 127.0.0.1 9092
 prove t/                         # offline unit checks only (also: make test)
 ```
 
-The e2e suite prints one line per check and ends with `54 passed, 0 failed`;
+The e2e suite prints one line per check and ends with `87 passed, 0 failed`;
 the exit status is non-zero on any failure. It needs `fork` (it is not run
-on Windows): the connection-failure section runs a small TCP proxy in a
-forked child, and the long-poll group section produces from a forked child
-while the parent polls.
+on Windows): the connection-failure and retry sections run small TCP
+proxies in forked children (one of them answers Produce with injected error
+codes), and the long-poll group section produces from a forked child while
+the parent polls.
 
 ## Not implemented
 
