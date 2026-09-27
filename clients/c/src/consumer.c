@@ -177,6 +177,20 @@ brp_err_t brp_consumer_fetch(brp_consumer_t *c, const char *topic, int32_t parti
         snprintf(context, sizeof context, "fetch %s-%d", topic, (int)partition);
         err = brp_server_error(code, context);
     }
+    /* max.poll.records: the caller resumes from the last returned offset
+     * + 1, so what is cut here is fetched again next time, not lost. */
+    int limit = c->config.max_poll_records;
+    if (!err && limit > 0 && n > (size_t)limit) {
+        size_t extra = n - (size_t)limit;
+        brp_record_t *tail = malloc(extra * sizeof *tail);
+        if (!tail) {
+            err = brp_set_error(BRP_ERR_NOMEM, "out of memory");
+        } else {
+            memcpy(tail, out + limit, extra * sizeof *tail);
+            brp_records_free(tail, extra);
+            n = (size_t)limit;
+        }
+    }
     if (err) {
         brp_records_free(out, n);
         return err;

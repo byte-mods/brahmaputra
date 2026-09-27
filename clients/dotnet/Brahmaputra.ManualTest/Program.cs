@@ -16,7 +16,7 @@ using System.Text;
 using System.Threading;
 using Brahmaputra;
 
-internal static class Program
+internal static partial class Program
 {
     private static int _passed;
     private static int _failed;
@@ -560,6 +560,8 @@ internal static class Program
             sender.Wait();
             producer.Close();
         }
+
+        RunChecklist(address);
     }
 }
 

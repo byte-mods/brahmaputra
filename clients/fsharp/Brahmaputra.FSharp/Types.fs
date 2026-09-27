@@ -311,6 +311,9 @@ type ConsumerConfig =
       FetchMinBytes: int
       /// `fetch.max.wait.ms`: the long-poll ceiling.
       FetchMaxWaitMs: int
+      /// `max.poll.records`: the most records one fetch returns (0: unlimited); the
+      /// rest come on the next fetch from the last returned offset + 1.
+      MaxPollRecords: int
       /// `client.rack`; `None` for no rack.
       ClientRack: string option
       /// `isolation.level`.
@@ -330,6 +333,7 @@ module ConsumerConfig =
           FetchMaxBytes = 8 * 1024 * 1024
           FetchMinBytes = 1
           FetchMaxWaitMs = 500
+          MaxPollRecords = 500
           ClientRack = None
           IsolationLevel = IsolationLevel.ReadUncommitted
           RequestTimeoutMs = 30_000
@@ -348,6 +352,8 @@ type GroupConsumerConfig =
       GroupInstanceId: string option
       /// `session.timeout.ms`.
       SessionTimeoutMs: int
+      /// `heartbeat.interval.ms`: keep it well under the session timeout; 0 uses a third of it.
+      HeartbeatIntervalMs: int
       /// How long the coordinator waits for members to rejoin during a rebalance.
       RebalanceTimeoutMs: int
       /// `max.poll.interval.ms`. Time spent inside poll never counts against it.
@@ -380,6 +386,7 @@ module GroupConsumerConfig =
           GroupId = ""
           GroupInstanceId = None
           SessionTimeoutMs = 10_000
+          HeartbeatIntervalMs = 3_000
           RebalanceTimeoutMs = 3_000
           MaxPollIntervalMs = 300_000
           MaxPollRecords = 500

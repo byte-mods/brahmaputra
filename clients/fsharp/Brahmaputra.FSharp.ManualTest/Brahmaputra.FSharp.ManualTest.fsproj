@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <Compile Include="Proxy.fs" />
+    <Compile Include="Checklist.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

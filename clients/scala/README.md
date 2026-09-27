@@ -8,8 +8,13 @@ results, `FiniteDuration` settings and `Iterator`/`LazyList` consumption, and th
 
 Scala 3.3 LTS, JVM 17+. No dependencies beyond the Scala library.
 
-Verified end to end against a live broker: **54/54 checks**, the Go suite's sections and
-checks, driven through this wrapper's API (`./test.sh HOST PORT`).
+Verified end to end against a live broker: **88/88 checks** — the Go suite's 54 checks plus
+34 covering the rest of the client feature checklist (batch.size, linger.ms, partitioners,
+record timestamps, send-and-wait offsets, a registered codec, retries and request / delivery
+timeouts through a fault-injecting proxy, bounds-checked decoding, fetch limits, the high
+watermark, offsets by timestamp, multi-topic groups, auto-commit, heartbeats and eviction,
+static membership, LeaveGroup, rebalances), all driven through this wrapper's API
+(`./test.sh HOST PORT`).
 
 ## Build
 
@@ -39,7 +44,11 @@ Using.resource(Producer(settings)) { producer =>
 
   producer.flush().get          // send everything buffered and wait for the acks
 
+  // A record with its own timestamp (unix ms); without one it gets the wall clock.
+  producer.send(ProducerRecord("orders", """{"id":5}""").withTimestamp(System.currentTimeMillis() - 60000))
+
   val offset: Try[Long] = producer.sendAndAwait(ProducerRecord("orders", """{"id":4}"""))
+  val pinned: Try[Long] = producer.sendAndAwait(ProducerRecord("orders", """{"id":6}""").toPartition(3))
 
   // Future-based: runs on the producer's own thread, one at a time, in call order.
   val done: Future[Unit] = producer.sendAsync(ProducerRecord("orders", "async"))
@@ -68,6 +77,8 @@ Using.resource(Consumer(ConsumerSettings("127.0.0.1:9092"))) { consumer =>
   val start = consumer.listOffsets("orders", 0, OffsetSpec.Earliest)
   val end = consumer.listOffsets("orders", 0, OffsetSpec.Latest)
   val anHourAgo = consumer.listOffsets("orders", 0, OffsetSpec.AtTimestamp(System.currentTimeMillis() - 3600000))
+
+  val metadata = consumer.metadata(Seq("orders")).get   // brokers, partitions and their leaders
 }
 ```
 
@@ -82,11 +93,13 @@ Keys, values and header values are `Option[Array[Byte]]`: `None` is null on the 
 val settings = GroupSettings(
   groupId = "billing",
   bootstrapServers = "127.0.0.1:9092",
-  topics = Seq("orders"),
+  topics = Seq("orders", "refunds"),   // any number of topics
   assignor = Assignor.Sticky,
   autoOffsetReset = AutoOffsetReset.Earliest,
   autoCommitInterval = None,           // commit explicitly
-  groupInstanceId = Some("worker-3"))  // static membership
+  groupInstanceId = Some("worker-3"),  // static membership
+  sessionTimeout = 10.seconds,
+  heartbeatInterval = 3.seconds)
 
 Using.resource(GroupConsumer(settings)) { member =>
   for (record <- member.iterator(pollTimeout = 500.millis)) {   // endless; a failed poll throws
@@ -106,7 +119,9 @@ immediately rather than after a session timeout.
 
 `maxPollInterval` bounds the time *between* polls; time spent inside `poll`, a slow join
 included, does not count. A member that stalls leaves the group and rejoins on its next
-`poll`; one the coordinator no longer knows (`UNKNOWN_MEMBER_ID`) rejoins as a new member.
+`poll`; one the coordinator no longer knows (`UNKNOWN_MEMBER_ID`, from a heartbeat or a
+commit) rejoins as a new member, and a commit fenced by a newer generation fails and the next
+`poll` rejoins.
 `AutoOffsetReset.Fail` (Kafka's `none`) makes `poll` fail with
 `NoOffsetForPartitionException`.
 
@@ -133,9 +148,13 @@ Case classes with defaults; change them with named arguments or `copy`. Times ar
 | `maxBlock` | `max.block.ms` | 60 s |
 | `dialTimeout` | — | 30 s |
 
+Only errors the broker returns before appending are retried, so a retry cannot duplicate a
+record; `retries` bounds the attempts after the first and `deliveryTimeout` the whole send.
+
 **`ConsumerSettings`**: `bootstrapServers`, `clientId`, `fetchMaxBytes` (8 MiB),
 `fetchMinBytes` (1), `fetchMaxWait` (500 ms), `readCommitted` (false), `rack`
-(`client.rack`, ""), `maxPollRecords` (500), `dialTimeout` (30 s).
+(`client.rack`, ""), `maxPollRecords` (`max.poll.records`: the most one `fetch` returns;
+500), `dialTimeout` (30 s).
 
 **`GroupSettings`**
 
@@ -144,6 +163,7 @@ Case classes with defaults; change them with named arguments or `copy`. Times ar
 | `groupId` | `group.id` | required |
 | `topics` | `subscribe(...)` | none (or call `subscribe`) |
 | `sessionTimeout` | `session.timeout.ms` | 10 s |
+| `heartbeatInterval` | `heartbeat.interval.ms` | 3 s (zero: a third of the session timeout) |
 | `rebalanceTimeout` | `rebalance.timeout.ms` | 3 s |
 | `maxPollInterval` | `max.poll.interval.ms` | 5 min |
 | `autoCommitInterval` | `auto.commit.interval.ms` | `Some(5.seconds)` (`None` disables) |
@@ -190,7 +210,7 @@ downloads the Scala 3.3.8 compiler and library from Maven Central into
 `~/.cache/brahmaputra-jvm` (override with `BRAHMAPUTRA_JVM_CACHE`) on first use, verifies
 their SHA-1s, compiles the Java driver with `javac -Werror` and then the wrapper and
 `src/test/scala/.../ManualTest.scala` with `scalac -Werror` into `build/test-sh`, and runs
-the suite. It prints `54 passed, 0 failed` and exits non-zero on any failure. With sbt:
+the suite. It prints `88 passed, 0 failed` and exits non-zero on any failure. With sbt:
 
 ```bash
 sbt "Test/runMain io.brahmaputra.scaladsl.ManualTest 127.0.0.1 9092"
@@ -199,5 +219,4 @@ sbt "Test/runMain io.brahmaputra.scaladsl.ManualTest 127.0.0.1 9092"
 ## Not implemented
 
 Same as the Java driver: no TLS (so no usable authentication), no idempotent or
-transactional producer. `sendAndAwait` always uses the partitioner (the Java `sendSync`
-takes no partition).
+transactional producer.

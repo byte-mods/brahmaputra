@@ -314,8 +314,8 @@ static brp_err_t produce(brp_producer_t *p, const char *topic, int32_t partition
     return err;
 }
 
-static brp_err_t flush_slot(brp_producer_t *p, size_t index) {
-    pthread_mutex_lock(&p->flush_mu);
+/* Takes slot `index`'s records and sends them. Called with flush_mu held. */
+static brp_err_t flush_slot_locked(brp_producer_t *p, size_t index) {
     pthread_mutex_lock(&p->mu);
     slot_t *s = &p->slots[index];
     raw_record_t *recs = s->recs;
@@ -330,6 +330,12 @@ static brp_err_t flush_slot(brp_producer_t *p, size_t index) {
     release(p, bytes);
     brp_err_t err = produce(p, topic, partition, recs, n, NULL);
     free_records(recs, n);
+    return err;
+}
+
+static brp_err_t flush_slot(brp_producer_t *p, size_t index) {
+    pthread_mutex_lock(&p->flush_mu);
+    brp_err_t err = flush_slot_locked(p, index);
     pthread_mutex_unlock(&p->flush_mu);
     return err;
 }
@@ -445,7 +451,24 @@ brp_err_t brp_producer_send_sync(brp_producer_t *p, const brp_message_t *m, int6
     size_t size;
     if ((err = copy_record(m, &rec, &size)) != BRP_OK) return err;
     int64_t base = -1;
-    err = produce(p, m->topic, partition, &rec, 1, &base);
+    /* Under flush_mu, and after whatever this partition already buffered:
+     * the offset returned must not land ahead of an earlier send. */
+    pthread_mutex_lock(&p->flush_mu);
+    pthread_mutex_lock(&p->mu);
+    size_t index = 0;
+    bool pending = false;
+    for (size_t i = 0; i < p->slot_count; i++) {
+        if (p->slots[i].partition == partition && strcmp(p->slots[i].topic, m->topic) == 0 &&
+            p->slots[i].n > 0) {
+            index = i;
+            pending = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&p->mu);
+    if (pending) err = flush_slot_locked(p, index);
+    if (!err) err = produce(p, m->topic, partition, &rec, 1, &base);
+    pthread_mutex_unlock(&p->flush_mu);
     raw_record_clear(&rec);
     if (!err && offset) *offset = base;
     return err;

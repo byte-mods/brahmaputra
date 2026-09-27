@@ -3,8 +3,14 @@
 Java 17+. No dependencies — standard library only (gzip from `java.util.zip`,
 CRC32C from `java.util.zip.CRC32C`).
 
-Verified end to end against a live broker: **54/54 checks**, the same
-sections and checks as the Go suite (`./test.sh HOST PORT`).
+Verified end to end against a live broker: **88/88 checks** — the Go
+suite's 54, section for section, plus 34 more covering every item of the
+client feature checklist (batch.size, linger.ms, round-robin and explicit
+partitions, record timestamps, send-and-wait offsets, a registered codec,
+retries / request / delivery timeouts through a fault-injecting proxy,
+bounds-checked decoding, fetch limits, the high watermark, offsets by
+timestamp, multi-topic groups, auto-commit, heartbeats and eviction, static
+membership, LeaveGroup and rebalances) (`./test.sh HOST PORT`).
 
 ## Build
 
@@ -51,10 +57,19 @@ try (Client.Producer producer = new Client.Producer("127.0.0.1", 9092, config)) 
     // A tombstone: a null value, distinct from an empty one.
     producer.send("orders", null, "user-7".getBytes(UTF_8));
 
+    // A record carrying its own timestamp (unix ms); the other overloads, or
+    // Client.NO_TIMESTAMP, stamp the wall clock at send time.
+    producer.send("orders", "{\"id\":5}".getBytes(UTF_8), null,
+            System.currentTimeMillis() - 60_000, List.of());
+
     producer.flush();   // send everything buffered and wait for the acks
 
     // Or wait for one record's offset. A full round trip — correct, and slow.
     long offset = producer.sendSync("orders", "{\"id\":4}".getBytes(UTF_8), null, null);
+    // ...to an explicit partition, with an explicit timestamp. Anything already
+    // buffered for that partition is sent first, so offsets keep send order.
+    long pinned = producer.sendSyncTo("orders", 3, "{\"id\":6}".getBytes(UTF_8), null,
+            Client.NO_TIMESTAMP, List.of());
 }
 ```
 
@@ -85,8 +100,15 @@ try (Client.Consumer consumer =
     long start = consumer.listOffsets("orders", 0, Client.EARLIEST);
     long end = consumer.listOffsets("orders", 0, Client.LATEST);
     long anHourAgo = consumer.listOffsets("orders", 0, System.currentTimeMillis() - 3_600_000);
+    // The first offset whose timestamp is at or after the one asked for.
+
+    Client.ClusterMetadata metadata = consumer.router().metadata(List.of("orders"), true);
+    int leader = metadata.leaderOf("orders", 0);   // requests are routed to it
 }
 ```
+
+A fetch returns at most `maxPollRecords` records; resume from the last
+returned offset + 1 and the rest come next time.
 
 ## Consume as a group
 
@@ -96,10 +118,12 @@ config.assignor = GroupConsumer.Assignor.STICKY;
 config.autoOffsetReset = GroupConsumer.AutoOffsetReset.EARLIEST;
 config.autoCommitIntervalMs = 0;      // commit explicitly
 config.groupInstanceId = "worker-3";  // static membership
+config.sessionTimeoutMs = 10_000;
+config.heartbeatIntervalMs = 3_000;
 
 try (GroupConsumer consumer =
         new GroupConsumer("127.0.0.1", 9092, "billing", config)) {
-    consumer.subscribe(List.of("orders"));
+    consumer.subscribe(List.of("orders", "refunds"));   // any number of topics
     while (true) {
         for (Client.ConsumedRecord record : consumer.poll(500)) {
             handle(record.value);
@@ -122,7 +146,9 @@ cannot rejoin while the thread is busy.
 `max.poll.interval.ms` bounds the time *between* polls. Time spent inside
 `poll` — including a slow join — does not count; a member that does stall
 leaves the group and rejoins on its next `poll`. A member the coordinator
-no longer knows (`UNKNOWN_MEMBER_ID`) rejoins as a new one.
+no longer knows (`UNKNOWN_MEMBER_ID`, from a heartbeat or a commit) rejoins
+as a new one; a commit fenced by a newer generation (`ILLEGAL_GENERATION`,
+`REBALANCE_IN_PROGRESS`) throws and the next `poll` rejoins.
 
 `AutoOffsetReset.NONE` makes `poll` throw
 `Protocol.NoOffsetForPartitionException` rather than guess where to start.
@@ -151,7 +177,9 @@ Public fields on the config classes, named after Kafka's settings.
 Only errors the broker returns *before* appending are retried
 (`NOT_LEADER_OR_FOLLOWER`, leader-epoch errors, `NOT_ENOUGH_REPLICAS`,
 `COORDINATOR_LOAD_IN_PROGRESS`, `INTERNAL`), so a retry cannot duplicate
-a record. When `buffer.memory` is full, `send` blocks for up to
+a record. `retries` bounds the attempts after the first and
+`delivery.timeout.ms` bounds the whole send; whichever runs out first
+ends it. When `buffer.memory` is full, `send` blocks for up to
 `max.block.ms` and then throws `producer buffer full`.
 
 **`Client.ConsumerConfig`**
@@ -164,7 +192,7 @@ a record. When `buffer.memory` is full, `send` blocks for up to
 | `fetchMaxWaitMs` | `fetch.max.wait.ms` | 500 |
 | `isolationLevel` | `isolation.level` | `Protocol.READ_UNCOMMITTED` |
 | `rack` | `client.rack` | `""` |
-| `maxPollRecords` | `max.poll.records` | 500 |
+| `maxPollRecords` | `max.poll.records` (per `fetch`) | 500 (0: unlimited) |
 | `dialTimeoutMs` | — | 30000 |
 
 **`GroupConsumer.GroupConfig`**
@@ -173,6 +201,7 @@ a record. When `buffer.memory` is full, `send` blocks for up to
 |---|---|---|
 | `clientId` | `client.id` | `brahmaputra-java` |
 | `sessionTimeoutMs` | `session.timeout.ms` | 10000 |
+| `heartbeatIntervalMs` | `heartbeat.interval.ms` | 3000 (0: a third of the session timeout) |
 | `rebalanceTimeoutMs` | `rebalance.timeout.ms` | 3000 |
 | `maxPollIntervalMs` | `max.poll.interval.ms` | 300000 |
 | `autoCommitIntervalMs` | `auto.commit.interval.ms` | 5000 (0 disables) |
@@ -227,7 +256,8 @@ Start a broker, then:
 
 `test.sh` compiles with plain `javac -Xlint:all -Werror` into `out/` and
 runs `io.brahmaputra.ManualTest` (`src/test/java`), a port of the Go
-driver's `cmd/manualtest`. It prints `54 passed, 0 failed` and exits
+driver's `cmd/manualtest` plus the checklist checks. It prints
+`88 passed, 0 failed` and exits
 non-zero on any failure. With Maven instead:
 
 ```bash

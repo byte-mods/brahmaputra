@@ -62,6 +62,7 @@ void brp_group_config_init(brp_group_config_t *config) {
     config->client_id = "brahmaputra-c";
     /* Kafka defaults to 45s; 10s as the Rust client does. */
     config->session_timeout_ms = 10000;
+    config->heartbeat_interval_ms = 3000;
     config->rebalance_timeout_ms = 3000;
     config->max_poll_interval_ms = 300000;
     config->auto_commit_interval_ms = 5000;
@@ -377,9 +378,35 @@ brp_err_t brp_group_consumer_commit(brp_group_consumer_t *g) {
         bp_i32(&w, g->positions[i].partition);
         bp_i64(&w, g->positions[i].offset);
     }
-    brp_err_t err = simple_request(g, API_OFFSET_COMMIT, &w, "offset_commit", NULL);
+    int32_t code = 0;
+    brp_err_t err = simple_request(g, API_OFFSET_COMMIT, &w, "offset_commit", &code);
     if (!err) g->last_commit_ms = brp_now_ms();
+    if (code == BRP_ERR_UNKNOWN_MEMBER_ID || code == BRP_ERR_ILLEGAL_GENERATION ||
+        code == BRP_ERR_REBALANCE_IN_PROGRESS) {
+        /* Fenced: this member is no longer in the generation it committed
+         * for. The next poll rejoins, as a new member when the coordinator
+         * no longer knows this one, rather than committing into the same
+         * wall again. */
+        pthread_mutex_lock(&g->mu);
+        if (code == BRP_ERR_UNKNOWN_MEMBER_ID) g->member_id[0] = 0;
+        g->joined = false;
+        pthread_mutex_unlock(&g->mu);
+    }
     return err;
+}
+
+char *brp_group_consumer_member_id(brp_group_consumer_t *g) {
+    pthread_mutex_lock(&g->mu);
+    char *id = brp_strdup(g->member_id);
+    pthread_mutex_unlock(&g->mu);
+    return id;
+}
+
+int32_t brp_group_consumer_generation(brp_group_consumer_t *g) {
+    pthread_mutex_lock(&g->mu);
+    int32_t generation = g->generation;
+    pthread_mutex_unlock(&g->mu);
+    return generation;
 }
 
 static void maybe_auto_commit(brp_group_consumer_t *g) {
@@ -899,7 +926,8 @@ static void *heartbeat_main(void *arg) {
     /* Two independent deadlines are enforced here, so wake often enough
      * for the shorter: deriving the tick from the session timeout alone
      * would leave a long session with a short poll interval unchecked. */
-    int heartbeat_every = g->config.session_timeout_ms / 3;
+    int heartbeat_every = g->config.heartbeat_interval_ms > 0 ? g->config.heartbeat_interval_ms
+                                                              : g->config.session_timeout_ms / 3;
     if (heartbeat_every < 1) heartbeat_every = 1;
     int poll_check_every = g->config.max_poll_interval_ms / 3;
     if (poll_check_every < 1) poll_check_every = 1;

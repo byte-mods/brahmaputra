@@ -3,8 +3,14 @@
 C11 + POSIX (pthreads, BSD sockets). No dependencies beyond libc, plus
 zlib when gzip is wanted (on by default, one compile flag to drop it).
 
-Verified end to end against a live broker: **54/54 checks**
-(`./test.sh 127.0.0.1 9092`), also clean under
+Verified end to end against a live broker: **88/88 checks**
+(`./test.sh 127.0.0.1 9092`) — the Go suite's 54 plus 34 covering the rest
+of the client feature checklist (batch.size, linger.ms, partitioners,
+timestamps, send-and-wait offsets, a registered lz4 codec, retries and
+request / delivery timeouts through a fault-injecting proxy, bounds-checked
+decoding, fetch limits, the high watermark, offsets by timestamp, metadata,
+multi-topic groups, auto-commit, heartbeats and eviction, static
+membership, LeaveGroup, rebalances) — also clean under
 `-fsanitize=address,undefined` (with leak detection) and
 `-fsanitize=thread`.
 
@@ -74,15 +80,18 @@ msg.headers = headers;
 msg.header_count = 1;
 brp_producer_send(producer, &msg);   /* buffered */
 
-int64_t offset;                      /* or one record, one round trip */
-brp_producer_send_sync(producer, &msg, &offset);
+int64_t offset;                      /* or one record, one round trip; */
+brp_producer_send_sync(producer, &msg, &offset);  /* anything buffered for its
+                                                     partition goes first */
 
 brp_producer_flush(producer);
 brp_producer_close(producer);        /* flushes, then frees */
 ```
 
 A tombstone is `msg.value = NULL`. An explicit partition is
-`msg.partition = 3`. `msg.timestamp_ms` overrides the record time.
+`msg.partition = 3`; `BRP_PARTITION_ANY` with a `NULL` key round-robins.
+`msg.timestamp_ms` (unix ms) overrides the record time; `<= 0` stamps the
+wall clock at send.
 
 ## Consume one partition
 
@@ -101,10 +110,20 @@ if (brp_consumer_fetch(consumer, "orders", 0, 0, 500,
     brp_records_free(records, count);
 }
 
-int64_t end;
+int64_t end, an_hour_ago;
 brp_consumer_list_offsets(consumer, "orders", 0, BRP_OFFSET_LATEST, &end);
+/* By timestamp: the first offset whose timestamp is at or after it. */
+brp_consumer_list_offsets(consumer, "orders", 0, now_ms - 3600000, &an_hour_ago);
+
+brp_metadata_t *md;                  /* brokers, partitions and their leaders */
+const char *wanted[] = {"orders"};
+brp_client_metadata(brp_consumer_client(consumer), wanted, 1, &md);
+brp_metadata_free(md);
 brp_consumer_close(consumer);
 ```
+
+A fetch returns at most `max_poll_records` records; fetch again from the
+last returned offset + 1 for the rest.
 
 ## Consume as a group
 
@@ -115,11 +134,13 @@ config.assignor = "sticky";
 config.auto_offset_reset = "earliest";
 config.auto_commit_interval_ms = 0;        /* commit explicitly */
 config.group_instance_id = "worker-3";     /* static membership */
+config.session_timeout_ms = 10000;
+config.heartbeat_interval_ms = 3000;
 
 brp_group_consumer_t *group;
 brp_group_consumer_new("127.0.0.1:9092", "billing", &config, &group);
-const char *topics[] = {"orders"};
-brp_group_consumer_subscribe(group, topics, 1);
+const char *topics[] = {"orders", "refunds"};   /* any number of topics */
+brp_group_consumer_subscribe(group, topics, 2);
 
 for (;;) {
     brp_record_t *records;
@@ -136,6 +157,14 @@ for (;;) {
 }
 brp_group_consumer_close(group);   /* commits, then leaves so partitions move at once */
 ```
+
+`brp_group_consumer_member_id()` and `brp_group_consumer_generation()`
+report the membership. A member the coordinator no longer knows
+(`BRP_ERR_UNKNOWN_MEMBER_ID`, from a heartbeat or a commit) rejoins as a
+new member on its next poll; a commit fenced by a newer generation fails
+with that code and the next poll rejoins. `max_poll_interval_ms` bounds the
+time *between* polls: a member that stalls leaves the group and rejoins on
+its next poll, while time spent inside a poll never counts.
 
 ## Configuration reference
 
@@ -156,6 +185,14 @@ Producer (`brp_producer_config_t`):
 | `max_block_ms` | `max.block.ms` | 60000 |
 | `socket_connection_setup_timeout_ms` | `socket.connection.setup.timeout.ms` | 30000 |
 
+`retries` bounds the attempts after the first, and `delivery_timeout_ms`
+the whole send (`BRP_ERR_DELIVERY_TIMEOUT`); only errors the broker returns
+before appending are retried, so a retry cannot duplicate. The producer's
+per-request socket timeout is `request_timeout_ms` + 5 s;
+`brp_client_config_t.request_timeout_ms` sets it for a bare client. A
+connection that times out or desynchronises is closed and redialled on
+next use (`brp_client_connected()` reports it).
+
 Consumer (`brp_consumer_config_t`):
 
 | Field | Kafka name | Default |
@@ -165,13 +202,15 @@ Consumer (`brp_consumer_config_t`):
 | `fetch_max_wait_ms` | `fetch.max.wait.ms` | 500 |
 | `isolation_level` | `isolation.level` | `BRP_READ_UNCOMMITTED` |
 | `client_rack` | `client.rack` | `""` |
-| `max_poll_records` | `max.poll.records` | 500 |
+| `max_poll_records` | `max.poll.records` | 500 (per fetch; 0 = unlimited) |
+| `socket_connection_setup_timeout_ms` | | 30000 |
 
 Group (`brp_group_config_t`):
 
 | Field | Kafka name | Default |
 |---|---|---|
 | `session_timeout_ms` | `session.timeout.ms` | 10000 |
+| `heartbeat_interval_ms` | `heartbeat.interval.ms` | 3000 (0 = a third of the session timeout) |
 | `rebalance_timeout_ms` | `rebalance.timeout.ms` | 3000 |
 | `max_poll_interval_ms` | `max.poll.interval.ms` | 300000 |
 | `auto_commit_interval_ms` | `auto.commit.interval.ms` | 5000 (0 = off) |
@@ -212,7 +251,8 @@ Start a broker, then:
 SANITIZE=1 ./test.sh 127.0.0.1 9092    # same suite under ASan + UBSan
 ```
 
-It ports the Go suite section for section and prints `N passed, 0 failed`.
+It ports the Go suite section for section, adds the checklist sections,
+and prints `88 passed, 0 failed`.
 It exits 0 on success, 1 if any check fails, and 2 on a fatal setup error.
 
 ## Not implemented

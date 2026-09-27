@@ -14,7 +14,13 @@ To use it from your own project, add a project reference:
 <ProjectReference Include="path/to/clients/dotnet/Brahmaputra/Brahmaputra.csproj" />
 ```
 
-Tested end to end against a live broker: **54/54 checks** (`./test.sh 127.0.0.1 9092`).
+Tested end to end against a live broker: **88/88 checks** (`./test.sh 127.0.0.1 9092`):
+the Go suite's 54 plus 34 covering the rest of the client feature checklist
+(batch.size, linger.ms, partitioners, timestamps, send-and-wait offsets, a
+registered codec, retries and request / delivery timeouts through a
+fault-injecting proxy, bounds-checked decoding, fetch limits, the high
+watermark, offsets by timestamp, metadata, multi-topic groups, auto-commit,
+heartbeats and eviction, static membership, LeaveGroup, rebalances).
 
 Every blocking call has an `…Async` twin that takes a `CancellationToken`.
 The sync methods wrap the async ones. The library uses `ConfigureAwait(false)`
@@ -77,7 +83,13 @@ long end   = consumer.ListOffsets("orders", 0, Wire.Latest);
 long start = consumer.ListOffsets("orders", 0, Wire.Earliest);
 long atT   = consumer.ListOffsets("orders", 0, DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeMilliseconds());
 FetchResult fr = await consumer.FetchVerboseAsync("orders", 0, end, 500);   // fr.HighWatermark
+
+ClusterMetadata md = consumer.Router.Metadata(new[] { "orders" }, refresh: true);
+int leader = md.LeaderOf("orders", 0);   // requests for orders-0 are routed there
 ```
+
+A fetch returns at most `MaxPollRecords` records; resume from the last
+returned offset + 1 and the rest come next time.
 
 ## Consume as a group
 
@@ -90,9 +102,11 @@ var config = new GroupConsumerConfig
     AutoOffsetReset = AutoOffsetReset.Earliest,
     EnableAutoCommit = false,        // commit explicitly
     GroupInstanceId = "worker-3",    // static membership
+    SessionTimeoutMs = 10_000,
+    HeartbeatIntervalMs = 3_000,
 };
 await using var consumer = new GroupConsumer(config);   // on dispose: commit if auto, then LeaveGroup
-consumer.Subscribe(new[] { "orders" });
+consumer.Subscribe(new[] { "orders", "refunds" });   // any number of topics
 
 while (!stopping.IsCancellationRequested)
 {
@@ -107,7 +121,10 @@ A `GroupConsumer` is not thread-safe, which matches Kafka's consumer. Poll
 and commit from one thread or one async flow. Heartbeats run on a
 background task. If the application stops polling for longer than
 `MaxPollIntervalMs`, the member leaves the group on its own, so a live but
-stuck process does not keep its partitions. The next poll rejoins.
+stuck process does not keep its partitions. The next poll rejoins. A member
+the coordinator no longer knows (`UNKNOWN_MEMBER_ID`, from a heartbeat or a
+commit) rejoins as a new member; a commit fenced by a newer generation
+throws and the next poll rejoins.
 
 ## Configuration
 
@@ -126,7 +143,7 @@ Names follow Kafka's. Where a default differs from Kafka's, the table says so.
 | `RequestTimeoutMs` | `request.timeout.ms` | 30000 |
 | `Retries` | `retries` | 5 (retriable broker errors only, so a retry never duplicates) |
 | `RetryBackoffMs` | `retry.backoff.ms` | 100 |
-| `DeliveryTimeoutMs` | `delivery.timeout.ms` | 120000 |
+| `DeliveryTimeoutMs` | `delivery.timeout.ms` | 120000 (from `Send` through the last retry) |
 | `BufferMemory` | `buffer.memory` | 32 MiB |
 | `MaxBlockMs` | `max.block.ms` | 60000, then `BufferFullException` |
 | `ConnectTimeoutMs` | `socket.connection.setup.timeout.ms` | 30000 |
@@ -138,7 +155,7 @@ Names follow Kafka's. Where a default differs from Kafka's, the table says so.
 | `FetchMaxBytes` | `fetch.max.bytes` | 8 MiB |
 | `FetchMinBytes` | `fetch.min.bytes` | 1 |
 | `FetchMaxWaitMs` | `fetch.max.wait.ms` | 500 |
-| `MaxPollRecords` | `max.poll.records` | 500 |
+| `MaxPollRecords` | `max.poll.records` | 500 (per fetch and per group poll; 0 unlimited) |
 | `ClientRack` | `client.rack` | empty |
 | `IsolationLevel` | `isolation.level` | `Wire.ReadUncommitted` |
 | `RequestTimeoutMs`, `ConnectTimeoutMs`, `BootstrapServers`, `ClientId` | | as above |
@@ -149,6 +166,7 @@ Names follow Kafka's. Where a default differs from Kafka's, the table says so.
 |---|---|---|
 | `GroupId` | `group.id` | required |
 | `SessionTimeoutMs` | `session.timeout.ms` | 10000 (Kafka: 45000) |
+| `HeartbeatIntervalMs` | `heartbeat.interval.ms` | 3000 (0: a third of the session timeout) |
 | `RebalanceTimeoutMs` | | 3000 |
 | `MaxPollIntervalMs` | `max.poll.interval.ms` | 300000 |
 | `EnableAutoCommit` | `enable.auto.commit` | true |
@@ -190,8 +208,9 @@ Start a broker, then:
 ```
 
 The script builds the solution in Release and runs `Brahmaputra.ManualTest`.
-That suite has the same sections and checks as the Go suite, and ends with
-`N passed, 0 failed`. It exits 1 if any check fails and 2 if setup fails
+That suite has the same sections and checks as the Go suite, followed by the
+checklist checks in `Brahmaputra.ManualTest/Checklist.cs`, and ends with
+`88 passed, 0 failed`. It exits 1 if any check fails and 2 if setup fails
 (for example, when no broker is reachable). You can also run it directly:
 
 ```bash

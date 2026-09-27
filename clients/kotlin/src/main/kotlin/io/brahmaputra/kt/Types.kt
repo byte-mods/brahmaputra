@@ -80,6 +80,8 @@ data class Header(val key: String, val value: ByteArray?) {
  * - `key == null` round-robins across partitions; a key pins the record to
  *   `murmur2(key) % partitions`, so records sharing a key keep their order.
  * - [partition] bypasses the partitioner entirely.
+ * - [timestamp] is the record's own time in unix milliseconds; null stamps the wall clock
+ *   when it is sent.
  */
 data class ProducerRecord(
     val topic: String,
@@ -87,6 +89,7 @@ data class ProducerRecord(
     val key: ByteArray? = null,
     val partition: Int? = null,
     val headers: List<Header> = emptyList(),
+    val timestamp: Long? = null,
 ) {
     companion object {
         /** A record whose key and value are UTF-8 text. */
@@ -96,8 +99,11 @@ data class ProducerRecord(
             key: String? = null,
             partition: Int? = null,
             headers: List<Header> = emptyList(),
+            timestamp: Long? = null,
         ): ProducerRecord =
-            ProducerRecord(topic, value?.encodeToByteArray(), key?.encodeToByteArray(), partition, headers)
+            ProducerRecord(
+                topic, value?.encodeToByteArray(), key?.encodeToByteArray(), partition, headers, timestamp,
+            )
 
         /** A tombstone: a null value, the log-compaction delete marker for [key]. */
         fun tombstone(topic: String, key: ByteArray, partition: Int? = null): ProducerRecord =
@@ -107,15 +113,15 @@ data class ProducerRecord(
     override fun equals(other: Any?): Boolean =
         other is ProducerRecord && topic == other.topic && partition == other.partition &&
             bytesEqual(key, other.key) && bytesEqual(value, other.value) &&
-            headers == other.headers
+            headers == other.headers && timestamp == other.timestamp
 
     override fun hashCode(): Int =
-        listOf(topic, partition, key?.contentHashCode(), value?.contentHashCode(), headers)
+        listOf(topic, partition, key?.contentHashCode(), value?.contentHashCode(), headers, timestamp)
             .hashCode()
 
     override fun toString(): String =
         "ProducerRecord(topic=$topic, partition=$partition, key=${describe(key)}, " +
-            "value=${describe(value)}, headers=$headers)"
+            "value=${describe(value)}, headers=$headers, timestamp=$timestamp)"
 }
 
 /** A topic and one of its partitions. */

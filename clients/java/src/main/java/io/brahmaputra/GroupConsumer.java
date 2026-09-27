@@ -80,6 +80,12 @@ public final class GroupConsumer implements AutoCloseable {
          * to 45s; this defaults to 10s as the Rust client does.
          */
         public int sessionTimeoutMs = 10_000;
+        /**
+         * How often the background thread heartbeats. Keep it well under
+         * {@link #sessionTimeoutMs} (Kafka's rule of thumb is a third). 0 derives it as a third
+         * of the session timeout.
+         */
+        public int heartbeatIntervalMs = 3_000;
         public int rebalanceTimeoutMs = 3_000;
         /**
          * Longest gap between polls before this member is presumed stuck and leaves. Separate
@@ -356,6 +362,19 @@ public final class GroupConsumer implements AutoCloseable {
         Reader reader = Reader.body(coordinatorRequest(ApiKey.OFFSET_COMMIT, writer.bytes()));
         int code = reader.int32();
         if (code != ErrorCode.NONE) {
+            // The commit was fenced: this member is no longer in the generation it committed
+            // for. The next poll rejoins — as a new member when the coordinator no longer knows
+            // this one — rather than committing into the same wall again.
+            if (code == ErrorCode.UNKNOWN_MEMBER_ID
+                    || code == ErrorCode.ILLEGAL_GENERATION
+                    || code == ErrorCode.REBALANCE_IN_PROGRESS) {
+                synchronized (membership) {
+                    if (code == ErrorCode.UNKNOWN_MEMBER_ID) {
+                        memberId = "";
+                    }
+                    joined = false;
+                }
+            }
             throw new ServerException(code, "offset_commit");
         }
         lastCommitMs = Client.nowMs();
@@ -556,7 +575,9 @@ public final class GroupConsumer implements AutoCloseable {
         // This loop enforces two independent deadlines, so it has to wake often enough for the
         // shorter of them. Deriving the tick from the session timeout alone would leave a long
         // session with a short poll interval unchecked until long after it stalled.
-        int heartbeatEvery = Math.max(config.sessionTimeoutMs / 3, 1);
+        int heartbeatEvery = config.heartbeatIntervalMs > 0
+                ? config.heartbeatIntervalMs
+                : Math.max(config.sessionTimeoutMs / 3, 1);
         int pollCheckEvery = Math.max(config.maxPollIntervalMs / 3, 1);
         int interval = Math.min(heartbeatEvery, pollCheckEvery);
         boolean leftForSlowPoll = false;

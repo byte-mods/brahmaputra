@@ -35,6 +35,11 @@ public final class Client {
     public static final long EARLIEST = -2L;
     /** Offset sentinel: the log end. */
     public static final long LATEST = -1L;
+    /**
+     * Passed as a send's {@code timestampMs} to stamp the record with the wall clock at send
+     * time, which is what the overloads without a timestamp do.
+     */
+    public static final long NO_TIMESTAMP = -1L;
 
     static long nowMs() {
         return System.currentTimeMillis();
@@ -810,6 +815,15 @@ public final class Client {
             sendTo(topic, choosePartition(topic, key), value, key, headers);
         }
 
+        /**
+         * Buffer one record carrying its own timestamp (unix ms; {@link #NO_TIMESTAMP} for the
+         * wall clock). A null key round-robins across partitions.
+         */
+        public void send(String topic, byte[] value, byte[] key, long timestampMs,
+                List<RecordHeader> headers) {
+            sendTo(topic, choosePartition(topic, key), value, key, timestampMs, headers);
+        }
+
         /** Buffer one record on an explicit partition, bypassing the partitioner. */
         public void sendTo(String topic, int partition, byte[] value, byte[] key,
                 RecordHeader... headers) {
@@ -831,6 +845,15 @@ public final class Client {
         /** Buffer one record on an explicit partition, bypassing the partitioner. */
         public void sendTo(String topic, int partition, byte[] value, byte[] key,
                 List<RecordHeader> headers) {
+            sendTo(topic, partition, value, key, NO_TIMESTAMP, headers);
+        }
+
+        /**
+         * Buffer one record on an explicit partition with its own timestamp (unix ms;
+         * {@link #NO_TIMESTAMP} for the wall clock at this call).
+         */
+        public void sendTo(String topic, int partition, byte[] value, byte[] key,
+                long timestampMs, List<RecordHeader> headers) {
             if (closed) {
                 throw new BrahmaputraException("producer is closed");
             }
@@ -847,7 +870,7 @@ public final class Client {
             boolean full;
             synchronized (lock) {
                 buffers.computeIfAbsent(slot, unused -> new ArrayList<>())
-                        .add(new Buffered(record, nowMs(), topic, partition));
+                        .add(new Buffered(record, stamp(timestampMs), topic, partition));
                 sizes.merge(slot, size, Integer::sum);
                 full = sizes.get(slot) >= config.batchSize;
             }
@@ -858,13 +881,38 @@ public final class Client {
 
         /** Send one record on its own and return its offset. Slow by design. */
         public long sendSync(String topic, byte[] value, byte[] key, List<RecordHeader> headers) {
-            int partition = choosePartition(topic, key);
+            return sendSync(topic, value, key, NO_TIMESTAMP, headers);
+        }
+
+        /** {@link #sendSync} with the record's own timestamp. */
+        public long sendSync(String topic, byte[] value, byte[] key, long timestampMs,
+                List<RecordHeader> headers) {
+            return sendSyncTo(topic, choosePartition(topic, key), value, key, timestampMs,
+                    headers);
+        }
+
+        /**
+         * Send one record to an explicit partition on its own and return its offset. Records
+         * already buffered for that partition go first, so the returned offset never lands
+         * ahead of a record sent earlier.
+         */
+        public long sendSyncTo(String topic, int partition, byte[] value, byte[] key,
+                long timestampMs, List<RecordHeader> headers) {
+            if (closed) {
+                throw new BrahmaputraException("producer is closed");
+            }
+            Slot slot = new Slot(topic, partition);
+            flushSlot(slot);
             Record record = new Record(key, value,
                     headers == null ? new ArrayList<>() : new ArrayList<>(headers));
-            synchronized (sendLockFor(new Slot(topic, partition))) {
+            synchronized (sendLockFor(slot)) {
                 return produce(topic, partition, Collections.singletonList(
-                        new Buffered(record, nowMs(), topic, partition)));
+                        new Buffered(record, stamp(timestampMs), topic, partition)));
             }
+        }
+
+        private static long stamp(long timestampMs) {
+            return timestampMs < 0 ? nowMs() : timestampMs;
         }
 
         /**
@@ -1126,6 +1174,7 @@ public final class Client {
         public int isolationLevel = Protocol.READ_UNCOMMITTED;
         /** This consumer's failure domain (`client.rack`), empty when it has none. */
         public String rack = "";
+        /** Most records one fetch returns; the rest are fetched next time. 0 is unlimited. */
         public int maxPollRecords = 500;
         public int dialTimeoutMs = 30_000;
     }
@@ -1207,6 +1256,9 @@ public final class Client {
             @SuppressWarnings("unchecked")
             List<DecodedBatch> batches = (List<DecodedBatch>) result[2];
             List<ConsumedRecord> out = new ArrayList<>();
+            // max.poll.records: the caller resumes from the last returned offset + 1, so what
+            // is cut here is fetched again next time rather than lost.
+            int cap = config.maxPollRecords > 0 ? config.maxPollRecords : Integer.MAX_VALUE;
             for (DecodedBatch batch : batches) {
                 for (int index = 0; index < batch.records.size(); index++) {
                     long recordOffset = batch.baseOffset + index;
@@ -1214,6 +1266,9 @@ public final class Client {
                     // already seen.
                     if (recordOffset < offset) {
                         continue;
+                    }
+                    if (out.size() >= cap) {
+                        break;
                     }
                     Record record = batch.records.get(index);
                     out.add(new ConsumedRecord(topic, partition, recordOffset, record.key,

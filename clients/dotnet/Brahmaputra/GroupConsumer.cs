@@ -37,6 +37,13 @@ public class GroupConsumerConfig : ConsumerConfig
     /// </summary>
     public int SessionTimeoutMs { get; set; } = 10_000;
 
+    /// <summary>
+    /// <c>heartbeat.interval.ms</c>: how often the background task heartbeats.
+    /// Keep it well under <see cref="SessionTimeoutMs"/> (Kafka's rule of thumb
+    /// is a third); 0 derives it as a third of the session timeout.
+    /// </summary>
+    public int HeartbeatIntervalMs { get; set; } = 3_000;
+
     /// <summary>How long the coordinator waits for members to rejoin during a rebalance.</summary>
     public int RebalanceTimeoutMs { get; set; } = 3_000;
 
@@ -272,7 +279,12 @@ public sealed class GroupConsumer : IDisposable, IAsyncDisposable
             // Generation fencing: a member that was rebalanced out may not
             // commit for partitions that now belong to someone else.
             if (code is (int)ErrorCode.IllegalGeneration or (int)ErrorCode.UnknownMemberId or (int)ErrorCode.RebalanceInProgress)
+            {
+                // The next poll rejoins, as a new member when the coordinator
+                // no longer knows this one.
+                if (code == (int)ErrorCode.UnknownMemberId) lock (_state) _memberId = "";
                 _joined = false;
+            }
             throw new ServerException(code, "offset_commit");
         }
         _lastCommitMs = NowMs();
@@ -515,7 +527,8 @@ public sealed class GroupConsumer : IDisposable, IAsyncDisposable
     {
         // This loop enforces two independent deadlines, so it wakes often
         // enough for the shorter of them.
-        int interval = Math.Max(1, Math.Min(_config.SessionTimeoutMs / 3, _config.MaxPollIntervalMs / 3));
+        int heartbeatEvery = _config.HeartbeatIntervalMs > 0 ? _config.HeartbeatIntervalMs : _config.SessionTimeoutMs / 3;
+        int interval = Math.Max(1, Math.Min(heartbeatEvery, _config.MaxPollIntervalMs / 3));
         bool leftForSlowPoll = false;
         var token = _stop.Token;
         while (!token.IsCancellationRequested)

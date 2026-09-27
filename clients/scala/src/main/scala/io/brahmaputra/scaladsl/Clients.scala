@@ -77,12 +77,18 @@ final class Producer(val underlying: Client.Producer) extends AutoCloseable {
 
   /**
    * Send one record on its own and return its offset: a full round trip, correct and slow.
-   * The partitioner chooses the partition, so `record.partition` must be empty.
+   * Records already buffered for the same partition go first, so the offset never lands ahead
+   * of an earlier send.
    */
   def sendAndAwait(record: ProducerRecord): Try[Long] = Try {
-    require(record.partition.isEmpty, "sendAndAwait picks the partition itself")
-    underlying.sendSync(record.topic, record.value.orNull, record.key.orNull,
-      record.headers.map(Convert.header).asJava)
+    val headers = record.headers.map(Convert.header).asJava
+    val timestamp = record.timestamp.getOrElse(Client.NO_TIMESTAMP)
+    record.partition match {
+      case Some(p) =>
+        underlying.sendSyncTo(record.topic, p, record.value.orNull, record.key.orNull, timestamp, headers)
+      case None =>
+        underlying.sendSync(record.topic, record.value.orNull, record.key.orNull, timestamp, headers)
+    }
   }
 
   /** The partitions of `topic` (auto-creating it where the broker does that). */
@@ -95,9 +101,10 @@ final class Producer(val underlying: Client.Producer) extends AutoCloseable {
 
   private def sendNow(record: ProducerRecord): Unit = {
     val headers = record.headers.map(Convert.header).asJava
+    val timestamp = record.timestamp.getOrElse(Client.NO_TIMESTAMP)
     record.partition match {
-      case Some(p) => underlying.sendTo(record.topic, p, record.value.orNull, record.key.orNull, headers)
-      case None => underlying.send(record.topic, record.value.orNull, record.key.orNull, headers)
+      case Some(p) => underlying.sendTo(record.topic, p, record.value.orNull, record.key.orNull, timestamp, headers)
+      case None => underlying.send(record.topic, record.value.orNull, record.key.orNull, timestamp, headers)
     }
   }
 

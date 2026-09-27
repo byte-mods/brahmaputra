@@ -16,8 +16,10 @@ import scala.util.{Failure, Success, Try, Using}
  *   ./test.sh 127.0.0.1 9092
  * }}}
  * A port of the Go driver's cmd/manualtest, section for section and check for check, written
- * against the wrapper's API. Only the connection-failure checks go a layer down, through
- * [[BrokerConnection]]. Exits 1 if any check failed and 2 on an unexpected error.
+ * against the wrapper's API, followed by checks for the rest of the client feature checklist.
+ * Only the connection-failure checks go a layer down, through [[BrokerConnection]], and the
+ * fault-injecting proxy builds its fake answers with the Java driver's frame codec. Exits 1
+ * if any check failed and 2 on an unexpected error.
  */
 object ManualTest {
   private var passed = 0
@@ -492,6 +494,549 @@ object ManualTest {
       Await.ready(late, 30.seconds)
       member.close()
       producer.close()
+    }
+
+    runExtra(host, port)
+  }
+
+  // -------------------------------------------------------------------------
+  // Checks beyond the Go suite: every item of the client feature checklist that the sections
+  // above do not already exercise, each through the wrapper's own API.
+  // -------------------------------------------------------------------------
+
+  private def runExtra(host: String, port: Int): Unit = {
+    val bootstrap = s"$host:$port"
+    val unbatched = ProducerSettings(bootstrap, linger = Duration.Zero)
+    val consumerSettings = ConsumerSettings(bootstrap)
+    def pollQuietly(member: GroupConsumer, timeout: FiniteDuration): Vector[ConsumerRecord] =
+      member.poll(timeout).getOrElse(Vector.empty)
+    def drain(member: GroupConsumer, want: Int, timeout: FiniteDuration): Int = {
+      var got = 0
+      val deadline = now() + timeout.toMillis
+      while (got < want && now() < deadline) got += pollQuietly(member, 300.millis).size
+      got
+    }
+    def awaitAssignment(member: GroupConsumer, timeout: FiniteDuration): Unit = {
+      val deadline = now() + timeout.toMillis
+      while (member.assignment.isEmpty && now() < deadline) pollQuietly(member, 200.millis)
+    }
+    def fetchAll(consumer: Consumer, topic: String, want: Int): Vector[ConsumerRecord] =
+      Try(consumer.iterator(topic, 0).take(want).toVector).getOrElse(Vector.empty)
+
+    section("producer: batch.size and linger.ms")
+    locally {
+      val batchTopic = unique("scala-batchsize")
+      val value = Array.fill[Byte](200)('b'.toByte)
+      // Only batch.size can send anything during this check.
+      Using.resources(Producer(ProducerSettings(bootstrap, linger = 60.seconds, batchSize = 1024)),
+        Consumer(consumerSettings)) { (producer, consumer) =>
+        for (_ <- 0 until 8) producer.send(ProducerRecord(batchTopic, value).toPartition(0)).get
+        val early = consumer.fetch(batchTopic, 0, 0, Duration.Zero).get.size
+        check("a batch that reaches batch.size is sent before linger.ms",
+          early >= 1 && early < 8, s"$early of 8 sent before any flush")
+        producer.flush().get
+        val after = fetchAll(consumer, batchTopic, 8).size
+        check("flush sends the partial batch that is left", after == 8, s"got $after")
+      }
+
+      val lingerTopic = unique("scala-linger")
+      Using.resources(Producer(ProducerSettings(bootstrap, linger = 500.millis)), Consumer(consumerSettings)) {
+        (producer, consumer) =>
+          producer.partitionsFor(lingerTopic).get
+          producer.send(ProducerRecord(lingerTopic, "lingering").toPartition(0)).get
+          val immediate = consumer.fetch(lingerTopic, 0, 0, Duration.Zero).get.size
+          Thread.sleep(1500)
+          val later = consumer.fetch(lingerTopic, 0, 0, Duration.Zero).get.size
+          check("linger.ms holds a record back, then sends it without a flush",
+            immediate == 0 && later == 1, s"immediately $immediate, after linger $later")
+      }
+    }
+
+    section("producer: partitioners")
+    locally {
+      val rrTopic = unique("scala-rr")
+      val pinTopic = unique("scala-pinned")
+      val partitions = Using.resource(Producer(unbatched)) { producer =>
+        val partitions = producer.partitionsFor(rrTopic).get
+        for (i <- 0 until partitions.size * 2) producer.send(ProducerRecord(rrTopic, s"rr$i")).get
+        producer.partitionsFor(pinTopic).get
+        producer.send(ProducerRecord(pinTopic, "pinned").toPartition(partitions.last)).get
+        partitions
+      }
+      Using.resource(Consumer(consumerSettings)) { consumer =>
+        val counts = partitions.map(p => p -> consumer.fetch(rrTopic, p, 0, Duration.Zero).get.size).toMap
+        val pinned = partitions.map(p => p -> consumer.fetch(pinTopic, p, 0, Duration.Zero).get.size).toMap
+        check("a null key round-robins across every partition", counts.values.forall(_ == 2), counts.toString)
+        check("an explicit partition is honoured",
+          pinned(partitions.last) == 1 && pinned.values.sum == 1, pinned.toString)
+      }
+    }
+
+    section("producer: record timestamps and send-and-wait")
+    locally {
+      val timeTopic = unique("scala-timestamps")
+      val syncTopic = unique("scala-sync")
+      val base = now() - 60000
+      val beforeSend = now()
+      val offsets = Using.resource(Producer(unbatched)) { producer =>
+        for (i <- 0 until 3)
+          producer.send(ProducerRecord(timeTopic, s"t$i").toPartition(0).withTimestamp(base + i * 1000L)).get
+        producer.send(ProducerRecord(timeTopic, "now").toPartition(0)).get
+        Vector.tabulate(2)(i => producer.sendAndAwait(ProducerRecord(syncTopic, s"s$i").toPartition(0)).get)
+      }
+      Using.resource(Consumer(consumerSettings)) { consumer =>
+        val got = consumer.fetch(timeTopic, 0, 0).get
+        check("an explicit record timestamp round-trips exactly",
+          got.size == 4 && (0 until 3).forall(i => got(i).timestamp == base + i * 1000L),
+          got.map(_.timestamp).toString)
+        check("a record without one is stamped with the wall clock",
+          got.size == 4 && got(3).timestamp >= beforeSend - 1000 && got(3).timestamp <= now() + 1000,
+          got.lastOption.map(_.timestamp).toString)
+        check("send-and-wait returns each record's offset", offsets == Vector(0L, 1L), offsets.toString)
+        val atHalf = consumer.listOffsets(timeTopic, 0, OffsetSpec.AtTimestamp(base + 500)).get
+        val atLast = consumer.listOffsets(timeTopic, 0, OffsetSpec.AtTimestamp(base + 2000)).get
+        check("list offsets by timestamp finds the first record at or after it",
+          atHalf == 1L && atLast == 2L, s"$atHalf, $atLast")
+      }
+    }
+
+    section("producer: codec registration")
+    locally {
+      val compressed = new java.util.concurrent.atomic.AtomicInteger()
+      val decompressed = new java.util.concurrent.atomic.AtomicInteger()
+      Codecs.register(Compression.Lz4,
+        payload => { compressed.incrementAndGet(); Lz4.literals(payload) },
+        data => { decompressed.incrementAndGet(); Lz4.decode(data) })
+      val lz4Topic = unique("scala-lz4")
+      val sent = Vector.tabulate(10)(i => bytes(s"lz4 record $i" + " " * 40))
+      Using.resource(Producer(unbatched.copy(compression = Compression.Lz4))) { producer =>
+        sent.zipWithIndex.foreach((value, i) =>
+          producer.send(ProducerRecord(lz4Topic, value).withKey(s"k$i").toPartition(0)).get)
+      }
+      Using.resource(Consumer(consumerSettings)) { consumer =>
+        val got = consumer.fetch(lz4Topic, 0, 0).get
+        check("a registered codec (lz4) compresses sends and decodes fetches",
+          got.size == sent.size && got.indices.forall(i => same(got(i).value, sent(i))) &&
+            compressed.get >= 10 && decompressed.get >= 10,
+          s"${got.size} records, ${compressed.get} compressed, ${decompressed.get} decompressed")
+      }
+      val refused = Using(Producer(unbatched.copy(compression = Compression.Zstd))) { producer =>
+        producer.send(ProducerRecord(unique("scala-zstd"), "x").toPartition(0)).get
+      }
+      check("an unregistered codec is refused, not sent uncompressed",
+        refused.failed.toOption.exists(e => String.valueOf(e.getMessage).contains("not registered")),
+        refused.toString)
+    }
+
+    section("producer: retries, request.timeout.ms and delivery.timeout.ms")
+    Using.resource(new FaultProxy(host, port)) { proxy =>
+      val retryTopic = unique("scala-retry")
+      val settings = ProducerSettings(s"127.0.0.1:${proxy.port}", linger = Duration.Zero, acks = Acks.All,
+        requestTimeout = 1234.millis, retries = 3, retryBackoff = 150.millis)
+      def sendThrough(settings: ProducerSettings, value: String): Try[Unit] =
+        Using(Producer(settings))(_.send(ProducerRecord(retryTopic, value).toPartition(0)).get)
+
+      proxy.failProduces(2)
+      var started = now()
+      var result = sendThrough(settings, "retried")
+      var elapsed = now() - started
+      check("request.timeout.ms and acks travel with every produce",
+        proxy.lastTimeoutMs == 1234 && proxy.lastAcks == -1,
+        s"timeout=${proxy.lastTimeoutMs} acks=${proxy.lastAcks}")
+      check("a retriable error is retried after retry.backoff.ms",
+        result.isSuccess && proxy.produces == 3 && elapsed >= 300,
+        s"attempts=${proxy.produces} elapsed=$elapsed result=$result")
+      Using.resource(Consumer(consumerSettings)) { consumer =>
+        val stored = consumer.fetch(retryTopic, 0, 0).get.size
+        check("the retried record is stored exactly once", stored == 1, s"stored $stored")
+      }
+
+      proxy.failProduces(-1)
+      result = sendThrough(settings.copy(retries = 2), "never")
+      check("retries bounds the attempts: the error surfaces after retries + 1",
+        result.isFailure && proxy.produces == 3, s"attempts=${proxy.produces} result=$result")
+
+      proxy.failProduces(-1)
+      started = now()
+      result = sendThrough(
+        settings.copy(retries = 1000000, retryBackoff = 50.millis, deliveryTimeout = 500.millis), "late")
+      elapsed = now() - started
+      check("delivery.timeout.ms bounds the time spent retrying",
+        result.isFailure && elapsed >= 450 && elapsed < 3000,
+        s"elapsed=$elapsed attempts=${proxy.produces} result=$result")
+
+      proxy.failProduces(0)
+      for (mode <- 1 to 2) {
+        proxy.corruptFetch = mode
+        val fetched = Using(Consumer(ConsumerSettings(s"127.0.0.1:${proxy.port}")))(
+          _.fetch(retryTopic, 0, 0, 100.millis).get)
+        check(if (mode == 1) "a negative length on the wire is an error"
+              else "a length past the end of the data is an error",
+          fetched.failed.toOption.exists(_.isInstanceOf[BrahmaputraException]), fetched.toString)
+      }
+      proxy.corruptFetch = 0
+    }
+
+    section("consumer: fetch limits, high watermark and metadata")
+    locally {
+      val fetchTopic = unique("scala-fetch")
+      val value = Array.fill[Byte](1000)('f'.toByte)
+      Using.resource(Producer(unbatched)) { producer =>
+        for (_ <- 0 until 10) producer.send(ProducerRecord(fetchTopic, value).toPartition(0)).get
+      }
+      Using.resource(Consumer(consumerSettings.copy(fetchMaxBytes = 2500))) { consumer =>
+        val got = consumer.fetch(fetchTopic, 0, 0).get.size
+        check("fetch.max.bytes caps what one fetch returns", got >= 1 && got < 10, s"got $got of 10")
+      }
+      Using.resource(Consumer(consumerSettings.copy(maxPollRecords = 4))) { consumer =>
+        val got = consumer.fetch(fetchTopic, 0, 0).get
+        check("max.poll.records caps one fetch", got.size == 4, s"got ${got.size}")
+        val next = consumer.fetch(fetchTopic, 0, 4).get
+        check("the records a cap held back come on the next fetch",
+          next.size == 4 && next.head.offset == 4L, s"got ${next.size}")
+      }
+      Using.resources(
+        Consumer(consumerSettings.copy(fetchMinBytes = 1000000, fetchMaxWait = 600.millis)),
+        Consumer(consumerSettings)) { (waiting, eager) =>
+        var started = now()
+        val waitedFor = waiting.fetch(fetchTopic, 0, 0, 600.millis).get.size
+        val waited = now() - started
+        started = now()
+        val eagerGot = eager.fetch(fetchTopic, 0, 0, 600.millis).get.size
+        val quick = now() - started
+        check("fetch.min.bytes holds a fetch open until fetch.max.wait.ms",
+          waited >= 450 && quick < 400 && waitedFor == 10 && eagerGot == 10,
+          s"waited ${waited}ms, eager ${quick}ms")
+
+        val result = eager.fetchWithWatermark(fetchTopic, 0, 0).get
+        check("the high watermark is reported", result.highWatermark == 10L, result.highWatermark.toString)
+
+        val metadata = eager.metadata(Seq(fetchTopic)).get
+        val brokerIds = metadata.brokers.map(_.nodeId).toSet
+        val partitions = metadata.topics.filter(_.name == fetchTopic).flatMap(_.partitions)
+        check("metadata names a live leader for every partition",
+          partitions.nonEmpty && partitions.forall(p => brokerIds.contains(p.leader)),
+          s"${partitions.size} partitions")
+      }
+    }
+
+    section("consumer group: several topics, auto-commit and max.poll.records")
+    locally {
+      val topicA = unique("scala-multi-a")
+      val topicB = unique("scala-multi-b")
+      Using.resource(Producer(unbatched)) { producer =>
+        for (i <- 0 until 6) {
+          producer.send(ProducerRecord(topicA, s"a$i")).get
+          producer.send(ProducerRecord(topicB, s"b$i")).get
+        }
+      }
+      val member = GroupConsumer(GroupSettings(unique("scala-multi"), bootstrap,
+        autoCommitInterval = Some(200.millis), maxPollRecords = 5, topics = Seq(topicA, topicB)))
+      val seen = Vector.newBuilder[ConsumerRecord]
+      var count = 0
+      var largest = 0
+      val deadline = now() + 20000
+      while (count < 12 && now() < deadline) {
+        val batch = pollQuietly(member, 500.millis)
+        largest = math.max(largest, batch.size)
+        count += batch.size
+        seen ++= batch
+      }
+      val topics = seen.result().map(_.topic).toSet
+      check("one member consumes every subscribed topic", count == 12 && topics.size == 2,
+        s"$count records from $topics")
+      check("max.poll.records caps each poll", largest >= 1 && largest <= 5, s"largest poll $largest")
+      // Nothing calls commit(): these polls are what auto-commit rides on.
+      val until = now() + 1000
+      while (now() < until) pollQuietly(member, 100.millis)
+      val total = member.committed().get.values.sum
+      check("auto.commit.interval.ms commits delivered positions without commit()",
+        total == 12L, s"committed $total")
+      member.close()
+    }
+
+    section("consumer group: heartbeats, session timeout and rejoin")
+    locally {
+      val hbTopic = unique("scala-heartbeat")
+      Using.resource(Producer(unbatched)) { producer =>
+        for (i <- 0 until 4) producer.send(ProducerRecord(hbTopic, s"h$i")).get
+      }
+      val steady = GroupConsumer(GroupSettings(unique("scala-hb"), bootstrap, autoCommitInterval = None,
+        sessionTimeout = 1500.millis, heartbeatInterval = 300.millis, topics = Seq(hbTopic)))
+      var got = drain(steady, 4, 15.seconds)
+      val member = steady.memberId
+      Thread.sleep(3500) // over twice the session timeout, with no poll
+      val committed = steady.commit()
+      check("heartbeats keep an idle member in its group past session.timeout.ms",
+        got == 4 && committed.isSuccess && steady.memberId == member, s"got=$got commit=$committed")
+      steady.close()
+
+      val quiet = GroupConsumer(GroupSettings(unique("scala-evicted"), bootstrap, autoCommitInterval = None,
+        sessionTimeout = 1.second, heartbeatInterval = 20.seconds, topics = Seq(hbTopic)))
+      got = drain(quiet, 4, 15.seconds)
+      val evicted = quiet.memberId
+      Thread.sleep(2500)
+      val fenced = quiet.commit()
+      check("a member that stops heartbeating is evicted after session.timeout.ms",
+        got == 4 && (fenced.failed.toOption match {
+          case Some(e: ServerException) => e.code == io.brahmaputra.Protocol.ErrorCode.UNKNOWN_MEMBER_ID
+          case _ => false
+        }), s"got=$got commit=$fenced")
+      // Only the join is checked: with no heartbeats this member is evicted again one session
+      // timeout after it rejoins.
+      val rejoined = quiet.poll(1.second)
+      check("an evicted member rejoins as a new member",
+        rejoined.isSuccess && quiet.memberId.nonEmpty && quiet.memberId != evicted,
+        s"$evicted -> ${quiet.memberId} poll=$rejoined")
+      quiet.close()
+    }
+
+    section("consumer group: static membership, LeaveGroup and rebalances")
+    locally {
+      val staticTopic = unique("scala-static")
+      val partitions = Using.resource(Producer(unbatched)) { producer =>
+        val partitions = producer.partitionsFor(staticTopic).get
+        for (i <- 0 until 4) producer.send(ProducerRecord(staticTopic, s"st$i")).get
+        partitions
+      }
+      val fixed = GroupSettings(unique("scala-static-grp"), bootstrap, autoCommitInterval = None,
+        heartbeatInterval = 300.millis, groupInstanceId = Some(unique("scala-instance")), topics = Seq(staticTopic))
+      val first = GroupConsumer(fixed)
+      awaitAssignment(first, 15.seconds)
+      val (firstMember, firstGeneration) = (first.memberId, first.generation)
+      val returning = GroupConsumer(fixed)
+      awaitAssignment(returning, 15.seconds)
+      check("a returning group.instance.id reclaims its member id without a rebalance",
+        firstMember.nonEmpty && returning.memberId == firstMember && returning.generation == firstGeneration,
+        s"$firstMember/$firstGeneration -> ${returning.memberId}/${returning.generation}")
+      returning.close()
+      first.close()
+
+      // LeaveGroup: with a 30 s session and a 10 s rebalance timeout, a successor could only get
+      // the partitions quickly if the first member told the coordinator it left.
+      val leaving = GroupSettings(unique("scala-leave-grp"), bootstrap, autoCommitInterval = None,
+        sessionTimeout = 30.seconds, rebalanceTimeout = 10.seconds, topics = Seq(staticTopic))
+      val departing = GroupConsumer(leaving)
+      awaitAssignment(departing, 15.seconds)
+      departing.close()
+      val started = now()
+      val successor = GroupConsumer(leaving)
+      awaitAssignment(successor, 15.seconds)
+      val took = now() - started
+      check("close sends LeaveGroup, so a successor is not kept waiting",
+        successor.assignment.size == partitions.size && took < 6000,
+        s"${successor.assignment.size} partitions after ${took}ms")
+      successor.close()
+
+      // Two members: the second's join makes the coordinator fence the first's generation; its
+      // heartbeat learns that, it rejoins, and the partitions split.
+      val sharing = GroupSettings(unique("scala-share-grp"), bootstrap, autoCommitInterval = None,
+        heartbeatInterval = 200.millis, topics = Seq(staticTopic))
+      val one = GroupConsumer(sharing)
+      awaitAssignment(one, 15.seconds)
+      val before = one.generation
+      val two = GroupConsumer(sharing)
+      @volatile var stop = false
+      val other = Future { while (!stop) pollQuietly(two, 200.millis) }
+      var split = false
+      val deadline = now() + 20000
+      while (!split && now() < deadline) {
+        pollQuietly(one, 200.millis)
+        val (mine, theirs) = (one.assignment, two.assignment)
+        split = mine.nonEmpty && theirs.nonEmpty &&
+          (mine ++ theirs).toSet.size == partitions.size && mine.size + theirs.size == partitions.size
+      }
+      stop = true
+      Await.ready(other, 10.seconds)
+      check("a second member rebalances the group and the partitions split between them",
+        split, s"${one.assignment} / ${two.assignment}")
+      check("the generation advances when the group rebalances",
+        one.generation > before, s"$before -> ${one.generation}")
+      two.close()
+      one.close()
+    }
+  }
+
+  /**
+   * lz4 in the broker's format (little-endian uncompressed length, then a raw LZ4 block). It
+   * compresses by emitting one literal run — valid LZ4 any decoder reads — and decodes full
+   * LZ4, matches included, so it reads what the broker's lz4 writes too.
+   */
+  private object Lz4 {
+    def literals(payload: Array[Byte]): Array[Byte] = {
+      val size = payload.length
+      val out = new java.io.ByteArrayOutputStream(size + size / 255 + 16)
+      for (shift <- 0 until 32 by 8) out.write(size >>> shift)
+      out.write(math.min(size, 15) << 4)
+      if (size >= 15) {
+        var rest = size - 15
+        while (rest >= 255) { out.write(255); rest -= 255 }
+        out.write(rest)
+      }
+      out.write(payload, 0, size)
+      out.toByteArray
+    }
+
+    def decode(data: Array[Byte]): Array[Byte] =
+      try {
+        val size = (0 until 4).foldLeft(0)((acc, i) => acc | ((data(i) & 0xff) << (8 * i)))
+        if (size < 0 || size > 256 * 1024 * 1024) throw new ProtocolException(s"lz4 size $size")
+        val out = new Array[Byte](size)
+        var in = 4
+        var at = 0
+        def length(start: Int): Int = {
+          var total = start
+          if (start == 15) {
+            var more = 255
+            while (more == 255) {
+              more = data(in) & 0xff
+              in += 1
+              total += more
+            }
+          }
+          total
+        }
+        var done = false
+        while (!done && in < data.length) {
+          val token = data(in) & 0xff
+          in += 1
+          val literals = length(token >>> 4)
+          System.arraycopy(data, in, out, at, literals)
+          in += literals
+          at += literals
+          if (in >= data.length) done = true
+          else {
+            val distance = (data(in) & 0xff) | ((data(in + 1) & 0xff) << 8)
+            in += 2
+            val matched = length(token & 15) + 4
+            if (distance == 0 || distance > at) throw new ProtocolException("lz4 match before the output")
+            for (_ <- 0 until matched) {
+              out(at) = out(at - distance)
+              at += 1
+            }
+          }
+        }
+        if (at != size) throw new ProtocolException(s"lz4 decoded $at of $size")
+        out
+      } catch {
+        case _: IndexOutOfBoundsException => throw new ProtocolException("truncated lz4 block")
+      }
+  }
+
+  /**
+   * Sits between a client and the broker, forwarding frames one request at a time, and can
+   * answer a produce with a retriable error or a fetch with a corrupt batch. It records the
+   * acks and timeout of every produce it sees. Built on the Java driver's frame codec.
+   */
+  private final class FaultProxy(targetHost: String, targetPort: Int) extends AutoCloseable {
+    import io.brahmaputra.Protocol
+    import java.nio.ByteBuffer
+
+    private val server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress)
+    private val live = mutable.Buffer.empty[Socket]
+    private var failuresLeft = 0
+    @volatile var corruptFetch = 0
+    @volatile var produces = 0
+    @volatile var lastAcks = Int.MinValue
+    @volatile var lastTimeoutMs = Int.MinValue
+    def port: Int = server.getLocalPort
+
+    daemon {
+      var open = true
+      while (open) {
+        Try(server.accept()) match {
+          case Failure(_) => open = false
+          case Success(client) =>
+            Try(new Socket(targetHost, targetPort)) match {
+              case Failure(_) => closeQuietly(client)
+              case Success(upstream) =>
+                live.synchronized { live += client; live += upstream }
+                daemon(serve(client, upstream))
+            }
+        }
+      }
+    }
+
+    /** Fail the next `count` produces (-1: every one) and reset the counters. */
+    def failProduces(count: Int): Unit = synchronized {
+      failuresLeft = count
+      produces = 0
+    }
+
+    private def takeFailure(): Boolean = synchronized {
+      if (failuresLeft == 0) false
+      else {
+        if (failuresLeft > 0) failuresLeft -= 1
+        true
+      }
+    }
+
+    private def serve(client: Socket, upstream: Socket): Unit =
+      try {
+        val in = new java.io.DataInputStream(client.getInputStream)
+        val out = client.getOutputStream
+        val upIn = new java.io.DataInputStream(upstream.getInputStream)
+        val upOut = upstream.getOutputStream
+        while (true) {
+          val frame = new Array[Byte](in.readInt())
+          in.readFully(frame)
+          val header = ByteBuffer.wrap(frame)
+          val apiKey = header.getShort(0)
+          val correlation = header.getInt(4)
+          val body = java.util.Arrays.copyOfRange(frame, 10 + math.max(header.getShort(8).toInt, 0), frame.length)
+          var reply: Array[Byte] = null
+          var oneway = false
+          if (apiKey == Protocol.ApiKey.PRODUCE) {
+            val reader = Protocol.Reader.body(body)
+            val topic = reader.string()
+            val partition = reader.int32()
+            val acks = reader.int32()
+            lastTimeoutMs = reader.int32()
+            lastAcks = acks
+            produces += 1
+            oneway = acks == 0
+            if (takeFailure())
+              reply = Protocol.Writer.body().string(topic).int32(partition)
+                .int32(Protocol.ErrorCode.NOT_ENOUGH_REPLICAS).int64(-1).int64(-1).bytes()
+          } else if (apiKey == Protocol.ApiKey.FETCH && corruptFetch != 0) {
+            val reader = Protocol.Reader.body(body)
+            val topic = reader.string()
+            val partition = reader.int32()
+            // A batch whose batch_length is negative (mode 1) or runs far past the bytes that
+            // follow (mode 2).
+            val batch = new Array[Byte](61)
+            ByteBuffer.wrap(batch).putInt(8, if (corruptFetch == 1) -1 else 1000000)
+            reply = Protocol.Writer.body().string(topic).int32(partition).int32(0)
+              .int64(1).int64(1).int64(batch.length.toLong).int32(-1).raw(batch).bytes()
+          }
+          if (reply != null) {
+            out.write(Protocol.encodeFrame(apiKey, correlation, null, reply))
+            out.flush()
+          } else {
+            writeFrame(upOut, frame)
+            if (!oneway) {
+              val response = new Array[Byte](upIn.readInt())
+              upIn.readFully(response)
+              writeFrame(out, response)
+            }
+          }
+        }
+      } catch {
+        case _: IOException => () // either side went away
+        case _: RuntimeException => ()
+      } finally {
+        closeQuietly(client)
+        closeQuietly(upstream)
+      }
+
+    private def writeFrame(out: java.io.OutputStream, payload: Array[Byte]): Unit = {
+      out.write(ByteBuffer.allocate(4 + payload.length).putInt(payload.length).put(payload).array())
+      out.flush()
+    }
+
+    override def close(): Unit = {
+      closeQuietly(server)
+      live.synchronized(live.foreach(closeQuietly))
     }
   }
 

@@ -70,6 +70,7 @@ class ConsumerSettings {
     var readCommitted: Boolean = false
     /** `client.rack`: read from an in-sync replica in this rack when there is one. */
     var rack: String = ""
+    /** `max.poll.records`: the most records one fetch returns (0: unlimited). */
     var maxPollRecords: Int = 500
     var dialTimeoutMs: Int = 30_000
 
@@ -94,6 +95,8 @@ class GroupConsumerSettings {
     var groupId: String = ""
     var clientId: String = "brahmaputra-kotlin"
     var sessionTimeoutMs: Int = 10_000
+    /** How often the member heartbeats; keep it well under [sessionTimeoutMs]. 0: a third of it. */
+    var heartbeatIntervalMs: Int = 3_000
     var rebalanceTimeoutMs: Int = 3_000
     /** Bounds the time *between* polls; time spent inside a poll does not count. */
     var maxPollIntervalMs: Int = 300_000
@@ -113,6 +116,7 @@ class GroupConsumerSettings {
     fun toJava(): JavaGroupConsumer.GroupConfig = JavaGroupConsumer.GroupConfig().also {
         it.clientId = clientId
         it.sessionTimeoutMs = sessionTimeoutMs
+        it.heartbeatIntervalMs = heartbeatIntervalMs
         it.rebalanceTimeoutMs = rebalanceTimeoutMs
         it.maxPollIntervalMs = maxPollIntervalMs
         it.autoCommitIntervalMs = autoCommitIntervalMs

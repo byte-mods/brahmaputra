@@ -1,11 +1,16 @@
 package io.brahmaputra.kt
 
+import io.brahmaputra.Protocol
 import java.io.Closeable
+import java.io.DataInputStream
 import java.io.IOException
+import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.nio.ByteBuffer
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.system.exitProcess
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -24,8 +29,10 @@ import kotlinx.coroutines.withTimeoutOrNull
  *   ./test.sh 127.0.0.1 9092
  *
  * A port of the Go driver's cmd/manualtest, section for section and check for check, written
- * against the wrapper's API. Only the connection-failure checks reach one layer down, through
- * BrokerConnection. Exits 1 if any check failed and 2 on an unexpected error.
+ * against the wrapper's API, followed by checks for the rest of the client feature checklist.
+ * Only the connection-failure checks reach one layer down, through BrokerConnection, and the
+ * fault-injecting proxy builds its fake answers with the Java driver's frame codec. Exits 1 if
+ * any check failed and 2 on an unexpected error.
  */
 
 private var passed = 0
@@ -557,6 +564,599 @@ private suspend fun runSuite(host: String, port: Int) {
         }
         member.close()
         producer.close()
+    }
+
+    runExtra(host, port)
+}
+
+// ---------------------------------------------------------------------------
+// Checks beyond the Go suite: every item of the client feature checklist that the sections
+// above do not already exercise, each through the wrapper's own API.
+// ---------------------------------------------------------------------------
+
+private suspend fun runExtra(host: String, port: Int) {
+    section("producer: batch.size and linger.ms")
+    run {
+        val batchTopic = unique("kotlin-batchsize")
+        val value = ByteArray(200) { 'b'.code.toByte() }
+        producer(host, port) {
+            lingerMs = 60_000 // only batch.size can send anything during this check
+            batchSize = 1024
+        }.use { producer ->
+            consumer(host, port).use { consumer ->
+                repeat(8) { producer.send(batchTopic, value, partition = 0) }
+                val early = consumer.fetch(batchTopic, 0, 0, 0).size
+                check("a batch that reaches batch.size is sent before linger.ms",
+                    early in 1..7, "$early of 8 sent before any flush")
+                producer.flush()
+                val after = consumer.fetchAll(batchTopic, 8).size
+                check("flush sends the partial batch that is left", after == 8, "got $after")
+            }
+        }
+
+        val lingerTopic = unique("kotlin-linger")
+        producer(host, port) { lingerMs = 500 }.use { producer ->
+            consumer(host, port).use { consumer ->
+                producer.partitionsFor(lingerTopic)
+                producer.send(lingerTopic, bytes("lingering"), partition = 0)
+                val immediate = consumer.fetch(lingerTopic, 0, 0, 0).size
+                delay(1500)
+                val later = consumer.fetch(lingerTopic, 0, 0, 0).size
+                check("linger.ms holds a record back, then sends it without a flush",
+                    immediate == 0 && later == 1, "immediately $immediate, after linger $later")
+            }
+        }
+    }
+
+    section("producer: partitioners")
+    run {
+        val rrTopic = unique("kotlin-rr")
+        val pinTopic = unique("kotlin-pinned")
+        val partitions: List<Int>
+        producer(host, port) { lingerMs = 0 }.use { producer ->
+            partitions = producer.partitionsFor(rrTopic)
+            repeat(partitions.size * 2) { producer.send(rrTopic, bytes("rr$it")) }
+            producer.partitionsFor(pinTopic)
+            producer.send(pinTopic, bytes("pinned"), partition = partitions.last())
+        }
+        consumer(host, port).use { consumer ->
+            val counts = partitions.associateWith { consumer.fetch(rrTopic, it, 0, 0).size }
+            val pinned = partitions.associateWith { consumer.fetch(pinTopic, it, 0, 0).size }
+            check("a null key round-robins across every partition", counts.values.all { it == 2 }, "$counts")
+            check("an explicit partition is honoured",
+                pinned[partitions.last()] == 1 && pinned.values.sum() == 1, "$pinned")
+        }
+    }
+
+    section("producer: record timestamps and send-and-wait")
+    run {
+        val timeTopic = unique("kotlin-timestamps")
+        val syncTopic = unique("kotlin-sync")
+        val base = now() - 60_000
+        val beforeSend = now()
+        val offsets: List<Long>
+        producer(host, port) { lingerMs = 0 }.use { producer ->
+            for (i in 0 until 3) {
+                producer.send(timeTopic, bytes("t$i"), partition = 0, timestamp = base + i * 1000L)
+            }
+            producer.send(timeTopic, bytes("now"), partition = 0)
+            offsets = List(2) {
+                producer.sendAndAwait(ProducerRecord(syncTopic, bytes("s$it"), partition = 0))
+            }
+        }
+        consumer(host, port).use { consumer ->
+            val got = consumer.fetch(timeTopic, 0, 0)
+            check("an explicit record timestamp round-trips exactly",
+                got.size == 4 && (0 until 3).all { got[it].timestamp == base + it * 1000L },
+                "${got.map { it.timestamp }}")
+            check("a record without one is stamped with the wall clock",
+                got.size == 4 && got[3].timestamp in (beforeSend - 1000)..(now() + 1000),
+                "${got.lastOrNull()?.timestamp}")
+            check("send-and-wait returns each record's offset", offsets == listOf(0L, 1L), "$offsets")
+            val atHalf = consumer.listOffsets(timeTopic, 0, OffsetSpec.AtTimestamp(base + 500))
+            val atLast = consumer.listOffsets(timeTopic, 0, OffsetSpec.AtTimestamp(base + 2000))
+            check("list offsets by timestamp finds the first record at or after it",
+                atHalf == 1L && atLast == 2L, "$atHalf, $atLast")
+        }
+    }
+
+    section("producer: codec registration")
+    run {
+        val compressed = AtomicInteger()
+        val decompressed = AtomicInteger()
+        Codecs.register(
+            Compression.LZ4,
+            compress = { compressed.incrementAndGet(); lz4Literals(it) },
+            decompress = { decompressed.incrementAndGet(); lz4Decode(it) },
+        )
+        val lz4Topic = unique("kotlin-lz4")
+        val sent = List(10) { bytes("lz4 record $it" + " ".repeat(40)) }
+        producer(host, port) {
+            lingerMs = 0
+            compression = Compression.LZ4
+        }.use { producer ->
+            sent.forEachIndexed { i, value -> producer.send(lz4Topic, value, bytes("k$i"), partition = 0) }
+        }
+        consumer(host, port).use { consumer ->
+            val got = consumer.fetch(lz4Topic, 0, 0)
+            check("a registered codec (lz4) compresses sends and decodes fetches",
+                got.size == sent.size && got.indices.all { got[it].value.contentEquals(sent[it]) } &&
+                    compressed.get() >= 10 && decompressed.get() >= 10,
+                "${got.size} records, ${compressed.get()} compressed, ${decompressed.get()} decompressed")
+        }
+        val refused = runCatching {
+            producer(host, port) {
+                lingerMs = 0
+                compression = Compression.ZSTD
+            }.use { it.send(unique("kotlin-zstd"), bytes("x"), partition = 0) }
+        }.exceptionOrNull()
+        check("an unregistered codec is refused, not sent uncompressed",
+            refused?.message?.contains("not registered") == true, "$refused")
+    }
+
+    section("producer: retries, request.timeout.ms and delivery.timeout.ms")
+    FaultProxy(host, port).use { proxy ->
+        val retryTopic = unique("kotlin-retry")
+        val settings: ProducerSettings.() -> Unit = {
+            lingerMs = 0
+            acks = Acks.ALL
+            requestTimeoutMs = 1234
+            retries = 3
+            retryBackoffMs = 150
+        }
+        proxy.failProduces(2)
+        var started = now()
+        var error = runCatching {
+            producer("127.0.0.1", proxy.port, settings).use { it.send(retryTopic, bytes("retried"), partition = 0) }
+        }.exceptionOrNull()
+        var elapsed = now() - started
+        check("request.timeout.ms and acks travel with every produce",
+            proxy.lastTimeoutMs == 1234 && proxy.lastAcks == -1,
+            "timeout=${proxy.lastTimeoutMs} acks=${proxy.lastAcks}")
+        check("a retriable error is retried after retry.backoff.ms",
+            error == null && proxy.produces == 3 && elapsed >= 300,
+            "attempts=${proxy.produces} elapsed=$elapsed error=$error")
+        consumer(host, port).use { consumer ->
+            val stored = consumer.fetch(retryTopic, 0, 0).size
+            check("the retried record is stored exactly once", stored == 1, "stored $stored")
+        }
+
+        proxy.failProduces(-1)
+        error = runCatching {
+            producer("127.0.0.1", proxy.port) {
+                settings()
+                retries = 2
+            }.use { it.send(retryTopic, bytes("never"), partition = 0) }
+        }.exceptionOrNull()
+        check("retries bounds the attempts: the error surfaces after retries + 1",
+            error != null && proxy.produces == 3, "attempts=${proxy.produces} error=$error")
+
+        proxy.failProduces(-1)
+        started = now()
+        error = runCatching {
+            producer("127.0.0.1", proxy.port) {
+                settings()
+                retries = 1_000_000
+                retryBackoffMs = 50
+                deliveryTimeoutMs = 500
+            }.use { it.send(retryTopic, bytes("late"), partition = 0) }
+        }.exceptionOrNull()
+        elapsed = now() - started
+        check("delivery.timeout.ms bounds the time spent retrying",
+            error != null && elapsed in 450..2999,
+            "elapsed=$elapsed attempts=${proxy.produces} error=$error")
+
+        proxy.failProduces(0)
+        for (mode in 1..2) {
+            proxy.corruptFetch = mode
+            val decodeError = runCatching {
+                consumer("127.0.0.1", proxy.port).use { it.fetch(retryTopic, 0, 0, 100) }
+            }.exceptionOrNull()
+            check(if (mode == 1) "a negative length on the wire is an error"
+                  else "a length past the end of the data is an error",
+                decodeError is BrahmaputraException, "$decodeError")
+        }
+        proxy.corruptFetch = 0
+    }
+
+    section("consumer: fetch limits, high watermark and metadata")
+    run {
+        val fetchTopic = unique("kotlin-fetch")
+        val value = ByteArray(1000) { 'f'.code.toByte() }
+        producer(host, port) { lingerMs = 0 }.use { producer ->
+            repeat(10) { producer.send(fetchTopic, value, partition = 0) }
+        }
+        consumer(host, port) { fetchMaxBytes = 2500 }.use { consumer ->
+            val got = consumer.fetch(fetchTopic, 0, 0).size
+            check("fetch.max.bytes caps what one fetch returns", got in 1..9, "got $got of 10")
+        }
+        consumer(host, port) { maxPollRecords = 4 }.use { consumer ->
+            val got = consumer.fetch(fetchTopic, 0, 0)
+            check("max.poll.records caps one fetch", got.size == 4, "got ${got.size}")
+            val next = consumer.fetch(fetchTopic, 0, 4)
+            check("the records a cap held back come on the next fetch",
+                next.size == 4 && next.first().offset == 4L, "got ${next.size}")
+        }
+        consumer(host, port) {
+            fetchMinBytes = 1_000_000
+            fetchMaxWaitMs = 600
+        }.use { waiting ->
+            consumer(host, port).use { eager ->
+                var started = now()
+                val waitedFor = waiting.fetch(fetchTopic, 0, 0, 600).size
+                val waited = now() - started
+                started = now()
+                val eagerGot = eager.fetch(fetchTopic, 0, 0, 600).size
+                val quick = now() - started
+                check("fetch.min.bytes holds a fetch open until fetch.max.wait.ms",
+                    waited >= 450 && quick < 400 && waitedFor == 10 && eagerGot == 10,
+                    "waited ${waited}ms, eager ${quick}ms")
+
+                val result = eager.fetchWithWatermark(fetchTopic, 0, 0)
+                check("the high watermark is reported", result.highWatermark == 10L, "${result.highWatermark}")
+
+                val metadata = eager.metadata(listOf(fetchTopic))
+                val brokerIds = metadata.brokers.map { it.nodeId }.toSet()
+                val partitions = metadata.partitionsOf(fetchTopic)
+                check("metadata names a live leader for every partition",
+                    partitions.isNotEmpty() && partitions.all { metadata.leaderOf(fetchTopic, it) in brokerIds },
+                    "${partitions.size} partitions")
+            }
+        }
+    }
+
+    section("consumer group: several topics, auto-commit and max.poll.records")
+    run {
+        val topicA = unique("kotlin-multi-a")
+        val topicB = unique("kotlin-multi-b")
+        producer(host, port) { lingerMs = 0 }.use { producer ->
+            repeat(6) {
+                producer.send(topicA, bytes("a$it"))
+                producer.send(topicB, bytes("b$it"))
+            }
+        }
+        val member = groupConsumer(host, port, unique("kotlin-multi")) {
+            autoCommitIntervalMs = 200
+            maxPollRecords = 5
+            topics = listOf(topicA, topicB)
+        }
+        val seen = mutableListOf<Record>()
+        var largest = 0
+        val deadline = now() + 20_000
+        while (seen.size < 12 && now() < deadline) {
+            val batch = member.pollQuietly(500)
+            largest = maxOf(largest, batch.size)
+            seen += batch
+        }
+        val topics = seen.map { it.topic }.toSet()
+        check("one member consumes every subscribed topic",
+            seen.size == 12 && topics.size == 2, "${seen.size} records from $topics")
+        check("max.poll.records caps each poll", largest in 1..5, "largest poll $largest")
+        // Nothing calls commit(): these polls are what auto-commit rides on.
+        val until = now() + 1_000
+        while (now() < until) member.pollQuietly(100)
+        val total = member.committed().values.sum()
+        check("auto.commit.interval.ms commits delivered positions without commit()",
+            total == 12L, "committed $total")
+        member.close()
+    }
+
+    section("consumer group: heartbeats, session timeout and rejoin")
+    run {
+        val hbTopic = unique("kotlin-heartbeat")
+        producer(host, port) { lingerMs = 0 }.use { producer ->
+            repeat(4) { producer.send(hbTopic, bytes("h$it")) }
+        }
+        val steady = groupConsumer(host, port, unique("kotlin-hb")) {
+            autoCommitIntervalMs = 0
+            sessionTimeoutMs = 1500
+            heartbeatIntervalMs = 300
+            topics = listOf(hbTopic)
+        }
+        var got = steady.drain(4, 15_000)
+        val member = steady.memberId
+        delay(3500) // over twice the session timeout, with no poll
+        val commitError = runCatching { steady.commit() }.exceptionOrNull()
+        check("heartbeats keep an idle member in its group past session.timeout.ms",
+            got == 4 && commitError == null && steady.memberId == member, "got=$got commit=$commitError")
+        steady.close()
+
+        val quiet = groupConsumer(host, port, unique("kotlin-evicted")) {
+            autoCommitIntervalMs = 0
+            sessionTimeoutMs = 1000
+            heartbeatIntervalMs = 20_000 // effectively never, within this check
+            topics = listOf(hbTopic)
+        }
+        got = quiet.drain(4, 15_000)
+        val evicted = quiet.memberId
+        delay(2500)
+        val fenced = runCatching { quiet.commit() }.exceptionOrNull()
+        check("a member that stops heartbeating is evicted after session.timeout.ms",
+            got == 4 && fenced is ServerException && fenced.code == ErrorCode.UNKNOWN_MEMBER_ID,
+            "got=$got commit=$fenced")
+        // Only the join is checked: with no heartbeats this member is evicted again one
+        // session timeout after it rejoins.
+        val rejoinError = runCatching { quiet.poll(1000) }.exceptionOrNull()
+        check("an evicted member rejoins as a new member",
+            rejoinError == null && quiet.memberId.isNotEmpty() && quiet.memberId != evicted,
+            "$evicted -> ${quiet.memberId} error=$rejoinError")
+        quiet.close()
+    }
+
+    section("consumer group: static membership, LeaveGroup and rebalances")
+    run {
+        val staticTopic = unique("kotlin-static")
+        val partitions: List<Int>
+        producer(host, port) { lingerMs = 0 }.use { producer ->
+            partitions = producer.partitionsFor(staticTopic)
+            repeat(4) { producer.send(staticTopic, bytes("st$it")) }
+        }
+        val staticGroup = unique("kotlin-static-grp")
+        val instance = unique("kotlin-instance")
+        val fixed: GroupConsumerSettings.() -> Unit = {
+            autoCommitIntervalMs = 0
+            heartbeatIntervalMs = 300
+            groupInstanceId = instance
+            topics = listOf(staticTopic)
+        }
+        val first = groupConsumer(host, port, staticGroup, fixed)
+        first.awaitAssignment(15_000)
+        val firstMember = first.memberId
+        val firstGeneration = first.generation
+        val returning = groupConsumer(host, port, staticGroup, fixed)
+        returning.awaitAssignment(15_000)
+        check("a returning group.instance.id reclaims its member id without a rebalance",
+            firstMember.isNotEmpty() && returning.memberId == firstMember &&
+                returning.generation == firstGeneration,
+            "$firstMember/$firstGeneration -> ${returning.memberId}/${returning.generation}")
+        returning.close()
+        first.close()
+
+        // LeaveGroup: with a 30 s session and a 10 s rebalance timeout, a successor could only
+        // get the partitions quickly if the first member told the coordinator it left.
+        val leaveGroup = unique("kotlin-leave-grp")
+        val leaving: GroupConsumerSettings.() -> Unit = {
+            autoCommitIntervalMs = 0
+            sessionTimeoutMs = 30_000
+            rebalanceTimeoutMs = 10_000
+            topics = listOf(staticTopic)
+        }
+        val departing = groupConsumer(host, port, leaveGroup, leaving)
+        departing.awaitAssignment(15_000)
+        departing.close()
+        val started = now()
+        val successor = groupConsumer(host, port, leaveGroup, leaving)
+        successor.awaitAssignment(15_000)
+        val took = now() - started
+        check("close sends LeaveGroup, so a successor is not kept waiting",
+            successor.assignment.size == partitions.size && took < 6_000,
+            "${successor.assignment.size} partitions after ${took}ms")
+        successor.close()
+
+        // Two members: the second's join makes the coordinator fence the first's generation;
+        // its heartbeat learns that, it rejoins, and the partitions split.
+        val shareGroup = unique("kotlin-share-grp")
+        val sharing: GroupConsumerSettings.() -> Unit = {
+            autoCommitIntervalMs = 0
+            heartbeatIntervalMs = 200
+            topics = listOf(staticTopic)
+        }
+        val one = groupConsumer(host, port, shareGroup, sharing)
+        one.awaitAssignment(15_000)
+        val before = one.generation
+        val two = groupConsumer(host, port, shareGroup, sharing)
+        var split = false
+        kotlinx.coroutines.coroutineScope {
+            // Each member polls on its own thread, so both can take part in the rebalance.
+            val other = launch(Dispatchers.IO) {
+                while (true) two.pollQuietly(200)
+            }
+            val deadline = now() + 20_000
+            while (!split && now() < deadline) {
+                one.pollQuietly(200)
+                val mine = one.assignment
+                val theirs = two.assignment
+                split = mine.isNotEmpty() && theirs.isNotEmpty() &&
+                    (mine + theirs).toSet().size == partitions.size && mine.size + theirs.size == partitions.size
+            }
+            other.cancel()
+        }
+        check("a second member rebalances the group and the partitions split between them",
+            split, "${one.assignment} / ${two.assignment}")
+        check("the generation advances when the group rebalances",
+            one.generation > before, "$before -> ${one.generation}")
+        two.close()
+        one.close()
+    }
+}
+
+/** Poll until [want] records have arrived; returns how many did. */
+private suspend fun GroupConsumer.drain(want: Int, timeoutMs: Long): Int {
+    var got = 0
+    val deadline = now() + timeoutMs
+    while (got < want && now() < deadline) got += pollQuietly(300).size
+    return got
+}
+
+/** Poll until the member holds partitions. */
+private suspend fun GroupConsumer.awaitAssignment(timeoutMs: Long) {
+    val deadline = now() + timeoutMs
+    while (assignment.isEmpty() && now() < deadline) pollQuietly(200)
+}
+
+/**
+ * lz4 in the broker's format (little-endian uncompressed length, then a raw LZ4 block),
+ * compressing by emitting one literal run — valid LZ4 any decoder reads.
+ */
+private fun lz4Literals(payload: ByteArray): ByteArray {
+    val size = payload.size
+    val out = java.io.ByteArrayOutputStream(size + size / 255 + 16)
+    for (shift in 0 until 32 step 8) out.write(size ushr shift)
+    out.write(minOf(size, 15) shl 4)
+    if (size >= 15) {
+        var rest = size - 15
+        while (rest >= 255) {
+            out.write(255)
+            rest -= 255
+        }
+        out.write(rest)
+    }
+    out.write(payload)
+    return out.toByteArray()
+}
+
+/** Full LZ4 block decoding, matches included, so it reads what the broker's lz4 writes too. */
+private fun lz4Decode(data: ByteArray): ByteArray {
+    try {
+        val size = (0 until 4).fold(0) { acc, i -> acc or ((data[i].toInt() and 0xFF) shl (8 * i)) }
+        if (size < 0 || size > 256 * 1024 * 1024) throw ProtocolException("lz4 size $size")
+        val out = ByteArray(size)
+        var input = 4
+        var at = 0
+        fun length(start: Int): Int {
+            var total = start
+            if (start == 15) {
+                do {
+                    val more = data[input++].toInt() and 0xFF
+                    total += more
+                } while (more == 255)
+            }
+            return total
+        }
+        while (input < data.size) {
+            val token = data[input++].toInt() and 0xFF
+            val literals = length(token ushr 4)
+            System.arraycopy(data, input, out, at, literals)
+            input += literals
+            at += literals
+            if (input >= data.size) break
+            val distance = (data[input].toInt() and 0xFF) or ((data[input + 1].toInt() and 0xFF) shl 8)
+            input += 2
+            val matched = length(token and 15) + 4
+            if (distance == 0 || distance > at) throw ProtocolException("lz4 match before the output")
+            repeat(matched) {
+                out[at] = out[at - distance]
+                at++
+            }
+        }
+        if (at != size) throw ProtocolException("lz4 decoded $at of $size")
+        return out
+    } catch (error: IndexOutOfBoundsException) {
+        throw ProtocolException("truncated lz4 block")
+    }
+}
+
+/**
+ * Sits between a client and the broker, forwarding frames one request at a time, and can
+ * answer a produce with a retriable error or a fetch with a corrupt batch. It records the acks
+ * and timeout of every produce it sees. Built on the Java driver's frame codec.
+ */
+private class FaultProxy(targetHost: String, targetPort: Int) : AutoCloseable {
+    private val server = ServerSocket(0, 50, InetAddress.getLoopbackAddress())
+    private val live = Collections.synchronizedList(mutableListOf<Socket>())
+    private var failuresLeft = 0
+    @Volatile var corruptFetch = 0
+    @Volatile var produces = 0
+    @Volatile var lastAcks = Int.MIN_VALUE
+    @Volatile var lastTimeoutMs = Int.MIN_VALUE
+    val port: Int get() = server.localPort
+
+    init {
+        daemon {
+            while (true) {
+                val client = try { server.accept() } catch (closed: IOException) { return@daemon }
+                val upstream = try {
+                    Socket(targetHost, targetPort)
+                } catch (error: IOException) {
+                    closeQuietly(client)
+                    continue
+                }
+                live += client
+                live += upstream
+                daemon { serve(client, upstream) }
+            }
+        }
+    }
+
+    /** Fail the next [count] produces (-1: every one) and reset the counters. */
+    @Synchronized
+    fun failProduces(count: Int) {
+        failuresLeft = count
+        produces = 0
+    }
+
+    @Synchronized
+    private fun takeFailure(): Boolean {
+        if (failuresLeft == 0) return false
+        if (failuresLeft > 0) failuresLeft--
+        return true
+    }
+
+    private fun serve(client: Socket, upstream: Socket) {
+        try {
+            val input = DataInputStream(client.getInputStream())
+            val output = client.getOutputStream()
+            val upInput = DataInputStream(upstream.getInputStream())
+            val upOutput = upstream.getOutputStream()
+            while (true) {
+                val frame = ByteArray(input.readInt()).also { input.readFully(it) }
+                val header = ByteBuffer.wrap(frame)
+                val apiKey = header.getShort(0)
+                val correlation = header.getInt(4)
+                val body = frame.copyOfRange(10 + maxOf(header.getShort(8).toInt(), 0), frame.size)
+                var reply: ByteArray? = null
+                var oneway = false
+                if (apiKey == Protocol.ApiKey.PRODUCE) {
+                    val reader = Protocol.Reader.body(body)
+                    val topic = reader.string()
+                    val partition = reader.int32()
+                    val acks = reader.int32()
+                    lastTimeoutMs = reader.int32()
+                    lastAcks = acks
+                    produces++
+                    oneway = acks == 0
+                    if (takeFailure()) {
+                        reply = Protocol.Writer.body().string(topic).int32(partition)
+                            .int32(ErrorCode.NOT_ENOUGH_REPLICAS).int64(-1).int64(-1).bytes()
+                    }
+                } else if (apiKey == Protocol.ApiKey.FETCH && corruptFetch != 0) {
+                    val reader = Protocol.Reader.body(body)
+                    val topic = reader.string()
+                    val partition = reader.int32()
+                    // A batch whose batch_length is negative (mode 1) or runs far past the bytes
+                    // that follow (mode 2).
+                    val batch = ByteArray(61)
+                    ByteBuffer.wrap(batch).putInt(8, if (corruptFetch == 1) -1 else 1_000_000)
+                    reply = Protocol.Writer.body().string(topic).int32(partition).int32(0)
+                        .int64(1).int64(1).int64(batch.size.toLong()).int32(-1).raw(batch).bytes()
+                }
+                if (reply != null) {
+                    output.write(Protocol.encodeFrame(apiKey, correlation, null, reply))
+                    output.flush()
+                    continue
+                }
+                writeFrame(upOutput, frame)
+                if (oneway) continue
+                writeFrame(output, ByteArray(upInput.readInt()).also { upInput.readFully(it) })
+            }
+        } catch (closed: IOException) {
+            // Either side went away.
+        } catch (closed: RuntimeException) {
+            // Likewise.
+        } finally {
+            closeQuietly(client)
+            closeQuietly(upstream)
+        }
+    }
+
+    private fun writeFrame(out: OutputStream, payload: ByteArray) {
+        out.write(ByteBuffer.allocate(4 + payload.size).putInt(payload.size).put(payload).array())
+        out.flush()
+    }
+
+    override fun close() {
+        closeQuietly(server)
+        synchronized(live) { live.forEach(::closeQuietly) }
     }
 }
 

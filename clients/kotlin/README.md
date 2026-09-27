@@ -8,8 +8,13 @@ does the work.
 
 Kotlin 2.4, JVM 17+. Dependencies: `kotlin-stdlib` and `kotlinx-coroutines-core`.
 
-Verified end to end against a live broker: **54/54 checks**, the Go suite's sections and
-checks, driven through this wrapper's API (`./test.sh HOST PORT`).
+Verified end to end against a live broker: **88/88 checks** — the Go suite's 54
+checks plus 34 covering the rest of the client feature checklist (batch.size, linger.ms,
+partitioners, record timestamps, send-and-wait offsets, a registered codec, retries and
+request / delivery timeouts through a fault-injecting proxy, bounds-checked decoding, fetch
+limits, the high watermark, offsets by timestamp, multi-topic groups, auto-commit,
+heartbeats and eviction, static membership, LeaveGroup, rebalances), all driven through
+this wrapper's API (`./test.sh HOST PORT`).
 
 ## Build
 
@@ -47,7 +52,11 @@ producer {
 
     producer.flush()   // send everything buffered and wait for the acks
 
+    // A record with its own timestamp (unix ms); null (the default) stamps the wall clock.
+    producer.send("orders", "{\"id\":5}".encodeToByteArray(), timestamp = System.currentTimeMillis() - 60_000)
+
     val offset = producer.sendAndAwait(ProducerRecord.of("orders", "{\"id\":4}"))  // one round trip
+    val pinned = producer.sendAndAwait(ProducerRecord.of("orders", "{\"id\":6}", partition = 3))
 }
 ```
 
@@ -74,6 +83,9 @@ consumer("127.0.0.1", 9092).use { consumer ->
     val start = consumer.listOffsets("orders", 0, OffsetSpec.Earliest)
     val end = consumer.listOffsets("orders", 0, OffsetSpec.Latest)
     val anHourAgo = consumer.listOffsets("orders", 0, OffsetSpec.AtTimestamp(System.currentTimeMillis() - 3_600_000))
+
+    val metadata = consumer.metadata(listOf("orders"))   // brokers, partitions, leaders
+    val leader = metadata.leaderOf("orders", 0)
 }
 ```
 
@@ -88,11 +100,13 @@ the round trip as null, and empty ones as empty.
 groupConsumer {
     bootstrapServers = "127.0.0.1:9092"
     groupId = "billing"
-    topics = listOf("orders")
+    topics = listOf("orders", "refunds")   // any number of topics
     assignor = Assignor.STICKY
     autoOffsetReset = AutoOffsetReset.EARLIEST
     autoCommitIntervalMs = 0        // commit explicitly
     groupInstanceId = "worker-3"    // static membership
+    sessionTimeoutMs = 10_000
+    heartbeatIntervalMs = 3_000
 }.use { member ->
     member.records().collect { record ->   // Flow<Record>: polls until cancelled
         handle(record)
@@ -109,7 +123,9 @@ so its partitions move immediately rather than after a session timeout.
 
 `maxPollIntervalMs` bounds the time *between* polls; time spent inside `poll`, a slow join
 included, does not count. A member that stalls leaves the group and rejoins on its next
-`poll`; one the coordinator no longer knows (`UNKNOWN_MEMBER_ID`) rejoins as a new member.
+`poll`; one the coordinator no longer knows (`UNKNOWN_MEMBER_ID`, from a heartbeat or a
+commit) rejoins as a new member, and a commit fenced by a newer generation throws and the
+next `poll` rejoins.
 `AutoOffsetReset.NONE` makes `poll` throw `NoOffsetForPartitionException`. Cancelling a
 coroutine while its poll is in flight discards that poll's records, as abandoning any
 consumer's poll would.
@@ -136,9 +152,13 @@ Properties of the DSL receivers, named after Kafka's settings.
 | `maxBlockMs` | `max.block.ms` | 60000 |
 | `dialTimeoutMs` | — | 30000 |
 
+Only errors the broker returns before appending are retried, so a retry cannot duplicate a
+record; `retries` bounds the attempts after the first and `deliveryTimeoutMs` the whole send.
+
 **`consumer { }`** (`ConsumerSettings`): `bootstrapServers`, `clientId`, `fetchMaxBytes`
 (8 MiB), `fetchMinBytes` (1), `fetchMaxWaitMs` (500), `readCommitted` (false),
-`rack` (`client.rack`, ""), `maxPollRecords` (500), `dialTimeoutMs` (30000).
+`rack` (`client.rack`, ""), `maxPollRecords` (`max.poll.records`, the most one `fetch`
+returns; 500), `dialTimeoutMs` (30000).
 
 **`groupConsumer { }`** (`GroupConsumerSettings`)
 
@@ -147,6 +167,7 @@ Properties of the DSL receivers, named after Kafka's settings.
 | `groupId` | `group.id` | required |
 | `topics` | `subscribe(...)` | none (or call `subscribe`) |
 | `sessionTimeoutMs` | `session.timeout.ms` | 10000 |
+| `heartbeatIntervalMs` | `heartbeat.interval.ms` | 3000 (0: a third of the session timeout) |
 | `rebalanceTimeoutMs` | `rebalance.timeout.ms` | 3000 |
 | `maxPollIntervalMs` | `max.poll.interval.ms` | 300000 |
 | `autoCommitIntervalMs` | `auto.commit.interval.ms` | 5000 (0 disables) |
@@ -193,7 +214,7 @@ runtime, `kotlin-stdlib` and `kotlinx-coroutines-core` from Maven Central into
 `~/.cache/brahmaputra-jvm` (override with `BRAHMAPUTRA_JVM_CACHE`) on first use, verifies
 their SHA-1s, compiles the Java driver with `javac -Werror` and then the wrapper and
 `src/test/kotlin/.../ManualTest.kt` with `kotlinc -Werror` into `build/test-sh`, and runs
-the suite. It prints `54 passed, 0 failed` and exits non-zero on any failure. With a build
+the suite. It prints `88 passed, 0 failed` and exits non-zero on any failure. With a build
 tool instead:
 
 ```bash
@@ -204,5 +225,4 @@ gradle manualTest -Pbroker=127.0.0.1:9092
 ## Not implemented
 
 Same as the Java driver: no TLS (so no usable authentication), no idempotent or
-transactional producer. `sendAndAwait` always uses the partitioner (the Java `sendSync`
-takes no partition).
+transactional producer.

@@ -62,7 +62,10 @@ public class ConsumerConfig
     /// <summary><c>fetch.max.wait.ms</c>: the long-poll ceiling when caught up.</summary>
     public int FetchMaxWaitMs { get; set; } = 500;
 
-    /// <summary><c>max.poll.records</c>: how many records a group poll returns.</summary>
+    /// <summary>
+    /// <c>max.poll.records</c>: the most records one fetch (or group poll)
+    /// returns; the rest come on the next one. 0 is unlimited.
+    /// </summary>
     public int MaxPollRecords { get; set; } = 500;
 
     /// <summary><c>client.rack</c>: this consumer's failure domain, empty for none.</summary>
@@ -178,9 +181,12 @@ public sealed class Consumer : IDisposable
         if (code != 0) throw new ServerException(code, $"fetch {topic}-{partition}");
 
         var output = new List<ConsumeResult>();
+        // max.poll.records: the caller resumes from the last returned offset + 1,
+        // so what is cut here is fetched again next time rather than lost.
+        int cap = _config.MaxPollRecords > 0 ? _config.MaxPollRecords : int.MaxValue;
         foreach (var batch in batches)
         {
-            for (int index = 0; index < batch.Records.Count; index++)
+            for (int index = 0; index < batch.Records.Count && output.Count < cap; index++)
             {
                 long recordOffset = batch.BaseOffset + index;
                 // A batch can start before the requested offset; skip what the

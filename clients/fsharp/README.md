@@ -22,8 +22,14 @@ with it:
 <ProjectReference Include="path/to/clients/fsharp/Brahmaputra.FSharp/Brahmaputra.FSharp.fsproj" />
 ```
 
-Tested end to end against a live broker: **54/54 checks**
-(`./test.sh 127.0.0.1 9092`).
+Tested end to end against a live broker: **88/88 checks**
+(`./test.sh 127.0.0.1 9092`): the Go suite's 54 plus 34 covering the rest of
+the client feature checklist (batch.size, linger.ms, partitioners,
+timestamps, send-and-wait offsets, a registered codec, retries and request /
+delivery timeouts through a fault-injecting proxy, bounds-checked decoding,
+fetch limits, the high watermark, offsets by timestamp, metadata,
+multi-topic groups, auto-commit, heartbeats and eviction, static membership,
+LeaveGroup, rebalances), all through this API.
 
 ## Conventions
 
@@ -87,6 +93,9 @@ match producer |> Producer.produce (ProducerRecord.ofString "orders" "x" |> Prod
 | Ok meta -> printfn "stored at %d-%A" meta.Partition meta.Offset    // Offset = None with acks=0
 | Error e -> eprintfn "failed: %s" e.Message
 
+// A record with its own unix-ms timestamp; without one it gets the send time.
+producer |> Producer.send (ProducerRecord.ofString "orders" "late" |> ProducerRecord.withTimestamp 1_700_000_000_000L) |> ignore
+
 // A tombstone: Value = None, distinct from an empty value.
 producer |> Producer.send (ProducerRecord.tombstone "orders" (Text.Encoding.UTF8.GetBytes "user-7")) |> ignore
 
@@ -130,7 +139,11 @@ let latest = consumer |> Consumer.listOffsets "orders" 0 OffsetSpec.Latest
 let hourAgo = consumer |> Consumer.listOffsets "orders" 0
                             (OffsetSpec.AtTimestamp(DateTimeOffset.UtcNow.AddHours(-1.).ToUnixTimeMilliseconds()))
 let verbose = consumer |> Consumer.fetchVerbose "orders" 0 0L 500    // FetchResult.HighWatermark
+let leaders = consumer |> Consumer.metadata    // Topics: name -> partitions, each with its Leader
 ```
+
+A fetch returns at most `MaxPollRecords` records; fetch again from the last
+returned offset + 1 for the rest.
 
 ## Consume as a group
 
@@ -140,10 +153,12 @@ let config =
         Assignor = Assignor.Sticky
         AutoOffsetReset = AutoOffsetReset.Earliest
         EnableAutoCommit = false               // commit explicitly
-        GroupInstanceId = Some "worker-3" }    // static membership
+        GroupInstanceId = Some "worker-3"      // static membership
+        SessionTimeoutMs = 10_000
+        HeartbeatIntervalMs = 3_000 }
 
 use consumer = GroupConsumer.create config    // on dispose: commit if auto, then LeaveGroup
-consumer |> GroupConsumer.subscribe [ "orders" ]
+consumer |> GroupConsumer.subscribe [ "orders"; "refunds" ]   // any number of topics
 
 let rec loop () = async {
     match! consumer |> GroupConsumer.pollAsync (TimeSpan.FromMilliseconds 500.) with
@@ -162,8 +177,11 @@ and commit from one thread or one async flow. Heartbeats run in the
 background. If the application stops polling for longer than
 `MaxPollIntervalMs`, the member leaves the group, and the next poll
 rejoins. Time spent inside `poll` never counts toward that limit.
-`GroupConsumer.committed`, `assignment`, `memberId` and `generation` report
-the member's state.
+A member the coordinator no longer knows (`UNKNOWN_MEMBER_ID`, from a
+heartbeat or a commit) rejoins as a new member, and a commit fenced by a
+newer generation returns `BrahmaputraError.Server` and the next poll
+rejoins. `GroupConsumer.committed`, `assignment`, `memberId` and
+`generation` report the member's state.
 
 ## Configuration
 
@@ -195,6 +213,7 @@ Field names follow Kafka's names. Build a config from `…Config.create` or
 | `FetchMaxBytes` | `fetch.max.bytes` | 8 MiB |
 | `FetchMinBytes` | `fetch.min.bytes` | 1 |
 | `FetchMaxWaitMs` | `fetch.max.wait.ms` | 500 |
+| `MaxPollRecords` | `max.poll.records` | 500 (per fetch, and per group poll; 0 unlimited) |
 | `ClientRack` | `client.rack` | `None` |
 | `IsolationLevel` | `isolation.level` | `ReadUncommitted` |
 | `RequestTimeoutMs` | `request.timeout.ms` | 30000 (client-side round-trip timeout per request) |
@@ -207,9 +226,9 @@ Field names follow Kafka's names. Build a config from `…Config.create` or
 | `GroupId` | `group.id` | required |
 | `GroupInstanceId` | `group.instance.id` | `None` (dynamic member) |
 | `SessionTimeoutMs` | `session.timeout.ms` | 10000 (Kafka: 45000) |
+| `HeartbeatIntervalMs` | `heartbeat.interval.ms` | 3000 (0: a third of the session timeout) |
 | `RebalanceTimeoutMs` | | 3000 |
 | `MaxPollIntervalMs` | `max.poll.interval.ms` | 300000 |
-| `MaxPollRecords` | `max.poll.records` | 500 |
 | `EnableAutoCommit` | `enable.auto.commit` | true |
 | `AutoCommitIntervalMs` | `auto.commit.interval.ms` | 5000 |
 | `AutoOffsetReset` | `auto.offset.reset` | `Earliest` (`Latest`; `None` returns `NoOffsetForPartition`) |
@@ -248,8 +267,9 @@ Start a broker, then run:
 The script builds the suite and the two libraries it uses in Release. All
 build output, including the C# driver's, goes to `clients/fsharp/artifacts`.
 It then runs `Brahmaputra.FSharp.ManualTest`. That suite is a check-for-check
-port of the Go suite, driven through the F# API, and it ends with
-`54 passed, 0 failed`. The script exits 1 if a check fails and 2 if setup
+port of the Go suite followed by the checklist checks
+(`Brahmaputra.FSharp.ManualTest/Checklist.fs`), driven through the F# API,
+and it ends with `88 passed, 0 failed`. The script exits 1 if a check fails and 2 if setup
 fails, for example when no broker is reachable. You can also run the suite
 directly:
 

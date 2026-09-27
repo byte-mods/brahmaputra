@@ -328,7 +328,9 @@ brp_err_t brp_producer_send(brp_producer_t *producer,
                             const brp_message_t *message);
 
 /* Sends one record on its own and returns its offset. A full round trip
- * per record: correct, and slow. offset may be NULL. */
+ * per record: correct, and slow. Records already buffered for the same
+ * partition are sent first, so the offset never lands ahead of an earlier
+ * send. offset may be NULL. */
 brp_err_t brp_producer_send_sync(brp_producer_t *producer,
                                  const brp_message_t *message,
                                  int64_t *offset);
@@ -363,7 +365,10 @@ typedef struct brp_consumer_config {
     int32_t fetch_max_wait_ms;/* fetch.max.wait.ms (caps each fetch)       */
     int32_t isolation_level;  /* isolation.level                           */
     const char *client_rack;  /* client.rack, "" or NULL for none          */
-    int max_poll_records;     /* max.poll.records (group consumer)         */
+    int max_poll_records;     /* max.poll.records: most records one fetch
+                                 (or group poll) returns; 0 = unlimited.
+                                 Fetch again from the last offset + 1 for
+                                 the rest.                                 */
     int socket_connection_setup_timeout_ms;
 } brp_consumer_config_t;
 
@@ -402,6 +407,8 @@ typedef struct brp_group_consumer brp_group_consumer_t;
 typedef struct brp_group_config {
     const char *client_id;          /* client.id                           */
     int32_t session_timeout_ms;     /* session.timeout.ms (10000)          */
+    int heartbeat_interval_ms;      /* heartbeat.interval.ms (3000); 0 = a
+                                       third of session.timeout.ms         */
     int32_t rebalance_timeout_ms;   /* rebalance.timeout.ms (3000)         */
     int max_poll_interval_ms;       /* max.poll.interval.ms (300000)       */
     int auto_commit_interval_ms;    /* auto.commit.interval.ms; 0 = off    */
@@ -446,7 +453,10 @@ brp_err_t brp_group_consumer_poll(brp_group_consumer_t *group, int timeout_ms,
                                   brp_record_t **records, size_t *count);
 
 /* Commits the positions of records delivered so far. At-least-once:
- * call it after processing, not before. */
+ * call it after processing, not before. A commit fenced by the coordinator
+ * (UNKNOWN_MEMBER_ID, ILLEGAL_GENERATION, REBALANCE_IN_PROGRESS) fails with
+ * that code and the next poll rejoins, as a new member when the
+ * coordinator no longer knows this one. */
 brp_err_t brp_group_consumer_commit(brp_group_consumer_t *group);
 
 /* Reads the group's committed offsets. count 0 asks for every partition
@@ -462,6 +472,13 @@ brp_err_t brp_group_consumer_committed(brp_group_consumer_t *group,
 brp_err_t brp_group_consumer_assignment(brp_group_consumer_t *group,
                                         brp_partition_offset_t **out,
                                         size_t *out_count);
+
+/* This member's id as the coordinator assigned it ("" before the first
+ * join). Release with brp_free(); NULL only when out of memory. */
+char *brp_group_consumer_member_id(brp_group_consumer_t *group);
+
+/* The group generation this member last joined (-1 before the first). */
+int32_t brp_group_consumer_generation(brp_group_consumer_t *group);
 
 /* Commits, sends LeaveGroup so partitions move at once rather than after
  * session.timeout.ms, stops the heartbeat thread and frees. Always frees;

@@ -51,27 +51,40 @@ class Producer(
         key: ByteArray? = null,
         partition: Int? = null,
         headers: List<Header> = emptyList(),
-    ) = send(ProducerRecord(topic, value, key, partition, headers))
+        timestamp: Long? = null,
+    ) = send(ProducerRecord(topic, value, key, partition, headers, timestamp))
 
     /** [send] for callers outside a coroutine: blocks the calling thread. */
     fun sendBlocking(record: ProducerRecord) {
         val headers = record.headers.map { it.toJava() }
         val partition = record.partition
+        val timestamp = record.timestamp ?: Client.NO_TIMESTAMP
         if (partition != null) {
-            underlying.sendTo(record.topic, partition, record.value, record.key, headers)
+            underlying.sendTo(record.topic, partition, record.value, record.key, timestamp, headers)
         } else {
-            underlying.send(record.topic, record.value, record.key, headers)
+            underlying.send(record.topic, record.value, record.key, timestamp, headers)
         }
     }
 
     /**
      * Send one record on its own and return its offset. A full round trip per record:
-     * correct, and slow. The partitioner picks the partition, so [ProducerRecord.partition]
-     * must be null.
+     * correct, and slow. Records already buffered for the same partition go first, so the
+     * offset never lands ahead of an earlier send.
      */
     suspend fun sendAndAwait(record: ProducerRecord): Long = withContext(Dispatchers.IO) {
-        require(record.partition == null) { "sendAndAwait picks the partition itself" }
-        underlying.sendSync(record.topic, record.value, record.key, record.headers.map { it.toJava() })
+        sendAndAwaitBlocking(record)
+    }
+
+    /** [sendAndAwait] for callers outside a coroutine. */
+    fun sendAndAwaitBlocking(record: ProducerRecord): Long {
+        val headers = record.headers.map { it.toJava() }
+        val timestamp = record.timestamp ?: Client.NO_TIMESTAMP
+        val partition = record.partition
+        return if (partition != null) {
+            underlying.sendSyncTo(record.topic, partition, record.value, record.key, timestamp, headers)
+        } else {
+            underlying.sendSync(record.topic, record.value, record.key, timestamp, headers)
+        }
     }
 
     /** Send everything buffered and wait for the acks; also reports failed linger flushes. */

@@ -760,6 +760,7 @@ let private run address =
     connectionFailures address
     maxPollInterval address
     timeInsidePoll address
+    Checklist.run check section address
 
 [<EntryPoint>]
 let main args =

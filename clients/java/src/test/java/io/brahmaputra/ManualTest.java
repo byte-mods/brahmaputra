@@ -10,6 +10,8 @@ import io.brahmaputra.Client.ProducerConfig;
 import io.brahmaputra.GroupConsumer.GroupConfig;
 import io.brahmaputra.Protocol.RecordHeader;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -17,6 +19,7 @@ import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -24,6 +27,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Exercises the Java driver against a live broker.
@@ -732,6 +736,765 @@ public final class ManualTest {
             }
             consumer.close();
             producer.close();
+        }
+
+        runExtra(host, port);
+    }
+
+    // -----------------------------------------------------------------------
+    // Checks beyond the Go suite: every item of the client feature checklist
+    // that the sections above do not already exercise.
+    // -----------------------------------------------------------------------
+
+    private static void runExtra(String host, int port) {
+        section("producer: batch.size and linger.ms");
+        {
+            String batchTopic = unique("java-batchsize");
+            ProducerConfig config = new ProducerConfig();
+            config.lingerMs = 60_000; // only batch.size can send anything during this check
+            config.batchSize = 1024;
+            byte[] value = new byte[200];
+            Arrays.fill(value, (byte) 'b');
+            try (Producer producer = new Producer(host, port, config);
+                    Consumer consumer = new Consumer(host, port, new ConsumerConfig())) {
+                for (int i = 0; i < 8; i++) {
+                    producer.sendTo(batchTopic, 0, value, null);
+                }
+                int early = consumer.fetch(batchTopic, 0, 0, 0).size();
+                check("a batch that reaches batch.size is sent before linger.ms",
+                        early >= 1 && early < 8, early + " of 8 sent before any flush");
+                producer.flush();
+                int after = fetchAll(consumer, batchTopic, 8).size();
+                check("flush sends the partial batch that is left", after == 8,
+                        "got " + after);
+            }
+
+            String lingerTopic = unique("java-linger");
+            ProducerConfig lingering = new ProducerConfig();
+            lingering.lingerMs = 500;
+            try (Producer producer = new Producer(host, port, lingering);
+                    Consumer consumer = new Consumer(host, port, new ConsumerConfig())) {
+                producer.router().partitions(lingerTopic);
+                producer.sendTo(lingerTopic, 0, bytes("lingering"), null);
+                int immediate = consumer.fetch(lingerTopic, 0, 0, 0).size();
+                sleep(1500);
+                int later = consumer.fetch(lingerTopic, 0, 0, 0).size();
+                check("linger.ms holds a record back, then sends it without a flush",
+                        immediate == 0 && later == 1,
+                        "immediately " + immediate + ", after linger " + later);
+            }
+        }
+
+        section("producer: partitioners");
+        {
+            String rrTopic = unique("java-rr");
+            String pinTopic = unique("java-pinned");
+            List<Integer> partitions;
+            try (Producer producer = new Producer(host, port, unbatched())) {
+                partitions = producer.router().partitions(rrTopic);
+                for (int i = 0; i < partitions.size() * 2; i++) {
+                    producer.send(rrTopic, bytes("rr" + i));
+                }
+                producer.router().partitions(pinTopic);
+                producer.sendTo(pinTopic, partitions.size() - 1, bytes("pinned"), null);
+            }
+            try (Consumer consumer = new Consumer(host, port, new ConsumerConfig())) {
+                boolean even = true;
+                StringBuilder counts = new StringBuilder();
+                int pinnedElsewhere = 0;
+                int pinnedThere = 0;
+                for (int partition : partitions) {
+                    int count = consumer.fetch(rrTopic, partition, 0, 0).size();
+                    counts.append(partition).append('=').append(count).append(' ');
+                    even &= count == 2;
+                    int pinned = consumer.fetch(pinTopic, partition, 0, 0).size();
+                    if (partition == partitions.size() - 1) {
+                        pinnedThere += pinned;
+                    } else {
+                        pinnedElsewhere += pinned;
+                    }
+                }
+                check("a null key round-robins across every partition", even,
+                        counts.toString().trim());
+                check("an explicit partition is honoured",
+                        pinnedThere == 1 && pinnedElsewhere == 0,
+                        pinnedThere + " there, " + pinnedElsewhere + " elsewhere");
+            }
+        }
+
+        section("producer: record timestamps and send-and-wait");
+        {
+            String timeTopic = unique("java-timestamps");
+            String syncTopic = unique("java-sync");
+            long base = System.currentTimeMillis() - 60_000;
+            long first;
+            long second;
+            long beforeSend = System.currentTimeMillis();
+            try (Producer producer = new Producer(host, port, unbatched())) {
+                for (int i = 0; i < 3; i++) {
+                    producer.sendTo(timeTopic, 0, bytes("t" + i), null, base + i * 1000L,
+                            Collections.emptyList());
+                }
+                producer.sendTo(timeTopic, 0, bytes("now"), null);
+                first = producer.sendSyncTo(syncTopic, 0, bytes("s0"), null,
+                        Client.NO_TIMESTAMP, Collections.emptyList());
+                second = producer.sendSyncTo(syncTopic, 0, bytes("s1"), null,
+                        Client.NO_TIMESTAMP, Collections.emptyList());
+            }
+            try (Consumer consumer = new Consumer(host, port, new ConsumerConfig())) {
+                List<ConsumedRecord> got = consumer.fetch(timeTopic, 0, 0, 500);
+                boolean exact = got.size() == 4;
+                for (int i = 0; exact && i < 3; i++) {
+                    exact = got.get(i).timestamp == base + i * 1000L;
+                }
+                check("an explicit record timestamp round-trips exactly", exact,
+                        got.size() + " records");
+                check("a record without one is stamped with the wall clock",
+                        got.size() == 4 && got.get(3).timestamp >= beforeSend - 1000
+                                && got.get(3).timestamp <= System.currentTimeMillis() + 1000,
+                        got.size() == 4 ? String.valueOf(got.get(3).timestamp) : "");
+                check("send-and-wait returns each record's offset", first == 0 && second == 1,
+                        first + ", " + second);
+                long atHalf = consumer.listOffsets(timeTopic, 0, base + 500);
+                long atLast = consumer.listOffsets(timeTopic, 0, base + 2000);
+                check("list offsets by timestamp finds the first record at or after it",
+                        atHalf == 1 && atLast == 2, atHalf + ", " + atLast);
+            }
+        }
+
+        section("producer: codec registration");
+        {
+            Lz4Literals lz4 = new Lz4Literals();
+            Protocol.registerCodec(Protocol.Compression.LZ4, lz4);
+            String lz4Topic = unique("java-lz4");
+            ProducerConfig config = unbatched();
+            config.compressionType = "lz4";
+            List<byte[]> sent = new ArrayList<>();
+            try (Producer producer = new Producer(host, port, config)) {
+                for (int i = 0; i < 10; i++) {
+                    byte[] value = bytes("lz4 record " + i + " ".repeat(40));
+                    sent.add(value);
+                    producer.sendTo(lz4Topic, 0, value, bytes("k" + i));
+                }
+            }
+            try (Consumer consumer = new Consumer(host, port, new ConsumerConfig())) {
+                List<ConsumedRecord> got = consumer.fetch(lz4Topic, 0, 0, 500);
+                boolean same = got.size() == sent.size();
+                for (int i = 0; same && i < got.size(); i++) {
+                    same = Arrays.equals(got.get(i).value, sent.get(i));
+                }
+                check("a registered codec (lz4) compresses sends and decodes fetches",
+                        same && lz4.compressed.get() >= 10 && lz4.decompressed.get() >= 10,
+                        got.size() + " records, " + lz4.compressed.get() + " compressed, "
+                                + lz4.decompressed.get() + " decompressed");
+            }
+            ProducerConfig zstd = unbatched();
+            zstd.compressionType = "zstd";
+            RuntimeException refused = null;
+            try (Producer producer = new Producer(host, port, zstd)) {
+                producer.sendTo(unique("java-zstd"), 0, bytes("x"), null);
+            } catch (RuntimeException error) {
+                refused = error;
+            }
+            check("an unregistered codec is refused, not sent uncompressed",
+                    refused != null && String.valueOf(refused.getMessage()).contains("not registered"),
+                    String.valueOf(refused));
+        }
+
+        section("producer: retries, request.timeout.ms and delivery.timeout.ms");
+        try (FaultProxy proxy = new FaultProxy(host, port)) {
+            String retryTopic = unique("java-retry");
+            ProducerConfig config = unbatched();
+            config.acks = -1;
+            config.requestTimeoutMs = 1234;
+            config.retries = 3;
+            config.retryBackoffMs = 150;
+            proxy.failProduces(2);
+            RuntimeException error = null;
+            long started = System.currentTimeMillis();
+            try (Producer producer = new Producer("127.0.0.1", proxy.port(), config)) {
+                producer.sendTo(retryTopic, 0, bytes("retried"), null);
+            } catch (RuntimeException failure) {
+                error = failure;
+            }
+            long elapsed = System.currentTimeMillis() - started;
+            check("request.timeout.ms and acks travel with every produce",
+                    proxy.lastTimeoutMs == 1234 && proxy.lastAcks == -1,
+                    "timeout=" + proxy.lastTimeoutMs + " acks=" + proxy.lastAcks);
+            check("a retriable error is retried after retry.backoff.ms",
+                    error == null && proxy.produces == 3 && elapsed >= 300,
+                    "attempts=" + proxy.produces + " elapsed=" + elapsed + " error=" + error);
+            try (Consumer consumer = new Consumer(host, port, new ConsumerConfig())) {
+                int stored = consumer.fetch(retryTopic, 0, 0, 500).size();
+                check("the retried record is stored exactly once", stored == 1,
+                        "stored " + stored);
+            }
+
+            proxy.failProduces(-1);
+            config.retries = 2;
+            error = null;
+            try (Producer producer = new Producer("127.0.0.1", proxy.port(), config)) {
+                producer.sendTo(retryTopic, 0, bytes("never"), null);
+            } catch (RuntimeException failure) {
+                error = failure;
+            }
+            check("retries bounds the attempts: the error surfaces after retries + 1",
+                    error != null && proxy.produces == 3,
+                    "attempts=" + proxy.produces + " error=" + error);
+
+            proxy.failProduces(-1);
+            config.retries = 1_000_000;
+            config.retryBackoffMs = 50;
+            config.deliveryTimeoutMs = 500;
+            error = null;
+            started = System.currentTimeMillis();
+            try (Producer producer = new Producer("127.0.0.1", proxy.port(), config)) {
+                producer.sendTo(retryTopic, 0, bytes("late"), null);
+            } catch (RuntimeException failure) {
+                error = failure;
+            }
+            elapsed = System.currentTimeMillis() - started;
+            check("delivery.timeout.ms bounds the time spent retrying",
+                    error != null && elapsed >= 450 && elapsed < 3000,
+                    "elapsed=" + elapsed + " attempts=" + proxy.produces + " error=" + error);
+
+            proxy.failProduces(0);
+            for (int mode = 1; mode <= 2; mode++) {
+                proxy.corruptFetch = mode;
+                RuntimeException decodeError = null;
+                try (Consumer consumer =
+                        new Consumer("127.0.0.1", proxy.port(), new ConsumerConfig())) {
+                    consumer.fetch(retryTopic, 0, 0, 100);
+                } catch (RuntimeException failure) {
+                    decodeError = failure;
+                }
+                check(mode == 1
+                                ? "a negative length on the wire is an error"
+                                : "a length past the end of the data is an error",
+                        decodeError instanceof Protocol.BrahmaputraException,
+                        String.valueOf(decodeError));
+            }
+            proxy.corruptFetch = 0;
+        }
+
+        section("consumer: fetch limits, high watermark and metadata");
+        {
+            String fetchTopic = unique("java-fetch");
+            byte[] value = new byte[1000];
+            Arrays.fill(value, (byte) 'f');
+            try (Producer producer = new Producer(host, port, unbatched())) {
+                for (int i = 0; i < 10; i++) {
+                    producer.sendTo(fetchTopic, 0, value, null);
+                }
+            }
+            ConsumerConfig small = new ConsumerConfig();
+            small.fetchMaxBytes = 2500;
+            try (Consumer consumer = new Consumer(host, port, small)) {
+                int got = consumer.fetch(fetchTopic, 0, 0, 500).size();
+                check("fetch.max.bytes caps what one fetch returns", got >= 1 && got < 10,
+                        "got " + got + " of 10");
+            }
+            ConsumerConfig capped = new ConsumerConfig();
+            capped.maxPollRecords = 4;
+            try (Consumer consumer = new Consumer(host, port, capped)) {
+                List<ConsumedRecord> got = consumer.fetch(fetchTopic, 0, 0, 500);
+                check("max.poll.records caps one fetch", got.size() == 4,
+                        "got " + got.size());
+                List<ConsumedRecord> next = consumer.fetch(fetchTopic, 0, 4, 500);
+                check("the records a cap held back come on the next fetch",
+                        next.size() == 4 && next.get(0).offset == 4, "got " + next.size());
+            }
+            ConsumerConfig patient = new ConsumerConfig();
+            patient.fetchMinBytes = 1_000_000;
+            patient.fetchMaxWaitMs = 600;
+            try (Consumer waiting = new Consumer(host, port, patient);
+                    Consumer eager = new Consumer(host, port, new ConsumerConfig())) {
+                long started = System.currentTimeMillis();
+                int waitedFor = waiting.fetch(fetchTopic, 0, 0, 600).size();
+                long waited = System.currentTimeMillis() - started;
+                started = System.currentTimeMillis();
+                int eagerGot = eager.fetch(fetchTopic, 0, 0, 600).size();
+                long quick = System.currentTimeMillis() - started;
+                check("fetch.min.bytes holds a fetch open until fetch.max.wait.ms",
+                        waited >= 450 && quick < 400 && waitedFor == 10 && eagerGot == 10,
+                        "waited " + waited + "ms, eager " + quick + "ms");
+
+                Client.FetchResult result = eager.fetchVerbose(fetchTopic, 0, 0, 500);
+                check("the high watermark is reported", result.highWatermark == 10,
+                        String.valueOf(result.highWatermark));
+
+                Client.ClusterMetadata metadata = eager.router()
+                        .metadata(Collections.singletonList(fetchTopic), true);
+                Set<Integer> brokerIds = new HashSet<>();
+                for (Client.BrokerInfo broker : metadata.brokers) {
+                    brokerIds.add(broker.nodeId);
+                }
+                List<Integer> partitions = metadata.partitionsOf(fetchTopic);
+                boolean led = !partitions.isEmpty();
+                for (int partition : partitions) {
+                    led &= brokerIds.contains(metadata.leaderOf(fetchTopic, partition));
+                }
+                check("metadata names a live leader for every partition", led,
+                        partitions.size() + " partitions");
+            }
+        }
+
+        section("consumer group: several topics, auto-commit and max.poll.records");
+        {
+            String topicA = unique("java-multi-a");
+            String topicB = unique("java-multi-b");
+            try (Producer producer = new Producer(host, port, unbatched())) {
+                for (int i = 0; i < 6; i++) {
+                    producer.send(topicA, bytes("a" + i));
+                    producer.send(topicB, bytes("b" + i));
+                }
+            }
+            GroupConfig config = new GroupConfig();
+            config.autoCommitIntervalMs = 200;
+            config.maxPollRecords = 5;
+            GroupConsumer consumer = new GroupConsumer(host, port, unique("java-multi"), config);
+            consumer.subscribe(Arrays.asList(topicA, topicB));
+            List<ConsumedRecord> seen = new ArrayList<>();
+            int largest = 0;
+            long deadline = System.currentTimeMillis() + 20_000;
+            while (seen.size() < 12 && System.currentTimeMillis() < deadline) {
+                List<ConsumedRecord> batch = pollQuietly(consumer, 500);
+                largest = Math.max(largest, batch.size());
+                seen.addAll(batch);
+            }
+            Set<String> topics = new HashSet<>();
+            for (ConsumedRecord record : seen) {
+                topics.add(record.topic);
+            }
+            check("one member consumes every subscribed topic",
+                    seen.size() == 12 && topics.size() == 2,
+                    seen.size() + " records from " + topics);
+            check("max.poll.records caps each poll", largest >= 1 && largest <= 5,
+                    "largest poll " + largest);
+            // Nothing calls commit(): these polls are what auto-commit rides on.
+            long until = System.currentTimeMillis() + 1_000;
+            while (System.currentTimeMillis() < until) {
+                pollQuietly(consumer, 100);
+            }
+            long total = 0;
+            for (long offset : consumer.committed(Collections.emptyList()).values()) {
+                total += offset;
+            }
+            check("auto.commit.interval.ms commits delivered positions without commit()",
+                    total == 12, "committed " + total);
+            consumer.close();
+        }
+
+        section("consumer group: heartbeats, session timeout and rejoin");
+        {
+            String hbTopic = unique("java-heartbeat");
+            try (Producer producer = new Producer(host, port, unbatched())) {
+                for (int i = 0; i < 4; i++) {
+                    producer.send(hbTopic, bytes("h" + i));
+                }
+            }
+            GroupConfig alive = new GroupConfig();
+            alive.autoCommitIntervalMs = 0;
+            alive.sessionTimeoutMs = 1500;
+            alive.heartbeatIntervalMs = 300;
+            GroupConsumer steady = new GroupConsumer(host, port, unique("java-hb"), alive);
+            steady.subscribe(Collections.singletonList(hbTopic));
+            int got = drain(steady, 4, 15_000);
+            String member = steady.memberId();
+            sleep(3500); // over twice the session timeout, with no poll
+            RuntimeException commitError = null;
+            try {
+                steady.commit();
+            } catch (RuntimeException error) {
+                commitError = error;
+            }
+            check("heartbeats keep an idle member in its group past session.timeout.ms",
+                    got == 4 && commitError == null && steady.memberId().equals(member),
+                    "got=" + got + " commit=" + commitError);
+            steady.close();
+
+            GroupConfig silent = new GroupConfig();
+            silent.autoCommitIntervalMs = 0;
+            silent.sessionTimeoutMs = 1000;
+            silent.heartbeatIntervalMs = 20_000; // effectively never, within this check
+            GroupConsumer quiet = new GroupConsumer(host, port, unique("java-evicted"), silent);
+            quiet.subscribe(Collections.singletonList(hbTopic));
+            got = drain(quiet, 4, 15_000);
+            String evicted = quiet.memberId();
+            sleep(2500);
+            RuntimeException fenced = null;
+            try {
+                quiet.commit();
+            } catch (RuntimeException error) {
+                fenced = error;
+            }
+            check("a member that stops heartbeating is evicted after session.timeout.ms",
+                    got == 4 && fenced instanceof Protocol.ServerException
+                            && ((Protocol.ServerException) fenced).code
+                                    == Protocol.ErrorCode.UNKNOWN_MEMBER_ID,
+                    "got=" + got + " commit=" + fenced);
+            RuntimeException rejoinError = null;
+            try {
+                // Only the join is checked: with no heartbeats this member will be evicted
+                // again one session timeout after it rejoins.
+                quiet.poll(1000);
+            } catch (RuntimeException error) {
+                rejoinError = error;
+            }
+            check("an evicted member rejoins as a new member",
+                    rejoinError == null && !quiet.memberId().isEmpty()
+                            && !quiet.memberId().equals(evicted),
+                    evicted + " -> " + quiet.memberId() + " error=" + rejoinError);
+            quiet.close();
+        }
+
+        section("consumer group: static membership, LeaveGroup and rebalances");
+        {
+            String staticTopic = unique("java-static");
+            List<Integer> partitions;
+            try (Producer producer = new Producer(host, port, unbatched())) {
+                partitions = producer.router().partitions(staticTopic);
+                for (int i = 0; i < 4; i++) {
+                    producer.send(staticTopic, bytes("st" + i));
+                }
+            }
+            GroupConfig fixed = new GroupConfig();
+            fixed.autoCommitIntervalMs = 0;
+            fixed.heartbeatIntervalMs = 300;
+            fixed.groupInstanceId = unique("java-instance");
+            String staticGroup = unique("java-static-grp");
+            GroupConsumer first = new GroupConsumer(host, port, staticGroup, fixed);
+            first.subscribe(Collections.singletonList(staticTopic));
+            awaitAssignment(first, 15_000);
+            String firstMember = first.memberId();
+            int firstGeneration = first.generation();
+            GroupConsumer returning = new GroupConsumer(host, port, staticGroup, fixed);
+            returning.subscribe(Collections.singletonList(staticTopic));
+            awaitAssignment(returning, 15_000);
+            check("a returning group.instance.id reclaims its member id without a rebalance",
+                    !firstMember.isEmpty() && returning.memberId().equals(firstMember)
+                            && returning.generation() == firstGeneration,
+                    firstMember + "/" + firstGeneration + " -> " + returning.memberId() + "/"
+                            + returning.generation());
+            returning.close();
+            first.close();
+
+            // LeaveGroup: with a 30 s session and a 10 s rebalance timeout, a successor could
+            // only get the partitions quickly if the first member told the coordinator it left.
+            GroupConfig leaving = new GroupConfig();
+            leaving.autoCommitIntervalMs = 0;
+            leaving.sessionTimeoutMs = 30_000;
+            leaving.rebalanceTimeoutMs = 10_000;
+            String leaveGroup = unique("java-leave-grp");
+            GroupConsumer departing = new GroupConsumer(host, port, leaveGroup, leaving);
+            departing.subscribe(Collections.singletonList(staticTopic));
+            awaitAssignment(departing, 15_000);
+            departing.close();
+            long started = System.currentTimeMillis();
+            GroupConsumer successor = new GroupConsumer(host, port, leaveGroup, leaving);
+            successor.subscribe(Collections.singletonList(staticTopic));
+            awaitAssignment(successor, 15_000);
+            long took = System.currentTimeMillis() - started;
+            check("close sends LeaveGroup, so a successor is not kept waiting",
+                    successor.assignment().size() == partitions.size() && took < 6_000,
+                    successor.assignment().size() + " partitions after " + took + "ms");
+            successor.close();
+
+            // Two members: the second's join makes the coordinator fence the first's
+            // generation; its heartbeat learns that, it rejoins, and the partitions split.
+            GroupConfig sharing = new GroupConfig();
+            sharing.autoCommitIntervalMs = 0;
+            sharing.heartbeatIntervalMs = 200;
+            String shareGroup = unique("java-share-grp");
+            GroupConsumer one = new GroupConsumer(host, port, shareGroup, sharing);
+            one.subscribe(Collections.singletonList(staticTopic));
+            awaitAssignment(one, 15_000);
+            int before = one.generation();
+            java.util.concurrent.atomic.AtomicReference<List<GroupConsumer.TopicPartition>>
+                    otherHolds = new java.util.concurrent.atomic.AtomicReference<>(
+                            Collections.emptyList());
+            java.util.concurrent.atomic.AtomicBoolean stop =
+                    new java.util.concurrent.atomic.AtomicBoolean();
+            Thread second = new Thread(() -> {
+                GroupConsumer two = new GroupConsumer(host, port, shareGroup, sharing);
+                two.subscribe(Collections.singletonList(staticTopic));
+                while (!stop.get()) {
+                    pollQuietly(two, 200);
+                    otherHolds.set(two.assignment());
+                }
+                two.close();
+            });
+            second.start();
+            boolean split = false;
+            long deadline = System.currentTimeMillis() + 20_000;
+            while (!split && System.currentTimeMillis() < deadline) {
+                pollQuietly(one, 200);
+                Set<GroupConsumer.TopicPartition> union = new HashSet<>(one.assignment());
+                union.addAll(otherHolds.get());
+                split = !one.assignment().isEmpty() && !otherHolds.get().isEmpty()
+                        && union.size() == partitions.size()
+                        && one.assignment().size() + otherHolds.get().size()
+                                == partitions.size();
+            }
+            stop.set(true);
+            try {
+                second.join(10_000);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+            check("a second member rebalances the group and the partitions split between them",
+                    split, one.assignment() + " / " + otherHolds.get());
+            check("the generation advances when the group rebalances",
+                    one.generation() > before, before + " -> " + one.generation());
+            one.close();
+        }
+    }
+
+    /** Poll until {@code want} records have arrived; returns how many did. */
+    private static int drain(GroupConsumer consumer, int want, long timeoutMs) {
+        int got = 0;
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (got < want && System.currentTimeMillis() < deadline) {
+            got += pollQuietly(consumer, 300).size();
+        }
+        return got;
+    }
+
+    /** Poll until the member holds partitions. */
+    private static void awaitAssignment(GroupConsumer consumer, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (consumer.assignment().isEmpty() && System.currentTimeMillis() < deadline) {
+            pollQuietly(consumer, 200);
+        }
+    }
+
+    /**
+     * A minimal lz4 codec in the broker's format (little-endian uncompressed length, then a raw
+     * LZ4 block). It compresses by emitting one literal run — valid LZ4 that any decoder reads —
+     * and decodes full LZ4, matches included, so it reads what the broker's lz4 writes too.
+     */
+    private static final class Lz4Literals implements Protocol.Codec {
+        final AtomicInteger compressed = new AtomicInteger();
+        final AtomicInteger decompressed = new AtomicInteger();
+
+        @Override
+        public byte[] compress(byte[] payload) {
+            compressed.incrementAndGet();
+            int size = payload.length;
+            ByteArrayOutputStream out = new ByteArrayOutputStream(size + size / 255 + 16);
+            out.write(size);
+            out.write(size >>> 8);
+            out.write(size >>> 16);
+            out.write(size >>> 24);
+            out.write(Math.min(size, 15) << 4);
+            if (size >= 15) {
+                int rest = size - 15;
+                for (; rest >= 255; rest -= 255) {
+                    out.write(255);
+                }
+                out.write(rest);
+            }
+            out.write(payload, 0, size);
+            return out.toByteArray();
+        }
+
+        @Override
+        public byte[] decompress(byte[] data) {
+            decompressed.incrementAndGet();
+            try {
+                int size = (data[0] & 0xFF) | (data[1] & 0xFF) << 8 | (data[2] & 0xFF) << 16
+                        | (data[3] & 0xFF) << 24;
+                if (size < 0 || size > 256 * 1024 * 1024) {
+                    throw new Protocol.ProtocolException("lz4 size " + size);
+                }
+                byte[] out = new byte[size];
+                int in = 4;
+                int at = 0;
+                while (in < data.length) {
+                    int token = data[in++] & 0xFF;
+                    int literals = token >>> 4;
+                    if (literals == 15) {
+                        int more;
+                        do {
+                            more = data[in++] & 0xFF;
+                            literals += more;
+                        } while (more == 255);
+                    }
+                    System.arraycopy(data, in, out, at, literals);
+                    in += literals;
+                    at += literals;
+                    if (in >= data.length) {
+                        break;
+                    }
+                    int distance = (data[in] & 0xFF) | (data[in + 1] & 0xFF) << 8;
+                    in += 2;
+                    int length = token & 15;
+                    if (length == 15) {
+                        int more;
+                        do {
+                            more = data[in++] & 0xFF;
+                            length += more;
+                        } while (more == 255);
+                    }
+                    length += 4;
+                    if (distance == 0 || distance > at) {
+                        throw new Protocol.ProtocolException("lz4 match before the output");
+                    }
+                    for (int i = 0; i < length; i++, at++) {
+                        out[at] = out[at - distance];
+                    }
+                }
+                if (at != size) {
+                    throw new Protocol.ProtocolException("lz4 decoded " + at + " of " + size);
+                }
+                return out;
+            } catch (IndexOutOfBoundsException error) {
+                throw new Protocol.ProtocolException("truncated lz4 block");
+            }
+        }
+    }
+
+    /**
+     * Sits between a client and the broker, forwarding frames one request at a time, and can
+     * answer a produce with a retriable error or a fetch with a corrupt batch. It records the
+     * acks and timeout of every produce it sees.
+     */
+    private static final class FaultProxy implements AutoCloseable {
+        private final ServerSocket server;
+        private final List<Socket> live = Collections.synchronizedList(new ArrayList<>());
+        private int failProduces;
+        volatile int corruptFetch;
+        volatile int produces;
+        volatile int lastAcks = Integer.MIN_VALUE;
+        volatile int lastTimeoutMs = Integer.MIN_VALUE;
+
+        FaultProxy(String targetHost, int targetPort) {
+            try {
+                server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+            } catch (IOException error) {
+                throw new UncheckedIOException(error);
+            }
+            daemon(() -> {
+                while (true) {
+                    Socket client;
+                    Socket upstream;
+                    try {
+                        client = server.accept();
+                    } catch (IOException closed) {
+                        return;
+                    }
+                    try {
+                        upstream = new Socket(targetHost, targetPort);
+                    } catch (IOException error) {
+                        closeQuietly(client);
+                        continue;
+                    }
+                    live.add(client);
+                    live.add(upstream);
+                    daemon(() -> serve(client, upstream));
+                }
+            });
+        }
+
+        int port() {
+            return server.getLocalPort();
+        }
+
+        /** Fail the next {@code count} produces (-1: every one) and reset the counters. */
+        synchronized void failProduces(int count) {
+            failProduces = count;
+            produces = 0;
+        }
+
+        private synchronized boolean takeFailure() {
+            if (failProduces == 0) {
+                return false;
+            }
+            if (failProduces > 0) {
+                failProduces--;
+            }
+            return true;
+        }
+
+        private void serve(Socket client, Socket upstream) {
+            try {
+                DataInputStream in = new DataInputStream(client.getInputStream());
+                OutputStream out = client.getOutputStream();
+                DataInputStream upIn = new DataInputStream(upstream.getInputStream());
+                OutputStream upOut = upstream.getOutputStream();
+                while (true) {
+                    byte[] frame = new byte[in.readInt()];
+                    in.readFully(frame);
+                    ByteBuffer header = ByteBuffer.wrap(frame);
+                    short apiKey = header.getShort(0);
+                    int correlation = header.getInt(4);
+                    int bodyAt = 10 + Math.max(header.getShort(8), 0);
+                    byte[] body = Arrays.copyOfRange(frame, bodyAt, frame.length);
+                    byte[] reply = null;
+                    boolean oneway = false;
+                    if (apiKey == Protocol.ApiKey.PRODUCE) {
+                        Protocol.Reader reader = Protocol.Reader.body(body);
+                        String topic = reader.string();
+                        int partition = reader.int32();
+                        int acks = reader.int32();
+                        int timeout = reader.int32();
+                        produces++;
+                        lastAcks = acks;
+                        lastTimeoutMs = timeout;
+                        oneway = acks == 0;
+                        if (takeFailure()) {
+                            reply = Protocol.Writer.body().string(topic).int32(partition)
+                                    .int32(Protocol.ErrorCode.NOT_ENOUGH_REPLICAS)
+                                    .int64(-1).int64(-1).bytes();
+                        }
+                    } else if (apiKey == Protocol.ApiKey.FETCH && corruptFetch != 0) {
+                        Protocol.Reader reader = Protocol.Reader.body(body);
+                        String topic = reader.string();
+                        int partition = reader.int32();
+                        // A batch whose batch_length is negative (mode 1) or runs far past
+                        // the bytes that follow (mode 2).
+                        byte[] batch = new byte[61];
+                        ByteBuffer.wrap(batch).putInt(8, corruptFetch == 1 ? -1 : 1_000_000);
+                        reply = Protocol.Writer.body().string(topic).int32(partition).int32(0)
+                                .int64(1).int64(1).int64(batch.length).int32(-1).raw(batch)
+                                .bytes();
+                    }
+                    if (reply != null) {
+                        out.write(Protocol.encodeFrame(apiKey, correlation, null, reply));
+                        out.flush();
+                        continue;
+                    }
+                    writeFrame(upOut, frame);
+                    if (oneway) {
+                        continue;
+                    }
+                    byte[] response = new byte[upIn.readInt()];
+                    upIn.readFully(response);
+                    writeFrame(out, response);
+                }
+            } catch (IOException | RuntimeException closed) {
+                // Either side went away.
+            } finally {
+                closeQuietly(client);
+                closeQuietly(upstream);
+            }
+        }
+
+        private static void writeFrame(OutputStream out, byte[] payload) throws IOException {
+            byte[] framed = new byte[4 + payload.length];
+            ByteBuffer.wrap(framed).putInt(payload.length).put(payload);
+            out.write(framed);
+            out.flush();
+        }
+
+        @Override
+        public void close() {
+            closeQuietly(server);
+            synchronized (live) {
+                for (Socket socket : live) {
+                    closeQuietly(socket);
+                }
+            }
         }
     }
 

@@ -92,22 +92,27 @@ object Header {
  *  - `key = None` round-robins across partitions; a key pins the record to
  *    `murmur2(key) % partitions`, so records sharing a key keep their order.
  *  - `partition` bypasses the partitioner.
+ *  - `timestamp` is the record's own time in unix milliseconds; `None` stamps the wall clock
+ *    when it is sent.
  */
 final case class ProducerRecord(
     topic: String,
     value: Option[Array[Byte]],
     key: Option[Array[Byte]] = None,
     partition: Option[Int] = None,
-    headers: Seq[Header] = Nil
+    headers: Seq[Header] = Nil,
+    timestamp: Option[Long] = None
 ) {
   def withKey(key: Array[Byte]): ProducerRecord = copy(key = Option(key))
   def withKey(key: String): ProducerRecord = copy(key = Some(key.getBytes(UTF_8)))
   def toPartition(partition: Int): ProducerRecord = copy(partition = Some(partition))
   def withHeaders(headers: Header*): ProducerRecord = copy(headers = this.headers ++ headers)
+  /** Carry this timestamp (unix ms) instead of the wall clock at send time. */
+  def withTimestamp(epochMillis: Long): ProducerRecord = copy(timestamp = Some(epochMillis))
 
   override def toString: String =
     s"ProducerRecord($topic, partition=$partition, key=${Bytes.describe(key)}, " +
-      s"value=${Bytes.describe(value)}, headers=$headers)"
+      s"value=${Bytes.describe(value)}, headers=$headers, timestamp=$timestamp)"
 }
 
 object ProducerRecord {
@@ -221,6 +226,7 @@ final case class ConsumerSettings(
     readCommitted: Boolean = false,
     /** `client.rack`: read from an in-sync replica in this rack when there is one. */
     rack: String = "",
+    /** `max.poll.records`: the most records one fetch returns (0: unlimited). */
     maxPollRecords: Int = 500,
     dialTimeout: FiniteDuration = 30.seconds
 ) {
@@ -244,6 +250,8 @@ final case class GroupSettings(
     bootstrapServers: String = "127.0.0.1:9092",
     clientId: String = "brahmaputra-scala",
     sessionTimeout: FiniteDuration = 10.seconds,
+    /** `heartbeat.interval.ms`: keep it well under `sessionTimeout`. */
+    heartbeatInterval: FiniteDuration = 3.seconds,
     rebalanceTimeout: FiniteDuration = 3.seconds,
     /** `max.poll.interval.ms`: bounds the time *between* polls, not time inside one. */
     maxPollInterval: FiniteDuration = 5.minutes,
@@ -263,6 +271,7 @@ final case class GroupSettings(
     val c = new JavaGroupConsumer.GroupConfig()
     c.clientId = clientId
     c.sessionTimeoutMs = Settings.millis(sessionTimeout)
+    c.heartbeatIntervalMs = Settings.millis(heartbeatInterval)
     c.rebalanceTimeoutMs = Settings.millis(rebalanceTimeout)
     c.maxPollIntervalMs = Settings.millis(maxPollInterval)
     c.autoCommitIntervalMs = autoCommitInterval.fold(0)(Settings.millis)
