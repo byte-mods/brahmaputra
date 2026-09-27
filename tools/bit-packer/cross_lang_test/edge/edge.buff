@@ -1,0 +1,38 @@
+version = 2.1.0
+
+// Every scalar and array type, at the values encoders get wrong: integer
+// extremes, negative zero-adjacent doubles, empty strings and arrays, and
+// multi-byte UTF-8. Every BitPacker target must encode the canonical value
+// (see README.md) to exactly edge_ref.bin and decode edge_ref.bin back.
+
+class Inner {
+    long big;
+    string label;
+}
+
+class Edge {
+    int i_min;
+    int i_max;
+    int i_zero;
+    int i_neg;
+    long l_min;
+    long l_max;
+    long l_neg;
+    float f;
+    double d;
+    double d_neg;
+    bool yes;
+    bool no;
+    string empty;
+    string unicode;
+    int[] ints;
+    long[] longs;
+    float[] floats;
+    double[] doubles;
+    bool[] bools;
+    string[] strings;
+    int[] no_ints;
+    Inner inner;
+    Inner[] inners;
+    Inner[] no_inners;
+}

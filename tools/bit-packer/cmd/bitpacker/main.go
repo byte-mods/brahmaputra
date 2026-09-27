@@ -264,6 +264,9 @@ func generateCode(lang string, classes []Class, cfg GeneratorConfig) error {
 		tmplStr = tmplPHP
 		fileName = baseName + ".php"
 	default:
+		if gen, ok := extraGenerators[lang]; ok {
+			return gen(classes, cfg)
+		}
 		return fmt.Errorf("unsupported language: %s", lang)
 	}
 
