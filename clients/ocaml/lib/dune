@@ -1,0 +1,4 @@
+(library
+ (name brahmaputra)
+ (public_name brahmaputra)
+ (libraries unix threads.posix camlzip))

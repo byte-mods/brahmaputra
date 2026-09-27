@@ -1,0 +1,21 @@
+opam-version: "2.0"
+name: "brahmaputra"
+version: "0.1.0"
+synopsis: "Native client for the Brahmaputra log broker"
+description: """
+Producer, consumer and consumer-group client speaking Brahmaputra's own
+wire protocol directly: batching with linger, acks 0/1/all, gzip built in
+with a pluggable codec registry, murmur2 keyed partitioning, leader
+routing, and join/sync/heartbeat groups with range, roundrobin and sticky
+assignment.
+"""
+license: "Apache-2.0"
+depends: [
+  "ocaml" {>= "4.14"}
+  "dune" {>= "3.0"}
+  "ocamlfind" {build}
+  "camlzip" {>= "1.11"}
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+]

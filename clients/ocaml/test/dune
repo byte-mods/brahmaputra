@@ -1,0 +1,3 @@
+(executable
+ (name manual_test)
+ (libraries brahmaputra unix threads.posix))
