@@ -120,6 +120,9 @@ public sealed class Producer : IDisposable, IAsyncDisposable
         public required long TimestampMs;
         public required long CreatedMs;
         public required int Size;
+        // True when the caller awaits this record's delivery itself
+        // (ProduceAsync), so a failure is already reported to someone.
+        public bool Observed;
         public readonly TaskCompletionSource<RecordMetadata> Completion =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
@@ -142,6 +145,9 @@ public sealed class Producer : IDisposable, IAsyncDisposable
     private int _roundRobin;
     private bool _closing;
     private bool _disposed;
+    // The first delivery failure of a record nobody awaited, reported by the
+    // next Flush or Close so a failed background send is never silent.
+    private Exception? _backgroundError;
 
     /// <summary>The routing layer, for callers that need metadata.</summary>
     public Router Router { get; }
@@ -187,7 +193,7 @@ public sealed class Producer : IDisposable, IAsyncDisposable
     /// <summary>Sends one record and waits until it is acknowledged.</summary>
     public async Task<RecordMetadata> ProduceAsync(ProducerRecord record, CancellationToken cancellationToken = default)
     {
-        Task<RecordMetadata> delivery = await EnqueueAsync(record, cancellationToken).ConfigureAwait(false);
+        Task<RecordMetadata> delivery = await EnqueueAsync(record, cancellationToken, observed: true).ConfigureAwait(false);
         return await delivery.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -218,10 +224,17 @@ public sealed class Producer : IDisposable, IAsyncDisposable
             }
             catch (Exception) when (!cancellationToken.IsCancellationRequested)
             {
-                // Surface the first failure itself rather than an aggregate.
-                var failed = tasks.First(t => t.IsFaulted);
-                throw failed.Exception!.InnerException!;
+                // Reported below, as the first failure itself rather than an aggregate.
             }
+            Exception? background;
+            lock (_lock)
+            {
+                background = _backgroundError;
+                _backgroundError = null;
+            }
+            var failed = tasks.FirstOrDefault(t => t.IsFaulted);
+            if (failed != null) throw failed.Exception!.InnerException!;
+            if (background != null) throw background;
         }
         finally
         {
@@ -232,7 +245,26 @@ public sealed class Producer : IDisposable, IAsyncDisposable
     /// <summary>Synchronous <see cref="FlushAsync"/>.</summary>
     public void Flush() => FlushAsync().GetAwaiter().GetResult();
 
-    /// <summary>Flushes, stops the sender and closes connections.</summary>
+    /// <summary>
+    /// Flushes, stops the sender and closes connections, then throws the first
+    /// delivery failure not yet reported, if any. Always releases resources.
+    /// </summary>
+    public async Task CloseAsync()
+    {
+        Exception? failure = null;
+        try { await FlushAsync().ConfigureAwait(false); }
+        catch (Exception e) { failure = e; }
+        await DisposeAsync().ConfigureAwait(false);
+        if (failure != null) throw failure;
+    }
+
+    /// <summary>Synchronous <see cref="CloseAsync"/>.</summary>
+    public void Close() => CloseAsync().GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Flushes, stops the sender and closes connections. Delivery failures are
+    /// left on the records' tasks; use <see cref="CloseAsync"/> to have them thrown.
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         lock (_lock)
@@ -255,7 +287,7 @@ public sealed class Producer : IDisposable, IAsyncDisposable
     // Buffering
     // -----------------------------------------------------------------------
 
-    private async Task<Task<RecordMetadata>> EnqueueAsync(ProducerRecord record, CancellationToken cancellationToken)
+    private async Task<Task<RecordMetadata>> EnqueueAsync(ProducerRecord record, CancellationToken cancellationToken, bool observed = false)
     {
         lock (_lock)
         {
@@ -275,6 +307,7 @@ public sealed class Producer : IDisposable, IAsyncDisposable
             TimestampMs = record.Timestamp ?? now,
             CreatedMs = now,
             Size = size,
+            Observed = observed,
         };
         bool wake;
         lock (_lock)
@@ -408,6 +441,8 @@ public sealed class Producer : IDisposable, IAsyncDisposable
         catch (Exception e)
         {
             foreach (var pending in batch) pending.Completion.TrySetException(e);
+            if (batch.Any(p => !p.Observed))
+                lock (_lock) _backgroundError ??= e;
         }
         finally
         {

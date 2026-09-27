@@ -102,6 +102,7 @@ public sealed class GroupConsumer : IDisposable, IAsyncDisposable
     private readonly List<ConsumeResult> _buffered = new();
 
     private long _lastPollMs;
+    private volatile bool _inPoll;
     private long _lastCommitMs;
     private bool _closed;
 
@@ -147,10 +148,25 @@ public sealed class GroupConsumer : IDisposable, IAsyncDisposable
     public async Task<IReadOnlyList<ConsumeResult>> PollAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
     {
         if (_subscribed.Count == 0) throw new InvalidOperationException("subscribe to at least one topic before polling");
-        // Stamped on entry: the interval bounds how long the application goes
-        // without asking for records, and a poll that blocks for its whole
-        // timeout is the consumer working normally.
+        // Stamped on entry and again on return, and not enforced in between:
+        // the interval bounds how long the *application* goes without asking
+        // for records, and a poll that blocks (for its timeout, or on a slow
+        // rebalance) is the consumer working normally.
         Interlocked.Exchange(ref _lastPollMs, NowMs());
+        _inPoll = true;
+        try
+        {
+            return await PollCoreAsync(timeout, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _lastPollMs, NowMs());
+            _inPoll = false;
+        }
+    }
+
+    private async Task<IReadOnlyList<ConsumeResult>> PollCoreAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
         var deadline = Stopwatch.StartNew();
 
         while (true)
@@ -515,7 +531,7 @@ public sealed class GroupConsumer : IDisposable, IAsyncDisposable
             if (!_joined || MemberId.Length == 0) continue;
 
             long idleMs = NowMs() - Interlocked.Read(ref _lastPollMs);
-            if (idleMs >= _config.MaxPollIntervalMs)
+            if (!_inPoll && idleMs >= _config.MaxPollIntervalMs)
             {
                 // The application stopped consuming though the process is
                 // alive. Heartbeating on would hold its partitions away from a
@@ -544,16 +560,20 @@ public sealed class GroupConsumer : IDisposable, IAsyncDisposable
                 w.Int32(generation);
                 w.String(memberId);
                 var r = new BodyReader(await CoordinatorRequestAsync(ApiKey.Heartbeat, w.ToArray(), token).ConfigureAwait(false));
-                switch ((ErrorCode)r.Int32())
+                var code = (ErrorCode)r.Int32();
+                if (code is ErrorCode.RebalanceInProgress or ErrorCode.IllegalGeneration or ErrorCode.UnknownMemberId)
                 {
-                    case ErrorCode.RebalanceInProgress:
-                    case ErrorCode.IllegalGeneration:
-                        _joined = false;
-                        break;
-                    case ErrorCode.UnknownMemberId:
-                        lock (_state) _memberId = "";
-                        _joined = false;
-                        break;
+                    lock (_state)
+                    {
+                        // Only if nothing changed since the snapshot: a late
+                        // answer for an old generation must not send a member
+                        // that already rejoined round again.
+                        if (_generation == generation && _memberId == memberId)
+                        {
+                            if (code == ErrorCode.UnknownMemberId) _memberId = "";
+                            _joined = false;
+                        }
+                    }
                 }
             }
             catch (OperationCanceledException)

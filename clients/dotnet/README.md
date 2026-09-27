@@ -14,7 +14,7 @@ To use it from your own project, add a project reference:
 <ProjectReference Include="path/to/clients/dotnet/Brahmaputra/Brahmaputra.csproj" />
 ```
 
-Tested end to end against a live broker: **38/38 checks** (`./test.sh 127.0.0.1 9092`).
+Tested end to end against a live broker: **54/54 checks** (`./test.sh 127.0.0.1 9092`).
 
 Every blocking call has an `…Async` twin that takes a `CancellationToken`.
 The sync methods wrap the async ones. The library uses `ConfigureAwait(false)`
@@ -57,6 +57,12 @@ producer.Send("orders", value: null, key: Encoding.UTF8.GetBytes("user-7"));
 
 await producer.FlushAsync();   // throws the first delivery failure, if any
 ```
+
+`FlushAsync` also throws when an earlier background send failed and nobody
+awaited that record's delivery task, so a failed linger flush is never
+silent. `CloseAsync` flushes, releases everything, and then throws any
+failure that has not been reported yet. `Dispose` and `DisposeAsync` drain
+the buffer the same way but do not throw; failures stay on each record's task.
 
 ## Consume one partition
 

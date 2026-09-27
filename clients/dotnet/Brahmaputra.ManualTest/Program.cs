@@ -349,5 +349,276 @@ internal static class Program
             }
             Check("a full buffer blocks and then reports", blocked);
         }
+
+        Section("wire edge cases");
+        {
+            string edgeTopic = Unique("dotnet-edge");
+            byte[] large = new byte[1 << 20];
+            for (int i = 0; i < large.Length; i++) large[i] = (byte)(i * 7);
+            byte[] unicodeKey = B("ключ-✓-🔑");
+            byte[] unicodeValue = B("значение — 数据 — 🚀");
+            using (var producer = new Producer(ProducerConf(address)))
+            {
+                producer.SendTo(edgeTopic, 0, large);
+                producer.SendTo(edgeTopic, 0, unicodeValue, unicodeKey, new RecordHeader("ünïcødé-🏷", B("✓")));
+                // An empty key and an empty header value are values, not nulls.
+                producer.SendTo(edgeTopic, 0, B("empty-key"), Array.Empty<byte>(),
+                    new RecordHeader("empty", Array.Empty<byte>()),
+                    new RecordHeader("null", (byte[]?)null));
+                producer.SendTo(edgeTopic, 0, B("null-key"));
+                producer.Close();
+            }
+            using var consumer = new Consumer(ConsumerConf(address));
+            var got = new List<ConsumeResult>();
+            for (long offset = 0; got.Count < 4;)
+            {
+                var batch = consumer.Fetch(edgeTopic, 0, offset, 500);
+                if (batch.Count == 0) break;
+                got.AddRange(batch);
+                offset = batch[^1].Offset + 1;
+            }
+            Check("edge records all arrive", got.Count == 4, $"got {got.Count}");
+            if (got.Count == 4)
+            {
+                Check("a 1 MiB value round-trips byte-identical", got[0].Value != null && got[0].Value!.AsSpan().SequenceEqual(large),
+                    $"{got[0].Value?.Length} bytes");
+                Check("unicode key, value and header key round-trip",
+                    got[1].Key != null && got[1].Key!.AsSpan().SequenceEqual(unicodeKey) &&
+                    got[1].Value != null && got[1].Value!.AsSpan().SequenceEqual(unicodeValue) &&
+                    got[1].Headers.Count == 1 && got[1].Headers[0].Key == "ünïcødé-🏷");
+                Check("an empty key stays empty, not null", got[2].Key != null && got[2].Key!.Length == 0, S(got[2].Key));
+                Check("an empty header value stays empty, not null",
+                    got[2].Headers.Count == 2 && got[2].Headers[0].Value is { Length: 0 } && got[2].Headers[1].Value == null,
+                    string.Join(",", got[2].Headers.Select(h => $"{h.Key}={S(h.Value)}")));
+                Check("a null key stays null", got[3].Key == null, S(got[3].Key));
+            }
+        }
+
+        Section("ordering under linger flushes");
+        {
+            string orderTopic = Unique("dotnet-order");
+            var config = ProducerConf(address);
+            config.LingerMs = 1;
+            config.BatchSize = 256;
+            const int total = 5000;
+            using (var producer = new Producer(config))
+            {
+                for (int i = 0; i < total; i++) producer.SendTo(orderTopic, 0, B(i.ToString()));
+                producer.Close();
+            }
+            using var consumer = new Consumer(ConsumerConf(address));
+            var values = new List<int>();
+            for (long offset = 0; values.Count < total;)
+            {
+                var batch = consumer.Fetch(orderTopic, 0, offset, 500);
+                if (batch.Count == 0) break;
+                values.AddRange(batch.Select(r => int.Parse(S(r.Value))));
+                offset = batch[^1].Offset + 1;
+            }
+            int inversions = Enumerable.Range(1, Math.Max(0, values.Count - 1)).Count(i => values[i] < values[i - 1]);
+            Check("every record of a partition arrives", values.Count == total, $"got {values.Count}");
+            Check("a partition's records keep send order", inversions == 0, $"{inversions} inversions");
+        }
+
+        Section("background flush failures are reported");
+        {
+            var config = ProducerConf(address);
+            config.LingerMs = 20;
+            var producer = new Producer(config);
+            Exception? sendError = null, flushError = null;
+            // Partition 999 does not exist, so the background send fails. The
+            // delivery task is deliberately not awaited: Flush must report it.
+            try { _ = producer.SendTo(Unique("dotnet-bgfail"), 999, B("lost")); }
+            catch (Exception e) { sendError = e; }
+            Thread.Sleep(300);
+            try { producer.Flush(); }
+            catch (Exception e) { flushError = e; }
+            Check("a failed linger flush surfaces on the next Flush", sendError == null && flushError != null,
+                $"send={sendError?.Message ?? "ok"} flush={flushError?.Message ?? "ok"}");
+            var closing = System.Threading.Tasks.Task.Run(() => { try { producer.Close(); } catch (Exception) { } });
+            Check("Close returns after a failed flush", closing.Wait(TimeSpan.FromSeconds(5)), "hung");
+        }
+
+        Section("connection failures");
+        {
+            // A broker that accepts and never answers must cost an error, not a
+            // thread blocked forever.
+            var silent = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+            silent.Start();
+            var held = new List<System.Net.Sockets.TcpClient>();
+            _ = System.Threading.Tasks.Task.Run(async () =>
+            {
+                try { while (true) { var c = await silent.AcceptTcpClientAsync(); lock (held) held.Add(c); } }
+                catch (Exception) { /* listener stopped */ }
+            });
+            string silentAddress = $"127.0.0.1:{((System.Net.IPEndPoint)silent.LocalEndpoint).Port}";
+            using (var conn = BrokerConnection.Connect(silentAddress, "dotnet-test", TimeSpan.FromSeconds(1), TimeSpan.FromMilliseconds(300)))
+            {
+                var started = Stopwatch.StartNew();
+                Exception? requestError = null;
+                try { conn.ApiVersions(); }
+                catch (Exception e) { requestError = e; }
+                Check("a request to an unresponsive broker times out",
+                    requestError != null && started.Elapsed < TimeSpan.FromSeconds(3), requestError?.Message ?? "answered");
+                Check("a timed-out connection is not reused", conn.IsBroken);
+            }
+            silent.Stop();
+            lock (held) foreach (var c in held) c.Dispose();
+
+            // A connection the broker drops is redialled, not kept forever.
+            using var proxy = new Proxy(address);
+            string dropTopic = Unique("dotnet-drop");
+            var producer = new Producer(ProducerConf(proxy.Address));
+            producer.SendTo(dropTopic, 0, B("before")).GetAwaiter().GetResult();
+            proxy.DropAll();
+            Exception? recovered = new Exception("not attempted");
+            for (int attempt = 0; attempt < 3 && recovered != null; attempt++)
+            {
+                try { producer.SendTo(dropTopic, 0, B("after")).GetAwaiter().GetResult(); recovered = null; }
+                catch (Exception e) { recovered = e; }
+            }
+            Check("a producer recovers after its connection drops", recovered == null, recovered?.Message ?? "");
+            producer.Dispose();
+
+            using var consumer = new Consumer(ConsumerConf(proxy.Address));
+            consumer.Fetch(dropTopic, 0, 0, 100);
+            proxy.DropAll();
+            Exception? fetchError = new Exception("not attempted");
+            IReadOnlyList<ConsumeResult> fetched = Array.Empty<ConsumeResult>();
+            for (int attempt = 0; attempt < 3 && fetchError != null; attempt++)
+            {
+                try { fetched = consumer.Fetch(dropTopic, 0, 0, 100); fetchError = null; }
+                catch (Exception e) { fetchError = e; }
+            }
+            Check("a consumer recovers after its connection drops", fetchError == null && fetched.Count >= 1,
+                fetchError?.Message ?? $"{fetched.Count} records");
+        }
+
+        Section("consumer group: max.poll.interval and rejoin");
+        {
+            string slowTopic = Unique("dotnet-slow");
+            var producer = new Producer(ProducerConf(address));
+            for (int i = 0; i < 10; i++) producer.Send(slowTopic, B($"s{i}"));
+            producer.Flush();
+            var groupConfig = GroupConf(address, Unique("dotnet-slow-grp"));
+            groupConfig.MaxPollIntervalMs = 1500;
+            using var consumer = new GroupConsumer(groupConfig);
+            consumer.Subscribe(new[] { slowTopic });
+            var first = new List<ConsumeResult>();
+            var deadline = Stopwatch.StartNew();
+            while (first.Count < 10 && deadline.Elapsed < TimeSpan.FromSeconds(15))
+            {
+                try { first.AddRange(consumer.Poll(TimeSpan.FromMilliseconds(300))); }
+                catch (BrahmaputraException) { break; }
+            }
+            consumer.Commit();
+            // Stall past max.poll.interval.ms: the member leaves the group.
+            Thread.Sleep(2500);
+            for (int i = 10; i < 20; i++) producer.Send(slowTopic, B($"s{i}"));
+            producer.Close();
+            var second = new List<ConsumeResult>();
+            Exception? pollError = null;
+            deadline.Restart();
+            while (second.Count < 10 && deadline.Elapsed < TimeSpan.FromSeconds(15))
+            {
+                try { second.AddRange(consumer.Poll(TimeSpan.FromMilliseconds(300))); }
+                catch (BrahmaputraException e) { pollError = e; break; }
+            }
+            Check("a member that stalled rejoins on its next poll",
+                first.Count == 10 && second.Count == 10 && pollError == null,
+                $"first={first.Count} second={second.Count} err={pollError?.Message ?? "none"}");
+        }
+
+        Section("consumer group: time inside poll does not count against max.poll.interval");
+        {
+            string joinTopic = Unique("dotnet-inpoll");
+            var producer = new Producer(ProducerConf(address));
+            producer.Router.Partitions(joinTopic);
+            var groupConfig = GroupConf(address, Unique("dotnet-inpoll-grp"));
+            // Far shorter than the first poll below, which spends ~1s joining
+            // (the broker's initial rebalance delay) and then waits for data.
+            groupConfig.MaxPollIntervalMs = 600;
+            using var consumer = new GroupConsumer(groupConfig);
+            consumer.Subscribe(new[] { joinTopic });
+            var sender = System.Threading.Tasks.Task.Run(() =>
+            {
+                Thread.Sleep(2000);
+                for (int i = 0; i < 10; i++) producer.Send(joinTopic, B($"j{i}"));
+            });
+            // One long poll: it joins, then waits for the records above.
+            IReadOnlyList<ConsumeResult> got = Array.Empty<ConsumeResult>();
+            Exception? pollError = null, commitError = null;
+            try { got = consumer.Poll(TimeSpan.FromSeconds(4)); }
+            catch (Exception e) { pollError = e; }
+            // Committed straight away, before another poll could quietly
+            // rejoin: this fails if the member left the group mid-poll.
+            try { consumer.Commit(); }
+            catch (Exception e) { commitError = e; }
+            Check("a member is still in its group after a long poll",
+                pollError == null && got.Count > 0 && commitError == null,
+                $"got={got.Count} poll={pollError?.Message ?? "ok"} commit={commitError?.Message ?? "ok"}");
+            sender.Wait();
+            producer.Close();
+        }
+    }
+}
+
+/// <summary>
+/// Forwards TCP to the broker and can sever every live connection, which is
+/// how a broker restart or an idle timeout looks to a client.
+/// </summary>
+internal sealed class Proxy : IDisposable
+{
+    private readonly System.Net.Sockets.TcpListener _listener;
+    private readonly List<System.Net.Sockets.TcpClient> _live = new();
+
+    public string Address { get; }
+
+    public Proxy(string target)
+    {
+        int colon = target.LastIndexOf(':');
+        string host = target[..colon];
+        int port = int.Parse(target[(colon + 1)..]);
+        _listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        _listener.Start();
+        Address = $"127.0.0.1:{((System.Net.IPEndPoint)_listener.LocalEndpoint).Port}";
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            while (true)
+            {
+                System.Net.Sockets.TcpClient client;
+                try { client = await _listener.AcceptTcpClientAsync(); }
+                catch (Exception) { return; }
+                var upstream = new System.Net.Sockets.TcpClient();
+                try { await upstream.ConnectAsync(host, port); }
+                catch (Exception) { client.Dispose(); upstream.Dispose(); continue; }
+                lock (_live) { _live.Add(client); _live.Add(upstream); }
+                _ = Pipe(client, upstream);
+                _ = Pipe(upstream, client);
+            }
+        });
+    }
+
+    private static async System.Threading.Tasks.Task Pipe(System.Net.Sockets.TcpClient from, System.Net.Sockets.TcpClient to)
+    {
+        try { await from.GetStream().CopyToAsync(to.GetStream()); }
+        catch (Exception) { /* either side closed */ }
+        to.Dispose();
+    }
+
+    public void DropAll()
+    {
+        lock (_live)
+        {
+            foreach (var c in _live) c.Dispose();
+            _live.Clear();
+        }
+        Thread.Sleep(50);
+    }
+
+    public void Dispose()
+    {
+        _listener.Stop();
+        DropAll();
     }
 }
