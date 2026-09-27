@@ -4,6 +4,7 @@ description = "Stateless WebSocket gateway: authenticated client streams into Br
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "brahmaputra-ws-gateway"

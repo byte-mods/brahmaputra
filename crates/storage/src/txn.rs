@@ -80,7 +80,7 @@ impl TransactionIndex {
 
         match fs::read(&path) {
             Ok(bytes) => {
-                for entry in bytes.chunks_exact(ENTRY_LEN) {
+                for entry in bytes.as_chunks::<ENTRY_LEN>().0 {
                     index.replay(entry);
                 }
             }

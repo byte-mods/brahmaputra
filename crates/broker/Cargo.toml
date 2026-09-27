@@ -4,6 +4,7 @@ description = "Data-plane broker: TCP server, partition actors, produce/fetch ha
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 brahmaputra-client.workspace = true

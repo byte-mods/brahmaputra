@@ -63,6 +63,9 @@ pub struct HttpNetworkConnection {
 }
 
 impl HttpNetworkConnection {
+    // `RPCError` is openraft's error type for every network call; its size
+    // is not ours to choose.
+    #[allow(clippy::result_large_err)]
     async fn send_rpc<Req, Resp, Err>(
         &self,
         path: &str,

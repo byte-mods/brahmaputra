@@ -78,7 +78,7 @@ impl ProducerIdManager {
 
         let mut epochs = HashMap::new();
         let mut max_counter = 0_u32;
-        for event in bytes.chunks_exact(EVENT_LEN) {
+        for event in bytes.as_chunks::<EVENT_LEN>().0 {
             let kind = event[0];
             let producer_id = i64::from_be_bytes(event[1..9].try_into().expect("event id"));
             let epoch = i16::from_be_bytes(event[9..11].try_into().expect("event epoch"));

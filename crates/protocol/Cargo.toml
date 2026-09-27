@@ -4,6 +4,7 @@ description = "Wire types and record batch codec for Brahmaputra (pure, sync, no
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 bytes.workspace = true

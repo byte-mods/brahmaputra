@@ -4,6 +4,7 @@ description = "Embedded metrics/admin HTTP API, RBAC login and operations dashbo
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 brahmaputra-broker.workspace = true

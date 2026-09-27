@@ -3,6 +3,7 @@ name = "brahmaputra-metadata"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 argon2 = { version = "0.5", features = ["password-hash"] }

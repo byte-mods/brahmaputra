@@ -4,6 +4,7 @@ description = "Async Rust client for Brahmaputra: producer, consumer, metadata"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 brahmaputra-protocol.workspace = true

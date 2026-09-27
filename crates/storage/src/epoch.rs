@@ -40,7 +40,7 @@ impl LeaderEpochCheckpoint {
 
         let valid_len = bytes.len() - bytes.len() % ENTRY_LEN;
         let mut entries: Vec<LeaderEpochEntry> = Vec::with_capacity(valid_len / ENTRY_LEN);
-        for chunk in bytes[..valid_len].chunks_exact(ENTRY_LEN) {
+        for chunk in bytes[..valid_len].as_chunks::<ENTRY_LEN>().0 {
             let entry = LeaderEpochEntry {
                 epoch: i32::from_be_bytes(chunk[..4].try_into().expect("four bytes")),
                 start_offset: i64::from_be_bytes(chunk[4..].try_into().expect("eight bytes")),

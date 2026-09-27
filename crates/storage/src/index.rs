@@ -107,7 +107,10 @@ impl<E: IndexEntry> SparseIndex<E> {
             .open(path)?;
         let mut raw = Vec::new();
         file.read_to_end(&mut raw)?;
-        let entries: Vec<E> = raw.chunks_exact(E::LEN).map(E::decode).collect();
+        // A torn trailing entry is dropped. (`as_chunks` cannot take a generic
+        // associated const as its size, so trim to whole entries instead.)
+        let whole = raw.len() - raw.len() % E::LEN;
+        let entries: Vec<E> = raw[..whole].chunks(E::LEN).map(E::decode).collect();
         let valid_len = entries.len() * E::LEN;
         if valid_len < raw.len() {
             file.set_len(valid_len as u64)?;

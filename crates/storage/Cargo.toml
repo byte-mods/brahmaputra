@@ -4,6 +4,7 @@ description = "Segmented append-only per-partition log for Brahmaputra (pure, sy
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 brahmaputra-protocol.workspace = true
