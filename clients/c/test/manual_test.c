@@ -1393,7 +1393,9 @@ static void run_checklist(const char *host, const char *port) {
         pthread_join(other, NULL);
         pthread_mutex_destroy(&second.mu);
         check("a second member rebalances the group and the partitions split between them", split,
-              "%zu / %zu", na, nb);
+              "%zu / %zu (generations: first %d, second %d)", na, nb,
+              (int)brp_group_consumer_generation(one),
+              (int)brp_group_consumer_generation(second.group));
         int32_t after = brp_group_consumer_generation(one);
         check("the generation advances when the group rebalances", after > before, "%d -> %d",
               (int)before, (int)after);

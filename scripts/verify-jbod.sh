@@ -96,7 +96,9 @@ stop_broker() {
   SERVER_PID=""
 }
 
-cli() { "$CLI_EXE" --broker "$BROKER" "$@"; }
+# Error text is asserted on below; a backtrace (RUST_BACKTRACE=1, as CI
+# sets) would push the message off the last line.
+cli() { RUST_BACKTRACE=0 "$CLI_EXE" --broker "$BROKER" "$@"; }
 
 # Partitions of `t` sitting on one disk, read off the filesystem rather than
 # from anything the broker says.

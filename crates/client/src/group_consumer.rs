@@ -969,7 +969,7 @@ impl GroupConsumer {
             *self.committable.lock().expect("committable positions") = positions.clone();
         }
 
-        let deadline = Instant::now() + max_wait;
+        let mut deadline = Instant::now() + max_wait;
         loop {
             // Checked every sweep, not only on entry: a rebalance the
             // heartbeat learns of mid-poll must stop this member fetching
@@ -988,6 +988,12 @@ impl GroupConsumer {
                     }
                     result => result?,
                 }
+                // `max_wait` is time spent waiting for records, and a join
+                // (which can take the group's whole initial rebalance delay)
+                // is not that. Without this, a poll that joins returns empty
+                // before its first fetch completes, and a caller that treats
+                // an empty poll as "caught up" stops with records unread.
+                deadline = Instant::now() + max_wait;
             }
             if !self.buffered.is_empty() {
                 return Ok(self.take_buffered());

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.1 — 2026-09-27
+
+A fix for consumer-group polling in the Rust client (and so the CLI), and CI
+fixes that let the full pipeline run on current stable Rust.
+
+### Fixed
+
+- `GroupConsumer::poll` measured its wait from before the group join, so a
+  join that took the group's initial rebalance delay used up the whole
+  budget. The poll then returned empty before its first fetch completed.
+  The time a poll spends waiting for records is again measured from after
+  any join.
+  - `brahmaputra-cli consume --group` treats an empty poll as "caught up",
+    so it could exit without reading anything. This was most visible when
+    a group resumed after its committed offset fell off the log.
+  - Introduced in 0.9.0. `verify-retention` catches it.
+- Clippy on Rust 1.98 (`chunks_exact_to_as_chunks`,
+  `result_large_err`), which stopped CI's check job and every job behind
+  it. The workspace now declares `rust-version = "1.88"`.
+- `verify-jbod` asserted on the CLI's last line of output, which is a
+  backtrace line when `RUST_BACKTRACE=1`, as CI sets.
+- CI: the Haskell driver and BitPacker jobs use the Ubuntu GHC that can
+  see the installed libraries, and the BitPacker job installs Dart.
+
 ## 0.9.0 — 2026-09-27
 
 Clients for 24 languages with one shared feature contract, a WebSocket

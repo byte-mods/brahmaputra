@@ -143,6 +143,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ghc libghc-network-dev libghc-zlib-dev libghc-stm-dev libghc-async-dev
+          # The runner's own GHC (ghcup) comes first on PATH and cannot see
+          # the apt-installed libraries; use the one that can.
+          echo "GHC=/usr/bin/ghc" >> "$GITHUB_ENV"
       - if: matrix.driver == 'ocaml'
         run: sudo apt-get update && sudo apt-get install -y ocaml ocaml-findlib libzip-ocaml-dev
       - if: matrix.driver == 'crystal'
@@ -198,6 +201,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-dev lua5.4 ghc ocaml ocaml-findlib erlang-nox elixir ldc nim crystal
+          echo "GHC=/usr/bin/ghc" >> "$GITHUB_ENV"
+      - uses: dart-lang/setup-dart@v1
       - name: run_all.sh
         run: bash tools/bit-packer/cross_lang_test/run_all.sh
 
