@@ -2,13 +2,17 @@ name: Release
 
 # Pushing a tag like v0.9.0 builds the release binaries and publishes them
 # with the matching CHANGELOG section as a GitHub release.
+#
+# It can also be run by hand on a branch (Actions > Release > Run workflow)
+# with a tag name: the binaries are built from that branch's head, and the
+# tag is created there if it does not exist yet.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build, e.g. v0.9.0"
+        description: "Tag to release, e.g. v0.9.0 (created at the branch head if missing)"
         required: true
 
 permissions:
@@ -27,7 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # A tag push builds the tag; a manual run builds the commit it was
+          # started on (the tag may not exist yet).
+          ref: ${{ github.event_name == 'push' && github.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
@@ -56,7 +62,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # A tag push builds the tag; a manual run builds the commit it was
+          # started on (the tag may not exist yet).
+          ref: ${{ github.event_name == 'push' && github.ref || github.sha }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -75,5 +83,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          # Only used when the tag does not exist yet.
+          target_commitish: ${{ github.sha }}
           body_path: notes.md
           files: dist/*
