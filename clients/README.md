@@ -9,36 +9,39 @@ ships as type declarations for the Node.js driver.
 
 | Language | Directory | Build | End-to-end suite, live broker |
 |---|---|---|---|
-| Rust | [../crates/client](../crates/client) | `cargo`, clippy clean | ✅ **56/56** (`examples/manual_test.rs`) |
-| Go | [go/](go) | `go vet` clean, suite runs under `-race` | ✅ **54/54** |
-| Node.js | [nodejs/](nodejs) | Node 22, no dependencies | ✅ **57/57** |
-| TypeScript | [typescript/](typescript) | typings in `nodejs/src/index.d.ts`, strict `tsc` | ✅ **57/57** |
-| Python | [python/](python) | Python ≥ 3.9, no dependencies | ✅ **54/54** |
-| Java | [java/](java) | Java 17, `javac -Xlint:all -Werror`; Maven `pom.xml` | ✅ **54/54** |
-| Kotlin | [kotlin/](kotlin) | over the Java driver; coroutines, DSL, Flow | ✅ **54/54** |
-| Scala | [scala/](scala) | over the Java driver; Scala 3, Try/Future | ✅ **54/54** |
-| C# / .NET | [dotnet/](dotnet) | .NET 8, warnings as errors, no NuGet packages | ✅ **54/54** |
-| F# | [fsharp/](fsharp) | over the .NET driver; Result/Async/Task | ✅ **54/54** |
-| C++ | [cpp/](cpp) | C++17, CMake, `-Wall -Wextra -Wpedantic` clean, TSan clean | ✅ **54/54** |
-| C | [c/](c) | C11, Make or CMake, `-Werror` clean, ASan/UBSan/TSan clean | ✅ **54/54** |
-| D | [d/](d) | LDC, `-w`; dub.json | ✅ **54/54** |
-| PHP | [php/](php) | PHP 8, Composer package with a no-Composer autoloader | ✅ **54/54** |
-| Ruby | [ruby/](ruby) | Ruby 3, gem, stdlib only | ✅ **54/54** |
-| Perl | [perl/](perl) | Perl 5.38, core modules only | ✅ **54/54** |
-| Lua | [lua/](lua) | Lua 5.4, LuaSocket (+ lua-zlib for gzip) | ✅ **54/54** |
-| Erlang | [erlang/](erlang) | OTP 25+, rebar3 layout, `erlc -Werror` | ✅ **54/54** |
-| Elixir | [elixir/](elixir) | Elixir 1.14+, `mix compile --warnings-as-errors`, no deps | ✅ **54/54** |
-| Haskell | [haskell/](haskell) | GHC 9.4, `-Wall -Werror`, boot packages + network/zlib | ✅ **54/54** |
-| OCaml | [ocaml/](ocaml) | OCaml 4.14, camlzip; dune/opam files shipped | ✅ **54/54** |
-| Crystal | [crystal/](crystal) | Crystal 1.11 shard, stdlib only | ✅ **54/54** |
-| Nim | [nim/](nim) | Nim 1.6, stdlib + system zlib | ✅ **54/54** |
-| Dart | [dart/](dart) | Dart 3, `dart analyze` clean, no packages | ✅ **54/54** |
+| Rust | [../crates/client](../crates/client) | `cargo`, clippy clean | ✅ **85/85** (`examples/manual_test.rs`) |
+| Go | [go/](go) | `go vet` clean, suite runs under `-race` | ✅ **80/80** |
+| Node.js | [nodejs/](nodejs) | Node 22, no dependencies | ✅ **83/83** |
+| TypeScript | [typescript/](typescript) | typings in `nodejs/src/index.d.ts`, strict `tsc` | ✅ **83/83** |
+| Python | [python/](python) | Python ≥ 3.9, no dependencies | ✅ **81/81** |
+| Java | [java/](java) | Java 17, `javac -Xlint:all -Werror`; Maven `pom.xml` | ✅ **88/88** |
+| Kotlin | [kotlin/](kotlin) | over the Java driver; coroutines, DSL, Flow | ✅ **88/88** |
+| Scala | [scala/](scala) | over the Java driver; Scala 3, Try/Future | ✅ **88/88** |
+| C# / .NET | [dotnet/](dotnet) | .NET 8, warnings as errors, no NuGet packages | ✅ **88/88** |
+| F# | [fsharp/](fsharp) | over the .NET driver; Result/Async/Task | ✅ **88/88** |
+| C++ | [cpp/](cpp) | C++17, CMake, `-Wall -Wextra -Wpedantic` clean, TSan clean | ✅ **87/87** |
+| C | [c/](c) | C11, Make or CMake, `-Werror` clean, ASan/UBSan/TSan clean | ✅ **88/88** |
+| D | [d/](d) | LDC, `-w`; dub.json | ✅ **87/87** |
+| PHP | [php/](php) | PHP 8, Composer package with a no-Composer autoloader | ✅ **81/81** |
+| Ruby | [ruby/](ruby) | Ruby 3, gem, stdlib only | ✅ **87/87** |
+| Perl | [perl/](perl) | Perl 5.38, core modules only | ✅ **87/87** |
+| Lua | [lua/](lua) | Lua 5.4, LuaSocket (+ lua-zlib for gzip) | ✅ **87/87** |
+| Erlang | [erlang/](erlang) | OTP 25+, rebar3 layout, `erlc -Werror` | ✅ **87/87** |
+| Elixir | [elixir/](elixir) | Elixir 1.14+, `mix compile --warnings-as-errors`, no deps | ✅ **85/85** |
+| Haskell | [haskell/](haskell) | GHC 9.4, `-Wall -Werror`, boot packages + network/zlib | ✅ **85/85** |
+| OCaml | [ocaml/](ocaml) | OCaml 4.14, camlzip; dune/opam files shipped | ✅ **85/85** |
+| Crystal | [crystal/](crystal) | Crystal 1.11 shard, stdlib only | ✅ **85/85** |
+| Nim | [nim/](nim) | Nim 1.6, stdlib + system zlib | ✅ **85/85** |
+| Dart | [dart/](dart) | Dart 3, `dart analyze` clean, no packages | ✅ **86/86** |
 
-Every suite is a port of the Go suite
-([go/cmd/manualtest](go/cmd/manualtest/main.go)) with the same sections
-and checks, so the numbers are comparable; Node, TypeScript and Rust carry
-a few extra checks of their own. CI runs every suite against a live broker
-on each push (the `clients` job).
+Every suite starts from the same 54-check port of the Go suite
+([go/cmd/manualtest](go/cmd/manualtest/main.go)). Each then adds the
+feature-audit checks: settings, retries through a fault-injecting proxy,
+fetch limits, group behaviour and decoder bounds. That puts every client
+at 80–88 checks against a live broker. The
+**[feature matrix](../docs/client-feature-matrix.md)** shows every
+producer, consumer and group feature, language by language. CI runs every
+suite on each push (the `clients` job).
 
 Single-threaded runtimes (PHP, Perl, Lua) batch inside
 `send`/`poll`/`flush` and heartbeat from `poll`, documented in each README.

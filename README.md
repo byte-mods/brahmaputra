@@ -9,11 +9,13 @@ binary, with no JVM, no ZooKeeper and no heap to tune.
 [![CI](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml/badge.svg)](https://github.com/byte-mods/brahmaputra/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-425%20passing-brightgreen.svg)](#verification)
+[![Tests](https://img.shields.io/badge/tests-448%20passing-brightgreen.svg)](#verification)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-Kafka%20comparison-blue.svg)](#performance)
 [![Transports](https://img.shields.io/badge/transport-TCP%20%C2%B7%20TLS%201.3%20%C2%B7%20QUIC-informational.svg)](#transports)
 [![Auth](https://img.shields.io/badge/auth-mTLS%20%C2%B7%20SCRAM--SHA--256%20%C2%B7%20ACLs-blueviolet.svg)](#authentication-and-access-control)
 [![Wire](https://img.shields.io/badge/wire-v4-lightgrey.svg)](docs/kafka-parity.md)
+[![Clients](https://img.shields.io/badge/clients-24%20languages-success.svg)](#client-libraries-in-24-languages)
+[![WebSocket](https://img.shields.io/badge/websocket-gateway-9cf.svg)](#websocket-gateway)
 
 </div>
 
@@ -29,6 +31,8 @@ open http://localhost:8080                              # dashboard
 | 🚀 **Measured against Kafka** | Reproducible comparisons cover replication, concurrency, record size, codecs and delivery settings. Results depend on workload and host. [Measurements and method →](#performance) |
 | 🧩 **One static binary** | Broker, controller, dashboard and metrics compiled in. No JVM, no ZooKeeper, no Prometheus required. |
 | 🔁 **Kafka semantics, not just Kafka shape** | Leader/ISR replication, leader-epoch truncation (KIP-101), high-watermark visibility, `acks=0/1/all`, idempotent **and transactional** producer, `read_committed` isolation, consumer groups with generation fencing. |
+| 🌐 **Clients in 24 languages** | Rust, Go, Node.js/TypeScript, Python, Java, Kotlin, Scala, C#, F#, C, C++, D, PHP, Ruby, Perl, Lua, Erlang, Elixir, Haskell, OCaml, Crystal, Nim, Dart. Each has the full producer, consumer and group feature set and is verified against a live broker. [Clients →](#client-libraries-in-24-languages) |
+| 📱 **WebSocket gateway for mobile and web** | Authenticated sockets stream into keyed topics through a stateless gateway that scales out without touching the brokers: ~5 KB per socket, and 19,000 sockets cost the broker 3 connections. [Gateway →](#websocket-gateway) |
 | 🔌 **Three transports, one flag** | Plain TCP, TLS 1.3, or QUIC — same wire format, same correctness suite. |
 | 🧪 **Verified by killing things** | Live scripts start real brokers, `kill -9` them mid-write, and audit what survived. Not only unit tests. |
 | 📊 **Operations built in** | Browse and live-tail messages, add partitions, change topic config, consumer lag, Prometheus endpoint, login and RBAC — [in one container](#docker). |
@@ -48,6 +52,8 @@ open http://localhost:8080                              # dashboard
 - [Producing and consuming](#producing-and-consuming)
 - [Consumer groups](#consumer-groups)
 - [Using the Rust client](#using-the-rust-client)
+- [Client libraries in 24 languages](#client-libraries-in-24-languages)
+- [WebSocket gateway](#websocket-gateway)
 - [Transactions](#transactions)
 - [One broker, several disks](#one-broker-several-disks)
 - [Inspecting and trimming a cluster](#inspecting-and-trimming-a-cluster)
@@ -86,10 +92,33 @@ open http://localhost:8080                              # dashboard
 | M13 | Cluster-wide dashboard views, local hosting scripts, sole-replica recovery | ✅ complete |
 | M14 | Surviving a controller outage, topic incarnations, hostile-input decoding | ✅ complete |
 | M15 | Review release: transactions and groups under leader change, fetch-path race, hot-path costs | ✅ complete |
+| M16 | Client libraries in 24 languages with a shared feature contract, WebSocket gateway, BitPacker for 24 languages | ✅ complete |
 
 Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
+
+### Upgrading to 0.9.0
+
+The broker, its wire format (BitPacker wire version 4) and the disk format
+are unchanged, so brokers need no coordinated upgrade. 0.9.0 adds clients
+and services around it:
+
+- **Client libraries in 24 languages.** Each one is audited against one
+  producer/consumer/group feature contract and verified by an
+  80–88-check live suite ([matrix](docs/client-feature-matrix.md)).
+- **The WebSocket gateway**, a separate binary (`brahmaputra-ws-gateway`)
+  that you deploy beside the cluster.
+- **Rust client additions:** `Producer::send_with_timestamp`,
+  `Producer::partition_for`, `Producer::close`, and settable request
+  timeouts. The timeout defaults to unbounded, so existing callers are
+  unaffected.
+- **Behaviour changes in some existing drivers:**
+  - Ruby, Perl and Lua producers no longer resend a batch after a
+    connection drops mid-request, which could write it twice. They retry
+    only retriable broker errors, as the other drivers do.
+  - Python's default compression is now `none` (it was `lz4`, which
+    needs an optional package).
 
 ### Upgrading to 0.8.1
 
@@ -671,6 +700,166 @@ This snippet is compiled as
 [crates/client/examples/readme_snippet.rs](crates/client/examples/readme_snippet.rs)
 (`cargo check -p brahmaputra-client --example readme_snippet`), so it
 cannot drift out of date with the API.
+
+## Client libraries in 24 languages
+
+Brahmaputra ships clients for **Rust, Go, Node.js, TypeScript, Python,
+Java, Kotlin, Scala, C#/.NET, F#, C, C++, D, PHP, Ruby, Perl, Lua, Erlang,
+Elixir, Haskell, OCaml, Crystal, Nim and Dart**. Eighteen speak the wire
+protocol natively: no FFI, no sidecar, no shared library to ship. Kotlin,
+Scala and F# are idiomatic libraries over the Java and .NET drivers.
+TypeScript ships as type declarations for the Node driver.
+
+Every client implements the same contract: acks 0/1/all, batching and
+linger, compression with a codec hook, retries and delivery timeouts, a
+bounded buffer, Kafka-compatible `murmur2` keyed partitioning, headers,
+timestamps and tombstones. Consumers get offsets by earliest, latest or
+timestamp, the high watermark and fetch limits. Consumer groups get range,
+roundrobin and sticky assignment, auto and manual commit, static
+membership, `max.poll.interval.ms` and a clean leave. Configuration names
+follow Kafka's.
+
+Each one is verified against a live broker by an 80–88-check end-to-end
+suite that CI runs on every push. The
+**[feature matrix](docs/client-feature-matrix.md)** shows every feature,
+language by language. **[clients/README.md](clients/README.md)** has the
+table of drivers, build notes, the wire-format notes and the one-command
+runner:
+
+```bash
+clients/run-e2e.sh                 # every driver against a private broker
+clients/run-e2e.sh python go c     # just these
+```
+
+A few of them in use (every driver's README has producer, consumer, group
+and configuration docs):
+
+**Python**
+
+```python
+from brahmaputra import Producer, ProducerConfig, GroupConsumer, GroupConfig, Assignor
+
+with Producer("127.0.0.1", 9092, ProducerConfig(acks=1, linger_ms=5, compression_type="gzip")) as p:
+    p.send("orders", b'{"id":1}', key=b"user-7")          # murmur2(key) picks the partition
+    p.send("orders", None, key=b"user-7")                 # tombstone
+    offset = p.send_and_wait("orders", b'{"id":2}')        # wait for the offset
+
+with GroupConsumer("127.0.0.1", 9092, "billing", GroupConfig(assignor=Assignor.STICKY)) as c:
+    c.subscribe(["orders"])
+    for record in c.poll(500):
+        handle(record.value)
+    c.commit()                                             # at-least-once: after processing
+```
+
+**Go**
+
+```go
+producer, _ := brahmaputra.NewProducer("127.0.0.1:9092", brahmaputra.DefaultProducerConfig())
+defer producer.Close()
+producer.Send("orders", []byte(`{"id":1}`), []byte("user-7"))
+offset, _ := producer.SendSync("orders", []byte(`{"id":2}`), nil)
+
+config := brahmaputra.DefaultGroupConfig()
+config.GroupInstanceID = "worker-3"                      // static membership
+consumer, _ := brahmaputra.NewGroupConsumer("127.0.0.1:9092", "billing", config)
+consumer.Subscribe([]string{"orders"})
+records, _ := consumer.Poll(500 * time.Millisecond)
+consumer.Commit()
+```
+
+**Node.js / TypeScript**
+
+```ts
+import { Producer, GroupConsumer, Assignor } from 'brahmaputra';
+
+const producer = await Producer.connect('127.0.0.1', 9092, { acks: -1, lingerMs: 5 });
+await producer.send('orders', '{"id":1}', { key: 'user-7', headers: [] });
+const offset: bigint = await producer.sendSync('orders', '{"id":2}');
+await producer.close();
+
+const consumer = await GroupConsumer.connect('127.0.0.1', 9092, 'billing', { assignor: Assignor.STICKY });
+consumer.subscribe(['orders']);
+for (const record of await consumer.poll(500)) handle(record.value);
+await consumer.commit();
+```
+
+Every language's own README:
+[Rust](crates/client/README.md) · [Go](clients/go) · [Node.js](clients/nodejs) · [TypeScript](clients/typescript) ·
+[Python](clients/python) · [Java](clients/java) · [Kotlin](clients/kotlin) · [Scala](clients/scala) ·
+[C#/.NET](clients/dotnet) · [F#](clients/fsharp) · [C](clients/c) · [C++](clients/cpp) · [D](clients/d) ·
+[PHP](clients/php) · [Ruby](clients/ruby) · [Perl](clients/perl) · [Lua](clients/lua) ·
+[Erlang](clients/erlang) · [Elixir](clients/elixir) · [Haskell](clients/haskell) · [OCaml](clients/ocaml) ·
+[Crystal](clients/crystal) · [Nim](clients/nim) · [Dart](clients/dart)
+
+**BitPacker**, the schema compiler behind the wire bodies
+([tools/bit-packer](tools/bit-packer)), generates code for the same 24
+languages. Every target passes one conformance suite (every type at its
+extremes, float precision, hostile input) and produces byte-identical
+output: `tools/bit-packer/cross_lang_test/run_all.sh`.
+
+## WebSocket gateway
+
+Phones and browsers should not hold broker connections.
+**[`brahmaputra-ws-gateway`](crates/gateway)** is a stateless service
+between them and the cluster. A client connects over WebSocket and
+authenticates once. Every message it sends becomes a record, whose
+partition is chosen by its key.
+
+```
+ phones, browsers ──wss──▶ L4 load balancer ──▶ gateway × N ──(2 producer conns each)──▶ brokers
+                                                 stateless        batched produce
+```
+
+```bash
+brahmaputra-ws-gateway --broker 127.0.0.1:9092 --jwt-secret "$SECRET" --default-topic events
+TOKEN=$(brahmaputra-ws-gateway mint-token --secret "$SECRET" --sub user-42)   # testing only
+```
+
+```js
+// Browser: the token rides in a subprotocol, since browsers cannot set
+// WebSocket headers. Native apps can send Authorization: Bearer instead.
+const ws = new WebSocket("wss://gw.example.com/ws?topic=orders",
+                         ["brahmaputra.v1", `bearer.${token}`]);
+ws.onopen = () => ws.send(JSON.stringify({ id: 1, key: "cart-7", value: '{"sku":1}' }));
+ws.onmessage = (e) => console.log(JSON.parse(e.data));
+// {"type":"ack","id":1,"topic":"orders","partition":5,"offset":1841}
+```
+
+- **Authentication:** HS256 JWTs, in a bearer header, the query string or
+  the subprotocol. The algorithm is never taken from the token; secrets
+  rotate with `kid`. A `topics` claim narrows where a token may write.
+- **Partitioning:** `murmur2(key) % partitions`, identical to every
+  client. The default key is the authenticated user, so each user's stream
+  stays ordered in one partition. Records carry an `x-gw-user` header that
+  clients cannot forge.
+- **Messages:** JSON text frames (`value`, `value_b64`, `"value": null`
+  for tombstones, headers), or binary frames for high-rate telemetry.
+  Per-message acks with partition and offset, and error codes marked
+  retryable or not.
+- **Cannot overload the broker:** a fixed producer pool (the broker sees
+  2 connections per instance whatever the socket count), per-partition
+  batching, a bounded buffer that fails fast with `OVERLOADED`, TCP
+  backpressure past `--max-inflight`, per-socket rate limits, readiness
+  that drops when the broker is unreachable, and broker quotas keyed on
+  the gateway's client id.
+- **Operations:** `/healthz`, `/readyz`, Prometheus `/metrics`. SIGTERM
+  drains in-flight messages before closing with 1001. Optional native TLS.
+  [Dockerfile and Kubernetes manifests](deploy/ws-gateway) (HPA, PDB)
+  are included.
+
+Measured with `scripts/verify-ws-gateway.sh` on one 4-core machine,
+gateway and load generator side by side:
+
+| | |
+|---|---|
+| Sockets | 19,000, all connected, none dropped (the container's descriptor limit) |
+| Traffic | 19,000 msgs/s, every one acknowledged, 0 errors |
+| Ack latency | p50 4–5 ms, p99 9–12 ms |
+| Memory | ~5 KB per idle socket, so ~5 GiB per million |
+| Broker cost | 3 connections for all 19,000 sockets; ~16 records per produce request |
+
+The protocol, every flag, kernel tuning for a million sockets and the
+deployment guide are in **[crates/gateway/README.md](crates/gateway/README.md)**.
 
 ## Transactions
 

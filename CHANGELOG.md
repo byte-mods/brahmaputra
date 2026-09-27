@@ -1,5 +1,107 @@
 # Changelog
 
+## 0.9.0 — 2026-09-27
+
+Clients for 24 languages with one shared feature contract, a WebSocket
+gateway for mobile and web clients, and BitPacker code generation for the
+same 24 languages. The broker, the BitPacker wire version (4) and the disk
+format are unchanged.
+
+### Added
+
+- **Client libraries in 24 languages.**
+  - Native drivers: Rust, Go, Node.js, Python, Java, C#/.NET, C, C++, D,
+    PHP, Ruby, Perl, Lua, Erlang, Elixir, Haskell, OCaml, Crystal, Nim and
+    Dart.
+  - Libraries over the Java and .NET drivers: Kotlin, Scala and F#.
+    TypeScript is covered by type declarations for the Node driver.
+  - Every client was audited against one producer/consumer/group feature
+    contract ([docs/client-feature-matrix.md](docs/client-feature-matrix.md))
+    and has a live end-to-end suite of 80–88 checks against a real broker.
+    The suites include retries against a fault-injecting proxy.
+  - `clients/run-e2e.sh` runs every suite; CI runs each on every push.
+- **`brahmaputra-ws-gateway`** ([crates/gateway](crates/gateway)), a
+  stateless WebSocket service. Clients authenticate once with an HS256
+  JWT (header, query string or browser subprotocol; `kid` rotation;
+  `topics` claims).
+  - Each JSON or binary frame becomes a record, partitioned by
+    `murmur2(key)`. The key defaults to the user, and every record
+    carries an unforgeable `x-gw-user` header.
+  - Clients get acks with partition and offset, error codes marked
+    retryable or not, per-socket rate and in-flight limits, idle
+    timeouts, graceful drain on SIGTERM, optional native TLS,
+    `/healthz`, `/readyz` and Prometheus `/metrics`.
+  - The broker is shielded from the edge:
+    - a fixed producer pool, so the broker sees 2 connections per
+      gateway instance;
+    - per-partition batching;
+    - a bounded buffer that fails fast with `OVERLOADED`;
+    - readiness that drops when the broker is unreachable.
+  - Measured with 19,000 sockets on one 4-core host: 19,000 msgs/s
+    acknowledged with 0 errors, p99 9–12 ms, ~5 KB per idle socket,
+    3 broker connections.
+  - `ws-loadgen` and `scripts/verify-ws-gateway.sh` reproduce the
+    measurement. A Dockerfile and Kubernetes manifests are in
+    [deploy/ws-gateway](deploy/ws-gateway).
+- **BitPacker targets for 24 languages**, each in its own generator file.
+  A new conformance suite covers every type at its extremes, float32
+  parity, trailing bytes and hostile input. Every target encodes
+  byte-identically (`tools/bit-packer/cross_lang_test/run_all.sh`,
+  run in CI).
+- **Rust client:** `Producer::send_with_timestamp`,
+  `Producer::partition_for`, `Producer::close`,
+  `Producer::set_request_timeout`, and
+  `Consumer`/`GroupConsumer::with_request_timeout`. The timeout is
+  unbounded by default, so existing behaviour is unchanged.
+- A release workflow: pushing a `v*` tag builds x86_64 and aarch64 Linux
+  binaries and publishes them with these notes.
+
+### Fixed
+
+- **Existing drivers:**
+  - **Node:** string keys and values were encoded as garbage under a
+    valid CRC, poisoning the partition. Large values overflowed the
+    stack. Linger and batch-full flushes could reorder a partition. The
+    sticky assignor sorted partitions as strings. A metadata error threw
+    `ReferenceError`.
+  - **Go:** empty keys and header values decoded as null, and the
+    heartbeat and `Poll` raced.
+  - **Python:** it had never been run. It crashed on tombstones and
+    defaulted to an optional codec.
+  - **Java:** it had never been compiled. It crashed on tombstones and
+    could reorder sends.
+  - **Across drivers:**
+    - background flush failures were silently dropped;
+    - `max.poll.interval.ms` was enforced during a poll's own rejoin;
+    - timed-out connections stayed in use.
+  - **Rust:** `commit_sync()` reported success for a refused commit, and
+    cancelled requests leaked for the connection's lifetime.
+- **BitPacker generators:**
+  - Go did not compile schemas using `long`, `float` or `double`, and
+    Rust had no floats.
+  - Python and JS scaled `float` fields in double precision, sending 2899
+    where the other targets send 2900.
+  - PHP used a different wire format.
+  - Java, C#, C++, JS and the Python C extension had unbounded reads and
+    allocations from untrusted lengths.
+  - The cross-language test had been compiling stale generated code; it
+    now generates fresh code for every language.
+- **.NET and Java drivers:** hostile lengths overflowed bounds checks or
+  forced 2 GiB allocations.
+
+### Changed
+
+- Ruby, Perl and Lua producers retry only retriable broker errors. A
+  connection that dropped mid-request used to trigger a resend, which
+  could duplicate the batch.
+
+### Known broker behaviour
+
+- `ListOffsets` by timestamp resolves to a whole batch: a timestamp inside
+  a multi-record batch returns that batch's base offset.
+- `JoinGroup` accepts an unknown non-empty member id rather than answering
+  `UNKNOWN_MEMBER_ID`.
+
 ## 0.8.1 — 2026-09-21
 
 Cold client routing and record encoding use fewer requests, connections and
