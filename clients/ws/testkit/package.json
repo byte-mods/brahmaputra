@@ -1,0 +1,7 @@
+{
+  "name": "brahmaputra-ws-testkit",
+  "private": true,
+  "type": "module",
+  "description": "Shared end-to-end fixtures for the WebSocket SDKs: gateway processes, tokens, a broker-side price producer",
+  "main": "index.mjs"
+}

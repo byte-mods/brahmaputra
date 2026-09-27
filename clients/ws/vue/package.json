@@ -1,0 +1,29 @@
+{
+  "name": "@brahmaputra/ws-vue",
+  "version": "0.10.0",
+  "description": "Vue 3 composables for the Brahmaputra WebSocket gateway: live price boards, tapes and publishing, with reconnects handled",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "@brahmaputra/ws-client": "^0.10.0",
+    "vue": "^3.3.0"
+  },
+  "devDependencies": {
+    "@brahmaputra/ws-client": "file:../js",
+    "typescript": "~6.0.3",
+    "vue": "^3.5.0"
+  }
+}

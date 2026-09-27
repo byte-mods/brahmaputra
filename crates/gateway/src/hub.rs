@@ -111,19 +111,21 @@ impl Hub {
     }
 
     /// Join `topic`'s feed, starting it if this is its first subscriber.
-    /// A feed that has just started gets a few seconds to read its history
-    /// first, so the snapshot is not empty merely because this subscriber
-    /// was the one that started it.
+    ///
+    /// A feed that has just started gets a few seconds to find the end of
+    /// its partitions and read its history first. That is what lets the
+    /// confirmation promise something: every record written after the
+    /// subscriber is told `subscribed` reaches it, and the snapshot is not
+    /// empty merely because this subscriber was the one that started the
+    /// feed.
     pub async fn subscribe(
         self: &Arc<Self>,
         topic: &str,
         keys: Option<&HashSet<Bytes>>,
         snapshot: bool,
     ) -> Subscription {
-        if snapshot {
-            let mut warm = self.feed(topic).warm.subscribe();
-            let _ = tokio::time::timeout(WARMUP_WAIT, warm.wait_for(|w| *w)).await;
-        }
+        let mut warm = self.feed(topic).warm.subscribe();
+        let _ = tokio::time::timeout(WARMUP_WAIT, warm.wait_for(|w| *w)).await;
         // The feeds lock is held until the channel is joined, so a feed
         // retiring for want of subscribers cannot slip in between (and a
         // feed that retired while this one waited is simply restarted).
@@ -254,11 +256,13 @@ async fn run_feed(hub: Arc<Hub>, feed: Arc<Feed>) {
             let c = consumer.as_ref().expect("connected");
             if partitions.is_empty() || last_refresh.elapsed() >= PARTITION_REFRESH {
                 last_refresh = Instant::now();
+                let promised = *feed.warm.borrow();
                 discover(
                     c,
                     &topic,
                     &mut partitions,
                     hub.config.snapshot_warmup_records,
+                    promised,
                 )
                 .await?;
             }
@@ -330,6 +334,7 @@ async fn discover(
     topic: &str,
     partitions: &mut Vec<PartitionState>,
     warmup: i64,
+    promised: bool,
 ) -> Result<(), ClientError> {
     let metadata = consumer.metadata(&[topic.to_owned()]).await?;
     let Some(info) = metadata.topics.iter().find(|t| t.name == topic) else {
@@ -338,17 +343,18 @@ async fn discover(
     if info.error_code != ec::NONE {
         return ClientError::from_error_code(info.error_code);
     }
-    let first_discovery = partitions.is_empty();
+    // Partitions found when the feed starts are live from their end.
+    // Partitions found after subscribers were told the feed is live (a
+    // topic created after it was subscribed to, or grown since) are live
+    // from their beginning: everything in them is news to someone.
+    let from_end = partitions.is_empty() && !promised;
     for p in &info.partitions {
         if partitions.iter().any(|s| s.partition == p.partition) {
             continue;
         }
         let latest = consumer.list_offsets(topic, p.partition, LATEST).await?;
         let earliest = consumer.list_offsets(topic, p.partition, EARLIEST).await?;
-        // A partition present when the feed starts is live from its end; one
-        // added later is live from its beginning, since everything in it is
-        // new to the subscribers already here.
-        let live_from = if first_discovery { latest } else { earliest };
+        let live_from = if from_end { latest } else { earliest };
         let position = (live_from - warmup.max(0)).max(earliest);
         debug!(%topic, partition = p.partition, position, live_from, "feed partition");
         partitions.push(PartitionState {

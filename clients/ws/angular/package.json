@@ -1,0 +1,31 @@
+{
+  "name": "@brahmaputra/ws-angular",
+  "version": "0.10.0",
+  "description": "Angular providers, signals and observables for the Brahmaputra WebSocket gateway: live price boards, tapes and publishing, with reconnects handled",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "@angular/core": ">=17",
+    "@brahmaputra/ws-client": "^0.10.0",
+    "rxjs": "^7.4.0"
+  },
+  "devDependencies": {
+    "@angular/core": "^20.0.0",
+    "@brahmaputra/ws-client": "file:../js",
+    "rxjs": "^7.8.0",
+    "typescript": "~5.8.0"
+  }
+}

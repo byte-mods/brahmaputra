@@ -1,0 +1,22 @@
+{
+  "name": "brahmaputra-ws-browser-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Real-browser end-to-end tests: React, Vue and Angular trading screens -> brahmaputra-ws-gateway -> Brahmaputra",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs && node --test --test-concurrency=1 browser.test.mjs"
+  },
+  "devDependencies": {
+    "@angular/common": "^20.0.0",
+    "@angular/compiler": "^20.0.0",
+    "@angular/core": "^20.0.0",
+    "@angular/platform-browser": "^20.0.0",
+    "esbuild": "^0.25.0",
+    "playwright-core": "~1.56.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "rxjs": "^7.8.0",
+    "vue": "^3.5.0"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "@brahmaputra/ws-client",
+  "version": "0.10.0",
+  "description": "Browser, React Native and Node client for the Brahmaputra WebSocket gateway: publish with acknowledgements, subscribe to live topics (price feeds) with snapshots, automatic reconnect",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./svelte": {
+      "types": "./dist/svelte.d.ts",
+      "default": "./dist/svelte.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.3"
+  }
+}

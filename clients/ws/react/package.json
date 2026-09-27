@@ -1,0 +1,30 @@
+{
+  "name": "@brahmaputra/ws-react",
+  "version": "0.10.0",
+  "description": "React hooks for the Brahmaputra WebSocket gateway: live price boards, tapes and publishing, with reconnects handled",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "@brahmaputra/ws-client": "^0.10.0",
+    "react": ">=18"
+  },
+  "devDependencies": {
+    "@brahmaputra/ws-client": "file:../js",
+    "@types/react": "^19.0.0",
+    "react": "^19.0.0",
+    "typescript": "~6.0.3"
+  }
+}
