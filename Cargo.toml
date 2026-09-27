@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.9.2"
 rust-version = "1.88"
 edition = "2021"
 license = "Apache-2.0"
@@ -74,11 +74,11 @@ ring = "0.17"
 # dev-dependencies
 tempfile = "3"
 
-brahmaputra-protocol = { path = "crates/protocol", version = "0.9.1" }
-brahmaputra-storage = { path = "crates/storage", version = "0.9.1" }
-brahmaputra-metadata = { path = "crates/metadata", version = "0.9.1" }
-brahmaputra-metrics = { path = "crates/metrics", version = "0.9.1" }
-brahmaputra-dashboard = { path = "crates/dashboard", version = "0.9.1" }
-brahmaputra-controller = { path = "crates/controller", version = "0.9.1" }
-brahmaputra-broker = { path = "crates/broker", version = "0.9.1" }
-brahmaputra-client = { path = "crates/client", version = "0.9.1" }
+brahmaputra-protocol = { path = "crates/protocol", version = "0.9.2" }
+brahmaputra-storage = { path = "crates/storage", version = "0.9.2" }
+brahmaputra-metadata = { path = "crates/metadata", version = "0.9.2" }
+brahmaputra-metrics = { path = "crates/metrics", version = "0.9.2" }
+brahmaputra-dashboard = { path = "crates/dashboard", version = "0.9.2" }
+brahmaputra-controller = { path = "crates/controller", version = "0.9.2" }
+brahmaputra-broker = { path = "crates/broker", version = "0.9.2" }
+brahmaputra-client = { path = "crates/client", version = "0.9.2" }

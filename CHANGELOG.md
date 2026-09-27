@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.2 — 2026-09-27
+
+A fix to the C client's consumer groups. Nothing else changes.
+
+### Fixed
+
+- **C client: a member could be evicted mid-rebalance without noticing.**
+  Heartbeats shared the fetch connection, whose lock is held for a whole
+  round trip. An application polling in a tight loop could starve the
+  heartbeat thread long enough for the coordinator to evict the member
+  during a rebalance. The member kept fetching its old partitions and never
+  rejoined, so two members could both believe they owned every partition.
+  The two-member rebalance check caught it intermittently on CI runners.
+  - Group-protocol traffic (heartbeat, join, sync, commit) now has its own
+    connection, so fetches can never delay heartbeats.
+  - A member whose heartbeats go unanswered for longer than
+    `session.timeout.ms` now assumes it was evicted and rejoins.
+
+### Added
+
+- `clients/c/test/rebalance_stress.c` (`make stress`) repeats the
+  two-member rebalance with fresh groups. A dispatch-only CI job runs it
+  100 times on a runner, with `BRP_DEBUG=1` group traces and the broker's
+  group debug log saved as artifacts.
+- `BRP_DEBUG=1` makes the C client trace join, sync and heartbeat results.
+- `clients/run-e2e.sh` accepts `BROKER_LOG` (the broker's tracing filter)
+  and prints the broker log's tail when a suite fails.
+
+### Changed (tests)
+
+- `verify-m6` greps here-strings instead of `printf | grep -q`, which
+  failed under `pipefail` when grep exited early.
+
 ## 0.9.1 — 2026-09-27
 
 A fix for consumer-group polling in the Rust client (and so the CLI), and CI

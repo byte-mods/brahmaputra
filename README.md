@@ -98,6 +98,14 @@ Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
 
+### Upgrading to 0.9.2
+
+A drop-in patch; only the C client changes. Rebuild applications that
+use the C client's consumer groups. In 0.9.1 and earlier, a member whose
+heartbeats were starved by a tight polling loop could be evicted
+mid-rebalance and keep fetching its old partitions. Group traffic now has
+its own connection. See the [changelog](CHANGELOG.md#092--2026-09-27).
+
 ### Upgrading to 0.9.1
 
 A drop-in patch for 0.9.0; no data, wire or configuration changes.
