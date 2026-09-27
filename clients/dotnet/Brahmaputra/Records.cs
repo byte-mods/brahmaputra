@@ -273,8 +273,10 @@ public static class RecordBatch
         int batchLength = BinaryPrimitives.ReadInt32BigEndian(data[(offset + 8)..]);
         if (batchLength < MinBatchLength) throw new BrahmaputraException("batch_length too small");
         int bodyAt = offset + HeaderLen;
+        // Compared as a remaining length: bodyAt + batchLength overflows for
+        // a hostile length near int.MaxValue and would pass the check.
+        if (batchLength > data.Length - bodyAt) throw new BrahmaputraException("truncated batch body");
         int end = bodyAt + batchLength;
-        if (end > data.Length) throw new BrahmaputraException("truncated batch body");
 
         byte magic = data[bodyAt + 4];
         if (magic != MagicV1 && magic != MagicV2) throw new BrahmaputraException($"unsupported magic {magic}");

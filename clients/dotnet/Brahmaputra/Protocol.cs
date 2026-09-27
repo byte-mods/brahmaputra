@@ -347,7 +347,7 @@ public sealed class BodyReader
     public string String()
     {
         int length = Int32();
-        if (length < 0 || _pos + length > _data.Length) throw new BrahmaputraException("truncated string");
+        if (length < 0 || length > _data.Length - _pos) throw new BrahmaputraException("truncated string");
         string value = Encoding.UTF8.GetString(_data, _pos, length);
         _pos += length;
         return value;

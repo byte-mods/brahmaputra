@@ -172,12 +172,17 @@ public sealed class BrokerConnection : IDisposable
         }
     }
 
+    private const int MaxFrameBytes = 256 * 1024 * 1024;
+
     private async Task<byte[]> ReadFrameAsync(CancellationToken cancellationToken)
     {
         byte[] header = new byte[4];
         await _stream.ReadExactlyAsync(header, cancellationToken).ConfigureAwait(false);
         int length = BinaryPrimitives.ReadInt32BigEndian(header);
         if (length < 0) throw new BrahmaputraException($"negative frame length {length}");
+        // A corrupt or hostile peer must not be able to make us allocate
+        // gigabytes from four bytes of header.
+        if (length > MaxFrameBytes) throw new BrahmaputraException($"frame length {length} exceeds {MaxFrameBytes}");
         byte[] payload = new byte[length];
         await _stream.ReadExactlyAsync(payload, cancellationToken).ConfigureAwait(false);
         return payload;
