@@ -1,0 +1,8 @@
+# LuaRocks build/install outputs
+*.rock
+*.src.rock
+lua_modules/
+.luarocks/
+luacov.*
+build/
+out/
