@@ -415,26 +415,37 @@ async fn serve(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
     let _ = stream.set_nodelay(true);
     match shared.tls.clone() {
         None => upgrade(shared, stream, peer).await,
-        Some(acceptor) => {
-            // The TLS handshake shares the upgrade's deadline: a client
-            // that stalls mid-handshake holds a socket and a task.
-            let deadline = Duration::from_secs(shared.config.handshake_timeout_secs);
-            match tokio::time::timeout(deadline, acceptor.accept(stream)).await {
-                Ok(Ok(tls)) => upgrade(shared, tls, peer).await,
-                Ok(Err(error)) => {
-                    debug!(%peer, %error, "tls handshake failed");
-                    shared
-                        .metrics
-                        .handshakes_rejected_other
-                        .fetch_add(1, Relaxed);
-                }
-                Err(_) => {
-                    shared
-                        .metrics
-                        .handshakes_rejected_other
-                        .fetch_add(1, Relaxed);
-                }
-            }
+        // Boxed so the TLS state machine (which embeds a rustls session)
+        // is only allocated for TLS sockets: an async fn is as large as its
+        // largest branch, and inline it more than doubled the memory of
+        // every plaintext socket.
+        Some(acceptor) => Box::pin(serve_tls(shared, acceptor, stream, peer)).await,
+    }
+}
+
+async fn serve_tls(
+    shared: Arc<Shared>,
+    acceptor: tokio_rustls::TlsAcceptor,
+    stream: TcpStream,
+    peer: SocketAddr,
+) {
+    // The TLS handshake shares the upgrade's deadline: a client that
+    // stalls mid-handshake holds a socket and a task.
+    let deadline = Duration::from_secs(shared.config.handshake_timeout_secs);
+    match tokio::time::timeout(deadline, acceptor.accept(stream)).await {
+        Ok(Ok(tls)) => upgrade(shared, tls, peer).await,
+        Ok(Err(error)) => {
+            debug!(%peer, %error, "tls handshake failed");
+            shared
+                .metrics
+                .handshakes_rejected_other
+                .fetch_add(1, Relaxed);
+        }
+        Err(_) => {
+            shared
+                .metrics
+                .handshakes_rejected_other
+                .fetch_add(1, Relaxed);
         }
     }
 }

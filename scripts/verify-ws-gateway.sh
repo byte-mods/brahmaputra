@@ -95,6 +95,11 @@ fail=0
 grep -q "connections established $CONNECTIONS\$" "$WORK/loadgen.txt" || { echo "FAIL: not every socket connected" >&2; fail=1; }
 grep -q '^error frames            0$' "$WORK/loadgen.txt" || { echo "FAIL: publishes were refused" >&2; fail=1; }
 grep -q '^closed by gateway       0$' "$WORK/loadgen.txt" || { echo "FAIL: the gateway dropped sockets" >&2; fail=1; }
+per_conn=$(awk '/^gateway bytes\/conn/{print $3}' "$WORK/loadgen.txt")
+if [[ -n "$per_conn" ]] && (( per_conn > ${MAX_BYTES_PER_CONN:-8192} )); then
+  echo "FAIL: $per_conn bytes per idle socket (budget ${MAX_BYTES_PER_CONN:-8192})" >&2
+  fail=1
+fi
 (( broker_conns <= 8 )) || { echo "FAIL: broker holds $broker_conns connections" >&2; fail=1; }
 # Batching is what keeps the broker's request rate flat as sockets grow:
 # at a high message rate, many records must share each request. (At a low

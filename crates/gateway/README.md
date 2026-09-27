@@ -157,7 +157,7 @@ load generator on the same machine):
 |---|---|
 | Sockets | **19,000**, all established in 6.4 s, 0 failed, 0 dropped |
 | Traffic | 1 msg/s per socket → **19,000 msgs/s**, every one acknowledged, 0 errors |
-| Ack latency | p50 **4 ms**, p99 **9 ms**, p99.9 13 ms |
+| Ack latency | p50 **4–5 ms**, p99 **9–12 ms**, p99.9 13–92 ms (varied across runs on a shared host) |
 | Gateway memory | **5.2 KB per idle socket** (101 MiB for 19,000; 103 MiB under load) |
 | Broker connections | **3** for all 19,000 sockets (2 producers + health) |
 | Broker requests | 680,389 records in 40,074 produce requests (~16 per request, ~1,050/s) |
