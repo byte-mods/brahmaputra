@@ -15,7 +15,9 @@ The sections and checks mirror clients/go/cmd/manualtest/main.go one for one.
 from __future__ import annotations
 
 import os
+import socket
 import sys
+import threading
 import time
 import uuid
 
@@ -25,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from brahmaputra import (  # noqa: E402
     Assignor,
     AutoOffsetReset,
+    Connection,
     Consumer,
     EARLIEST,
     GroupConfig,
@@ -370,8 +373,350 @@ def main() -> int:
         check("a full buffer blocks and then reports", blocked and waited >= 0.25,
               f"blocked={blocked} after {waited:.3f}s")
 
+    section("wire edge cases")
+    edge_topic = unique("py-edge")
+    large = bytes((i * 7) & 0xFF for i in range(1 << 20))
+    unicode_key = "ключ-✓-🔑".encode()
+    unicode_value = "значение — 数据 — 🚀".encode()
+    with Producer(HOST, PORT, ProducerConfig(linger_ms=0)) as producer:
+        producer.send(edge_topic, large, partition=0)
+        producer.send(
+            edge_topic,
+            unicode_value,
+            key=unicode_key,
+            partition=0,
+            headers=[RecordHeader("ünïcødé-🏷", "✓".encode())],
+        )
+        # An empty key and an empty header value are values, not nulls.
+        producer.send(
+            edge_topic,
+            b"empty-key",
+            key=b"",
+            partition=0,
+            headers=[RecordHeader("empty", b""), RecordHeader("null", None)],
+        )
+        producer.send(edge_topic, b"null-key", key=None, partition=0)
+    got = []
+    with Consumer(HOST, PORT) as consumer:
+        offset = 0
+        while len(got) < 4:
+            batch = consumer.fetch(edge_topic, 0, offset, 500)
+            if not batch:
+                break
+            got.extend(batch)
+            offset = batch[-1].offset + 1
+    check("edge records all arrive", len(got) == 4, f"got {len(got)}")
+    if len(got) == 4:
+        check(
+            "a 1 MiB value round-trips byte-identical",
+            got[0].value == large,
+            f"{len(got[0].value or b'')} bytes",
+        )
+        check(
+            "unicode key, value and header key round-trip",
+            got[1].key == unicode_key
+            and got[1].value == unicode_value
+            and len(got[1].headers) == 1
+            and got[1].headers[0].key == "ünïcødé-🏷",
+        )
+        check(
+            "an empty key stays empty, not null",
+            got[2].key is not None and len(got[2].key) == 0,
+            repr(got[2].key),
+        )
+        check(
+            "an empty header value stays empty, not null",
+            len(got[2].headers) == 2
+            and got[2].headers[0].value is not None
+            and len(got[2].headers[0].value) == 0
+            and got[2].headers[1].value is None,
+            repr(got[2].headers),
+        )
+        check("a null key stays null", got[3].key is None, repr(got[3].key))
+
+    section("ordering under linger flushes")
+    order_topic = unique("py-order")
+    total = 5000
+    with Producer(HOST, PORT, ProducerConfig(linger_ms=1, batch_size=256)) as producer:
+        for index in range(total):
+            producer.send(order_topic, str(index).encode(), partition=0)
+    values = []
+    with Consumer(HOST, PORT) as consumer:
+        offset = 0
+        while len(values) < total:
+            batch = consumer.fetch(order_topic, 0, offset, 500)
+            if not batch:
+                break
+            values.extend(int(r.value) for r in batch)
+            offset = batch[-1].offset + 1
+    inversions = sum(1 for a, b in zip(values, values[1:]) if b < a)
+    check("every record of a partition arrives", len(values) == total, f"got {len(values)}")
+    check("a partition's records keep send order", inversions == 0, f"{inversions} inversions")
+
+    section("background flush failures are reported")
+    producer = Producer(HOST, PORT, ProducerConfig(linger_ms=20))
+    send_error = flush_error = None
+    try:
+        # Partition 999 does not exist, so the linger ticker's flush fails.
+        producer.send(unique("py-bgfail"), b"lost", partition=999)
+    except Exception as error:  # noqa: BLE001
+        send_error = error
+    time.sleep(0.3)
+    try:
+        producer.flush()
+    except Exception as error:  # noqa: BLE001
+        flush_error = error
+    check(
+        "a failed linger flush surfaces on the next flush",
+        send_error is None and flush_error is not None,
+        f"send={send_error!r} flush={flush_error!r}",
+    )
+    closer = threading.Thread(target=lambda: _quietly(producer.close), daemon=True)
+    closer.start()
+    closer.join(5.0)
+    check("close returns after a failed flush", not closer.is_alive(), "hung")
+
+    section("connection failures")
+    # A broker that accepts and never answers must cost an error, not a
+    # thread blocked forever.
+    silent = _SilentServer()
+    connection = Connection("127.0.0.1", silent.port, "py-test", 1.0)
+    connection.set_request_timeout(0.3)
+    started = time.monotonic()
+    request_error = None
+    try:
+        connection.api_versions()
+    except Exception as error:  # noqa: BLE001
+        request_error = error
+    check(
+        "a request to an unresponsive broker times out",
+        request_error is not None and time.monotonic() - started < 3.0,
+        repr(request_error),
+    )
+    check("a timed-out connection is not reused", connection.broken)
+    connection.close()
+    silent.close()
+
+    # A connection the broker drops is redialled, not kept forever.
+    proxy = _Proxy(HOST, PORT)
+    drop_topic = unique("py-drop")
+    producer = Producer("127.0.0.1", proxy.port, ProducerConfig(linger_ms=0))
+    producer.send(drop_topic, b"before", partition=0)
+    proxy.drop_all()
+    recovered: object = "not attempted"
+    for _ in range(3):
+        try:
+            producer.send(drop_topic, b"after", partition=0)
+            recovered = None
+            break
+        except Exception as error:  # noqa: BLE001
+            recovered = error
+    check("a producer recovers after its connection drops", recovered is None, repr(recovered))
+    _quietly(producer.close)
+    consumer = Consumer("127.0.0.1", proxy.port)
+    consumer.fetch(drop_topic, 0, 0, 100)
+    proxy.drop_all()
+    fetch_error: object = "not attempted"
+    fetched = []
+    for _ in range(3):
+        try:
+            fetched = consumer.fetch(drop_topic, 0, 0, 100)
+            fetch_error = None
+            break
+        except Exception as error:  # noqa: BLE001
+            fetch_error = error
+    check(
+        "a consumer recovers after its connection drops",
+        fetch_error is None and len(fetched) >= 1,
+        repr(fetch_error),
+    )
+    consumer.close()
+    proxy.close()
+
+    section("consumer group: max.poll.interval and rejoin")
+    slow_topic = unique("py-slow")
+    producer = Producer(HOST, PORT, ProducerConfig(linger_ms=0))
+    for index in range(10):
+        producer.send(slow_topic, f"s{index}".encode())
+    consumer = GroupConsumer(
+        HOST,
+        PORT,
+        unique("py-slow-grp"),
+        GroupConfig(auto_commit_interval_ms=0, max_poll_interval_ms=1500),
+    )
+    consumer.subscribe([slow_topic])
+    first = []
+    deadline = time.time() + 15
+    while len(first) < 10 and time.time() < deadline:
+        try:
+            first.extend(consumer.poll(300))
+        except Exception:  # noqa: BLE001
+            break
+    consumer.commit()
+    # Stall past max.poll.interval.ms: the member leaves the group.
+    time.sleep(2.5)
+    for index in range(10, 20):
+        producer.send(slow_topic, f"s{index}".encode())
+    producer.close()
+    second = []
+    poll_error = None
+    deadline = time.time() + 15
+    while len(second) < 10 and time.time() < deadline:
+        try:
+            second.extend(consumer.poll(300))
+        except Exception as error:  # noqa: BLE001
+            poll_error = error
+            break
+    check(
+        "a member that stalled rejoins on its next poll",
+        len(first) == 10 and len(second) == 10 and poll_error is None,
+        f"first={len(first)} second={len(second)} err={poll_error!r}",
+    )
+    consumer.close()
+
+    section("consumer group: time inside poll does not count against max.poll.interval")
+    join_topic = unique("py-inpoll")
+    producer = Producer(HOST, PORT, ProducerConfig(linger_ms=0))
+    producer.router.partitions(join_topic)
+    # Far shorter than the first poll below, which spends ~1s joining (the
+    # broker's initial rebalance delay) and then waits for data.
+    consumer = GroupConsumer(
+        HOST,
+        PORT,
+        unique("py-inpoll-grp"),
+        GroupConfig(auto_commit_interval_ms=0, max_poll_interval_ms=600),
+    )
+    consumer.subscribe([join_topic])
+
+    def produce_later() -> None:
+        time.sleep(2.0)
+        for index in range(10):
+            _quietly(lambda: producer.send(join_topic, f"j{index}".encode()))
+
+    feeder = threading.Thread(target=produce_later, daemon=True)
+    feeder.start()
+    poll_error = commit_error = None
+    got = []
+    # One long poll: it joins, then waits for the records above.
+    try:
+        got = consumer.poll(4000)
+    except Exception as error:  # noqa: BLE001
+        poll_error = error
+    # Committed straight away, before another poll could quietly rejoin:
+    # this fails if the member left the group mid-poll.
+    try:
+        consumer.commit()
+    except Exception as error:  # noqa: BLE001
+        commit_error = error
+    check(
+        "a member is still in its group after a long poll",
+        poll_error is None and len(got) > 0 and commit_error is None,
+        f"got={len(got)} poll={poll_error!r} commit={commit_error!r}",
+    )
+    consumer.close()
+    feeder.join()
+    producer.close()
+
     print(f"\n{PASSED} passed, {FAILED} failed")
     return 1 if FAILED else 0
+
+
+def _quietly(fn) -> None:
+    try:
+        fn()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class _SilentServer:
+    """Accepts connections and reads forever, never answering."""
+
+    def __init__(self) -> None:
+        self._listener = socket.socket()
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen()
+        self.port = self._listener.getsockname()[1]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                conn, _ = self._listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=_drain, args=(conn,), daemon=True).start()
+
+    def close(self) -> None:
+        self._listener.close()
+
+
+def _drain(conn: socket.socket) -> None:
+    try:
+        while conn.recv(65536):
+            pass
+    except OSError:
+        pass
+
+
+class _Proxy:
+    """Forwards TCP to the broker and can sever every live connection,
+    which is how a broker restart or an idle timeout looks to a client."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self._target = (host, port)
+        self._listener = socket.socket()
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen()
+        self.port = self._listener.getsockname()[1]
+        self._lock = threading.Lock()
+        self._live = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                client, _ = self._listener.accept()
+            except OSError:
+                return
+            try:
+                upstream = socket.create_connection(self._target)
+            except OSError:
+                client.close()
+                continue
+            with self._lock:
+                self._live += [client, upstream]
+            threading.Thread(target=_pipe, args=(client, upstream), daemon=True).start()
+            threading.Thread(target=_pipe, args=(upstream, client), daemon=True).start()
+
+    def drop_all(self) -> None:
+        with self._lock:
+            for conn in self._live:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                conn.close()
+            self._live = []
+        time.sleep(0.05)
+
+    def close(self) -> None:
+        self._listener.close()
+        self.drop_all()
+
+
+def _pipe(source: socket.socket, sink: socket.socket) -> None:
+    try:
+        while True:
+            data = source.recv(65536)
+            if not data:
+                break
+            sink.sendall(data)
+    except OSError:
+        pass
+    try:
+        sink.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

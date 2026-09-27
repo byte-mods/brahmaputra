@@ -130,7 +130,13 @@ class GroupConsumer:
         self._fetch_positions: Dict[Tuple[str, int], int] = {}
         self._buffered: List[ConsumedRecord] = []
         self._last_poll_ms = _now_ms()
+        #: True while `poll` runs. max_poll_interval_ms bounds the gap
+        #: *between* polls — time the application spends processing — so a
+        #: poll that is itself busy joining a slow rebalance must not count.
+        self._in_poll = False
         self._last_commit_ms = _now_ms()
+        #: Guards the fields the heartbeat thread shares: member id,
+        #: generation, joined, and the poll timestamps.
         self._lock = threading.Lock()
         self._closed = False
         self._stop = threading.Event()
@@ -141,7 +147,15 @@ class GroupConsumer:
 
     def subscribe(self, topics: Sequence[str]) -> None:
         self._subscribed = list(topics)
-        self._joined = False
+        self._set_joined(False)
+
+    def _membership(self) -> Tuple[str, int, bool]:
+        with self._lock:
+            return self._member_id, self._generation, self._joined
+
+    def _set_joined(self, joined: bool) -> None:
+        with self._lock:
+            self._joined = joined
 
     def close(self) -> None:
         """Commit, leave the group, then stop.
@@ -154,13 +168,14 @@ class GroupConsumer:
         with self._lock:
             self._closed = True
         self._stop.set()
+        member_id, _, joined = self._membership()
         try:
-            if self._joined:
+            if joined:
                 self.commit()
         except BrahmaputraError:
             pass
         try:
-            if self._member_id:
+            if member_id:
                 self._leave()
         except BrahmaputraError:
             # Best effort: the caller is shutting down, and failing here
@@ -180,16 +195,28 @@ class GroupConsumer:
     def poll(self, timeout_ms: int = 1000) -> List[ConsumedRecord]:
         if not self._subscribed:
             raise BrahmaputraError("subscribe to at least one topic before polling")
-        # Stamped on entry, not on return: the interval bounds how long the
-        # *application* may go without asking for records, and a poll that
-        # blocks for its full timeout is the consumer working normally.
-        self._last_poll_ms = _now_ms()
+        # Stamped on entry and again on return, and not enforced in between:
+        # the interval bounds how long the *application* may go without
+        # asking for records, and a poll that blocks — for its timeout, or
+        # on a slow rebalance — is the consumer working normally.
+        with self._lock:
+            self._last_poll_ms = _now_ms()
+            self._in_poll = True
+        try:
+            return self._poll(timeout_ms)
+        finally:
+            with self._lock:
+                self._last_poll_ms = _now_ms()
+                self._in_poll = False
 
-        if not self._joined:
-            self._join()
-
+    def _poll(self, timeout_ms: int) -> List[ConsumedRecord]:
         deadline = time.monotonic() + timeout_ms / 1000.0
         while True:
+            # Checked every sweep, not only on entry: a rebalance the
+            # heartbeat learns of mid-poll must stop this member fetching
+            # partitions it may no longer own.
+            if not self._membership()[2]:
+                self._join()
             if self._buffered:
                 return self._take_buffered()
             if not self._assignment:
@@ -253,10 +280,11 @@ class GroupConsumer:
         """Commit the delivered positions. At-least-once: call after processing."""
         if not self._positions:
             return
+        member_id, generation, _ = self._membership()
         writer = body_writer()
         writer.string(self.group_id)
-        writer.i32(self._generation)
-        writer.string(self._member_id)
+        writer.i32(generation)
+        writer.string(member_id)
         entries = sorted(self._positions.items())
         writer.i32(len(entries))
         for (topic, partition), offset in entries:
@@ -318,7 +346,7 @@ class GroupConsumer:
             writer.string(self.group_id)
             writer.i32(self.config.session_timeout_ms)
             writer.i32(self.config.rebalance_timeout_ms)
-            writer.string(self._member_id)
+            writer.string(self._membership()[0])
             writer.string_array(self._subscribed)
             writer.string(self.config.group_instance_id)
 
@@ -326,6 +354,12 @@ class GroupConsumer:
             code = reader.i32()
             if code == ErrorCode.REBALANCE_IN_PROGRESS:
                 time.sleep(0.1)
+                continue
+            if code == ErrorCode.UNKNOWN_MEMBER_ID:
+                # The coordinator dropped this member (session expiry, or
+                # removed while it waited): join again as a new one.
+                with self._lock:
+                    self._member_id = ""
                 continue
             if code != ErrorCode.NONE:
                 raise ServerError(code, "join_group")
@@ -342,24 +376,26 @@ class GroupConsumer:
                     held.append((reader.string(), reader.i32()))
                 members.append((name, topics, held))
 
-            self._member_id = member_id
-            self._generation = generation
+            with self._lock:
+                self._member_id = member_id
+                self._generation = generation
 
             assignments = (
                 self._compute_assignments(members) if member_id == leader_id else []
             )
             if self._sync(assignments):
-                self._joined = True
+                self._set_joined(True)
                 return
         raise BrahmaputraError(
             f"consumer group failed to stabilise after {JOIN_ATTEMPTS} join attempts"
         )
 
     def _sync(self, assignments: List[Tuple[str, List[Tuple[str, int]]]]) -> bool:
+        member_id, generation, _ = self._membership()
         writer = body_writer()
         writer.string(self.group_id)
-        writer.i32(self._generation)
-        writer.string(self._member_id)
+        writer.i32(generation)
+        writer.string(member_id)
         writer.i32(len(assignments))
         for member_id, partitions in assignments:
             writer.string(member_id)
@@ -371,6 +407,10 @@ class GroupConsumer:
         reader = body_reader(self._coordinator_request(ApiKey.SYNC_GROUP, writer.bytes()))
         code = reader.i32()
         if code in (ErrorCode.REBALANCE_IN_PROGRESS, ErrorCode.ILLEGAL_GENERATION):
+            return False
+        if code == ErrorCode.UNKNOWN_MEMBER_ID:
+            with self._lock:
+                self._member_id = ""
             return False
         if code != ErrorCode.NONE:
             raise ServerError(code, "sync_group")
@@ -424,12 +464,12 @@ class GroupConsumer:
     def _leave(self) -> None:
         writer = body_writer()
         writer.string(self.group_id)
-        writer.string(self._member_id)
+        writer.string(self._membership()[0])
         reader = body_reader(self._coordinator_request(ApiKey.LEAVE_GROUP, writer.bytes()))
         code = reader.i32()
         if code != ErrorCode.NONE:
             raise ServerError(code, "leave_group")
-        self._joined = False
+        self._set_joined(False)
 
     def _heartbeat_loop(self) -> None:
         # This loop enforces two independent deadlines, so it has to wake
@@ -455,11 +495,13 @@ class GroupConsumer:
         with self._lock:
             if self._closed:
                 return left_for_slow_poll
-        if not self._joined or not self._member_id:
+            idle_ms = _now_ms() - self._last_poll_ms
+            in_poll = self._in_poll
+            member_id, generation, joined = self._member_id, self._generation, self._joined
+        if not joined or not member_id:
             return left_for_slow_poll
 
-        idle_ms = _now_ms() - self._last_poll_ms
-        if idle_ms >= self.config.max_poll_interval_ms:
+        if not in_poll and idle_ms >= self.config.max_poll_interval_ms:
             # The application has stopped consuming even though the process
             # is alive. Continuing to heartbeat would assert a liveness this
             # member no longer has, holding its partitions away from a
@@ -469,22 +511,25 @@ class GroupConsumer:
                     self._leave()
                 except BrahmaputraError:
                     pass
-                self._joined = False
+                self._set_joined(False)
             return True
 
         writer = body_writer()
         writer.string(self.group_id)
-        writer.i32(self._generation)
-        writer.string(self._member_id)
+        writer.i32(generation)
+        writer.string(member_id)
         reader = body_reader(self._coordinator_request(ApiKey.HEARTBEAT, writer.bytes()))
         if reader.i32() in (
             ErrorCode.REBALANCE_IN_PROGRESS,
             ErrorCode.UNKNOWN_MEMBER_ID,
             ErrorCode.ILLEGAL_GENERATION,
         ):
-            # Rejoin on the next poll; the generation this member holds is
-            # no longer the group's.
-            self._joined = False
+            # Rejoin on the next poll — but only if nothing changed since
+            # the snapshot: a heartbeat for an old generation answering
+            # after the member already rejoined must not send it round again.
+            with self._lock:
+                if self._generation == generation and self._member_id == member_id:
+                    self._joined = False
         return False
 
     # -- coordinator routing ----------------------------------------------

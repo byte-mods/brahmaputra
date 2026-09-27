@@ -81,14 +81,30 @@ def _scram_client_proof(
     return base64.b64encode(proof).decode("ascii")
 
 
-class Connection:
-    """One TCP connection to one broker, multiplexed by correlation id.
+#: Bound on one request/response round trip. It must exceed the longest
+#: the broker may legitimately hold a request (a fetch long-poll, an
+#: acks=all wait, a JoinGroup waiting out a rebalance), so it is generous;
+#: its job is to turn a wedged broker into an error instead of a thread
+#: blocked forever.
+DEFAULT_REQUEST_TIMEOUT_S = 120.0
 
-    The broker answers concurrently and out of order, so responses are
-    matched by correlation id rather than by arrival order. A single lock
-    guards the socket; this client is thread-safe but not concurrent —
-    which matches how the Rust client behaves and is enough for a producer
-    that batches.
+
+class BrokerConnectionError(BrahmaputraError):
+    """The connection failed (I/O error, timeout, desync) and was closed."""
+
+
+class Connection:
+    """One TCP connection to one broker.
+
+    A lock serialises request/response pairs, so there is at most one
+    request in flight per connection; that is enough for a producer that
+    batches, and it is what keeps a partition's appends in order.
+
+    Any I/O failure, timeout or correlation mismatch leaves the byte stream
+    at an unknown position — a partial frame may have been written, or a
+    late response may still arrive — so the connection is closed and
+    marked :attr:`broken` rather than reused. The router notices and
+    redials.
     """
 
     def __init__(
@@ -101,14 +117,31 @@ class Connection:
         self.host = host
         self.port = port
         self.client_id = client_id
+        self.request_timeout = DEFAULT_REQUEST_TIMEOUT_S
         self._correlation = 0
         self._lock = threading.Lock()
-        self._sock = socket.create_connection((host, port), timeout=timeout)
+        self._broken = False
+        try:
+            self._sock = socket.create_connection((host, port), timeout=timeout)
+        except OSError as error:
+            raise BrokerConnectionError(f"connect to {host}:{port}: {error}") from error
         # Responses are small and latency matters more than packet count;
         # without this every request pays Nagle plus the peer's delayed ACK.
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
+    @property
+    def broken(self) -> bool:
+        """True once this connection has failed and must not be reused."""
+        return self._broken
+
+    def set_request_timeout(self, seconds: Optional[float]) -> None:
+        """How long one round trip may take before the connection is
+        abandoned. None or <= 0 disables the bound."""
+        with self._lock:
+            self.request_timeout = seconds if seconds and seconds > 0 else None
+
     def close(self) -> None:
+        self._broken = True
         try:
             self._sock.close()
         except OSError:
@@ -120,45 +153,92 @@ class Connection:
     def __exit__(self, *_exc) -> None:
         self.close()
 
+    def _fail(self, error: BaseException) -> BrokerConnectionError:
+        # Called with the lock held.
+        self.close()
+        if isinstance(error, BrokerConnectionError):
+            return error
+        return BrokerConnectionError(
+            f"connection to {self.host}:{self.port} failed: {error!r}"
+        )
+
+    def _check_usable(self) -> None:
+        if self._broken:
+            raise BrokerConnectionError(
+                f"connection to {self.host}:{self.port} is broken; the router will redial"
+            )
+
     def request(self, api_key: int, body: bytes) -> bytes:
         with self._lock:
-            self._correlation += 1
+            self._check_usable()
+            self._correlation = (self._correlation + 1) & 0x7FFFFFFF
             correlation_id = self._correlation
-            self._sock.sendall(encode_frame(api_key, correlation_id, self.client_id, body))
-            payload = self._read_frame()
-            _key, got, response_body = decode_frame_payload(payload)
+            deadline = (
+                time.monotonic() + self.request_timeout if self.request_timeout else None
+            )
+            try:
+                self._arm(deadline)
+                self._sock.sendall(encode_frame(api_key, correlation_id, self.client_id, body))
+                # Includes a timeout: the response may still be on its way,
+                # and reading on from here would pair it with the next request.
+                payload = self._read_frame(deadline)
+                _key, got, response_body = decode_frame_payload(payload)
+            except (OSError, BrahmaputraError) as error:
+                raise self._fail(error) from error
             if got != correlation_id:
                 # A response for a request we are no longer waiting on can
                 # only mean the stream has desynchronised; continuing would
                 # pair every later response with the wrong request.
-                raise ProtocolError(
+                raise self._fail(ProtocolError(
                     f"correlation id mismatch: expected {correlation_id}, got {got}"
-                )
+                ))
             return response_body
 
     def send_oneway(self, api_key: int, body: bytes) -> None:
         """Send without awaiting a response (`acks=0`)."""
         with self._lock:
-            self._correlation += 1
-            self._sock.sendall(encode_frame(api_key, self._correlation, self.client_id, body))
+            self._check_usable()
+            self._correlation = (self._correlation + 1) & 0x7FFFFFFF
+            deadline = (
+                time.monotonic() + self.request_timeout if self.request_timeout else None
+            )
+            try:
+                self._arm(deadline)
+                self._sock.sendall(
+                    encode_frame(api_key, self._correlation, self.client_id, body)
+                )
+            except OSError as error:
+                raise self._fail(error) from error
 
-    def _read_frame(self) -> bytes:
-        header = self._read_exact(4)
+    def _arm(self, deadline: Optional[float]) -> None:
+        if deadline is None:
+            self._sock.settimeout(None)
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("request timed out")
+        self._sock.settimeout(remaining)
+
+    def _read_frame(self, deadline: Optional[float]) -> bytes:
+        header = self._read_exact(4, deadline)
         (length,) = struct.unpack(">i", header)
         if length < 0:
             raise ProtocolError(f"negative frame length {length}")
-        return self._read_exact(length)
+        return self._read_exact(length, deadline)
 
-    def _read_exact(self, count: int) -> bytes:
-        chunks = []
-        remaining = count
-        while remaining:
-            chunk = self._sock.recv(remaining)
-            if not chunk:
-                raise BrahmaputraError("connection closed by broker")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
+    def _read_exact(self, count: int, deadline: Optional[float]) -> bytes:
+        buf = bytearray(count)
+        view = memoryview(buf)
+        got = 0
+        while got < count:
+            # socket timeouts apply per call, so re-arm with what is left of
+            # the whole round trip's budget.
+            self._arm(deadline)
+            n = self._sock.recv_into(view[got:], count - got)
+            if not n:
+                raise BrokerConnectionError("connection closed by broker")
+            got += n
+        return bytes(buf)
 
     # -- APIs that live on any connection ---------------------------------
 
@@ -351,15 +431,21 @@ class BrokerRouter:
     bootstrap list to maintain. Metadata is cached and refreshed only when
     a request comes back saying the route was stale, because refreshing on
     every request would put the control plane on the data path.
+
+    A connection that failed is replaced on its next use rather than kept:
+    without that, one dropped socket — a broker restart, an idle timeout on
+    a load balancer — would fail every later request for the life of the
+    client.
     """
 
     def __init__(self, host: str, port: int, client_id: str, timeout: float = 30.0) -> None:
         self._client_id = client_id
         self._timeout = timeout
+        self._seed_address = (host, port)
         self._seed = Connection(host, port, client_id, timeout)
         self._connections: Dict[int, Connection] = {}
         self._metadata: Optional[ClusterMetadata] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def close(self) -> None:
         with self._lock:
@@ -367,16 +453,30 @@ class BrokerRouter:
                 if connection is not self._seed:
                     connection.close()
             self._connections.clear()
-        self._seed.close()
+            self._seed.close()
 
     @property
     def seed(self) -> Connection:
+        """The connection this router was opened with, redialled if broken."""
+        with self._lock:
+            return self._live_seed()
+
+    def _live_seed(self) -> Connection:
+        # Called with the lock held.
+        if not self._seed.broken:
+            return self._seed
+        old = self._seed
+        host, port = self._seed_address
+        self._seed = Connection(host, port, self._client_id, self._timeout)
+        for node_id, cached in list(self._connections.items()):
+            if cached is old:
+                self._connections[node_id] = self._seed
         return self._seed
 
     def metadata(self, topics: Sequence[str] = (), refresh: bool = False) -> ClusterMetadata:
         with self._lock:
             if refresh or self._metadata is None:
-                self._metadata = self._seed.metadata(topics)
+                self._metadata = self._live_seed().metadata(topics)
             return self._metadata
 
     def refresh(self, topic: str) -> ClusterMetadata:
@@ -398,7 +498,7 @@ class BrokerRouter:
         if leader is None:
             metadata = self.refresh(topic)
             leader = metadata.leader_of(topic, partition)
-        if leader is None:
+        if leader is None or leader < 0:
             raise BrahmaputraError(f"no leader for {topic}-{partition}")
         return self._connection_to(leader, metadata)
 
@@ -406,7 +506,11 @@ class BrokerRouter:
         with self._lock:
             existing = self._connections.get(node_id)
             if existing is not None:
-                return existing
+                if not existing.broken:
+                    return existing
+                del self._connections[node_id]
+                if existing is not self._seed:
+                    existing.close()
             for broker in metadata.brokers:
                 if broker.node_id == node_id:
                     # A single-broker cluster advertises the address the
@@ -414,8 +518,9 @@ class BrokerRouter:
                     # we dialled; reuse the seed rather than opening a
                     # second connection to ourselves.
                     if len(metadata.brokers) == 1:
-                        self._connections[node_id] = self._seed
-                        return self._seed
+                        seed = self._live_seed()
+                        self._connections[node_id] = seed
+                        return seed
                     connection = Connection(
                         broker.host, broker.port, self._client_id, self._timeout
                     )
@@ -518,6 +623,7 @@ class Producer:
         self._ticker: Optional[threading.Thread] = None
         self._background_error: Optional[BaseException] = None
         self._stop = threading.Event()
+        self._send_locks: Dict[Tuple[str, int], threading.Lock] = {}
         if self.config.linger_ms > 0:
             self._ticker = threading.Thread(target=self._linger_loop, daemon=True)
             self._ticker.start()
@@ -605,16 +711,33 @@ class Producer:
         return self._produce(topic, partition, [_Buffered(record, _now_ms())])
 
     def flush(self) -> None:
-        """Send every buffered record and wait for acknowledgement."""
+        """Send every buffered record and wait for acknowledgement.
+
+        Also raises the failure of any background (linger) flush since the
+        last call, because those records are gone and no other call would
+        say so.
+        """
         with self._lock:
             slots = [slot for slot, records in self._buffers.items() if records]
-            error, self._background_error = self._background_error, None
+        first: Optional[BaseException] = None
         for topic, partition in slots:
-            self._flush_partition(topic, partition)
-        if error is not None:
-            # A linger-driven flush failed with nobody to tell; this caller
-            # asked for delivery, so it is the one that hears about it.
-            raise error
+            try:
+                self._flush_partition(topic, partition)
+            except Exception as error:  # noqa: BLE001
+                first = first or error
+        # Wait out batches the linger ticker has in flight, so "flushed"
+        # means acknowledged and their failures are seen below.
+        with self._lock:
+            locks = list(self._send_locks.values())
+        for send_lock in locks:
+            with send_lock:
+                pass
+        with self._lock:
+            background, self._background_error = self._background_error, None
+        if first is not None:
+            raise first
+        if background is not None:
+            raise background
 
     # -- internals --------------------------------------------------------
 
@@ -665,29 +788,40 @@ class Producer:
         # notified on every release, which would turn the linger into a
         # flush-after-every-flush loop.
         while not self._stop.wait(interval):
-            try:
-                with self._lock:
-                    slots = [slot for slot, records in self._buffers.items() if records]
-                for topic, partition in slots:
+            with self._lock:
+                slots = [slot for slot, records in self._buffers.items() if records]
+            for topic, partition in slots:
+                try:
                     self._flush_partition(topic, partition)
-            except Exception as error:  # noqa: BLE001
-                # A background flush that fails must not kill the ticker;
-                # the next explicit flush surfaces the error to a caller
-                # who can actually act on it.
-                with self._lock:
-                    if self._background_error is None:
-                        self._background_error = error
+                except Exception as error:  # noqa: BLE001
+                    # A background flush that fails must not kill the
+                    # ticker, nor stop other partitions flushing. Those
+                    # records have left the buffer, so the error is the only
+                    # trace of them: the next flush()/close() raises it.
+                    with self._lock:
+                        if self._background_error is None:
+                            self._background_error = error
 
     def _flush_partition(self, topic: str, partition: int) -> None:
         slot = (topic, partition)
         with self._lock:
-            batch = self._buffers.get(slot)
-            if not batch:
-                return
-            self._buffers[slot] = []
-            size = self._sizes.pop(slot, 0)
-        self._release(size)
-        self._produce(topic, partition, batch)
+            send_lock = self._send_locks.get(slot)
+            if send_lock is None:
+                send_lock = self._send_locks[slot] = threading.Lock()
+        # Held across the round trip (and any retries): a partition has at
+        # most one batch in flight, and batches leave in the order they were
+        # taken. Without it the linger ticker and a send that fills a batch
+        # could each take a batch for the same partition and race to the
+        # connection, reordering the log.
+        with send_lock:
+            with self._lock:
+                batch = self._buffers.get(slot)
+                if not batch:
+                    return
+                self._buffers[slot] = []
+                size = self._sizes.pop(slot, 0)
+            self._release(size)
+            self._produce(topic, partition, batch)
 
     def _produce(self, topic: str, partition: int, buffered: List[_Buffered]) -> int:
         if not buffered:
@@ -894,7 +1028,7 @@ def _decode_fetch_response(body: bytes) -> Tuple[int, int, List[DecodedBatch]]:
     # offset and every batch after it would fail to decode.
     reader.i32()  # preferred_read_replica
     trailing = reader.rest()
-    if batches_length > len(trailing):
+    if batches_length < 0 or batches_length > len(trailing):
         raise ProtocolError("fetch response claims more batch bytes than it carries")
     raw = trailing[: int(batches_length)]
 

@@ -35,6 +35,7 @@ from .protocol import (
 from .client import (
     EARLIEST,
     LATEST,
+    BrokerConnectionError,
     BrokerInfo,
     BrokerRouter,
     ClusterMetadata,
@@ -64,6 +65,7 @@ __all__ = [
     "Assignor",
     "AutoOffsetReset",
     "BrahmaputraError",
+    "BrokerConnectionError",
     "BrokerInfo",
     "BrokerRouter",
     "ClusterMetadata",

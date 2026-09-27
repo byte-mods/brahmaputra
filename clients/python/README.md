@@ -8,7 +8,7 @@ pip install ./clients/python              # core, no dependencies
 pip install "./clients/python[zstd]"      # plus an optional codec (lz4, zstd, snappy, all)
 ```
 
-Verified end to end against a live broker: **38/38 checks**
+Verified end to end against a live broker: **54/54 checks**
 (`./test.sh 127.0.0.1 9092`). The suite mirrors the Go driver's
 `cmd/manualtest` section for section and check for check, and the wire
 encodings (frames, BitPacker bodies, record batches, CRC32C, murmur2) and
@@ -49,7 +49,18 @@ with Producer("127.0.0.1", 9092, ProducerConfig(
 waits for acknowledgement. When `buffer_memory` bytes are buffered, `send`
 blocks for up to `max_block_ms` and then raises `BrahmaputraError`
 ("producer buffer full"). A failed background (linger) flush is raised
-from the next `flush`.
+from the next `flush` (or `close`). Each partition has at most one batch in
+flight, so linger-driven and batch-full flushes never reorder a partition.
+
+## Connections
+
+Each request has a round-trip deadline (`Connection.request_timeout`,
+default 120 s, generous enough for long-polls and rebalances). A timeout,
+I/O error or correlation mismatch closes the connection and marks it
+`broken` — it is never reused, since the byte stream is at an unknown
+position — and raises `BrokerConnectionError`. The router redials a broken
+connection on its next use, so after a broker restart the call that hit
+the dead socket fails and the next one succeeds.
 
 ## Consume one partition
 
@@ -88,7 +99,11 @@ with GroupConsumer("127.0.0.1", 9092, "billing", GroupConfig(
 Closing commits and then sends `LeaveGroup`, so its partitions move
 immediately rather than after a session timeout. With
 `auto_offset_reset="none"` and no committed offset, `poll` raises
-`NoOffsetForPartition`.
+`NoOffsetForPartition`. `max_poll_interval_ms` bounds the time *between*
+polls: time spent inside `poll` (including a slow join) never counts, and
+a member that did stall past it leaves the group and rejoins on its next
+`poll`. A member the coordinator no longer knows (`UNKNOWN_MEMBER_ID`)
+rejoins as a new member.
 
 ## Configuration
 
@@ -164,4 +179,4 @@ brahmaputra-server --data-dir ./data --default-partitions 4
 # equivalently: python3 clients/python/test_manual.py 127.0.0.1 9092
 ```
 
-It prints `38 passed, 0 failed` and exits non-zero on any failure.
+It prints `54 passed, 0 failed` and exits non-zero on any failure.
