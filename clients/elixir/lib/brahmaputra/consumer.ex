@@ -81,28 +81,8 @@ defmodule Brahmaputra.Consumer do
   works across a version mismatch.
   """
   def api_versions(%__MODULE__{router: router, config: config}) do
-    with {:ok, seed} <- Router.seed(router),
-         {:ok, body} <-
-           Brahmaputra.Connection.request(
-             seed,
-             api(:api_versions),
-             body([w_string(config.client_id), w_string(Brahmaputra.version())])
-           ) do
-      guard(fn ->
-        {code, rest} = body |> open_body() |> r_int32()
-        if code != 0, do: throw({:server_error, server_error(code, "api_versions")})
-
-        {ranges, rest} =
-          r_array(rest, fn data ->
-            {key, data} = r_int32(data)
-            {min, data} = r_int32(data)
-            {max, data} = r_int32(data)
-            {{key, min, max}, data}
-          end)
-
-        {broker_version, _} = r_string(rest)
-        {:ok, ranges, broker_version}
-      end)
+    with {:ok, seed} <- Router.seed(router) do
+      Brahmaputra.Connection.api_versions(seed, config.client_id)
     end
   end
 
@@ -222,7 +202,7 @@ defmodule Brahmaputra.Consumer do
       # skipping a field would take them from the wrong offset.
       {_preferred_read_replica, rest} = r_int32(rest)
 
-      if batches_length > byte_size(rest) do
+      if batches_length < 0 or batches_length > byte_size(rest) do
         raise Error, message: "fetch response claims more batch bytes than it carries"
       end
 

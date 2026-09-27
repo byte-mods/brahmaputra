@@ -47,7 +47,7 @@ defmodule Brahmaputra.Router do
     do: GenServer.call(router, {:conn_for, topic, partition}, :infinity)
 
   @doc "Sends a request to a partition's leader."
-  def request(router, topic, partition, api_key, body, timeout \\ 60_000) do
+  def request(router, topic, partition, api_key, body, timeout \\ nil) do
     with {:ok, conn} <- conn_for(router, topic, partition) do
       Connection.request(conn, api_key, body, timeout)
     end
@@ -162,15 +162,27 @@ defmodule Brahmaputra.Router do
   end
 
   @impl true
+  def handle_info({:connection_broken, pid}, state) do
+    # Sent by the connection before it reports the failure to its caller,
+    # so the caller's retry already finds it gone and gets a fresh dial.
+    state = forget(state, pid)
+    Connection.close(pid)
+    {:noreply, state}
+  end
+
   def handle_info({:EXIT, pid, _reason}, state) do
+    {:noreply, forget(state, pid)}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  defp forget(state, pid) do
     # A connection died (the broker closed it or a request failed). Forget
     # it; the next request to that broker redials.
     conns = state.conns |> Enum.reject(fn {_, c} -> c == pid end) |> Map.new()
     seed = if state.seed == pid, do: nil, else: state.seed
-    {:noreply, %{state | conns: conns, seed: seed}}
+    %{state | conns: conns, seed: seed}
   end
-
-  def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do

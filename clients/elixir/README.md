@@ -14,15 +14,15 @@ end
 mix compile --warnings-as-errors
 ```
 
-Verified end to end against a live broker: **38/38 checks**
+Verified end to end against a live broker: **54/54 checks**
 (`./test.sh 127.0.0.1 9092`).
 
 ## Processes
 
 | Module | What it is |
 |---|---|
-| `Brahmaputra.Connection` | GenServer owning one TCP socket; serialises request/response pairs by correlation id |
-| `Brahmaputra.Router` | GenServer caching metadata and one connection per broker; routes by partition leader |
+| `Brahmaputra.Connection` | GenServer owning one TCP socket; one request in flight, a request timeout (default 120 s, `set_request_timeout/2`), and marked broken — never reused — after any I/O error or timeout |
+| `Brahmaputra.Router` | GenServer caching metadata and one connection per broker; routes by partition leader and redials a broken connection on next use |
 | `Brahmaputra.Producer` | GenServer batching per partition; linger via `Process.send_after` |
 | `Brahmaputra.Consumer` | Plain struct around a router; functions run in the caller |
 | `Brahmaputra.GroupConsumer` | GenServer; heartbeat timer, join/sync, commits, LeaveGroup on close |
@@ -176,4 +176,4 @@ mix run e2e/manual_test.exs 127.0.0.1 9092
 ```
 
 It prints the same sections and checks as the Go suite and ends with
-`38 passed, 0 failed`; it exits 1 on a failed check and 2 on a fatal error.
+`54 passed, 0 failed`; it exits 1 on a failed check and 2 on a fatal error.

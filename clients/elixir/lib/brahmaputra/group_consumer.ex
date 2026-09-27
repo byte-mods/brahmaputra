@@ -173,7 +173,12 @@ defmodule Brahmaputra.GroupConsumer do
 
   def handle_call({:poll, timeout_ms}, _from, state) do
     {result, state} = do_poll(state, timeout_ms)
-    {:reply, result, state}
+    # Stamped on entry and again on return, and never enforced in between
+    # (the timer's message waits while a poll runs): the interval bounds how
+    # long the *application* goes without asking for records, and a poll
+    # that blocks — for its timeout, or on a slow rebalance — is the
+    # consumer working normally.
+    {:reply, result, %{state | last_poll_ms: Util.mono_ms()}}
   end
 
   def handle_call(:commit, _from, state) do
@@ -209,8 +214,6 @@ defmodule Brahmaputra.GroupConsumer do
     do: {{:error, %Error{message: "subscribe to at least one topic before polling"}}, state}
 
   defp do_poll(state, timeout_ms) do
-    # Stamped on entry, not on return: the interval bounds how long the
-    # *application* may go without asking for records.
     state = %{state | last_poll_ms: Util.mono_ms(), left_for_slow_poll: false}
     deadline = Util.mono_ms() + timeout_ms
 
@@ -439,8 +442,9 @@ defmodule Brahmaputra.GroupConsumer do
           Process.sleep(100)
           join(state, attempts - 1)
 
-        # Our member id expired (we left, or the session lapsed): join fresh.
-        {13, _} when state.member_id != "" ->
+        # The coordinator dropped this member (session expiry, or removed
+        # while it waited): join again as a new one.
+        {13, _} ->
           join(%{state | member_id: ""}, attempts - 1)
 
         {0, {generation, member_id, leader_id, members}} ->
@@ -558,6 +562,9 @@ defmodule Brahmaputra.GroupConsumer do
       case decoded do
         {code, _} when code in [14, 16] ->
           {:ok, false, state}
+
+        {13, _} ->
+          {:ok, false, %{state | member_id: ""}}
 
         {0, slots} ->
           case apply_assignment(state, slots) do

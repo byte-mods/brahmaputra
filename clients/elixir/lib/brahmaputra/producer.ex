@@ -74,13 +74,20 @@ defmodule Brahmaputra.Producer do
   def send_sync(producer, topic, value, opts \\ []),
     do: GenServer.call(producer, {:send_sync, topic, value, opts}, :infinity)
 
-  @doc "Sends every buffered record and waits for acknowledgement."
+  @doc """
+  Sends every buffered record and waits for acknowledgement. Also reports a
+  failure of any background (linger) flush since the last call, because
+  those records are gone and no other call would say so.
+  """
   def flush(producer), do: GenServer.call(producer, :flush, :infinity)
 
   @doc "The producer's router, for callers that need metadata."
   def router(producer), do: GenServer.call(producer, :router, :infinity)
 
-  @doc "Flushes, stops the linger timer and releases connections."
+  @doc """
+  Flushes, stops the linger timer and releases connections. Returns the
+  final flush's error, or an unreported background flush failure.
+  """
   def close(producer) do
     GenServer.call(producer, :close, :infinity)
   catch
@@ -178,7 +185,10 @@ defmodule Brahmaputra.Producer do
   def handle_call(:router, _from, state), do: {:reply, state.router, state}
 
   def handle_call(:close, _from, state) do
+    # The timer and connections are released even when the final flush
+    # fails; that failure (or an earlier background one) is still returned.
     {result, state} = flush_all(state)
+    result = if result == :ok and state.last_error, do: {:error, state.last_error}, else: result
 
     for waiter <- :queue.to_list(state.waiters) do
       Process.cancel_timer(waiter.timer)
