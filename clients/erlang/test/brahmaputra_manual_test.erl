@@ -364,7 +364,285 @@ run(Address) ->
         check("a full buffer blocks and then reports", Blocked, ""),
         ?P:stop(Producer)
     end)(),
+
+    wire_edge_cases(Address),
+    ordering_under_linger(Address),
+    background_flush_failures(Address),
+    connection_failures(Address),
+    max_poll_interval_rejoin(Address),
+    time_inside_poll(Address),
     ok.
+
+%% Fetch from offset 0 until Want records are in hand or a fetch comes
+%% back empty.
+fetch_all(C, Topic, Partition, Want) -> fetch_all(C, Topic, Partition, Want, 0, []).
+
+fetch_all(C, Topic, Partition, Want, Offset, Acc) when length(Acc) < Want ->
+    case ?C:fetch(C, Topic, Partition, Offset, 500) of
+        {ok, [_ | _] = Batch} ->
+            #{offset := Last} = lists:last(Batch),
+            fetch_all(C, Topic, Partition, Want, Last + 1, Acc ++ Batch);
+        _ ->
+            Acc
+    end;
+fetch_all(_C, _Topic, _Partition, _Want, _Offset, Acc) ->
+    Acc.
+
+wire_edge_cases(Address) ->
+    section("wire edge cases"),
+    EdgeTopic = unique("erl-edge"),
+    Producer = producer(Address, #{}),
+    Large = << <<((I * 7) band 16#FF)>> || I <- lists:seq(0, (1 bsl 20) - 1) >>,
+    UnicodeKey = <<"ключ-✓-🔑"/utf8>>,
+    UnicodeValue = <<"значение — 数据 — 🚀"/utf8>>,
+    HeaderKey = <<"ünïcødé-🏷"/utf8>>,
+    must(?P:send_to(Producer, EdgeTopic, 0, Large)),
+    must(?P:send_to(Producer, EdgeTopic, 0, UnicodeValue,
+                    #{key => UnicodeKey, headers => [{HeaderKey, <<"✓"/utf8>>}]})),
+    %% An empty key and an empty header value are values, not nulls.
+    must(?P:send_to(Producer, EdgeTopic, 0, <<"empty-key">>,
+                    #{key => <<>>, headers => [{<<"empty">>, <<>>}, {<<"null">>, undefined}]})),
+    must(?P:send_to(Producer, EdgeTopic, 0, <<"null-key">>)),
+    must(?P:close(Producer)),
+    C = consumer(Address),
+    Got = fetch_all(C, EdgeTopic, 0, 4),
+    check("edge records all arrive", length(Got) =:= 4, fmt("got ~b", [length(Got)])),
+    case Got of
+        [R0, R1, R2, R3] ->
+            V0 = maps:get(value, R0),
+            check("a 1 MiB value round-trips byte-identical", V0 =:= Large,
+                  fmt("~b bytes", [byte_size(V0)])),
+            check("unicode key, value and header key round-trip",
+                  maps:get(key, R1) =:= UnicodeKey andalso maps:get(value, R1) =:= UnicodeValue
+                  andalso [K || {K, _} <- maps:get(headers, R1)] =:= [HeaderKey], ""),
+            check("an empty key stays empty, not null", maps:get(key, R2) =:= <<>>,
+                  fmt("~p", [maps:get(key, R2)])),
+            check("an empty header value stays empty, not null",
+                  maps:get(headers, R2) =:= [{<<"empty">>, <<>>}, {<<"null">>, undefined}],
+                  fmt("~p", [maps:get(headers, R2)])),
+            check("a null key stays null", maps:get(key, R3) =:= undefined,
+                  fmt("~p", [maps:get(key, R3)]));
+        _ ->
+            ok
+    end,
+    ?C:close(C).
+
+ordering_under_linger(Address) ->
+    section("ordering under linger flushes"),
+    OrderTopic = unique("erl-order"),
+    Producer = must(?P:start_link(Address, #{linger_ms => 1, batch_size => 256})),
+    Total = 5000,
+    [must(?P:send_to(Producer, OrderTopic, 0, integer_to_binary(I)))
+     || I <- lists:seq(0, Total - 1)],
+    must(?P:close(Producer)),
+    C = consumer(Address),
+    Values = [binary_to_integer(V) || #{value := V} <- fetch_all(C, OrderTopic, 0, Total)],
+    Inversions = length([x || {A, B} <- lists:zip(lists:droplast([0 | Values]), Values),
+                              B < A]),
+    check("every record of a partition arrives", length(Values) =:= Total,
+          fmt("got ~b", [length(Values)])),
+    check("a partition's records keep send order", Inversions =:= 0,
+          fmt("~b inversions", [Inversions])),
+    ?C:close(C).
+
+background_flush_failures(Address) ->
+    section("background flush failures are reported"),
+    Producer = must(?P:start_link(Address, #{linger_ms => 20})),
+    %% Partition 999 does not exist, so the linger timer's flush fails.
+    SendResult = ?P:send_to(Producer, unique("erl-bgfail"), 999, <<"lost">>),
+    timer:sleep(300),
+    FlushResult = ?P:flush(Producer),
+    check("a failed linger flush surfaces on the next Flush",
+          SendResult =:= ok andalso FlushResult =/= ok,
+          fmt("send=~p flush=~p", [SendResult, FlushResult])),
+    Self = self(),
+    Closer = spawn(fun() -> Self ! {closed, self(), ?P:close(Producer)} end),
+    receive
+        {closed, Closer, _} -> check("Close returns after a failed flush", true, "")
+    after 5000 ->
+        check("Close returns after a failed flush", false, "hung")
+    end.
+
+connection_failures({Host, Port} = Address) ->
+    section("connection failures"),
+    %% A broker that accepts and never answers must cost an error, not a
+    %% caller blocked forever.
+    {ok, Silent} = gen_tcp:listen(0, [binary, {active, true}, {reuseaddr, true}]),
+    {ok, SilentPort} = inet:port(Silent),
+    SilentAcceptor = spawn(fun() -> silent_accept(Silent) end),
+    ok = gen_tcp:controlling_process(Silent, SilentAcceptor),
+    Conn = must(brahmaputra_conn:start("127.0.0.1", SilentPort, <<"erl-test">>, 1000)),
+    ok = brahmaputra_conn:set_request_timeout(Conn, 300),
+    Started = now_ms(),
+    RequestResult = brahmaputra_conn:api_versions(Conn),
+    check("a request to an unresponsive broker times out",
+          element(1, RequestResult) =:= error andalso now_ms() - Started < 3000,
+          fmt("~p", [RequestResult])),
+    check("a timed-out connection is not reused", brahmaputra_conn:broken(Conn), ""),
+    brahmaputra_conn:stop(Conn),
+    exit(SilentAcceptor, kill),
+
+    %% A connection the broker drops is redialled, not kept forever.
+    Proxy = start_proxy(Host, Port),
+    ProxyAddress = {"127.0.0.1", proxy_port(Proxy)},
+    DropTopic = unique("erl-drop"),
+    Producer = producer(ProxyAddress, #{}),
+    must(?P:send_to(Producer, DropTopic, 0, <<"before">>)),
+    drop_all(Proxy),
+    Recovered = retry(3, fun() -> ?P:send_to(Producer, DropTopic, 0, <<"after">>) end),
+    check("a producer recovers after its connection drops", Recovered =:= ok,
+          fmt("~p", [Recovered])),
+    _ = ?P:close(Producer),
+    C = consumer(ProxyAddress),
+    _ = must(?C:fetch(C, DropTopic, 0, 0, 100)),
+    drop_all(Proxy),
+    Fetched = retry(3, fun() -> ?C:fetch(C, DropTopic, 0, 0, 100) end),
+    check("a consumer recovers after its connection drops",
+          case Fetched of {ok, [_ | _]} -> true; _ -> false end, fmt("~p", [Fetched])),
+    ?C:close(C),
+    stop_proxy(Proxy),
+    _ = Address,
+    ok.
+
+retry(1, Fun) -> Fun();
+retry(N, Fun) ->
+    case Fun() of
+        {error, _} -> retry(N - 1, Fun);
+        Other -> Other
+    end.
+
+silent_accept(Listen) ->
+    case gen_tcp:accept(Listen) of
+        {ok, _Socket} -> silent_accept(Listen); % active: bytes arrive and are ignored
+        {error, _} -> ok
+    end.
+
+%% A TCP proxy to the broker that can sever every live connection, which is
+%% how a broker restart or a load balancer's idle timeout looks to a client.
+start_proxy(Host, Port) ->
+    Self = self(),
+    Manager = spawn(fun() -> proxy_manager(Self, Host, Port) end),
+    receive {proxy_port, Manager, P} -> {Manager, P} end.
+
+proxy_port({_, P}) -> P.
+
+proxy_manager(Owner, Host, Port) ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, P} = inet:port(Listen),
+    Manager = self(),
+    spawn_link(fun() -> proxy_accept(Manager, Listen, Host, Port) end),
+    Owner ! {proxy_port, self(), P},
+    proxy_loop(Listen, []).
+
+proxy_loop(Listen, Pairs) ->
+    receive
+        {pair, Pid} ->
+            proxy_loop(Listen, [Pid | Pairs]);
+        {drop, From} ->
+            [exit(Pid, kill) || Pid <- Pairs],
+            From ! dropped,
+            proxy_loop(Listen, []);
+        {stop, From} ->
+            [exit(Pid, kill) || Pid <- Pairs],
+            gen_tcp:close(Listen),
+            From ! stopped
+    end.
+
+proxy_accept(Manager, Listen, Host, Port) ->
+    case gen_tcp:accept(Listen) of
+        {ok, Client} ->
+            Pair = spawn(fun() -> proxy_pair(Host, Port) end),
+            ok = gen_tcp:controlling_process(Client, Pair),
+            Pair ! {client, Client},
+            Manager ! {pair, Pair},
+            proxy_accept(Manager, Listen, Host, Port);
+        {error, _} ->
+            ok
+    end.
+
+%% Owns both sockets, so killing this process closes both.
+proxy_pair(Host, Port) ->
+    receive {client, Client} -> ok end,
+    {ok, Upstream} = gen_tcp:connect(Host, Port, [binary, {active, true}]),
+    ok = inet:setopts(Client, [{active, true}]),
+    proxy_pump(Client, Upstream).
+
+proxy_pump(Client, Upstream) ->
+    receive
+        {tcp, Client, Data} -> ok = gen_tcp:send(Upstream, Data), proxy_pump(Client, Upstream);
+        {tcp, Upstream, Data} -> ok = gen_tcp:send(Client, Data), proxy_pump(Client, Upstream);
+        {tcp_closed, _} -> gen_tcp:close(Client), gen_tcp:close(Upstream);
+        {tcp_error, _, _} -> gen_tcp:close(Client), gen_tcp:close(Upstream)
+    end.
+
+drop_all({Manager, _}) ->
+    Manager ! {drop, self()},
+    receive dropped -> ok end,
+    timer:sleep(50).
+
+stop_proxy({Manager, _}) ->
+    Manager ! {stop, self()},
+    receive stopped -> ok end.
+
+max_poll_interval_rejoin(Address) ->
+    section("consumer group: max.poll.interval and rejoin"),
+    SlowTopic = unique("erl-slow"),
+    Producer = producer(Address, #{}),
+    [must(?P:send(Producer, SlowTopic, list_to_binary(fmt("s~b", [I])))) || I <- lists:seq(0, 9)],
+    Group = must(?G:start_link(Address, unique("erl-slow-grp"),
+                               #{auto_commit_interval_ms => 0, max_poll_interval_ms => 1500})),
+    ok = ?G:subscribe(Group, [SlowTopic]),
+    {First, _} = poll_until(Group, 10, 15000, 300),
+    must(?G:commit(Group)),
+    %% Stall past max.poll.interval.ms: the member leaves the group.
+    timer:sleep(2500),
+    [must(?P:send(Producer, SlowTopic, list_to_binary(fmt("s~b", [I])))) || I <- lists:seq(10, 19)],
+    must(?P:close(Producer)),
+    {Second, PollErr} = poll_until(Group, 10, 15000, 300),
+    check("a member that stalled rejoins on its next poll",
+          length(First) =:= 10 andalso length(Second) =:= 10 andalso PollErr =:= ok,
+          fmt("first=~b second=~b err=~p", [length(First), length(Second), PollErr])),
+    must(?G:close(Group)).
+
+%% Like poll_for, but a poll error ends the loop and is returned.
+poll_until(Group, Want, Ms, PollMs) -> poll_until(Group, Want, now_ms() + Ms, PollMs, []).
+
+poll_until(Group, Want, Deadline, PollMs, Acc) ->
+    case length(Acc) < Want andalso now_ms() < Deadline of
+        false -> {Acc, ok};
+        true ->
+            case ?G:poll(Group, PollMs) of
+                {ok, Records} -> poll_until(Group, Want, Deadline, PollMs, Acc ++ Records);
+                {error, _} = E -> {Acc, E}
+            end
+    end.
+
+time_inside_poll(Address) ->
+    section("consumer group: time inside poll does not count against max.poll.interval"),
+    JoinTopic = unique("erl-inpoll"),
+    Producer = producer(Address, #{}),
+    _ = must(brahmaputra_router:partitions(?P:router(Producer), JoinTopic)),
+    %% Far shorter than the poll below, which spends ~1s joining (the
+    %% broker's initial rebalance delay) and then waits for data.
+    Group = must(?G:start_link(Address, unique("erl-inpoll-grp"),
+                               #{auto_commit_interval_ms => 0, max_poll_interval_ms => 600})),
+    ok = ?G:subscribe(Group, [JoinTopic]),
+    spawn(fun() ->
+                  timer:sleep(2000),
+                  [?P:send(Producer, JoinTopic, list_to_binary(fmt("j~b", [I])))
+                   || I <- lists:seq(0, 9)]
+          end),
+    %% One long poll: it joins, then waits for the records above.
+    PollResult = ?G:poll(Group, 4000),
+    %% Committed straight away, before another poll could quietly rejoin:
+    %% this fails if the member left the group mid-poll.
+    CommitResult = ?G:commit(Group),
+    Got = case PollResult of {ok, Rs} -> length(Rs); _ -> 0 end,
+    check("a member is still in its group after a long poll",
+          Got > 0 andalso CommitResult =:= ok,
+          fmt("got=~b poll=~p commit=~p", [Got, element(1, PollResult), CommitResult])),
+    must(?G:close(Group)),
+    must(?P:close(Producer)).
 
 wait_for_no_offset(Group, Deadline) ->
     case now_ms() < Deadline of

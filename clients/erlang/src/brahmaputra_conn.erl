@@ -11,14 +11,20 @@
 
 -include("brahmaputra.hrl").
 
--export([start_link/3, start_link/4, request/3, request/4, send_oneway/3, stop/1,
-         api_versions/1]).
+-export([start_link/3, start_link/4, start/4, request/3, request/4, send_oneway/3, stop/1,
+         set_request_timeout/2, broken/1, api_versions/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--define(DEFAULT_REQUEST_TIMEOUT, 35000).
+%% Bounds one round trip when the caller names no timeout. It must exceed
+%% the longest the broker may legitimately hold a request (a fetch
+%% long-poll, an acks=all wait, a JoinGroup waiting out a rebalance); its
+%% job is to turn a wedged broker into an error, not a caller blocked
+%% forever.
+-define(DEFAULT_REQUEST_TIMEOUT, 120000).
 
 -record(state, {socket :: gen_tcp:socket(),
                 client_id :: binary(),
+                request_timeout = ?DEFAULT_REQUEST_TIMEOUT :: timeout(),
                 next = 0 :: integer(),
                 pending = #{} :: #{integer() => {gen_server:from(), reference()}}}).
 
@@ -32,12 +38,35 @@ start_link(Host, Port, ClientId) ->
 start_link(Host, Port, ClientId, ConnectTimeout) ->
     gen_server:start_link(?MODULE, {to_list(Host), Port, ClientId, ConnectTimeout}, []).
 
-%% @doc Send one request and wait for its response body.
+%% @doc Like {@link start_link/4} but unlinked, for a caller that does not
+%% trap exits and would rather see `{error, closed}' than share a crash.
+start(Host, Port, ClientId, ConnectTimeout) ->
+    gen_server:start(?MODULE, {to_list(Host), Port, ClientId, ConnectTimeout}, []).
+
+%% @doc Change the round-trip bound used by {@link request/3}.
+set_request_timeout(Conn, Timeout) ->
+    gen_server:call(Conn, {set_request_timeout, Timeout}, infinity).
+
+%% @doc Whether this connection failed and must not be reused. A timeout,
+%% I/O error or undecodable frame leaves the byte stream at an unknown
+%% position, so the connection stops rather than carrying on; the router
+%% notices and redials.
+-spec broken(pid()) -> boolean().
+broken(Conn) ->
+    try gen_server:call(Conn, ping, 5000) of
+        pong -> false
+    catch
+        exit:_ -> true
+    end.
+
+%% @doc Send one request and wait for its response body, bounded by this
+%% connection's request timeout.
 -spec request(pid(), integer(), iodata()) -> {ok, binary()} | {error, term()}.
 request(Conn, ApiKey, Body) ->
-    request(Conn, ApiKey, Body, ?DEFAULT_REQUEST_TIMEOUT).
+    request(Conn, ApiKey, Body, default).
 
--spec request(pid(), integer(), iodata(), timeout()) -> {ok, binary()} | {error, term()}.
+-spec request(pid(), integer(), iodata(), timeout() | default) ->
+          {ok, binary()} | {error, term()}.
 request(Conn, ApiKey, Body, Timeout) ->
     try
         gen_server:call(Conn, {request, ApiKey, Body, Timeout}, infinity)
@@ -100,6 +129,12 @@ init({Host, Port, ClientId, ConnectTimeout}) ->
         {error, Reason} -> {stop, {connect_failed, Reason}}
     end.
 
+handle_call(ping, _From, State) ->
+    {reply, pong, State};
+handle_call({set_request_timeout, Timeout}, _From, State) ->
+    {reply, ok, State#state{request_timeout = Timeout}};
+handle_call({request, ApiKey, Body, default}, From, State) ->
+    handle_call({request, ApiKey, Body, State#state.request_timeout}, From, State);
 handle_call({request, ApiKey, Body, Timeout}, From, State) ->
     Corr = next_corr(State#state.next),
     Frame = brahmaputra_protocol:encode_frame(ApiKey, Corr, State#state.client_id, Body),
@@ -112,14 +147,14 @@ handle_call({request, ApiKey, Body, Timeout}, From, State) ->
             Pending = maps:put(Corr, {From, TRef}, State#state.pending),
             {noreply, State#state{next = Corr, pending = Pending}};
         {error, Reason} ->
-            {stop, {send_failed, Reason}, {error, {send_failed, Reason}}, State}
+            {stop, {shutdown, {send_failed, Reason}}, {error, {send_failed, Reason}}, State}
     end;
 handle_call({oneway, ApiKey, Body}, _From, State) ->
     Corr = next_corr(State#state.next),
     Frame = brahmaputra_protocol:encode_frame(ApiKey, Corr, State#state.client_id, Body),
     case gen_tcp:send(State#state.socket, Frame) of
         ok -> {reply, ok, State#state{next = Corr}};
-        {error, Reason} -> {stop, {send_failed, Reason}, {error, Reason}, State}
+        {error, Reason} -> {stop, {shutdown, {send_failed, Reason}}, {error, Reason}, State}
     end.
 
 handle_cast(_Msg, State) ->
@@ -139,17 +174,20 @@ handle_info({tcp, Socket, Payload}, State = #state{socket = Socket}) ->
                     {noreply, State}
             end;
         {error, Reason} ->
-            {stop, {bad_frame, Reason}, State}
+            {stop, {shutdown, {bad_frame, Reason}}, State}
     end;
 handle_info({tcp_closed, Socket}, State = #state{socket = Socket}) ->
     {stop, normal, State};
 handle_info({tcp_error, Socket, Reason}, State = #state{socket = Socket}) ->
-    {stop, {tcp_error, Reason}, State};
+    {stop, {shutdown, {tcp_error, Reason}}, State};
 handle_info({request_timeout, Corr}, State) ->
     case maps:take(Corr, State#state.pending) of
         {{From, _}, Pending} ->
+            %% The response may still be on its way and the broker is not
+            %% answering in time: give up on this connection entirely
+            %% instead of leaving it pooled for the next request.
             gen_server:reply(From, {error, timeout}),
-            {noreply, State#state{pending = Pending}};
+            {stop, {shutdown, request_timeout}, State#state{pending = Pending}};
         error ->
             {noreply, State}
     end;

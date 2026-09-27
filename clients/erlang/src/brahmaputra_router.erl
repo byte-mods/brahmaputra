@@ -119,12 +119,8 @@ handle_call({conn_for, Topic, Partition}, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({'EXIT', Pid, _Reason}, State = #state{seed = Pid}) ->
-    Conns = maps:filter(fun(_, C) -> C =/= Pid end, State#state.conns),
-    {noreply, State#state{seed = undefined, conns = Conns}};
 handle_info({'EXIT', Pid, _Reason}, State) ->
-    Conns = maps:filter(fun(_, C) -> C =/= Pid end, State#state.conns),
-    {noreply, State#state{conns = Conns}};
+    {noreply, forget(Pid, State)};
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -137,14 +133,27 @@ terminate(_Reason, State) ->
 %% internals
 %% ---------------------------------------------------------------------------
 
+ensure_seed(State = #state{seed = Seed}) when is_pid(Seed) ->
+    %% The 'EXIT' may not have been processed yet; a dead seed is redialled
+    %% now rather than handed out for one more failed request.
+    case is_process_alive(Seed) of
+        true -> {ok, State};
+        false -> ensure_seed(forget(Seed, State))
+    end;
 ensure_seed(State = #state{seed = undefined}) ->
     case brahmaputra_conn:start_link(State#state.host, State#state.port,
                                      State#state.client_id, State#state.connect_timeout) of
         {ok, Seed} -> {ok, State#state{seed = Seed}};
         {error, _} = E -> E
-    end;
-ensure_seed(State) ->
-    {ok, State}.
+    end.
+
+forget(Pid, State) ->
+    Conns = maps:filter(fun(_, C) -> C =/= Pid end, State#state.conns),
+    Seed = case State#state.seed of
+               Pid -> undefined;
+               Other -> Other
+           end,
+    State#state{seed = Seed, conns = Conns}.
 
 do_metadata(_Topics, false, State = #state{metadata = M}) when M =/= undefined ->
     {{ok, M}, State};
@@ -216,10 +225,15 @@ do_conn_for(Topic, Partition, State0) ->
 
 connect_leader(Leader, _M, Topic, Partition, State) when Leader < 0 ->
     {{error, {no_leader, Topic, Partition}}, State};
-connect_leader(Leader, #{brokers := Brokers}, _Topic, _Partition, State) ->
+connect_leader(Leader, M = #{brokers := Brokers}, Topic, Partition, State) ->
     case maps:find(Leader, State#state.conns) of
         {ok, Conn} ->
-            {{ok, Conn}, State};
+            case is_process_alive(Conn) of
+                true -> {{ok, Conn}, State};
+                %% A connection that failed is replaced on its next use:
+                %% one dropped socket must not fail every later request.
+                false -> connect_leader(Leader, M, Topic, Partition, forget(Conn, State))
+            end;
         error ->
             case [B || B = #{node_id := Id} <- Brokers, Id =:= Leader] of
                 [] ->

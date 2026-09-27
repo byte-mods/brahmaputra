@@ -18,16 +18,16 @@ Without rebar3, build with plain `erlc`:
 make            # compiles src/ into ebin/, warning-free under -Werror
 ```
 
-Verified end to end against a live broker: **38/38 checks**
+Verified end to end against a live broker: **54/54 checks**
 (`./test.sh 127.0.0.1 9092`).
 
 ## Design
 
 | Process | Module | Role |
 |---|---|---|
-| one `gen_server` per broker connection | `brahmaputra_conn` | owns the socket (`{packet, 4}` is the frame's int32 length prefix); pipelines requests by correlation id |
-| one per client | `brahmaputra_router` | metadata cache, leader routing, redials dropped connections |
-| producer `gen_server` | `brahmaputra_producer` | per-partition batches, `linger_ms` via `erlang:send_after/3`, bounded buffer that parks senders |
+| one `gen_server` per broker connection | `brahmaputra_conn` | owns the socket (`{packet, 4}` is the frame's int32 length prefix); pipelines requests by correlation id; stops on any timeout or I/O error rather than staying pooled (`request_timeout` default 120 s, `set_request_timeout/2`) |
+| one per client | `brahmaputra_router` | metadata cache, leader routing; a connection that died is redialled on its next use |
+| producer `gen_server` | `brahmaputra_producer` | per-partition batches, `linger_ms` via `erlang:send_after/3`, bounded buffer that parks senders; batches go out from the one process, so a partition never has two in flight and keeps send order |
 | group `gen_server` | `brahmaputra_group` | join/sync/heartbeat; heartbeats on a timer that keeps firing during `poll/2` |
 | (plain module) | `brahmaputra_consumer` | partition fetches and offset lookups over a router |
 | (plain module) | `brahmaputra_protocol` | BitPacker, frames, record batches, CRC32C, murmur2, codecs |

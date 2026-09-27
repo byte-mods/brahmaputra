@@ -129,8 +129,9 @@ handle_call({poll, _}, _From, State = #state{subscribed = []}) ->
 handle_call({poll, _}, _From, State = #state{pending_poll = {_, _}}) ->
     {reply, {error, poll_in_progress}, State};
 handle_call({poll, TimeoutMs}, From, State) ->
-    %% Stamped on entry: the interval bounds how long the application goes
-    %% without asking, and a poll blocking for its timeout is working.
+    %% Stamped on entry and on return, and not enforced in between: the
+    %% interval bounds how long the application goes without asking, and a
+    %% poll blocking for its timeout or on a slow rebalance is working.
     Now = now_ms(),
     run_poll(State#state{last_poll_ms = Now, pending_poll = {From, Now + TimeoutMs}});
 handle_call(commit, _From, State) ->
@@ -183,7 +184,9 @@ run_poll(State = #state{pending_poll = {From, Deadline}}) ->
     case poll_step(Deadline, State) of
         {done, Reply, S} ->
             gen_server:reply(From, Reply),
-            {noreply, S#state{pending_poll = undefined}};
+            %% Stamped again on return: the interval measures the gap
+            %% between polls, which starts when this one hands back.
+            {noreply, S#state{pending_poll = undefined, last_poll_ms = now_ms()}};
         {continue, Delay, S} ->
             _ = erlang:send_after(Delay, self(), poll_step),
             {noreply, S}
@@ -366,6 +369,10 @@ do_join(State, AttemptsLeft) ->
                 {ok, {?ERR_REBALANCE_IN_PROGRESS}} ->
                     timer:sleep(100),
                     do_join(State, AttemptsLeft - 1);
+                {ok, {?ERR_UNKNOWN_MEMBER_ID}} ->
+                    %% The coordinator dropped this member (session expiry,
+                    %% or it left for a slow poll): join again as a new one.
+                    do_join(State#state{member_id = <<>>}, AttemptsLeft - 1);
                 {ok, {Code}} ->
                     {error, P:server_error(Code, join_group), State};
                 {ok, {Generation, MemberId, LeaderId, Members}} ->
@@ -465,6 +472,8 @@ do_sync(Assignments, State) ->
                 {ok, {code, Code}} when Code =:= ?ERR_REBALANCE_IN_PROGRESS;
                                         Code =:= ?ERR_ILLEGAL_GENERATION ->
                     {retry, State};
+                {ok, {code, ?ERR_UNKNOWN_MEMBER_ID}} ->
+                    {retry, State#state{member_id = <<>>}};
                 {ok, {code, Code}} ->
                     {error, P:server_error(Code, sync_group), State};
                 {error, Reason} ->
@@ -539,7 +548,8 @@ heartbeat_tick(State = #state{joined = false}) -> State;
 heartbeat_tick(State = #state{member_id = <<>>}) -> State;
 heartbeat_tick(State = #state{config = Config}) ->
     Idle = now_ms() - State#state.last_poll_ms,
-    case Idle >= maps:get(max_poll_interval_ms, Config) of
+    InPoll = State#state.pending_poll =/= undefined,
+    case not InPoll andalso Idle >= maps:get(max_poll_interval_ms, Config) of
         true ->
             %% The application stopped consuming though the process is
             %% alive. Heartbeating on would assert a liveness this member no

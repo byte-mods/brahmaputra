@@ -166,7 +166,7 @@ decode_fetch(Resp) ->
         %% Read though unused: the batches trail the struct, so skipping a
         %% field would decode them from the wrong offset.
         {_PreferredReplica, R7} = P:dec_int32(R6),
-        BatchesLen =< byte_size(R7) orelse throw({decode_error, fetch_batches_overrun}),
+        (BatchesLen >= 0 andalso BatchesLen =< byte_size(R7)) orelse throw({decode_error, fetch_batches_overrun}),
         {Code, HighWatermark, binary:part(R7, 0, BatchesLen)}
     end),
     case Decoded of
