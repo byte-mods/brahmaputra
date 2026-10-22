@@ -169,6 +169,13 @@ struct Args {
     #[arg(long)]
     flush_interval_ms: Option<u64>,
 
+    /// Start kernel writeback of a segment's appended bytes once this many
+    /// have accumulated (a scheduling hint, not a flush; 0 disables). Keeps
+    /// dirty pages from reaching the memory limit where the kernel stops
+    /// every writer to drain them at once.
+    #[arg(long, default_value_t = brahmaputra_storage::DEFAULT_WRITEBACK_BYTES)]
+    writeback_bytes: u64,
+
     /// Per-client produce byte rate. Over-rate clients have their
     /// acknowledgements delayed, never rejected.
     #[arg(long)]
@@ -454,6 +461,7 @@ async fn run_standalone(args: Args) -> Result<()> {
             retention_bytes: args.retention_bytes,
             flush_interval_messages: args.flush_interval_messages,
             flush_interval_ms: args.flush_interval_ms,
+            writeback_bytes: args.writeback_bytes,
             compact: args.cleanup_policy == "compact",
             delete_retention_ms: args.delete_retention_ms,
             min_cleanable_dirty_ratio: args.min_cleanable_dirty_ratio,
@@ -577,6 +585,7 @@ async fn run_cluster(args: Args, cluster: ClusterSettings) -> Result<()> {
                 retention_bytes: args.retention_bytes,
                 flush_interval_messages: args.flush_interval_messages,
                 flush_interval_ms: args.flush_interval_ms,
+                writeback_bytes: args.writeback_bytes,
                 compact: args.cleanup_policy == "compact",
                 delete_retention_ms: args.delete_retention_ms,
                 min_cleanable_dirty_ratio: args.min_cleanable_dirty_ratio,

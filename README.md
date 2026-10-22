@@ -99,6 +99,22 @@ Every milestone is verified by live scripts that start real brokers, kill
 them, and audit what survived — not only by unit tests. See
 [Verification](#verification).
 
+### Upgrading to 0.10.1
+
+**No wire change and no on-disk format change**: wire version 4, logs and
+checkpoints read unchanged. Upgrading is a restart.
+
+Every performance loss and every lease expiry left open by the 0.8.1 review
+had one cause, reproduced in the benchmark container: the broker never asked
+the kernel to write anything out, so under a memory limit dirty data climbed
+to the cgroup's threshold and the kernel parked every writer — every
+partition actor, on the same threads that serve connections and heartbeats —
+until the backlog had drained. Two changes: partition actors now run on
+their own I/O runtime (`io_threads`), so a blocked append holds up other
+appends and nothing else; and segments hand their appended bytes to kernel
+writeback every `--writeback-bytes` (8 MiB) so the backlog never forms. It
+is a scheduling hint, not a flush; durability is still `flush.*`.
+
 ### Upgrading to 0.10.0
 
 A drop-in upgrade: publish-only clients and deployments behave exactly as
@@ -1447,6 +1463,7 @@ Each row is asserted by a script, not by argument.
 | `--min-cleanable-dirty-ratio` | 0.5 | how dirty a log must be before a compaction pass rewrites it |
 | `--min-compaction-lag-ms`, `--max-compaction-lag-ms` | 0 / off | protect a record from compaction for a while; force a pass regardless of the ratio |
 | `--flush-interval-messages`, `--flush-interval-ms` | off | fsync policy |
+| `--writeback-bytes` | 8 MiB | hand a segment's appended bytes to kernel writeback (an `fdatasync` on a dedicated thread, never on the partition actor) once this many have accumulated, so dirty pages never reach the memory limit where the kernel stops every writer to drain them at once. A scheduling hint, not a flush; 0 disables it |
 | `--max-frame-bytes` | 32 MiB | largest request or response frame (`socket.request.max.bytes`) |
 | `--max-message-bytes` | off | largest batch a producer may send (`message.max.bytes`) |
 | `--index-interval-bytes` | 4096 | sparse-index density (`log.index.interval.bytes`) |
@@ -1641,35 +1658,38 @@ than papered over with a larger timeout. Run the live suites serially.
 
 ## Performance
 
-Version 0.8.1 includes a reproducible Kafka comparison matrix covering RF=1/3,
+Version 0.10.1 includes a reproducible Kafka comparison matrix covering RF=1/3,
 TCP/QUIC concurrency, 1-MiB records, all five codecs, acks=0/1/all, idempotence
 and a fixed offered rate. Both systems use consumer groups and matched producer
 idempotence. Codec comparisons use identical, highly compressible payloads.
 
-Current measurements are collected in the [0.8.1 benchmark reports](docs/benchmarks/0.8.1/README.md).
+Current measurements are collected in the [0.10.1 benchmark reports](docs/benchmarks/0.10.1/README.md).
 Results and limitations are discussed in the
-[release review](docs/release-0.8.1-review.md). Correctness evidence is
+[release review](docs/release-0.10.1-review.md). Correctness evidence is
 mapped separately in the [validation matrix](docs/release-validation-matrix.md).
 
 One current configuration: RF=3, `acks=all`, minimum ISR 2, four clients,
-500,000 × 256-B records per client (single shared-host run):
+500,000 × 256-B records per client (single shared-host run, thirteen
+unrelated containers left running):
 
-| Rate (records/sec) | Kafka 4.3.1 | Brahmaputra 0.8.1 |
+| Rate (records/sec) | Kafka 4.3.1 | Brahmaputra 0.10.1 |
 | --- | ---: | ---: |
-| Produce, wall clock | 235,516 | 757,576 |
-| Produce, client-measured | 324,641 | 1,118,540 |
-| Consume, wall clock | 439,657 | 1,403,509 |
-| Consume, client-measured | 1,676,449 | 4,684,019 |
+| Produce, wall clock | 119,197 | 384,098 |
+| Produce, client-measured | 161,113 | 497,186 |
+| Consume, wall clock | 260,010 | 1,207,001 |
+| Consume, client-measured | 825,274 | 3,753,357 |
+| Produce p99.9 ack latency | 6.7 s | 111 ms |
 
-Results depend on workload and timing boundary. Across the matrix, Brahmaputra
-leads 69 of 84 throughput comparisons and uses fewer CPU core-seconds in 50 of
-52 comparisons; all 104 average/peak working-set memory comparisons are lower.
-Kafka wins the remaining throughput and CPU-work comparisons, including both
-large-record QUIC CPU measurements. These counts include correlated measures
-of the same runs, not independent trials. All losing rows remain published.
-Two earlier attempts failed during broker lease recovery under load. The final
-run paused 14 unrelated application containers and passed every scenario, but
-still observed lease recovery; the heartbeat-stall cause remains unresolved.
+Results depend on workload and timing boundary. Across the matrix, over TCP
+Brahmaputra wins all 66 throughput comparisons (wall-clock median 4.09×,
+minimum 1.47×) and uses fewer CPU core-seconds in 50 of 52 comparisons; all
+104 average/peak working-set memory comparisons are lower. Encrypted QUIC,
+compared against plaintext Kafka, wins every wall-clock row but loses six of
+its ten client-measured rows — both 1 MiB-record rates, both single-client
+rates and two multi-client consume rates — and spends more CPU there. These counts include correlated measures of the same
+runs, not independent trials. All losing rows remain published. The lease
+expiries and stalls that earlier runs suffered had a single cause, fixed in
+0.10.1 (see the review); this run observed none.
 
 ```bash
 bash scripts/bench-release.sh

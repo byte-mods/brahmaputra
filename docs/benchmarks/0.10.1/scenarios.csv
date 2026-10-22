@@ -1,0 +1,13 @@
+scenario,exit_code
+replicated,0
+concurrency,0
+large-records,0
+codec-none,0
+codec-lz4,0
+codec-gzip,0
+codec-snappy,0
+codec-zstd,0
+acks-0,0
+acks-all,0
+idempotent,0
+rate-limited,0

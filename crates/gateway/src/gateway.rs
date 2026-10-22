@@ -895,6 +895,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 reason: reason.into(),
             };
             let _ = tokio::time::timeout(Duration::from_secs(2), self.ws.close(Some(frame))).await;
+            // Drain whatever the peer still has in flight before the socket
+            // is dropped — at the transport level, because after a
+            // too-large frame the WebSocket layer has already given up on
+            // the stream and will not consume the rest of that message. A
+            // socket closed with unread bytes in its receive buffer is
+            // answered with a reset rather than a FIN on Windows, which
+            // discards the close frame the client was just sent: it sees a
+            // reset instead of the 1009. Reading to the peer's FIN (its
+            // reply to our close) makes the close orderly. Bounded, because
+            // a peer that keeps sending must not hold the task.
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                use tokio::io::AsyncReadExt;
+                let mut sink = [0u8; 8192];
+                while matches!(self.ws.get_mut().read(&mut sink).await, Ok(n) if n > 0) {}
+            })
+            .await;
         }
     }
 

@@ -87,11 +87,19 @@ async fn main() -> anyhow::Result<()> {
     let config = cli.config.context("missing configuration")?;
     let gateway = brahmaputra_ws_gateway::start(config).await?;
 
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    // SIGTERM is what a container runtime or a supervisor sends; Windows
+    // has no such signal, and the gateway must still build and run there —
+    // the development host is Windows — so it listens for Ctrl-C alone.
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
     }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down: draining connections");
     gateway.shutdown().await;
     Ok(())

@@ -82,6 +82,10 @@ pub struct BrokerConfig {
     pub log_config: LogConfig,
     /// Bounded command-channel capacity per partition actor.
     pub channel_capacity: usize,
+    /// Worker threads for the runtime partition actors run on. Their file
+    /// writes block, so this is sized for threads that sit in the kernel,
+    /// not for CPUs: zero means twice the CPUs, and at least four.
+    pub io_threads: usize,
     /// Largest accepted frame (post-length-prefix bytes).
     pub max_frame_bytes: usize,
     /// Broker-wide `message.max.bytes`; a topic that sets
@@ -155,6 +159,7 @@ impl Default for BrokerConfig {
             default_partitions: 1,
             log_config: LogConfig::default(),
             channel_capacity: 1024,
+            io_threads: 0,
             max_frame_bytes: 32 * 1024 * 1024,
             max_message_bytes: None,
             retention_check_interval: Duration::from_secs(1),
@@ -334,6 +339,21 @@ pub struct Broker {
     /// recovery before its metadata image can arrive on another task.
     registration_recovery: Mutex<Option<(BrokerEpoch, String)>>,
     addr: SocketAddr,
+    /// Where partition actors run: a runtime of its own, because their
+    /// appends block in the kernel and must not take the connection and
+    /// control-plane workers with them. See [`actor::spawn_on`].
+    io: tokio::runtime::Handle,
+    /// Kept alive here and shut down without blocking when the broker
+    /// goes away; a runtime cannot be dropped from inside another one.
+    io_runtime: Mutex<Option<tokio::runtime::Runtime>>,
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.io_runtime.lock().ok().and_then(|mut slot| slot.take()) {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +433,21 @@ impl Broker {
         let initial_broker_epoch = config.broker_epoch.unwrap_or(0);
         let initial_lease_active = config.metadata_cache.is_none() || initial_broker_epoch != 0;
         let config_quota = config.quota;
+        let io_threads = if config.io_threads == 0 {
+            std::thread::available_parallelism()
+                .map(|cpus| cpus.get() * 2)
+                .unwrap_or(4)
+                .max(4)
+        } else {
+            config.io_threads
+        };
+        let io_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(io_threads)
+            .thread_name("brahmaputra-io")
+            .enable_all()
+            .build()
+            .map_err(|error| BrokerError::Meta(format!("cannot start the I/O runtime: {error}")))?;
+        let io = io_runtime.handle().clone();
         let broker = Broker {
             config,
             state,
@@ -437,6 +472,8 @@ impl Broker {
             lease_active: AtomicBool::new(initial_lease_active),
             registration_recovery: Mutex::new(None),
             addr,
+            io,
+            io_runtime: Mutex::new(Some(io_runtime)),
         };
         let local_partitions = if let Some(cache) = broker.metadata_cache() {
             let image = cache.snapshot();
@@ -1585,6 +1622,7 @@ impl Broker {
                     self.config.metadata_cache.is_some() && self.config.replication_enabled;
                 let (handle, task) = match (replicated_commit, maintenance_enabled) {
                     (true, true) => actor::spawn_cluster_with_retention(
+                        self.io.clone(),
                         log,
                         self.config.channel_capacity,
                         Some(self.config.retention_check_interval),
@@ -1592,17 +1630,21 @@ impl Broker {
                         log_config.clone(),
                     ),
                     (true, false) => actor::spawn_cluster(
+                        self.io.clone(),
                         log,
                         self.config.channel_capacity,
                         dir.clone(),
                         log_config.clone(),
                     ),
                     (false, true) => actor::spawn_with_retention(
+                        self.io.clone(),
                         log,
                         self.config.channel_capacity,
                         Some(self.config.retention_check_interval),
                     ),
-                    (false, false) => actor::spawn(log, self.config.channel_capacity),
+                    (false, false) => {
+                        actor::spawn_on(self.io.clone(), log, self.config.channel_capacity)
+                    }
                 };
                 lifecycle.actor_tasks.push(task);
                 if let Some(incarnation) = incarnation {

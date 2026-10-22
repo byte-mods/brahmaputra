@@ -713,13 +713,26 @@ impl RecordBatch {
     }
 }
 
+/// The part of `payload` that `piece` points into, as a `Bytes` sharing
+/// the same allocation.
+///
+/// Keys and values are handed out as slices of the batch rather than
+/// copies of it: a read is zero-copy from the socket to the batch, and
+/// copying every value back out again — a full extra memcpy per record,
+/// a megabyte each for large records — would undo that on the way to the
+/// caller.
+fn sub(payload: &Bytes, piece: &[u8]) -> Bytes {
+    let start = piece.as_ptr() as usize - payload.as_ptr() as usize;
+    payload.slice(start..start + piece.len())
+}
+
 fn decode_records(
-    payload: &[u8],
+    payload: &Bytes,
     has_headers: bool,
     has_null_values: bool,
 ) -> Result<Vec<Record>, ProtocolError> {
     let mut records = Vec::new();
-    let mut slice = payload;
+    let mut slice: &[u8] = payload;
     while !slice.is_empty() {
         let record_len = get_uvarint(&mut slice)? as usize;
         if slice.len() < record_len {
@@ -744,7 +757,7 @@ fn decode_records(
             }
             let (k, r) = rec.split_at(len);
             rec = r;
-            Some(Bytes::copy_from_slice(k))
+            Some(sub(payload, k))
         };
 
         let raw_value_len = get_uvarint(&mut rec)?;
@@ -764,7 +777,7 @@ fn decode_records(
             }
             let (v, r) = rec.split_at(value_len);
             rec = r;
-            Some(Bytes::copy_from_slice(v))
+            Some(sub(payload, v))
         };
 
         let timestamp_delta = zigzag_decode(get_uvarint(&mut rec)?);
@@ -808,7 +821,7 @@ fn decode_records(
                     }
                     let (v, r) = rec.split_at(len);
                     rec = r;
-                    Some(Bytes::copy_from_slice(v))
+                    Some(sub(payload, v))
                 };
                 headers.push(RecordHeader { key, value });
             }
@@ -1485,7 +1498,7 @@ mod tests {
         put_uvarint(&mut payload, rec.len() as u64);
         payload.extend_from_slice(&rec);
 
-        let error = decode_records(&payload, true, false).unwrap_err();
+        let error = decode_records(&payload.clone().freeze(), true, false).unwrap_err();
         assert!(
             matches!(error, ProtocolError::Malformed(_)),
             "expected a malformed error, got {error:?}"

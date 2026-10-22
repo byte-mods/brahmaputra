@@ -30,6 +30,10 @@ const LOG_START_FILE: &str = "logstart";
 /// is larger. Big enough to cover many small batches in one syscall,
 /// small enough not to read far past what a fetch will actually use.
 const READ_CHUNK_BYTES: usize = 1024 * 1024;
+/// Eight megabytes: large enough that the hint is rare next to the appends,
+/// small enough that a burst at hundreds of megabytes a second starts
+/// draining within a fraction of a second rather than at the wall.
+pub const DEFAULT_WRITEBACK_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Bytes of a batch that must be read to learn where it ends and which
 /// offsets it covers: through `last_offset_delta`. Everything after this is
@@ -474,6 +478,12 @@ pub struct LogConfig {
     /// a correctness break, and its commit rate is low enough that the
     /// cost does not matter.
     pub hwm_checkpoint_interval_ms: u64,
+    /// Hand appended bytes to the kernel's writeback once this many have
+    /// accumulated in a segment, so dirty data never piles up to the
+    /// cgroup limit where the kernel stops every writer to drain it at
+    /// once. A hint, not a flush: durability is still `flush.*`. Zero
+    /// disables it.
+    pub writeback_bytes: u64,
 }
 
 impl Default for LogConfig {
@@ -493,6 +503,7 @@ impl Default for LogConfig {
             max_compaction_lag_ms: None,
             log_append_time: false,
             hwm_checkpoint_interval_ms: DEFAULT_HWM_CHECKPOINT_INTERVAL_MS,
+            writeback_bytes: DEFAULT_WRITEBACK_BYTES,
         }
     }
 }
@@ -583,6 +594,7 @@ impl Log {
             base_offsets[base_offsets.len() - 1],
             config.index_interval_bytes,
         )?;
+        active.writeback_bytes = config.writeback_bytes;
         let recovery = active.recover()?;
         let next_offset = recovery.next_offset;
         segments.push(active);
@@ -1279,11 +1291,12 @@ impl Log {
         if let Some(active) = self.segments.last() {
             active.sync()?;
         }
-        let seg = Segment::open(
+        let mut seg = Segment::open(
             &self.dir,
             self.next_offset,
             self.config.index_interval_bytes,
         )?;
+        seg.writeback_bytes = self.config.writeback_bytes;
         self.segments.push(seg);
         self.unflushed_records = 0;
         self.last_flush_ms = now_ms();
@@ -1308,6 +1321,7 @@ mod tests {
             // checkpoint eagerly and assert on the resulting bytes. The
             // write cadence has its own test.
             hwm_checkpoint_interval_ms: 0,
+            writeback_bytes: 0,
             ..LogConfig::default()
         }
     }
@@ -1339,6 +1353,7 @@ mod tests {
     fn txn_config() -> LogConfig {
         LogConfig {
             hwm_checkpoint_interval_ms: 0,
+            writeback_bytes: 0,
             ..LogConfig::default()
         }
     }
@@ -2376,6 +2391,7 @@ mod hwm_checkpoint_cadence_tests {
             segment_bytes: 4096,
             index_interval_bytes: 64,
             hwm_checkpoint_interval_ms: interval_ms,
+            writeback_bytes: 0,
             ..LogConfig::default()
         }
     }
@@ -2427,6 +2443,26 @@ mod hwm_checkpoint_cadence_tests {
         }
         let log = Log::open(dir.path(), config(60_000)).unwrap();
         assert_eq!(log.high_watermark(), 5);
+    }
+
+    /// A follower truncates its log on a leader change, which can leave a
+    /// segment shorter than the last writeback hint reached. The next
+    /// append must start a fresh hint window from the new end rather than
+    /// subtract past it.
+    #[test]
+    fn a_truncation_below_the_last_writeback_hint_does_not_underflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hinted = config(60_000);
+        hinted.writeback_bytes = 64;
+        let mut log = Log::open(dir.path(), hinted).unwrap();
+        for value in 0..8 {
+            log.append(one_batch(value)).unwrap();
+        }
+        log.truncate_to(1).unwrap();
+        for value in 0..8 {
+            log.append(one_batch(value)).unwrap();
+        }
+        assert_eq!(log.log_end_offset(), 9);
     }
 
     /// The journal is append-only, so without folding it back it grew by
@@ -2484,6 +2520,7 @@ mod chunked_read_tests {
             segment_bytes: 1024 * 1024,
             index_interval_bytes: 64,
             hwm_checkpoint_interval_ms: 0,
+            writeback_bytes: 0,
             ..LogConfig::default()
         }
     }
@@ -2678,6 +2715,7 @@ mod region_tests {
             segment_bytes: 4096,
             index_interval_bytes: 64,
             hwm_checkpoint_interval_ms: 0,
+            writeback_bytes: 0,
             ..LogConfig::default()
         }
     }
@@ -3472,6 +3510,7 @@ mod compaction_tests {
             segment_bytes: 256,
             index_interval_bytes: 64,
             hwm_checkpoint_interval_ms: 0,
+            writeback_bytes: 0,
             compact: true,
             // These tests are about what compaction decides, not about when
             // it decides to run, so let every pass run.
@@ -4152,6 +4191,7 @@ mod segment_ms_tests {
             segment_ms,
             index_interval_bytes: 64,
             hwm_checkpoint_interval_ms: 0,
+            writeback_bytes: 0,
             ..LogConfig::default()
         }
     }

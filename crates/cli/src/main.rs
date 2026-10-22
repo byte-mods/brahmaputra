@@ -748,6 +748,50 @@ where
     Ok(completed)
 }
 
+/// Periodic progress on stderr for long count-mode runs.
+///
+/// Reports the cumulative count and the rate over the last interval, so a
+/// stall reads as a line with a rate of zero at a known second rather
+/// than as a mysteriously low end-of-run average.
+struct Progress {
+    started: Instant,
+    last_report: Instant,
+    total: u64,
+    at_last_report: u64,
+}
+
+impl Progress {
+    const INTERVAL: Duration = Duration::from_secs(2);
+
+    fn new(started: Instant) -> Self {
+        Progress {
+            started,
+            last_report: started,
+            total: 0,
+            at_last_report: 0,
+        }
+    }
+
+    fn tick(&mut self, verb: &str) {
+        self.total += 1;
+        let now = Instant::now();
+        let since = now.duration_since(self.last_report);
+        if since < Self::INTERVAL {
+            return;
+        }
+        let recent = self.total - self.at_last_report;
+        eprintln!(
+            "progress: {verb} {} records, {:.0} msgs/sec over the last {:.1}s, {:.1}s elapsed",
+            self.total,
+            recent as f64 / since.as_secs_f64(),
+            since.as_secs_f64(),
+            now.duration_since(self.started).as_secs_f64()
+        );
+        self.last_report = now;
+        self.at_last_report = self.total;
+    }
+}
+
 /// Summarise acknowledgement waits as milliseconds, by nearest rank.
 ///
 /// Nearest rank rather than interpolation so a reported percentile is a
@@ -1892,10 +1936,16 @@ async fn produce(options: ProduceOptions) -> Result<()> {
                 }
             });
             let mut waits: Vec<u32> = Vec::with_capacity(if latency { count as usize } else { 0 });
+            // A progress line every two seconds, on stderr so it never
+            // disturbs the final summary a harness parses. A run that
+            // finishes in 2 s prints nothing; a run that stalls shows
+            // exactly when, which a single end-of-run rate cannot.
+            let mut progress = Progress::new(started);
             let sent = drive_ordered(sends, in_flight.max(1), |(_, waited)| {
                 if latency {
                     waits.push(waited.as_micros().min(u128::from(u32::MAX)) as u32);
                 }
+                progress.tick("produced");
             })
             .await?;
             debug_assert_eq!(sent as u64, count);
@@ -2183,6 +2233,7 @@ async fn consume_group(
     let mut bytes = 0u64;
     let mut printed = 0u64;
     let mut seen_version = consumer.assignment_version();
+    let mut progress = Progress::new(started);
     loop {
         // Never let a poll hand back more than the remaining --max budget:
         // records returned count as consumed, so over-fetching here would
@@ -2214,6 +2265,7 @@ async fn consume_group(
                 );
             }
             printed += 1;
+            progress.tick("consumed");
             if max.is_some_and(|max| printed >= max) {
                 consumer.commit_sync().await?;
                 report_consume_rate(quiet, printed, bytes, started);

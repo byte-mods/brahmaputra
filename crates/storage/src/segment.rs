@@ -3,6 +3,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use brahmaputra_protocol::{validate_batch_header, BATCH_HEADER_LEN, MIN_BATCH_LENGTH};
@@ -30,6 +32,15 @@ pub(crate) struct Segment {
     index_interval_bytes: u64,
     /// Log bytes appended since the last index entry.
     bytes_since_index: u64,
+    /// Ask the kernel to start writing appended bytes out once this many
+    /// have accumulated; zero disables the hint. See [`Segment::append_batch`].
+    pub writeback_bytes: u64,
+    /// Where the bytes not yet handed to writeback begin.
+    writeback_from: u64,
+    /// Whether a background `fdatasync` is queued for this segment's log
+    /// file; see [`crate::writeback`].
+    #[cfg(unix)]
+    writeback_queued: Arc<AtomicBool>,
 }
 
 fn log_path(dir: &Path, base_offset: i64) -> PathBuf {
@@ -104,7 +115,36 @@ impl Segment {
             timeindex,
             index_interval_bytes,
             bytes_since_index: 0,
+            writeback_bytes: 0,
+            writeback_from: size,
+            #[cfg(unix)]
+            writeback_queued: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Hand `[from, from + len)` to the kernel's writeback without waiting.
+    ///
+    /// The log is written into the page cache and never synced unless a
+    /// flush policy says so, which is the right durability trade and the
+    /// fast path — until the dirty data reaches the limit the kernel sets
+    /// for the process's memory cgroup. At that point the kernel flushes
+    /// the whole backlog and *blocks every writer* until it has drained:
+    /// a 4 GiB container producing at 150 MB/s stalls for five seconds at
+    /// around 600 MiB. Handing the kernel the file to write out early,
+    /// every few megabytes, keeps writeback running alongside the appends
+    /// instead of all at once at the wall. This is RocksDB's
+    /// `bytes_per_sync` discipline; a scheduling hint, not a durability
+    /// guarantee.
+    ///
+    /// The work is an `fdatasync` on a dedicated thread, never on the
+    /// actor; see [`crate::writeback`]. `sync_file_range` would be the
+    /// cheaper call, but on overlayfs — a container's root — it returns
+    /// success and writes nothing, and a hint that cannot be trusted to
+    /// have happened is worse than one that costs a thread.
+    fn hint_writeback(&self, from: u64, len: u64) {
+        let _ = (from, len);
+        #[cfg(unix)]
+        crate::writeback::request_sync(&self.log_file, &self.writeback_queued);
     }
 
     pub fn read_at(&self, position: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -148,6 +188,13 @@ impl Segment {
         (&*self.log_file).write_all(bytes)?;
         self.size += bytes.len() as u64;
         self.bytes_since_index += bytes.len() as u64;
+        // A truncation can leave the file shorter than the last hint; the
+        // next hint then simply starts from the new end.
+        self.writeback_from = self.writeback_from.min(self.size);
+        if self.writeback_bytes > 0 && self.size - self.writeback_from >= self.writeback_bytes {
+            self.hint_writeback(self.writeback_from, self.size - self.writeback_from);
+            self.writeback_from = self.size;
+        }
         self.max_timestamp = Some(
             self.max_timestamp
                 .map_or(max_timestamp, |t| t.max(max_timestamp)),

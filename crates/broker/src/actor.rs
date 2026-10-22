@@ -15,6 +15,7 @@ use std::time::Duration;
 use brahmaputra_protocol::{validate_batch_header, BatchHeader, ProducerMetadata, RecordBatch};
 use brahmaputra_storage::{LeaderEpochEntry, Log, LogConfig, StorageError};
 use bytes::Bytes;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tracing::{debug, trace, warn};
@@ -757,19 +758,40 @@ fn actor_gone() -> StorageError {
 
 /// Spawn the actor task for an already-open `log`. Returns the handle and
 /// the task's join handle (awaited during graceful shutdown).
-pub fn spawn(log: Log, capacity: usize) -> (PartitionHandle, tokio::task::JoinHandle<()>) {
-    spawn_mode(log, capacity, None, true, None)
+#[cfg(test)]
+pub(crate) fn spawn(log: Log, capacity: usize) -> (PartitionHandle, tokio::task::JoinHandle<()>) {
+    spawn_mode(Handle::current(), log, capacity, None, true, None)
+}
+
+/// [`spawn`], but on a specific runtime.
+///
+/// A partition actor does blocking file I/O inline — the append is a
+/// `write()` into the page cache, and the kernel is free to park that
+/// call for seconds when dirty pages reach the cgroup's limit. On the
+/// runtime that also serves connections, heartbeats and group
+/// coordination, one such pause on every worker thread stops the whole
+/// broker; the lease expiries seen under replicated load were exactly
+/// that. Actors therefore run on the broker's I/O runtime, so a blocked
+/// write holds up only other writes.
+pub(crate) fn spawn_on(
+    on: Handle,
+    log: Log,
+    capacity: usize,
+) -> (PartitionHandle, tokio::task::JoinHandle<()>) {
+    spawn_mode(on, log, capacity, None, true, None)
 }
 
 /// Spawn a cluster replica actor. Local client appends remain uncommitted
 /// until leader-side replication progress explicitly advances HWM.
 pub(crate) fn spawn_cluster(
+    on: Handle,
     log: Log,
     capacity: usize,
     dir: PathBuf,
     config: LogConfig,
 ) -> (PartitionHandle, tokio::task::JoinHandle<()>) {
     spawn_mode(
+        on,
         log,
         capacity,
         None,
@@ -781,14 +803,16 @@ pub(crate) fn spawn_cluster(
 /// Spawn an actor and, when configured, periodically apply the log's
 /// retention policy on the same single-owner task as reads and appends.
 pub(crate) fn spawn_with_retention(
+    on: Handle,
     log: Log,
     capacity: usize,
     retention_check_interval: Option<Duration>,
 ) -> (PartitionHandle, tokio::task::JoinHandle<()>) {
-    spawn_mode(log, capacity, retention_check_interval, true, None)
+    spawn_mode(on, log, capacity, retention_check_interval, true, None)
 }
 
 pub(crate) fn spawn_cluster_with_retention(
+    on: Handle,
     log: Log,
     capacity: usize,
     retention_check_interval: Option<Duration>,
@@ -796,6 +820,7 @@ pub(crate) fn spawn_cluster_with_retention(
     config: LogConfig,
 ) -> (PartitionHandle, tokio::task::JoinHandle<()>) {
     spawn_mode(
+        on,
         log,
         capacity,
         retention_check_interval,
@@ -811,6 +836,7 @@ struct ResetContext {
 }
 
 fn spawn_mode(
+    on: Handle,
     log: Log,
     capacity: usize,
     retention_check_interval: Option<Duration>,
@@ -827,7 +853,7 @@ fn spawn_mode(
         interval
     });
     let disruptions = Arc::new(AtomicU64::new(0));
-    let task = tokio::spawn(run(
+    let task = on.spawn(run(
         log,
         rx,
         wm_tx,
@@ -1537,7 +1563,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = LogConfig::default();
         let log = Log::open(dir.path(), config.clone()).unwrap();
-        let (handle, task) = spawn_cluster(log, 16, dir.path().to_owned(), config);
+        let (handle, task) =
+            spawn_cluster(Handle::current(), log, 16, dir.path().to_owned(), config);
         let mut batch = producer_batch(0, 0, &["replicated"]);
         batch.leader_epoch = 7;
         let raw = batch.encode();
@@ -1665,7 +1692,13 @@ mod tests {
     async fn replica_append_checkpoints_each_batch_epoch_at_its_exact_base() {
         let dir = tempfile::tempdir().unwrap();
         let log = Log::open(dir.path(), LogConfig::default()).unwrap();
-        let (handle, task) = spawn_cluster(log, 16, dir.path().to_owned(), LogConfig::default());
+        let (handle, task) = spawn_cluster(
+            Handle::current(),
+            log,
+            16,
+            dir.path().to_owned(),
+            LogConfig::default(),
+        );
 
         let first = RecordBatch::new(0, 8, 1_000, vec![Record::new("old")]).encode();
         let second = RecordBatch::new(1, 9, 2_000, vec![Record::new("new")]).encode();
@@ -1691,7 +1724,8 @@ mod tests {
         )
         .unwrap();
         log.set_high_watermark(1).unwrap();
-        let (handle, task) = spawn_cluster(log, 16, dir.path().to_owned(), config);
+        let (handle, task) =
+            spawn_cluster(Handle::current(), log, 16, dir.path().to_owned(), config);
 
         handle.reset_to_offset(5).await.unwrap();
         assert_eq!(handle.offsets().await.unwrap(), (5, 5, 5));
@@ -1723,7 +1757,8 @@ mod tests {
             },
         )
         .unwrap();
-        let (handle, task) = spawn_with_retention(log, 16, Some(Duration::from_millis(10)));
+        let (handle, task) =
+            spawn_with_retention(Handle::current(), log, 16, Some(Duration::from_millis(10)));
 
         for i in 0..4 {
             handle.append(batch(i, 1)).await.unwrap();

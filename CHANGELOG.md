@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.10.1 — 2026-10-23
+
+The stall release. Every unresolved performance loss and every unresolved
+lease expiry in the 0.8.1 review traced to one mechanism, reproduced inside
+the benchmark container with a dirty-page sampler: the broker writes into
+the page cache and never asks the kernel to write anything out, so under a
+memory limit the dirty data climbs to the cgroup's threshold, the kernel
+flips the whole backlog into writeback and parks every writer until it has
+drained. Each partition actor was parked inside `write()` on a runtime
+worker thread, so with as many actors as workers the *whole broker* stopped:
+no acknowledgements, no fetches, no group joins, no controller heartbeats.
+The published four-client produce phase spent 21 of its 28 seconds at 3 %
+CPU; p99.9 acknowledgement latency was six seconds; the two-client consume
+phase waited ten seconds for a coordinator append that was stuck behind the
+previous phase's flush; and the replicated runs lost broker leases for the
+same reason.
+
+**No wire change and no on-disk format change.** Wire version 4; logs,
+indexes and checkpoints are read unchanged.
+
+### Fixed
+
+- **Partition actors run on their own I/O runtime.** A blocking append now
+  holds up other appends, never the connection, group-coordination or
+  lease-heartbeat work, which stay on the main runtime. The runtime is
+  sized for threads that sit in the kernel rather than for CPUs:
+  `io_threads` in the broker config, zero meaning twice the CPUs and at
+  least four. Measured in the 4-CPU benchmark container, this alone turned
+  the four-client produce phase's zero-throughput cliff into steady
+  progress and took p99.9 acknowledgement latency from 6.2 s to 0.3 s.
+
+- **Appended bytes are handed to writeback continuously.** Every
+  `--writeback-bytes` (default 8 MiB) a segment asks the kernel to start
+  writing its recent appends out: `sync_file_range(SYNC_FILE_RANGE_WRITE)`
+  on Linux, which schedules I/O without waiting for it. Where the
+  filesystem refuses the hint — overlayfs, which is a container's root —
+  the file is queued for `fdatasync` on one dedicated writeback thread
+  instead, coalesced to one request per segment. This is RocksDB's
+  `bytes_per_sync` discipline. It is a scheduling hint, not a durability
+  guarantee: `flush.messages` and `flush.ms` still own durability, and 0
+  disables it. Writeback now runs alongside production instead of all at
+  once at the dirty limit, so dirty data no longer carries over to stall
+  the consume phase that follows.
+
+- **A follower truncation no longer trips the writeback cursor.** Found by
+  the workspace suite on the first run of this change: a segment cut
+  shorter than its last hint underflowed on the next append. The cursor is
+  clamped to the file length; pinned by a test.
+
+- **The WebSocket gateway builds on Windows again.** Its SIGTERM handling
+  used `tokio::signal::unix` unconditionally, which does not exist there
+  and failed every workspace-wide build on the development host; it is now
+  Unix-only, and the gateway listens for Ctrl-C alone elsewhere.
+
+- **A gateway client refused for an oversized message receives its 1009
+  close frame.** The gateway sent the frame and dropped the socket with the
+  rest of the oversized message still unread; Windows answers that with a
+  reset rather than a FIN, which discards the close frame the client was
+  just sent, so it saw a connection reset instead. The transport is now
+  drained to the peer's FIN, bounded by two seconds, before the socket is
+  dropped. Found by running the gateway's end-to-end suite on Windows,
+  where it had never run.
+
+### Changed
+
+- **Record decoding is zero-copy.** Keys, values and header values are
+  slices of the batch the reader already owns rather than copies of it —
+  a full extra memcpy per record, a megabyte each on the large-record
+  benchmark's consume path, is gone.
+
+- **`brahmaputra-cli produce --count` and `consume --max` print a progress
+  line on stderr every two seconds** with the cumulative count and the
+  rate over the last interval, so a stall shows up as a line with a rate
+  of zero at a known second instead of as a low end-of-run average. The
+  final summary line a harness parses is unchanged.
+
 ## 0.10.0 — 2026-09-27
 
 UIs can now read from Brahmaputra through the WebSocket gateway, not only

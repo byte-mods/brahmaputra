@@ -348,6 +348,21 @@ One caveat stands: three brokers on one machine share a disk and a NIC, so
 the absolute numbers are below any real deployment — for both systems
 equally, which is what preserves the ratios.
 
+**0.10.1 re-measured the whole twelve-group matrix** after fixing the
+dirty-page stall ([§9a](#closed-in-0101)), on the same host with thirteen
+unrelated containers left running — the contention the previous certified
+run had to pause. Over TCP, Brahmaputra wins all 66 throughput comparisons
+(wall-clock median 4.09×, minimum 1.47×; client-measured median 3.23×),
+with lower CPU core-seconds in 50 of 52 rows and lower working-set memory
+in all 104. RF=3, `acks=all`, four clients: 384,098 against 119,197
+records/s wall-clock, with p99.9 acknowledgement latency of 111 ms against
+6.7 s. The six remaining throughput losses are all encrypted QUIC against
+plaintext Kafka: both 1 MiB-record rates, both single-client rates and two
+multi-client consume rates, all client-measured.
+Every row, including those, is in
+[docs/benchmarks/0.10.1](benchmarks/0.10.1/README.md); the
+[release review](release-0.10.1-review.md#final-measurements) discusses them.
+
 ## 9. Gaps ranked by impact
 
 **Decisive**
@@ -431,6 +446,20 @@ equally, which is what preserves the ratios.
 
 Recorded because this document has drifted before, and a gap list that
 only ever grows is not being read against the code.
+
+### Closed in 0.10.1
+
+- **The broker no longer stops when the kernel throttles its writes.** The
+  one cause behind every unresolved 0.8.1 loss and lease expiry: with no
+  writeback ever requested, dirty pages reached the memory cgroup's limit
+  and the kernel parked every partition actor inside `write()` — on the
+  runtime threads that also serve connections, groups and controller
+  heartbeats. Actors now run on a dedicated I/O runtime, and segments hand
+  appended bytes to a background `fdatasync` every 8 MiB so the backlog
+  never forms. Kafka keeps its network threads separate from its I/O
+  threads for exactly this reason; this was the missing half of that
+  design. Reproduced and measured in [the investigation
+  notes](performance-investigation.md#root-cause-found-2026-10-23-090).
 
 ### Closed in 0.7.0
 

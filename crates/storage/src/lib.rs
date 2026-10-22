@@ -24,9 +24,11 @@ mod index;
 mod log;
 mod segment;
 mod txn;
+#[cfg(unix)]
+mod writeback;
 
 pub use epoch::{LeaderEpochCheckpoint, LeaderEpochEntry};
 pub use error::StorageError;
-pub use log::{Log, LogConfig, LogRegion};
+pub use log::{Log, LogConfig, LogRegion, DEFAULT_WRITEBACK_BYTES};
 pub use segment::read_exact_at;
 pub use txn::{AbortedTransaction, TransactionIndex};

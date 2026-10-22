@@ -2,9 +2,61 @@
 
 Goal: exceed Kafka throughput while using less CPU and memory in every published
 scenario, retain correctness and durability, publish verified results, and push
-the resulting changes to main. This goal is not yet achieved.
+the resulting changes to main.
 
-Latest status (2026-09-21): the final twelve-group comparison passed and is
+## Root cause found (2026-10-23, 0.10.1)
+
+Every open item below — the four-client TCP produce loss, the two-client
+consume loss, the QUIC produce losses at 2–8 clients, the large-record
+consume loss, and the lease expiries under replicated load — had one cause.
+
+The 0.8.1 cgroup CPU timeline for the four-client TCP produce phase showed
+the real work finishing in five seconds at 400 % CPU, then 21 seconds at 3 %
+CPU, then a two-second burst. That is not a throughput ceiling; it is a
+wait. Reproduced inside the same 4-CPU/4-GiB container with a dirty-page
+sampler (`memory.stat` `file_dirty`/`file_writeback` every 0.5 s): dirty
+data climbs at ~150 MB/s to about 600 MiB, the kernel flips the whole set
+into writeback at the cgroup's dirty limit, and every writer is parked at
+zero until it has drained. The broker never asked the kernel to write
+anything out, so the backlog always formed; each partition actor was parked
+inside `write()` on a runtime worker thread, so with as many actors as
+workers the whole broker stopped, including the controller heartbeats.
+That is the "heartbeat stall" that was never explained.
+
+Two changes close it. Partition actors run on their own I/O runtime
+(`io_threads`), so a blocked append holds up other appends and nothing
+else. And segments hand their appended bytes to writeback every
+`--writeback-bytes` (8 MiB): `sync_file_range(SYNC_FILE_RANGE_WRITE)` was
+the obvious call and was found, by direct test, to return success and write
+nothing on overlayfs — a container's root — so the mechanism is an
+`fdatasync` queued to one dedicated thread, coalesced per segment.
+
+Measured in the container before the matrix rerun, Brahmaputra only, same
+harness settings (1,000,000 × 256 B per client, acks=1, no compression):
+
+| Level | 0.8.1 published | 0.10.1 container repro | Kafka 4.3.1 published |
+| --- | ---: | ---: | ---: |
+| produce ×2 | 3.0 s | 4.6 s | 10.7 s |
+| produce ×4 | 28.0 s (p99.9 6.1 s) | 8.8 s (p99.9 0.1 s) | 19.9 s |
+| produce ×8 | 33.1 s | 20.6 s | 71.8 s |
+| consume ×2 | 11.4 s | 1.5 s | 4.4 s |
+| consume ×4 | 1.5 s | 1.7 s | 12.8 s |
+| consume ×8 | 9.2 s | 3.1 s | 29.5 s |
+
+The paired matrix was then rerun on the same host — without stopping the
+thirteen unrelated containers that the certified 0.8.1 run had to pause —
+and is published under [docs/benchmarks/0.10.1](benchmarks/0.10.1/README.md).
+Over TCP, Brahmaputra wins all 66 throughput comparisons (wall-clock median
+4.09×, minimum 1.47×; client-measured median 3.23×), with lower CPU
+core-seconds in 50 of 52 rows and lower working-set memory in all 104. The
+remaining six throughput losses are all encrypted QUIC against plaintext
+Kafka, client-measured, concentrated on 1 MiB records and single-client
+rates. The replicated runs recorded no lease
+expiry. The [0.10.1 review](release-0.10.1-review.md#final-measurements) has
+every losing row. The universal objective stated at the top of this file is
+met for TCP and not for QUIC on large records.
+
+Previous status (2026-09-21): the final twelve-group comparison passed and is
 published in [the 0.8.1 reports](benchmarks/0.8.1/README.md). Windows and Linux
 each passed 426 Rust tests. Performance losses and lease-recovery failures
 remain, so the universal performance objective is still open. Earlier progress
