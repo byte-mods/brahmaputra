@@ -33,6 +33,7 @@ pub use group_consumer::{Assignor, AutoOffsetReset, ConsumedRecord, GroupConsume
 pub use producer::{murmur2, Producer, ProducerConfig};
 pub use quic::datacenter_endpoint_config as quic_endpoint_config;
 pub use quic::tune_for_datacenter as tune_quic_transport;
+pub use quic::tune_udp_socket as tune_quic_socket;
 pub use replica::{ReplicaClient, ReplicaFetchResult};
 pub use tls::TlsSettings;
 pub use transactional::{TransactionalProducer, DEFAULT_TRANSACTION_TIMEOUT_MS};

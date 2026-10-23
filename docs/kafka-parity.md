@@ -356,9 +356,11 @@ run had to pause. Over TCP, Brahmaputra wins all 66 throughput comparisons
 with lower CPU core-seconds in 50 of 52 rows and lower working-set memory
 in all 104. RF=3, `acks=all`, four clients: 384,098 against 119,197
 records/s wall-clock, with p99.9 acknowledgement latency of 111 ms against
-6.7 s. The six remaining throughput losses are all encrypted QUIC against
-plaintext Kafka: both 1 MiB-record rates, both single-client rates and two
-multi-client consume rates, all client-measured.
+6.7 s. The encrypted transports are compared with Kafka over TLS: TLS on
+TCP wins all 18 of its rows (wall-clock median 5.33×) and QUIC wins 16 of
+18, the two losses being 1 MiB records (0.57×, 0.55×), where userspace
+QUIC's per-byte cost in a four-CPU container is the ceiling. In all, 100
+of 102 throughput comparisons across 412 pairs.
 Every row, including those, is in
 [docs/benchmarks/0.10.1](benchmarks/0.10.1/README.md); the
 [release review](release-0.10.1-review.md#final-measurements) discusses them.

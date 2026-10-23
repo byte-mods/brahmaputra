@@ -81,6 +81,39 @@ printf 'system,phase,clients,records,seconds,msgs_per_sec,client_msgs_per_sec,cp
 # ------------------------------------------------------------- sampling
 
 source "$ROOT/scripts/bench-resources.sh"
+
+# ------------------------------------------------------------- kafka tls
+# Encrypted QUIC against plaintext Kafka compares a transport that encrypts
+# with one that does not. Kafka therefore also serves an SSL listener on
+# the same broker, from a self-signed certificate generated with the
+# image's own keytool, and every QUIC row is paired with the Kafka-over-TLS
+# row of the same phase. The plaintext listener and its rows are unchanged.
+KAFKA_TLS_PASS="benchpass"
+# Host paths handed to Docker must be in the platform's own form; on Git
+# Bash that means converting back to Windows.
+if ! command -v host_path >/dev/null 2>&1; then
+  host_path() {
+    if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi
+  }
+fi
+kafka_tls_material() {
+  local dir="$1"
+  mkdir -p "$dir"
+  docker_run run --rm -v "$(host_path "$dir"):/certs" --entrypoint sh "$KAFKA_IMAGE" -c '
+    set -e
+    keytool -genkeypair -alias kafka -keyalg RSA -keysize 2048 -validity 3650 -storetype PKCS12 \
+      -keystore /certs/kafka.p12 -storepass '"$KAFKA_TLS_PASS"' -keypass '"$KAFKA_TLS_PASS"' \
+      -dname "CN=bench-kafka" -ext "SAN=dns:bench-kafka,dns:localhost" >/dev/null 2>&1
+    keytool -exportcert -alias kafka -keystore /certs/kafka.p12 -storepass '"$KAFKA_TLS_PASS"' -rfc -file /certs/kafka.crt >/dev/null 2>&1
+    keytool -importcert -noprompt -alias kafka -file /certs/kafka.crt -storetype PKCS12 \
+      -keystore /certs/truststore.p12 -storepass '"$KAFKA_TLS_PASS"' >/dev/null 2>&1
+    printf "%s" '"$KAFKA_TLS_PASS"' > /certs/keystore.creds
+    printf "%s" '"$KAFKA_TLS_PASS"' > /certs/key.creds
+    printf "security.protocol=SSL\nssl.truststore.location=/etc/kafka/secrets/truststore.p12\nssl.truststore.password=%s\nssl.truststore.type=PKCS12\n" '"$KAFKA_TLS_PASS"' > /certs/client-ssl.properties
+  ' || die "cannot generate Kafka TLS material"
+}
+KAFKA_TLS_PRODUCER_PROPS="security.protocol=SSL ssl.truststore.location=/etc/kafka/secrets/truststore.p12 ssl.truststore.password=$KAFKA_TLS_PASS ssl.truststore.type=PKCS12"
+
 start_sampling() { start_resource_sampling "$2" "$1"; }
 stop_sampling() { stop_resource_sampling; }
 summarize_samples() { summarize_resource_samples "$1"; }
@@ -148,15 +181,22 @@ record_level() {
 
 start_kafka() {
   stage "Kafka"
+  kafka_tls_material "$RESULTS/kafka-tls"
   docker_run run -d --name bench-kafka --network "$NETWORK" \
     --cpus "$CPUS" --memory "$MEMORY" \
     -e KAFKA_NODE_ID=1 \
     -e KAFKA_PROCESS_ROLES=broker,controller \
-    -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
-    -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://bench-kafka:9092 \
+    -e KAFKA_LISTENERS=PLAINTEXT://:9092,SSL://:9094,CONTROLLER://:9093 \
+    -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://bench-kafka:9092,SSL://bench-kafka:9094 \
     -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
     -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@bench-kafka:9093 \
-    -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+    -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SSL:SSL \
+    -e KAFKA_SSL_KEYSTORE_FILENAME=kafka.p12 \
+    -e KAFKA_SSL_KEYSTORE_CREDENTIALS=keystore.creds \
+    -e KAFKA_SSL_KEY_CREDENTIALS=key.creds \
+    -e KAFKA_SSL_KEYSTORE_TYPE=PKCS12 \
+    -e KAFKA_SSL_CLIENT_AUTH=none \
+    -v "$(host_path "$RESULTS/kafka-tls"):/etc/kafka/secrets" \
     -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
     -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
     -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
@@ -246,6 +286,60 @@ run_kafka_level() {
     "$(sum_client_rates kafka-consume "$RESULTS"/kafka-consume-"$clients"-*.txt)"
 }
 
+# Kafka again, over its SSL listener: the comparator for encrypted QUIC.
+run_kafka_tls_level() {
+  local clients="$1" index start elapsed
+  stage "Kafka over TLS: $clients concurrent client(s)"
+  for (( index = 0; index < clients; index++ )); do
+    kafka_topic "$TOPIC-s$clients-$index"
+  done
+  start_sampling bench-kafka "$RESULTS/kafka-tls-produce-$clients.stats"
+  start="$(now_ms)"
+  pids=()
+  for (( index = 0; index < clients; index++ )); do
+    docker_run exec \
+      -e KAFKA_HEAP_OPTS="$KAFKA_CLIENT_HEAP" \
+      -e KAFKA_JVM_PERFORMANCE_OPTS="$KAFKA_CLIENT_GC" \
+      bench-kafka /opt/kafka/bin/kafka-producer-perf-test.sh \
+      --topic "$TOPIC-s$clients-$index" --num-records "$PER_CLIENT" \
+      --record-size "$RECORD_SIZE" --throughput -1 \
+      --producer-props bootstrap.servers=bench-kafka:9094 "acks=$ACKS" \
+        "batch.size=$BATCH_SIZE" "linger.ms=$LINGER_MS" \
+        "compression.type=$COMPRESSION" "max.request.size=$MAX_BYTES" \
+        "buffer.memory=33554432" "enable.idempotence=false" $KAFKA_TLS_PRODUCER_PROPS \
+      > "$RESULTS/kafka-tls-produce-$clients-$index.txt" 2>&1 &
+    pids+=($!)
+  done
+  wait_all || { stop_sampling; die "Kafka TLS produce failed at $clients clients"; }
+  elapsed=$(( $(now_ms) - start ))
+  stop_sampling
+  record_level kafka-tls produce "$clients" $(( PER_CLIENT * clients )) "$elapsed" \
+    "$RESULTS/kafka-tls-produce-$clients.stats" \
+    "$(sum_client_rates kafka-produce "$RESULTS"/kafka-tls-produce-"$clients"-*.txt)"
+
+  start_sampling bench-kafka "$RESULTS/kafka-tls-consume-$clients.stats"
+  start="$(now_ms)"
+  pids=()
+  for (( index = 0; index < clients; index++ )); do
+    docker_run exec \
+      -e KAFKA_HEAP_OPTS="$KAFKA_CLIENT_HEAP" \
+      -e KAFKA_JVM_PERFORMANCE_OPTS="$KAFKA_CLIENT_GC" \
+      bench-kafka /opt/kafka/bin/kafka-consumer-perf-test.sh \
+      --bootstrap-server bench-kafka:9094 --topic "$TOPIC-s$clients-$index" \
+      --messages "$PER_CLIENT" --group "matched-tls-$clients-$index-$RANDOM" \
+      --timeout 300000 --fetch-size "$MAX_BYTES" \
+      --consumer.config /etc/kafka/secrets/client-ssl.properties \
+      > "$RESULTS/kafka-tls-consume-$clients-$index.txt" 2>&1 &
+    pids+=($!)
+  done
+  wait_all || { stop_sampling; die "Kafka TLS consume failed at $clients clients"; }
+  elapsed=$(( $(now_ms) - start ))
+  stop_sampling
+  record_level kafka-tls consume "$clients" $(( PER_CLIENT * clients )) "$elapsed" \
+    "$RESULTS/kafka-tls-consume-$clients.stats" \
+    "$(sum_client_rates kafka-consume "$RESULTS"/kafka-tls-consume-"$clients"-*.txt)"
+}
+
 # ---------------------------------------------------------- brahmaputra
 
 start_brahmaputra() {
@@ -320,6 +414,7 @@ TOPIC="matched-$(date +%s)"
 
 start_kafka
 for level in $LEVELS; do run_kafka_level "$level"; done
+for level in $LEVELS; do run_kafka_tls_level "$level"; done
 KAFKA_DISK="$(disk_bytes bench-kafka /tmp/kraft-combined-logs)"
 docker_run rm -f bench-kafka >/dev/null
 
@@ -332,6 +427,13 @@ start_brahmaputra bench-quic quic
 for level in $LEVELS; do run_brahmaputra_level bench-quic quic quic "$level"; done
 QUIC_DISK="$(disk_bytes bench-quic /data)"
 docker_run rm -f bench-quic >/dev/null
+
+# Brahmaputra over TLS on TCP: the transport that matches Kafka's own
+# encrypted one (kernel TCP, userspace TLS), paired with Kafka over TLS.
+start_brahmaputra bench-tls tcp-tls
+for level in $LEVELS; do run_brahmaputra_level bench-tls tcp-tls tls "$level"; done
+TLS_DISK="$(disk_bytes bench-tls /data)"
+docker_run rm -f bench-tls >/dev/null
 
 # -------------------------------------------------------------- report
 # Two readings per phase: the level whose CPU sits closest to Kafka's own
@@ -388,9 +490,17 @@ emit_matched() {
     "$(ratio "$(field "$quic_row" 6)" "$(field "$kafka_row" 6)")"
   printf '| Peak msgs/sec (any level) | %s | %s | %s |\n' \
     "$(field "$kafka_row" 6)" "$(field "$tcp_peak" 6)" "$(field "$quic_peak" 6)"
-  printf '| Peak ratio vs Kafka peak | 1.00x | %s | %s |\n\n' \
+  printf '| Peak ratio vs Kafka peak | 1.00x | %s | %s |\n' \
     "$(ratio "$(field "$tcp_peak" 6)" "$(field "$kafka_row" 6)")" \
     "$(ratio "$(field "$quic_peak" 6)" "$(field "$kafka_row" 6)")"
+  local tls_peak brahma_tls_peak
+  tls_peak="$(peak_row kafka-tls "$phase")"
+  brahma_tls_peak="$(peak_row tls "$phase")"
+  printf '| Kafka over TLS, peak msgs/sec | %s | | |\n' "$(field "$tls_peak" 6)"
+  printf '| Brahmaputra over TLS (tcp-tls), peak msgs/sec | | %s | |\n' "$(field "$brahma_tls_peak" 6)"
+  printf '| Peak ratio vs Kafka over TLS | | %s (tcp-tls) | %s (quic) |\n\n' \
+    "$(ratio "$(field "$brahma_tls_peak" 6)" "$(field "$tls_peak" 6)")" \
+    "$(ratio "$(field "$quic_peak" 6)" "$(field "$tls_peak" 6)")"
 }
 
 {

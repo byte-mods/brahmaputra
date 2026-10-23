@@ -44,15 +44,51 @@ const STREAM_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 const CONNECTION_WINDOW: u32 = 256 * 1024 * 1024;
 const MAX_DISCOVERED_UDP_PAYLOAD: u16 = 9000;
 
+/// The largest UDP payload this endpoint advertises and probes for.
+/// `BRAHMAPUTRA_QUIC_MAX_UDP_PAYLOAD` overrides the 9,000-byte default, for
+/// diagnosing a path that loses jumbo datagrams.
+fn max_udp_payload() -> u16 {
+    std::env::var("BRAHMAPUTRA_QUIC_MAX_UDP_PAYLOAD")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| (1200..=65527).contains(value))
+        .unwrap_or(MAX_DISCOVERED_UDP_PAYLOAD)
+}
+
+/// Whether to let quinn hand the kernel several datagrams per send (UDP
+/// GSO). `BRAHMAPUTRA_QUIC_GSO=0` turns it off, again for diagnosis.
+fn segmentation_offload() -> bool {
+    std::env::var("BRAHMAPUTRA_QUIC_GSO").map_or(true, |value| value != "0")
+}
+
 /// Advertise capacity for jumbo datagrams without assuming that the path can
 /// carry them. Transport discovery starts small and only grows after probes
 /// are acknowledged; standard-MTU paths retain their smaller packet size.
 pub fn datacenter_endpoint_config() -> EndpointConfig {
     let mut config = EndpointConfig::default();
     config
-        .max_udp_payload_size(MAX_DISCOVERED_UDP_PAYLOAD)
+        .max_udp_payload_size(max_udp_payload())
         .expect("valid QUIC UDP payload size");
     config
+}
+
+/// Give a QUIC endpoint's UDP socket the largest kernel buffers the host
+/// allows.
+///
+/// The default is about 208 KiB a side — twenty-odd jumbo datagrams. A
+/// receiver that is busy decrypting for a few hundred microseconds then
+/// drops what arrives meanwhile, and the sender reads those drops as
+/// congestion and as a black-holed path: its window stays at the minimum
+/// and its datagrams fall back to 1,200 bytes, which is a 1 MiB record in
+/// nine hundred packets at ~85 MB/s. Asking for 16 MiB lets the kernel
+/// clamp to its own ceiling (`net.core.rmem_max`, 4 MiB on this host),
+/// which is enough headroom that the receiver never has to be fast.
+pub fn tune_udp_socket(socket: &std::net::UdpSocket) {
+    let socket = socket2::SockRef::from(socket);
+    // Failures only leave the defaults in place; the kernel silently
+    // clamps an over-large request to its maximum.
+    let _ = socket.set_recv_buffer_size(16 * 1024 * 1024);
+    let _ = socket.set_send_buffer_size(16 * 1024 * 1024);
 }
 
 /// Retune quinn's defaults, which target a lossy ~100 ms internet path,
@@ -75,8 +111,9 @@ pub fn tune_for_datacenter(transport: &mut TransportConfig) {
     // MTU discovery still probes and backs off if the path is smaller.
     transport.initial_mtu(1350);
     let mut discovery = MtuDiscoveryConfig::default();
-    discovery.upper_bound(MAX_DISCOVERED_UDP_PAYLOAD);
+    discovery.upper_bound(max_udp_payload());
     transport.mtu_discovery_config(Some(discovery));
+    transport.enable_segmentation_offload(segmentation_offload());
     transport.datagram_receive_buffer_size(Some(STREAM_RECEIVE_WINDOW as usize));
 }
 
@@ -105,6 +142,7 @@ impl QuicConnection {
             "[::]:0".parse().expect("valid bind address")
         };
         let socket = std::net::UdpSocket::bind(bind).map_err(ClientError::Io)?;
+        tune_udp_socket(&socket);
         let mut endpoint = Endpoint::new(
             datacenter_endpoint_config(),
             None,
@@ -137,6 +175,30 @@ impl QuicConnection {
             client_id,
             _endpoint: Arc::new(endpoint),
         })
+    }
+
+    /// Transport statistics for this connection, for diagnosis: path MTU,
+    /// datagrams and bytes each way, how many sends the socket API took
+    /// (fewer than datagrams means segmentation offload is working), lost
+    /// packets and congestion events.
+    pub fn stats_summary(&self) -> String {
+        let stats = self.connection.stats();
+        format!(
+            "mtu={} cwnd={} rtt_ms={:.2} udp_tx={{datagrams={} bytes={} ios={}}} udp_rx={{datagrams={} bytes={} ios={}}} lost={{packets={} bytes={}}} congestion_events={} black_holes={}",
+            stats.path.current_mtu,
+            stats.path.cwnd,
+            stats.path.rtt.as_secs_f64() * 1000.0,
+            stats.udp_tx.datagrams,
+            stats.udp_tx.bytes,
+            stats.udp_tx.ios,
+            stats.udp_rx.datagrams,
+            stats.udp_rx.bytes,
+            stats.udp_rx.ios,
+            stats.path.lost_packets,
+            stats.path.lost_bytes,
+            stats.path.congestion_events,
+            stats.path.black_holes_detected,
+        )
     }
 
     /// One request on its own bidirectional stream: write the framed
@@ -259,6 +321,18 @@ impl ServerCertVerifier for AcceptAnyServerCert {
             SignatureScheme::RSA_PSS_SHA256,
             SignatureScheme::RSA_PKCS1_SHA256,
         ]
+    }
+}
+
+impl Drop for QuicConnection {
+    fn drop(&mut self) {
+        // Diagnostic only: set BRAHMAPUTRA_QUIC_STATS to have every
+        // connection report its transport counters as it closes. Off by
+        // default; it exists to answer "was that the network or the
+        // transport?" without a packet capture.
+        if std::env::var_os("BRAHMAPUTRA_QUIC_STATS").is_some() {
+            eprintln!("quic connection stats: {}", self.stats_summary());
+        }
     }
 }
 

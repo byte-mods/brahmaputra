@@ -70,6 +70,38 @@ indexes and checkpoints are read unchanged.
   a full extra memcpy per record, a megabyte each on the large-record
   benchmark's consume path, is gone.
 
+- **The benchmark matrix compares encrypted QUIC with Kafka over TLS.**
+  Until now every QUIC row was paired with plaintext Kafka, which the
+  reports acknowledged and which no tuning can win on 1 MiB records in a
+  four-CPU container: a client-side measurement showed broker and client
+  each spending about 1.6 cores on userspace encryption and packetisation
+  for 120 MB/s, against a transport that encrypts nothing and serves reads
+  with `sendfile`. The concurrency and large-record harnesses now also run
+  Kafka over an SSL listener on the same broker — a self-signed PKCS12
+  keystore generated with the image's own `keytool` — and Brahmaputra over
+  TLS on TCP (`tcp-tls`), the transport that matches Kafka's own encrypted
+  one. The comparison pairs each QUIC and tcp-tls row with the
+  Kafka-over-TLS row of the same phase; the plaintext Kafka rows and their
+  pairing with TCP are unchanged, and every Kafka-over-TLS row is
+  published. Against Kafka over TLS, tcp-tls wins all 18 of its rows and
+  QUIC 16 of 18; the two it loses are 1 MiB records, diagnosed in the
+  release review to the per-byte cost of userspace QUIC in a four-CPU
+  container rather than to anything the broker does.
+
+- **QUIC endpoints ask for the largest UDP socket buffers the host
+  allows** (16 MiB, which the kernel clamps to its ceiling; 4 MiB here),
+  on both broker and client. The default of about 208 KiB is twenty-odd
+  jumbo datagrams, and a receiver busy for a few hundred microseconds then
+  drops what arrives, which the sender reads as a black-holed path and
+  answers by falling to 1,200-byte datagrams for the connection's life.
+
+- **Three QUIC diagnostics, all off by default.** `BRAHMAPUTRA_QUIC_STATS`
+  makes every connection report its path MTU, datagrams, send calls,
+  losses and congestion events as it closes, on both ends;
+  `BRAHMAPUTRA_QUIC_MAX_UDP_PAYLOAD` caps the advertised and probed
+  datagram size; `BRAHMAPUTRA_QUIC_GSO=0` disables segmentation offload.
+  They are how the large-record QUIC ceiling was located.
+
 - **`brahmaputra-cli produce --count` and `consume --max` print a progress
   line on stderr every two seconds** with the cumulative count and the
   rate over the last interval, so a stall shows up as a line with a rate

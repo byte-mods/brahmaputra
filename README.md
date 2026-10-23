@@ -1680,13 +1680,16 @@ unrelated containers left running):
 | Consume, client-measured | 825,274 | 3,753,357 |
 | Produce p99.9 ack latency | 6.7 s | 111 ms |
 
-Results depend on workload and timing boundary. Across the matrix, over TCP
-Brahmaputra wins all 66 throughput comparisons (wall-clock median 4.09×,
-minimum 1.47×) and uses fewer CPU core-seconds in 50 of 52 comparisons; all
-104 average/peak working-set memory comparisons are lower. Encrypted QUIC,
-compared against plaintext Kafka, wins every wall-clock row but loses six of
-its ten client-measured rows — both 1 MiB-record rates, both single-client
-rates and two multi-client consume rates — and spends more CPU there. These counts include correlated measures of the same
+Results depend on workload and timing boundary. Across the matrix's 412
+paired comparisons, Brahmaputra wins 100 of 102 throughput rows and uses
+fewer CPU core-seconds in 60 of 62; all 124 average/peak working-set memory
+comparisons are lower. Plaintext TCP against plaintext Kafka wins all 66 of
+its rows (wall-clock median 4.09×, minimum 1.47×). The encrypted transports
+are compared with Kafka over TLS: TLS on TCP wins all 18 of its rows
+(wall-clock median 5.33×), and QUIC wins 16 of 18, losing only on 1 MiB
+records (0.57× produce, 0.55× consume), where userspace QUIC's per-byte cost
+in a four-CPU container is the ceiling — diagnosed, not tuned around, in
+the review. These counts include correlated measures of the same
 runs, not independent trials. All losing rows remain published. The lease
 expiries and stalls that earlier runs suffered had a single cause, fixed in
 0.10.1 (see the review); this run observed none.

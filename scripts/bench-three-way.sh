@@ -53,6 +53,39 @@ docker_run network create "$NETWORK" >/dev/null 2>&1 || true
 # ------------------------------------------------------------- sampling
 
 source "$ROOT/scripts/bench-resources.sh"
+
+# ------------------------------------------------------------- kafka tls
+# Encrypted QUIC against plaintext Kafka compares a transport that encrypts
+# with one that does not. Kafka therefore also serves an SSL listener on
+# the same broker, from a self-signed certificate generated with the
+# image's own keytool, and every QUIC row is paired with the Kafka-over-TLS
+# row of the same phase. The plaintext listener and its rows are unchanged.
+KAFKA_TLS_PASS="benchpass"
+# Host paths handed to Docker must be in the platform's own form; on Git
+# Bash that means converting back to Windows.
+if ! command -v host_path >/dev/null 2>&1; then
+  host_path() {
+    if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi
+  }
+fi
+kafka_tls_material() {
+  local dir="$1"
+  mkdir -p "$dir"
+  docker_run run --rm -v "$(host_path "$dir"):/certs" --entrypoint sh "$KAFKA_IMAGE" -c '
+    set -e
+    keytool -genkeypair -alias kafka -keyalg RSA -keysize 2048 -validity 3650 -storetype PKCS12 \
+      -keystore /certs/kafka.p12 -storepass '"$KAFKA_TLS_PASS"' -keypass '"$KAFKA_TLS_PASS"' \
+      -dname "CN=bench-kafka" -ext "SAN=dns:bench-kafka,dns:localhost" >/dev/null 2>&1
+    keytool -exportcert -alias kafka -keystore /certs/kafka.p12 -storepass '"$KAFKA_TLS_PASS"' -rfc -file /certs/kafka.crt >/dev/null 2>&1
+    keytool -importcert -noprompt -alias kafka -file /certs/kafka.crt -storetype PKCS12 \
+      -keystore /certs/truststore.p12 -storepass '"$KAFKA_TLS_PASS"' >/dev/null 2>&1
+    printf "%s" '"$KAFKA_TLS_PASS"' > /certs/keystore.creds
+    printf "%s" '"$KAFKA_TLS_PASS"' > /certs/key.creds
+    printf "security.protocol=SSL\nssl.truststore.location=/etc/kafka/secrets/truststore.p12\nssl.truststore.password=%s\nssl.truststore.type=PKCS12\n" '"$KAFKA_TLS_PASS"' > /certs/client-ssl.properties
+  ' || die "cannot generate Kafka TLS material"
+}
+KAFKA_TLS_PRODUCER_PROPS="security.protocol=SSL ssl.truststore.location=/etc/kafka/secrets/truststore.p12 ssl.truststore.password=$KAFKA_TLS_PASS ssl.truststore.type=PKCS12"
+
 start_sampling() { start_resource_sampling "$2" "$1"; }
 stop_sampling() { stop_resource_sampling; }
 summarize_samples() { summarize_resource_samples "$1"; }
@@ -70,11 +103,17 @@ start_kafka() {
     --cpus "$CPUS" --memory "$MEMORY" \
     -e KAFKA_NODE_ID=1 \
     -e KAFKA_PROCESS_ROLES=broker,controller \
-    -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
-    -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://bench-kafka:9092 \
+    -e KAFKA_LISTENERS=PLAINTEXT://:9092,SSL://:9094,CONTROLLER://:9093 \
+    -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://bench-kafka:9092,SSL://bench-kafka:9094 \
     -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
     -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@bench-kafka:9093 \
-    -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+    -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SSL:SSL \
+    -e KAFKA_SSL_KEYSTORE_FILENAME=kafka.p12 \
+    -e KAFKA_SSL_KEYSTORE_CREDENTIALS=keystore.creds \
+    -e KAFKA_SSL_KEY_CREDENTIALS=key.creds \
+    -e KAFKA_SSL_KEYSTORE_TYPE=PKCS12 \
+    -e KAFKA_SSL_CLIENT_AUTH=none \
+    -v "$(host_path "$RESULTS/kafka-tls"):/etc/kafka/secrets" \
     -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
     -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
     -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
@@ -157,7 +196,13 @@ mb_per_sec() { awk -v r="$1" -v s="$RECORD_SIZE" 'BEGIN { printf "%.2f", r * s /
 
 TOPIC="threeway-$(date +%s)"
 
+mkdir -p "$RESULTS"
+kafka_tls_material "$RESULTS/kafka-tls"
 start_kafka
+docker_run exec bench-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server bench-kafka:9092 --create --if-not-exists \
+  --topic "$TOPIC-tls" --partitions "$PARTITIONS" --replication-factor 1 \
+  --config max.message.bytes="$MAX_BYTES" >/dev/null
 docker_run exec bench-kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server bench-kafka:9092 --create --if-not-exists \
   --topic "$TOPIC" --partitions "$PARTITIONS" --replication-factor 1 \
@@ -182,6 +227,26 @@ docker_run exec -e KAFKA_HEAP_OPTS="$KAFKA_CLIENT_HEAP" bench-kafka /opt/kafka/b
   > "$RESULTS/kafka-consume.txt" 2>&1 \
   || { stop_sampling; cat "$RESULTS/kafka-consume.txt" >&2; die "Kafka consume failed"; }
 stop_sampling
+info "produce over TLS"
+start_sampling bench-kafka "$RESULTS/kafka-tls-produce-stats.txt"
+docker_run exec -e KAFKA_HEAP_OPTS="$KAFKA_CLIENT_HEAP" bench-kafka /opt/kafka/bin/kafka-producer-perf-test.sh \
+  --topic "$TOPIC-tls" --num-records "$RECORDS" --record-size "$RECORD_SIZE" \
+  --throughput -1 \
+  --producer-props bootstrap.servers=bench-kafka:9094 "acks=$ACKS" \
+    "batch.size=$BATCH_SIZE" "linger.ms=$LINGER_MS" "compression.type=$COMPRESSION" \
+    "max.request.size=$MAX_BYTES" "buffer.memory=268435456" "enable.idempotence=false" $KAFKA_TLS_PRODUCER_PROPS \
+  > "$RESULTS/kafka-tls-produce.txt" 2>&1 \
+  || { stop_sampling; cat "$RESULTS/kafka-tls-produce.txt" >&2; die "Kafka TLS produce failed"; }
+stop_sampling
+info "consume over TLS"
+start_sampling bench-kafka "$RESULTS/kafka-tls-consume-stats.txt"
+docker_run exec -e KAFKA_HEAP_OPTS="$KAFKA_CLIENT_HEAP" bench-kafka /opt/kafka/bin/kafka-consumer-perf-test.sh \
+  --bootstrap-server bench-kafka:9094 --topic "$TOPIC-tls" --messages "$RECORDS" \
+  --group "threeway-tls-$RANDOM" --timeout 180000 --fetch-size "$MAX_BYTES" \
+  --consumer.config /etc/kafka/secrets/client-ssl.properties \
+  > "$RESULTS/kafka-tls-consume.txt" 2>&1 \
+  || { stop_sampling; cat "$RESULTS/kafka-tls-consume.txt" >&2; die "Kafka TLS consume failed"; }
+stop_sampling
 docker_run rm -f bench-kafka >/dev/null
 
 run_brahmaputra() {
@@ -203,15 +268,25 @@ run_brahmaputra() {
 
 run_brahmaputra bench-tcp tcp tcp
 run_brahmaputra bench-quic quic quic
+run_brahmaputra bench-tls tcp-tls tls
 
 # -------------------------------------------------------------- report
 
 read -r KP_RATE KP_MB <<<"$(parse_kafka_produce "$RESULTS/kafka-produce.txt")"
 read -r KC_RATE KC_MB <<<"$(parse_kafka_consume "$RESULTS/kafka-consume.txt")"
+read -r SP_RATE SP_MB <<<"$(parse_kafka_produce "$RESULTS/kafka-tls-produce.txt")"
+read -r SC_RATE SC_MB <<<"$(parse_kafka_consume "$RESULTS/kafka-tls-consume.txt")"
+read -r SP_CPU SP_CPU_MAX SP_MEM SP_MEM_MAX <<<"$(summarize_samples "$RESULTS/kafka-tls-produce-stats.txt")"
+read -r SC_CPU SC_CPU_MAX SC_MEM SC_MEM_MAX <<<"$(summarize_samples "$RESULTS/kafka-tls-consume-stats.txt")"
 TP_RATE="$(parse_rate "$RESULTS/tcp-produce.txt")"
 TC_RATE="$(parse_rate "$RESULTS/tcp-consume.txt")"
 QP_RATE="$(parse_rate "$RESULTS/quic-produce.txt")"
 QC_RATE="$(parse_rate "$RESULTS/quic-consume.txt")"
+LP_RATE="$(parse_rate "$RESULTS/tls-produce.txt")"
+LC_RATE="$(parse_rate "$RESULTS/tls-consume.txt")"
+read -r LP_CPU LP_CPU_MAX LP_MEM LP_MEM_MAX <<<"$(summarize_samples "$RESULTS/tls-produce-stats.txt")"
+read -r LC_CPU LC_CPU_MAX LC_MEM LC_MEM_MAX <<<"$(summarize_samples "$RESULTS/tls-consume-stats.txt")"
+TLS_DISK="$(cat "$RESULTS/tls-disk.txt" 2>/dev/null || true)"
 
 read -r KP_CPU KP_CPU_MAX KP_MEM KP_MEM_MAX <<<"$(summarize_samples "$RESULTS/kafka-produce-stats.txt")"
 read -r KC_CPU KC_CPU_MAX KC_MEM KC_MEM_MAX <<<"$(summarize_samples "$RESULTS/kafka-consume-stats.txt")"
@@ -234,32 +309,39 @@ QUIC_DISK="$(cat "$RESULTS/quic-disk.txt" 2>/dev/null || true)"
   printf 'Producer idempotence is disabled on both systems.\n\n'
   printf 'Initial consumer-group rebalance delay is %s ms on both brokers.\n\n' "$GROUP_INITIAL_REBALANCE_DELAY_MS"
 
-  printf '| Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC |\n'
-  printf '|---|---|---|---|\n'
-  printf '| Produce msgs/sec | %s | %s | %s |\n' "${KP_RATE:-n/a}" "${TP_RATE:-n/a}" "${QP_RATE:-n/a}"
-  printf '| Produce MB/sec | %s | %s | %s |\n' \
-    "${KP_MB:-n/a}" "$(mb_per_sec "${TP_RATE:-0}")" "$(mb_per_sec "${QP_RATE:-0}")"
-  printf '| Consume msgs/sec | %s | %s | %s |\n' "${KC_RATE:-n/a}" "${TC_RATE:-n/a}" "${QC_RATE:-n/a}"
-  printf '| Consume MB/sec | %s | %s | %s |\n' \
-    "${KC_MB:-n/a}" "$(mb_per_sec "${TC_RATE:-0}")" "$(mb_per_sec "${QC_RATE:-0}")"
-  printf '| Produce CPU %% avg / peak | %s / %s | %s / %s | %s / %s |\n' \
-    "$KP_CPU" "$KP_CPU_MAX" "$TP_CPU" "$TP_CPU_MAX" "$QP_CPU" "$QP_CPU_MAX"
-  printf '| Produce memory MiB avg / peak | %s / %s | %s / %s | %s / %s |\n' \
-    "$KP_MEM" "$KP_MEM_MAX" "$TP_MEM" "$TP_MEM_MAX" "$QP_MEM" "$QP_MEM_MAX"
-  printf '| Consume CPU %% avg / peak | %s / %s | %s / %s | %s / %s |\n' \
-    "$KC_CPU" "$KC_CPU_MAX" "$TC_CPU" "$TC_CPU_MAX" "$QC_CPU" "$QC_CPU_MAX"
-  printf '| Consume memory MiB avg / peak | %s / %s | %s / %s | %s / %s |\n' \
-    "$KC_MEM" "$KC_MEM_MAX" "$TC_MEM" "$TC_MEM_MAX" "$QC_MEM" "$QC_MEM_MAX"
-  printf '| Log bytes on disk | %s | %s | %s |\n' \
-    "${KAFKA_DISK:-n/a}" "${TCP_DISK:-n/a}" "${QUIC_DISK:-n/a}"
-  printf '| Disk bytes per record | %s | %s | %s |\n' \
+  printf 'Kafka is also measured over its SSL listener, and Brahmaputra over TLS on\n'
+  printf 'TCP (tcp-tls), the transport that matches it: kernel TCP with userspace\n'
+  printf 'TLS. Encrypted QUIC and tcp-tls are each compared with Kafka over TLS;\n'
+  printf 'plaintext Kafka is the comparator for plaintext TCP.\n\n'
+  printf '| Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC | Kafka TLS | Brahmaputra TLS |\n'
+  printf '|---|---|---|---|---|---|\n'
+  printf '| Produce msgs/sec | %s | %s | %s | %s | %s |\n' "${KP_RATE:-n/a}" "${TP_RATE:-n/a}" "${QP_RATE:-n/a}" "${SP_RATE:-n/a}" "${LP_RATE:-n/a}"
+  printf '| Produce MB/sec | %s | %s | %s | %s | %s |\n' \
+    "${KP_MB:-n/a}" "$(mb_per_sec "${TP_RATE:-0}")" "$(mb_per_sec "${QP_RATE:-0}")" "${SP_MB:-n/a}" "$(mb_per_sec "${LP_RATE:-0}")"
+  printf '| Consume msgs/sec | %s | %s | %s | %s | %s |\n' "${KC_RATE:-n/a}" "${TC_RATE:-n/a}" "${QC_RATE:-n/a}" "${SC_RATE:-n/a}" "${LC_RATE:-n/a}"
+  printf '| Consume MB/sec | %s | %s | %s | %s | %s |\n' \
+    "${KC_MB:-n/a}" "$(mb_per_sec "${TC_RATE:-0}")" "$(mb_per_sec "${QC_RATE:-0}")" "${SC_MB:-n/a}" "$(mb_per_sec "${LC_RATE:-0}")"
+  printf '| Produce CPU %% avg / peak | %s / %s | %s / %s | %s / %s | %s / %s | %s / %s |\n' \
+    "$KP_CPU" "$KP_CPU_MAX" "$TP_CPU" "$TP_CPU_MAX" "$QP_CPU" "$QP_CPU_MAX" "$SP_CPU" "$SP_CPU_MAX" "$LP_CPU" "$LP_CPU_MAX"
+  printf '| Produce memory MiB avg / peak | %s / %s | %s / %s | %s / %s | %s / %s | %s / %s |\n' \
+    "$KP_MEM" "$KP_MEM_MAX" "$TP_MEM" "$TP_MEM_MAX" "$QP_MEM" "$QP_MEM_MAX" "$SP_MEM" "$SP_MEM_MAX" "$LP_MEM" "$LP_MEM_MAX"
+  printf '| Consume CPU %% avg / peak | %s / %s | %s / %s | %s / %s | %s / %s | %s / %s |\n' \
+    "$KC_CPU" "$KC_CPU_MAX" "$TC_CPU" "$TC_CPU_MAX" "$QC_CPU" "$QC_CPU_MAX" "$SC_CPU" "$SC_CPU_MAX" "$LC_CPU" "$LC_CPU_MAX"
+  printf '| Consume memory MiB avg / peak | %s / %s | %s / %s | %s / %s | %s / %s | %s / %s |\n' \
+    "$KC_MEM" "$KC_MEM_MAX" "$TC_MEM" "$TC_MEM_MAX" "$QC_MEM" "$QC_MEM_MAX" "$SC_MEM" "$SC_MEM_MAX" "$LC_MEM" "$LC_MEM_MAX"
+  printf '| Log bytes on disk | %s | %s | %s | (shared broker) | %s |\n' \
+    "${KAFKA_DISK:-n/a}" "${TCP_DISK:-n/a}" "${QUIC_DISK:-n/a}" "${TLS_DISK:-n/a}"
+  printf '| Disk bytes per record | %s | %s | %s | (shared broker) | %s |\n' \
     "$(awk -v d="${KAFKA_DISK:-n/a}" -v r="$RECORDS" 'BEGIN{if(r && d ~ /^[0-9]+$/) printf "%.0f", d/r; else print "n/a"}')" \
     "$(awk -v d="${TCP_DISK:-n/a}" -v r="$RECORDS" 'BEGIN{if(r && d ~ /^[0-9]+$/) printf "%.0f", d/r; else print "n/a"}')" \
-    "$(awk -v d="${QUIC_DISK:-n/a}" -v r="$RECORDS" 'BEGIN{if(r && d ~ /^[0-9]+$/) printf "%.0f", d/r; else print "n/a"}')"
-  printf '| Produce msgs/sec per CPU%% | %s | %s | %s |\n' \
+    "$(awk -v d="${QUIC_DISK:-n/a}" -v r="$RECORDS" 'BEGIN{if(r && d ~ /^[0-9]+$/) printf "%.0f", d/r; else print "n/a"}')" \
+    "$(awk -v d="${TLS_DISK:-n/a}" -v r="$RECORDS" 'BEGIN{if(r && d ~ /^[0-9]+$/) printf "%.0f", d/r; else print "n/a"}')"
+  printf '| Produce msgs/sec per CPU%% | %s | %s | %s | %s | %s |\n' \
     "$(awk -v t="${KP_RATE:-0}" -v c="$KP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')" \
     "$(awk -v t="${TP_RATE:-0}" -v c="$TP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')" \
-    "$(awk -v t="${QP_RATE:-0}" -v c="$QP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')"
+    "$(awk -v t="${QP_RATE:-0}" -v c="$QP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')" \
+    "$(awk -v t="${SP_RATE:-0}" -v c="$SP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')" \
+    "$(awk -v t="${LP_RATE:-0}" -v c="$LP_CPU" 'BEGIN{if(c+0>0) printf "%.1f", t/c; else print "n/a"}')"
   printf '\nRaw output, cgroup samples and CPU-time summaries: `bench/results/three-way/`.\n'
   resource_report "$RESULTS"
 } > "$REPORT"

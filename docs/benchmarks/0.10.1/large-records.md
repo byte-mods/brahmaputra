@@ -9,19 +9,24 @@ Producer idempotence is disabled on both systems.
 
 Initial consumer-group rebalance delay is 0 ms on both brokers.
 
-| Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC |
-|---|---|---|---|
-| Produce msgs/sec | 180.277628 | 242 | 92 |
-| Produce MB/sec | 180.28 | 242.00 | 92.00 |
-| Consume msgs/sec | 320.0512 | 898 | 85 |
-| Consume MB/sec | 320.0512 | 898.00 | 85.00 |
-| Produce CPU % avg / peak | 254.2 / 558.8 | 135.9 / 472.8 | 301.7 / 501.3 |
-| Produce memory MiB avg / peak | 1008.1 / 1763.5 | 266.7 / 390.9 | 315.9 / 496.7 |
-| Consume CPU % avg / peak | 200.1 / 476.6 | 88.1 / 157.8 | 272.4 / 364.1 |
-| Consume memory MiB avg / peak | 2219.3 / 3935.1 | 1190.3 / 2242.4 | 811.9 / 1369.7 |
-| Log bytes on disk | n/a | 2097228816 | 2097227597 |
-| Disk bytes per record | n/a | 1048614 | 1048614 |
-| Produce msgs/sec per CPU% | 0.7 | 1.8 | 0.3 |
+Kafka is also measured over its SSL listener, and Brahmaputra over TLS on
+TCP (tcp-tls), the transport that matches it: kernel TCP with userspace
+TLS. Encrypted QUIC and tcp-tls are each compared with Kafka over TLS;
+plaintext Kafka is the comparator for plaintext TCP.
+
+| Metric | Kafka | Brahmaputra TCP | Brahmaputra QUIC | Kafka TLS | Brahmaputra TLS |
+|---|---|---|---|---|---|
+| Produce msgs/sec | 186.532363 | 284 | 92 | 161.004669 | 215 |
+| Produce MB/sec | 186.53 | 284.00 | 92.00 | 161.00 | 215.00 |
+| Consume msgs/sec | 323.4153 | 879 | 87 | 158.0778 | 442 |
+| Consume MB/sec | 323.4153 | 879.00 | 87.00 | 158.0778 | 442.00 |
+| Produce CPU % avg / peak | 256.9 / 530.2 | 191.4 / 2084.4 | 300.9 / 554.8 | 253.7 / 771.5 | 154.8 / 539.2 |
+| Produce memory MiB avg / peak | 1008.2 / 1758.1 | 269.2 / 368.0 | 334.9 / 534.2 | 3452.9 / 3990.1 | 233.2 / 360.0 |
+| Consume CPU % avg / peak | 193.5 / 416.9 | 86.5 / 160.7 | 267.3 / 365.7 | 201.2 / 493.4 | 144.8 / 262.3 |
+| Consume memory MiB avg / peak | 2219.4 / 3943.1 | 1188.7 / 2252.1 | 854.4 / 1417.7 | 3313.9 / 3683.5 | 848.4 / 1453.3 |
+| Log bytes on disk | n/a | 2097229606 | 2097227880 | (shared broker) | 2097229859 |
+| Disk bytes per record | n/a | 1048615 | 1048614 | (shared broker) | 1048615 |
+| Produce msgs/sec per CPU% | 0.7 | 1.5 | 0.3 | 0.6 | 1.4 |
 
 Raw output, cgroup samples and CPU-time summaries: `bench/results/three-way/`.
 
@@ -37,9 +42,13 @@ average CPU describes utilization during each system's own run.
 
 | Phase artifact | Sampling window (s) | CPU time (core-seconds) | Average cores |
 |---|---:|---:|---:|
-| kafka-consume-stats.txt | 11.000 | 22.014 | 2.001 |
-| kafka-produce-stats.txt | 15.160 | 38.534 | 2.542 |
-| quic-consume-stats.txt | 24.730 | 67.368 | 2.724 |
-| quic-produce-stats.txt | 23.110 | 69.718 | 3.017 |
-| tcp-consume-stats.txt | 3.620 | 3.190 | 0.881 |
-| tcp-produce-stats.txt | 9.560 | 12.996 | 1.359 |
+| kafka-consume-stats.txt | 11.000 | 21.281 | 1.935 |
+| kafka-produce-stats.txt | 14.800 | 38.023 | 2.569 |
+| kafka-tls-consume-stats.txt | 17.630 | 35.466 | 2.012 |
+| kafka-tls-produce-stats.txt | 16.770 | 42.545 | 2.537 |
+| quic-consume-stats.txt | 24.250 | 64.813 | 2.673 |
+| quic-produce-stats.txt | 23.250 | 69.959 | 3.009 |
+| tcp-consume-stats.txt | 3.740 | 3.235 | 0.865 |
+| tcp-produce-stats.txt | 8.440 | 16.156 | 1.914 |
+| tls-consume-stats.txt | 5.850 | 8.468 | 1.448 |
+| tls-produce-stats.txt | 10.720 | 16.599 | 1.548 |

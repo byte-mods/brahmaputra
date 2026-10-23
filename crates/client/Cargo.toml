@@ -12,6 +12,7 @@ bytes.workspace = true
 crc32c.workspace = true
 futures.workspace = true
 quinn.workspace = true
+socket2.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 rustls-pemfile.workspace = true

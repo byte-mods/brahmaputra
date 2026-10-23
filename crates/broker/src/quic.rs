@@ -86,6 +86,7 @@ impl QuicListener {
 
         let socket = std::net::UdpSocket::bind(addr)
             .map_err(|error| BrokerError::Meta(format!("cannot bind quic socket: {error}")))?;
+        brahmaputra_client::tune_quic_socket(&socket);
         let endpoint = Endpoint::new(
             brahmaputra_client::quic_endpoint_config(),
             Some(config),
@@ -208,6 +209,24 @@ async fn serve_connection(
         }
     }
     streams.shutdown().await;
+    // Diagnostic counterpart of the client's BRAHMAPUTRA_QUIC_STATS: the
+    // sender's view of the path is the one that explains a slow download.
+    if std::env::var_os("BRAHMAPUTRA_QUIC_STATS").is_some() {
+        let stats = connection.stats();
+        tracing::info!(
+            %peer,
+            mtu = stats.path.current_mtu,
+            cwnd = stats.path.cwnd,
+            rtt_ms = stats.path.rtt.as_secs_f64() * 1000.0,
+            tx_datagrams = stats.udp_tx.datagrams,
+            tx_bytes = stats.udp_tx.bytes,
+            tx_ios = stats.udp_tx.ios,
+            lost_packets = stats.path.lost_packets,
+            congestion_events = stats.path.congestion_events,
+            black_holes = stats.path.black_holes_detected,
+            "quic connection stats"
+        );
+    }
 }
 
 /// Read one framed request off `recv`, dispatch it, write the response.

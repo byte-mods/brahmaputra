@@ -355,6 +355,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "socket2",
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
